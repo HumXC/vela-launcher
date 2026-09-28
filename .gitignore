@@ -1,0 +1,14 @@
+.pi
+openspec
+.pi-lens
+.vscode
+.mnemon
+.envrc
+.direnv
+.zig-cache
+.gitnexus
+.nix-cache
+zig-out
+zig-pkg
+build
+result

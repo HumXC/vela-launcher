@@ -1,0 +1,29 @@
+.{
+    .name = .vela_launcher,
+    .fingerprint = 0x722af1a98fa1f513,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .dvui = .{
+            .url = "git+https://github.com/david-vanderson/dvui#f719b09b7d23b5e734fa10f2c9e5004ca42590f6",
+            .hash = "dvui-0.5.0-dev-AQFJmZPiAwGJlkO3EpYY907g1uWyms6mXSz-zj_HQ2h8",
+        },
+        .sdl = .{
+            .url = "git+https://github.com/allyourcodebase/SDL#0a9d5c36488aad32fcf989d465eb879db6e356b4",
+            .hash = "sdl-1.0.3+3.4.16-i4QD0e0HqgDYP8m4T3rMJShyaDLy8ksp8qzCrCSncaPB",
+        },
+        .curl = .{
+            .url = "git+https://github.com/jiacai2050/zig-curl#1ac5ec3d10afa1c4591464ed24550e3874ce865c",
+            .hash = "curl-0.5.0-P4tT4e_-AABZBa1zBmiSKFQo7xV0DJ2cUxFfH4KiQKj2",
+        },
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
+            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
