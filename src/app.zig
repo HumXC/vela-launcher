@@ -34,3 +34,7 @@ pub fn deinit(win: *dvui.Window) void {
 pub fn frame() !dvui.App.Result {
     return .ok;
 }
+
+test {
+    _ = @import("core/root.zig");
+}

@@ -6,9 +6,12 @@ openspec
 .envrc
 .direnv
 .zig-cache
+.zig-global-cache
+__pycache__/
 .gitnexus
 .nix-cache
 zig-out
 zig-pkg
 build
 result
+.minecraft

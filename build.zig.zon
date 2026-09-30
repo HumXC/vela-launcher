@@ -20,6 +20,14 @@
             .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
             .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
         },
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio#v0.18.0",
+            .hash = "zio-0.18.0-xHbVVELgKQAU2hnwYL9MA0iXUydUZYlBfXxOUUM6v_Uv",
+        },
+        .dusty = .{
+            .url = "git+https://github.com/lalinsky/dusty#v0.3.1",
+            .hash = "dusty-0.3.1-Qdw7Rpd3IABFjZ0h7ymC-j2FkkcPRA52RYSW6AMojKlY",
+        },
     },
     .paths = .{
         "build.zig",
