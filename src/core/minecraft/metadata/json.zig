@@ -60,7 +60,42 @@ pub fn sha1(v: V) !Sha1 {
     return result;
 }
 pub fn maybeSha1(v: V, name: []const u8) !?Sha1 {
-    return if (try optional(v, name)) |x| try sha1(x) else null;
+    const value = try optional(v, name) orelse return null;
+    return if (value == .null) null else try sha1(value);
+}
+
+test "optional SHA1 accepts absent null and valid strict hexadecimal" {
+    for ([_][]const u8{ "{}", "{\"sha1\":null}" }) |document| {
+        var parsed = try std.json.parseFromSlice(V, std.testing.allocator, document, .{});
+        defer parsed.deinit();
+        try std.testing.expect(try maybeSha1(parsed.value, "sha1") == null);
+    }
+    var parsed = try std.json.parseFromSlice(V, std.testing.allocator, "{\"sha1\":\"0000000000000000000000000000000000000001\"}", .{});
+    defer parsed.deinit();
+    var expected: Sha1 = @splat(0);
+    expected[19] = 1;
+    try std.testing.expectEqualSlices(u8, &expected, &(try maybeSha1(parsed.value, "sha1")).?);
+    try std.testing.expectError(error.ExpectedString, sha1(.null));
+}
+
+test "optional SHA1 rejects malformed non-null values" {
+    const cases = [_]struct { document: []const u8, err: anyerror }{
+        .{ .document = "{\"sha1\":true}", .err = error.ExpectedString },
+        .{ .document = "{\"sha1\":false}", .err = error.ExpectedString },
+        .{ .document = "{\"sha1\":123}", .err = error.ExpectedString },
+        .{ .document = "{\"sha1\":1.5}", .err = error.ExpectedString },
+        .{ .document = "{\"sha1\":{}}", .err = error.ExpectedString },
+        .{ .document = "{\"sha1\":[]}", .err = error.ExpectedString },
+        .{ .document = "{\"sha1\":\"gggggggggggggggggggggggggggggggggggggggg\"}", .err = error.InvalidSha1 },
+        .{ .document = "{\"sha1\":\"\"}", .err = error.InvalidSha1 },
+        .{ .document = "{\"sha1\":\"000000000000000000000000000000000000000\"}", .err = error.InvalidSha1 },
+        .{ .document = "{\"sha1\":\"00000000000000000000000000000000000000000\"}", .err = error.InvalidSha1 },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(V, std.testing.allocator, case.document, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(case.err, maybeSha1(parsed.value, "sha1"));
+    }
 }
 pub fn strings(a: A, v: V) ![]const []const u8 {
     const input = try array(v);

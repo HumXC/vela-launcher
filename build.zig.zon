@@ -24,14 +24,15 @@
             .url = "git+https://github.com/lalinsky/zio#v0.18.0",
             .hash = "zio-0.18.0-xHbVVELgKQAU2hnwYL9MA0iXUydUZYlBfXxOUUM6v_Uv",
         },
-        .dusty = .{
-            .url = "git+https://github.com/lalinsky/dusty#v0.3.1",
-            .hash = "dusty-0.3.1-Qdw7Rpd3IABFjZ0h7ymC-j2FkkcPRA52RYSW6AMojKlY",
+        .nbt = .{
+            .url = "git+https://github.com/Bedrock-Phanatics/nbt-zig#517afb14c20857b1ce0e1eeb9218ea08402c3bf6",
+            .hash = "nbt-1.0.0-iJUBvhqIAQD5ahfn4dAaKmv4WazDZp5LTG6oDoyYQ0VM",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "build-support",
         "src",
     },
 }

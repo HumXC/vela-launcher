@@ -31,11 +31,14 @@ pub const Editor = struct {
         self.reset();
     }
 
+    pub fn readyForSave(self: *const Editor) bool {
+        self.checkAddress();
+        return self.status == .ready and self.len > 0 and self.len <= max_bytes and printable(self.bytes[0..self.len]);
+    }
+
     /// Borrow only until the next edit/reset. Copy into an owned job before reset.
     pub fn borrowForSave(self: *const Editor) error{InvalidKey}![]const u8 {
-        self.checkAddress();
-        if (self.len == 0 or self.len > max_bytes or !printable(self.bytes[0..self.len]))
-            return error.InvalidKey;
+        if (!self.readyForSave()) return error.InvalidKey;
         return self.bytes[0..self.len];
     }
 
@@ -72,7 +75,7 @@ pub const Editor = struct {
                 dvui.cursorSet(.ibeam);
         }
         result.edited = entry.text_changed or result.cancel;
-        result.submit = entry.enter_pressed and !result.cancel;
+        result.submit = entry.enter_pressed and !result.cancel and self.readyForSave();
         result.status = self.status;
         return result;
     }
@@ -152,7 +155,9 @@ pub const Editor = struct {
             },
             else => {},
         }
+        const prior_len = entry.len;
         entry.processEvent(event);
+        if (entry.len != prior_len) self.status = if (entry.len == 0) .empty else .ready;
     }
 
     fn insert(self: *Editor, entry: *dvui.TextEntryWidget, input: []const u8, selected: bool) void {
@@ -172,6 +177,7 @@ pub const Editor = struct {
         }
         // Validation precedes DVUI's selection deletion, CR/LF stripping and
         // capacity truncation, so rejected replacements leave the key intact.
+        if (input.len == 0 and selection.start == selection.end) return;
         entry.textTyped(input, selected);
         self.status = if (entry.len == 0) .empty else .ready;
         self.sync(entry);
@@ -256,23 +262,39 @@ test "CF key editor validates full ASCII range and save boundary" {
         const byte = [_]u8{@intCast(value)};
         try std.testing.expectEqual(value >= 33 and value <= 126, printable(&byte));
     }
+}
+
+test "CF key editor save boundary uses bounded testing renderer" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    var editor: Editor = .{};
+    defer editor.deinit();
     var fixture = try dvui.testing.init(.{});
     defer fixture.deinit();
     var entry: dvui.TextEntryWidget = undefined;
     editor.initEntry(&entry, .{});
     defer editor.finishEntry(&entry);
     const full: [max_bytes]u8 = @splat('K');
-    editor.insert(&entry, &full, false);
+    editor.insert(&entry, full[0 .. max_bytes - 1], false);
+    try std.testing.expectEqual(max_bytes - 1, entry.len);
+    try std.testing.expect(editor.readyForSave());
+    try std.testing.expectEqualStrings(full[0 .. max_bytes - 1], try editor.borrowForSave());
+    editor.insert(&entry, "K", false);
     try std.testing.expectEqual(max_bytes, entry.len);
+    try std.testing.expect(editor.readyForSave());
     try std.testing.expectEqualStrings(&full, try editor.borrowForSave());
     try testZeros(editor.bytes[max_bytes..]);
     editor.insert(&entry, "X", false);
     try std.testing.expectEqual(Status.too_long, editor.status);
-    try std.testing.expectEqualStrings(&full, try editor.borrowForSave());
+    try std.testing.expect(!editor.readyForSave());
+    try std.testing.expectError(error.InvalidKey, editor.borrowForSave());
+    try std.testing.expectEqualStrings(&full, editor.bytes[0..editor.len]);
     entry.textLayout.selection.* = .{ .start = 0, .cursor = max_bytes, .end = max_bytes };
     const oversized: [max_bytes + 1]u8 = @splat('Z');
     editor.insert(&entry, &oversized, false);
-    try std.testing.expectEqualStrings(&full, try editor.borrowForSave());
+    try std.testing.expectEqual(Status.too_long, editor.status);
+    try std.testing.expect(!editor.readyForSave());
+    try std.testing.expectError(error.InvalidKey, editor.borrowForSave());
+    try std.testing.expectEqualStrings(&full, editor.bytes[0..editor.len]);
     try std.testing.expectEqual(@as(usize, 0), entry.textLayout.selection.start);
     editor.insert(&entry, "ValidReplacement", false);
     try std.testing.expectEqualStrings("ValidReplacement", try editor.borrowForSave());
@@ -281,6 +303,7 @@ test "CF key editor validates full ASCII range and save boundary" {
 }
 
 test "CF key editor rejects invalid replacements and wipes consumed events" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     var fixture = try dvui.testing.init(.{});
     defer fixture.deinit();
     var editor: Editor = .{};
@@ -301,7 +324,9 @@ test "CF key editor rejects invalid replacements and wipes consumed events" {
         try std.testing.expect(event.handled);
         try testZeros(buffer[0..input.len]);
         try std.testing.expectEqual(Status.invalid_input, editor.status);
-        try std.testing.expectEqualStrings("OwnedCanary!", try editor.borrowForSave());
+        try std.testing.expect(!editor.readyForSave());
+        try std.testing.expectError(error.InvalidKey, editor.borrowForSave());
+        try std.testing.expectEqualStrings("OwnedCanary!", editor.bytes[0..editor.len]);
     }
     var accepted = "FreshCanary!".*;
     var event: dvui.Event = .{ .target_widgetId = entry.data().id, .evt = .{ .text = .{
@@ -315,6 +340,7 @@ test "CF key editor rejects invalid replacements and wipes consumed events" {
 }
 
 test "CF key editor copy cut aliases never change clipboard or selection" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     var fixture = try dvui.testing.init(.{});
     defer fixture.deinit();
     try fixture.backend.clipboardTextSet("PublicClipboard");
@@ -349,6 +375,7 @@ test "CF key editor copy cut aliases never change clipboard or selection" {
 }
 
 test "CF key editor validated paste preserves navigation and deletion" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     var fixture = try dvui.testing.init(.{});
     defer fixture.deinit();
     var editor: Editor = .{};
@@ -364,9 +391,13 @@ test "CF key editor validated paste preserves navigation and deletion" {
     try fixture.backend.clipboardTextSet("Rejected\nPaste");
     var invalid_paste = testKey(&entry, .v, .lcontrol);
     try testDispatch(&editor, &entry, &invalid_paste);
-    try std.testing.expectEqualStrings("PasteCanary!", try editor.borrowForSave());
+    try std.testing.expect(!editor.readyForSave());
+    try std.testing.expectError(error.InvalidKey, editor.borrowForSave());
+    try std.testing.expectEqualStrings("PasteCanary!", editor.bytes[0..editor.len]);
     var left = testKey(&entry, .left, .none);
     try testDispatch(&editor, &entry, &left);
+    try std.testing.expect(!editor.readyForSave());
+    try std.testing.expectError(error.InvalidKey, editor.borrowForSave());
     entry.draw();
     try std.testing.expectEqual(editor.len - 1, entry.textLayout.selection.cursor);
     editor.finishEntry(&entry);
@@ -387,6 +418,7 @@ test "CF key editor validated paste preserves navigation and deletion" {
 }
 
 test "CF key editor first repeated touch and handled release persist export lock" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     var fixture = try dvui.testing.init(.{});
     defer fixture.deinit();
     try fixture.backend.clipboardTextSet("PublicClipboard");
@@ -426,6 +458,7 @@ test "CF key editor first repeated touch and handled release persist export lock
 }
 
 test "CF key editor public draw keeps identity private and cancellation wipes" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     var fixture = try dvui.testing.init(.{});
     defer fixture.deinit();
     var editor: Editor = .{};
@@ -457,6 +490,7 @@ test "CF key editor public draw keeps identity private and cancellation wipes" {
 }
 
 test "CF key editor configured mask and lifecycle contain no raw cache" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     var fixture = try dvui.testing.init(.{});
     defer fixture.deinit();
     var editor: Editor = .{};
@@ -484,7 +518,77 @@ test "CF key editor configured mask and lifecycle contain no raw cache" {
     try std.testing.expectEqualStrings("replace_selected_text", unsupported_actions[0]);
 }
 
+test "CF key editor rejected paste blocks Enter across frames until actual edit or clear" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    var fixture = try dvui.testing.init(.{});
+    defer fixture.deinit();
+    var editor: Editor = .{};
+    defer editor.deinit();
+    var data: dvui.WidgetData = undefined;
+    _ = editor.draw(@src(), .{ .data_out = &data });
+    const oversized: [max_bytes + 1]u8 = @splat('Z');
+    const rejected = [_][]const u8{ "Invalid\nCanary!", &oversized };
+    for (rejected, 0..) |input, index| {
+        try testAdvance(&fixture);
+        dvui.focusWidget(data.id, null, null);
+        _ = try fixture.window.addEventTextSelect(.{ .start = 0, .end = editor.len, .target_id = data.id });
+        _ = try fixture.window.addEventText(.{ .text = "RetainedCanary!", .target_id = data.id });
+        _ = try fixture.window.addEventKey(.{ .code = .enter, .action = .down, .mod = .none });
+        const ready = editor.draw(@src(), .{ .data_out = &data });
+        try std.testing.expect(ready.submit and editor.readyForSave());
+        try testAdvance(&fixture);
+        try fixture.backend.clipboardTextSet(input);
+        _ = try fixture.window.addEventTextSelect(.{ .start = 0, .end = editor.len, .target_id = data.id });
+        _ = try fixture.window.addEventKey(.{ .code = .v, .action = .down, .mod = .lcontrol });
+        _ = try fixture.window.addEventKey(.{ .code = .enter, .action = .down, .mod = .none });
+        const invalid = editor.draw(@src(), .{ .data_out = &data });
+        try std.testing.expectEqual(if (index == 0) Status.invalid_input else Status.too_long, invalid.status);
+        try std.testing.expect(!invalid.submit and !editor.readyForSave());
+        try std.testing.expectError(error.InvalidKey, editor.borrowForSave());
+        try std.testing.expectEqualStrings("RetainedCanary!", editor.bytes[0..editor.len]);
+        try testZeros(editor.bytes[editor.len..]);
+        try testAdvance(&fixture);
+        _ = try fixture.window.addEventKey(.{ .code = .enter, .action = .down, .mod = .none });
+        const still_invalid = editor.draw(@src(), .{ .data_out = &data });
+        try std.testing.expect(!still_invalid.submit);
+        try std.testing.expectError(error.InvalidKey, editor.borrowForSave());
+        try testAdvance(&fixture);
+        try fixture.backend.clipboardTextSet("");
+        _ = try fixture.window.addEventTextSelect(.{ .start = editor.len, .end = editor.len, .target_id = data.id });
+        _ = try fixture.window.addEventKey(.{ .code = .v, .action = .down, .mod = .lcontrol });
+        _ = try fixture.window.addEventKey(.{ .code = .left, .action = .down, .mod = .none });
+        _ = try fixture.window.addEventKey(.{ .code = .enter, .action = .down, .mod = .none });
+        const unchanged = editor.draw(@src(), .{ .data_out = &data });
+        try std.testing.expect(!unchanged.submit and !editor.readyForSave());
+        try std.testing.expectError(error.InvalidKey, editor.borrowForSave());
+        try testAdvance(&fixture);
+        _ = try fixture.window.addEventKey(.{ .code = .backspace, .action = .down, .mod = .none });
+        _ = try fixture.window.addEventKey(.{ .code = .enter, .action = .down, .mod = .none });
+        const corrected = editor.draw(@src(), .{ .data_out = &data });
+        try std.testing.expect(corrected.edited and corrected.submit and editor.readyForSave());
+        try std.testing.expectEqual(Status.ready, corrected.status);
+        try std.testing.expectEqual("RetainedCanary!".len - 1, (try editor.borrowForSave()).len);
+        try testZeros(editor.bytes[editor.len..]);
+    }
+    editor.reset();
+    try testZeros(&editor.bytes);
+    try testAdvance(&fixture);
+    _ = try fixture.window.addEventKey(.{ .code = .enter, .action = .down, .mod = .none });
+    const cleared = editor.draw(@src(), .{ .data_out = &data });
+    try std.testing.expectEqual(Status.empty, cleared.status);
+    try std.testing.expect(!cleared.submit and !editor.readyForSave());
+    try std.testing.expectError(error.InvalidKey, editor.borrowForSave());
+    try testAdvance(&fixture);
+    const full: [max_bytes]u8 = @splat('K');
+    _ = try fixture.window.addEventText(.{ .text = &full, .target_id = data.id });
+    _ = try fixture.window.addEventKey(.{ .code = .enter, .action = .down, .mod = .none });
+    const fresh = editor.draw(@src(), .{ .data_out = &data });
+    try std.testing.expect(fresh.submit and editor.readyForSave());
+    try std.testing.expectEqualStrings(&full, try editor.borrowForSave());
+}
+
 test "CF key editor supported selection submit middle focus and final reset" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     var fixture = try dvui.testing.init(.{});
     defer fixture.deinit();
     var editor: Editor = .{};

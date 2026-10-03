@@ -1,4 +1,4 @@
-//! Pure modern-vanilla launch preparation. Execution and Java discovery belong to caller.
+//! Pure modern/legacy launch preparation. Execution and Java discovery belong to caller.
 const std = @import("std");
 const m = @import("metadata/root.zig");
 const install = @import("install_plan.zig");
@@ -22,6 +22,8 @@ pub const Options = struct {
     extra_jvm: []const []const u8 = &.{},
     extra_game: []const []const u8 = &.{},
     natives_directory: ?[]const u8 = null,
+    game_directory: ?[]const u8 = null,
+    game_assets: ?[]const u8 = null,
     launcher_name: []const u8 = "vela",
     launcher_version: []const u8 = "dev",
     resolution_width: ?u32 = null,
@@ -37,8 +39,8 @@ pub const Launch = struct { argv: []const []const u8, cwd: []const u8 };
 /// Returned argv contains credentials; do not print it in normal logs.
 pub fn build(allocator: std.mem.Allocator, version: m.version.Version, plan: install.Plan, env: m.rules.Environment, options: Options) !m.Owned(Launch) {
     if (version.inherits_from != null) return error.UnresolvedInheritance;
-    if (version.jar != null) return error.UnsupportedJarOverride;
-    const arguments = version.arguments orelse return error.UnsupportedLegacyArguments;
+    const arguments = version.arguments orelse m.version.Arguments{ .game = null, .jvm = null };
+    if (version.arguments == null and version.minecraft_arguments == null) return error.UnsupportedLegacyArguments;
     const main = version.main_class orelse return error.MissingMainClass;
     if (main.len == 0 or main[0] == '-' or main[0] == '@') return error.InvalidMainClass;
     if (!std.fs.path.isAbsolute(options.root)) return error.AbsoluteRootRequired;
@@ -58,10 +60,17 @@ pub fn build(allocator: std.mem.Allocator, version: m.version.Version, plan: ins
     const natives = options.natives_directory orelse if (plan.native_extractions.len != 0) plan.native_extractions[0].destination else try std.fs.path.join(a, &.{ options.root, "versions", version.id, "natives" });
     if (!std.fs.path.isAbsolute(natives)) return error.AbsoluteNativePathRequired;
     for (plan.native_extractions) |extraction| if (!std.mem.eql(u8, extraction.destination, natives)) return error.NativeDirectoryMismatch;
-    var context: Context = .{ .a = a, .version = version, .options = options, .classpath = cp, .natives = natives };
+    const game_directory = options.game_directory orelse options.root;
+    if (!std.fs.path.isAbsolute(game_directory)) return error.AbsoluteGamePathRequired;
+    try tokenValid(game_directory);
+    const game_assets = options.game_assets orelse plan.game_assets_directory orelse try std.fs.path.join(a, &.{ options.root, "assets" });
+    if (!std.fs.path.isAbsolute(game_assets)) return error.AbsoluteAssetPathRequired;
+    try tokenValid(game_assets);
+    for (plan.native_checks) |check| if (check.suitability == .incompatible) return error.IncompatibleNativeArchitecture;
+    var context: Context = .{ .a = a, .version = version, .options = options, .classpath = cp, .natives = natives, .game_assets = game_assets };
     var jvm = try command.Builder.init(a, options.java_executable);
     defer jvm.deinit();
-    const jvm_tokens = try context.arguments(arguments.jvm orelse return error.MissingJvmArguments, env);
+    const jvm_tokens = if (arguments.jvm) |args| try context.arguments(args, env) else if (version.minecraft_arguments != null) try context.expandMany(if (std.mem.eql(u8, env.os_name, "osx")) &.{ "-XstartOnFirstThread", "-Djava.library.path=${natives_directory}", "-Dminecraft.launcher.brand=${launcher_name}", "-Dminecraft.launcher.version=${launcher_version}", "-cp", "${classpath}" } else &.{ "-Djava.library.path=${natives_directory}", "-Dminecraft.launcher.brand=${launcher_name}", "-Dminecraft.launcher.version=${launcher_version}", "-cp", "${classpath}" }) else return error.MissingJvmArguments;
     try validateJvm(jvm_tokens);
     try java.append(&jvm, jvm_tokens);
     // Ensure classpath exists even for minimal metadata, preserving explicit metadata setting.
@@ -90,7 +99,8 @@ pub fn build(allocator: std.mem.Allocator, version: m.version.Version, plan: ins
     try java.append(&jvm, extra_jvm);
     var game = try command.Builder.init(a, "game");
     defer game.deinit();
-    try appendGame(&game, try context.arguments(arguments.game orelse return error.MissingGameArguments, env));
+    const game_tokens = if (arguments.game) |args| try context.arguments(args, env) else try context.expandMany(try m.version.tokenizeLegacy(a, version.minecraft_arguments orelse return error.MissingGameArguments));
+    try appendGame(&game, game_tokens);
     if (options.resolution_width) |width| {
         if (width == 0 or options.resolution_height.? == 0) return error.InvalidResolution;
         try appendGame(&game, &.{ "--width", try std.fmt.allocPrint(a, "{d}", .{width}), "--height", try std.fmt.allocPrint(a, "{d}", .{options.resolution_height.?}) });
@@ -103,7 +113,7 @@ pub fn build(allocator: std.mem.Allocator, version: m.version.Version, plan: ins
     try tokenValid(main);
     out[jvm_argv.len] = try a.dupe(u8, main);
     for (game_argv[1..], jvm_argv.len + 1..) |token, i| out[i] = try a.dupe(u8, token);
-    return .{ .value = .{ .argv = out, .cwd = try a.dupe(u8, options.root) }, .arena = arena, .backing = allocator };
+    return .{ .value = .{ .argv = out, .cwd = try a.dupe(u8, game_directory) }, .arena = arena, .backing = allocator };
 }
 const Context = struct {
     a: std.mem.Allocator,
@@ -111,6 +121,7 @@ const Context = struct {
     options: Options,
     classpath: []const u8,
     natives: []const u8,
+    game_assets: []const u8,
     logging_path: ?[]const u8 = null,
     fn arguments(self: *Context, source: []const m.version.Argument, env: m.rules.Environment) ![]const []const u8 {
         var tokens: std.ArrayList([]const u8) = .empty;
@@ -143,15 +154,16 @@ const Context = struct {
     fn lookup(self: *Context, name: []const u8) ![]const u8 {
         const o = self.options;
         const values = .{
-            .{ "classpath", self.classpath },                  .{ "natives_directory", self.natives },
-            .{ "launcher_name", o.launcher_name },             .{ "launcher_version", o.launcher_version },
-            .{ "auth_player_name", o.identity.name },          .{ "auth_uuid", o.identity.uuid },
-            .{ "auth_access_token", o.identity.access_token }, .{ "user_type", o.identity.user_type },
-            .{ "version_name", self.version.id },              .{ "version_type", self.version.kind orelse "release" },
-            .{ "game_directory", o.root },                     .{ "clientid", o.identity.client_id },
-            .{ "auth_xuid", o.identity.xuid },                 .{ "user_properties", o.identity.user_properties },
+            .{ "classpath", self.classpath },                      .{ "natives_directory", self.natives },
+            .{ "launcher_name", o.launcher_name },                 .{ "launcher_version", o.launcher_version },
+            .{ "auth_player_name", o.identity.name },              .{ "auth_uuid", o.identity.uuid },
+            .{ "auth_access_token", o.identity.access_token },     .{ "user_type", o.identity.user_type },
+            .{ "version_name", self.version.id },                  .{ "version_type", self.version.kind orelse "release" },
+            .{ "game_directory", o.game_directory orelse o.root }, .{ "clientid", o.identity.client_id },
+            .{ "auth_xuid", o.identity.xuid },                     .{ "user_properties", o.identity.user_properties },
         };
         inline for (values) |pair| if (std.mem.eql(u8, name, pair[0])) return pair[1];
+        if (std.mem.eql(u8, name, "game_assets")) return self.game_assets;
         if (std.mem.eql(u8, name, "library_directory")) return std.fs.path.join(self.a, &.{ o.root, "libraries" });
         if (std.mem.eql(u8, name, "assets_root")) return std.fs.path.join(self.a, &.{ o.root, "assets" });
         if (std.mem.eql(u8, name, "assets_index_name")) return (self.version.asset_index orelse return error.MissingAssetIndex).id;
@@ -210,4 +222,64 @@ fn appendGame(builder: *command.Builder, tokens: []const []const u8) !void {
         };
         if (!recognized) try builder.addRaw(token);
     }
+}
+
+const legacy_launch_fixture = "{\"id\":\"1.7.10-forge\",\"mainClass\":\"net.minecraft.launchwrapper.Launch\",\"minecraftArguments\":\"--username ${auth_player_name} --version ${version_name} --gameDir ${game_directory} --assetsDir ${game_assets} --accessToken ${auth_access_token} --session ${auth_session} --userProperties ${user_properties} --tweakClass first --tweakClass second \\\"literal quoted value\\\"\",\"assetIndex\":{\"id\":\"legacy\",\"url\":\"https://example/index\"}}";
+const legacy_launch_plan: install.Plan = .{
+    .files = &.{},
+    .native_extractions = &.{},
+    .classpath = &.{ "/game/libraries/launchwrapper.jar", "/game/versions/1.7.10/1.7.10.jar" },
+    .client_path = "/game/versions/1.7.10/1.7.10.jar",
+    .game_assets_directory = "/game/assets/virtual/legacy",
+};
+const legacy_launch_options: Options = .{
+    .root = "/game",
+    .java_executable = "/fake/java",
+    .game_directory = "/game/versions/My Forge",
+    .natives_directory = "/game/versions/My Forge/natives",
+    .identity = .{ .name = "Offline Player $(no-shell)", .uuid = "0123456789abcdef0123456789abcdef", .user_properties = "{\"skin\":[\"a b\"]}" },
+};
+fn legacyLaunchAllocationCase(a: std.mem.Allocator) !void {
+    var version = try m.version.parseSlice(a, legacy_launch_fixture);
+    defer version.deinit();
+    var launched = try build(a, version.value, legacy_launch_plan, .{ .os_name = "linux", .arch = "x86_64" }, legacy_launch_options);
+    defer launched.deinit();
+    try std.testing.expectEqualStrings("/game/versions/My Forge", launched.value.cwd);
+}
+fn argvIndex(argv: []const []const u8, token: []const u8) ?usize {
+    for (argv, 0..) |item, i| if (std.mem.eql(u8, item, token)) return i;
+    return null;
+}
+test "legacy launch preserves Forge tweaks and substitutes without retokenizing" {
+    const a = std.testing.allocator;
+    try std.testing.checkAllAllocationFailures(a, legacyLaunchAllocationCase, .{});
+    var version = try m.version.parseSlice(a, legacy_launch_fixture);
+    defer version.deinit();
+    var launched = try build(a, version.value, legacy_launch_plan, .{ .os_name = "linux", .arch = "x86_64" }, legacy_launch_options);
+    defer launched.deinit();
+    const argv = launched.value.argv;
+    const main = argvIndex(argv, "net.minecraft.launchwrapper.Launch").?;
+    const cp = argvIndex(argv, "-cp").?;
+    try std.testing.expect(cp < main);
+    try std.testing.expectEqualStrings("/game/libraries/launchwrapper.jar:/game/versions/1.7.10/1.7.10.jar", argv[cp + 1]);
+    try std.testing.expect(argvIndex(argv, "-Djava.library.path=/game/versions/My Forge/natives") != null);
+    try std.testing.expectEqualStrings(legacy_launch_options.identity.name, argv[argvIndex(argv, "--username").? + 1]);
+    try std.testing.expectEqualStrings("/game/assets/virtual/legacy", argv[argvIndex(argv, "--assetsDir").? + 1]);
+    try std.testing.expectEqualStrings("token:0:0123456789abcdef0123456789abcdef", argv[argvIndex(argv, "--session").? + 1]);
+    try std.testing.expectEqualStrings(legacy_launch_options.identity.user_properties, argv[argvIndex(argv, "--userProperties").? + 1]);
+    const tweaks = argvIndex(argv, "--tweakClass").?;
+    try std.testing.expectEqualStrings("first", argv[tweaks + 1]);
+    try std.testing.expectEqualStrings("--tweakClass", argv[tweaks + 2]);
+    try std.testing.expectEqualStrings("second", argv[tweaks + 3]);
+    try std.testing.expectEqualStrings("literal quoted value", argv[tweaks + 4]);
+    try std.testing.expectEqual(@as(u64, 8), m.version.requiredJavaMajor(version.value));
+    var mac = try build(a, version.value, legacy_launch_plan, .{ .os_name = "osx", .arch = "aarch64" }, legacy_launch_options);
+    defer mac.deinit();
+    try std.testing.expect(argvIndex(mac.value.argv, "-XstartOnFirstThread").? < argvIndex(mac.value.argv, "net.minecraft.launchwrapper.Launch").?);
+    var checked = legacy_launch_plan;
+    checked.native_checks = &.{.{ .archive_path = "/game/custom.jar", .classifier = "natives-osx", .suitability = .inspection_required }};
+    var pending = try build(a, version.value, checked, .{ .os_name = "osx", .arch = "aarch64" }, legacy_launch_options);
+    defer pending.deinit();
+    checked.native_checks = &.{.{ .archive_path = "/game/custom.jar", .classifier = "natives-osx", .suitability = .incompatible }};
+    try std.testing.expectError(error.IncompatibleNativeArchitecture, build(a, version.value, checked, .{ .os_name = "osx", .arch = "aarch64" }, legacy_launch_options));
 }

@@ -3,9 +3,25 @@
 //! Io and allocator must support ordinary concurrent OS threads.
 const std = @import("std");
 const curl = @import("curl");
+const public_network = @import("public_network.zig");
 const c = curl.libcurl;
 const Allocator = std.mem.Allocator;
 const capacity = 256;
+
+fn timeoutAsLong(timeout_ms: u32) error{InvalidTimeout}!c_long {
+    return std.math.cast(c_long, timeout_ms) orelse error.InvalidTimeout;
+}
+
+test "curl timeout conversion preserves values and rejects overflow" {
+    try std.testing.expectEqual(@as(c_long, 0), try timeoutAsLong(0));
+    try std.testing.expectEqual(@as(c_long, 120_000), try timeoutAsLong(120_000));
+    const largest: u32 = @min(std.math.maxInt(u32), std.math.maxInt(c_long));
+    try std.testing.expectEqual(@as(c_long, @intCast(largest)), try timeoutAsLong(largest));
+    if (comptime @bitSizeOf(c_long) == 32) {
+        try std.testing.expectError(error.InvalidTimeout, timeoutAsLong(largest + 1));
+        try std.testing.expectError(error.InvalidTimeout, timeoutAsLong(std.math.maxInt(u32)));
+    }
+}
 pub const Phase = enum { queued, preparing, ready, downloading, processing, parsing, committing, complete, failed, canceled };
 pub fn terminal(p: Phase) bool {
     return p == .complete or p == .failed or p == .canceled;
@@ -32,6 +48,13 @@ pub const Request = struct {
     proxy: ?[]const u8 = null,
     ca_bundle: ?[]const u8 = null,
     timeout_ms: u32 = 120_000,
+    /// Prevent initial or redirected requests from using plaintext HTTP.
+    https_only: bool = false,
+    /// Disable redirects for provider-pinned or otherwise sensitive transfers.
+    follow_redirects: bool = true,
+    /// Reject resolved nonpublic endpoints before socket creation; proxies unsupported.
+    /// Disables automatic redirects so curl cannot reuse unchecked cached sockets.
+    require_public_address: bool = false,
 };
 pub const Result = union(enum) { file: []const u8, bytes: []const u8, json: std.json.Value };
 pub const Snapshot = struct { progress: Progress, result: ?Result, failure: ?anyerror, source: Source, http_status: u16 };
@@ -142,6 +165,10 @@ pub const Service = struct {
         return s;
     }
     pub fn submit(self: *Service, request: Request) !*Task {
+        _ = try timeoutAsLong(request.timeout_ms);
+        if (request.require_public_address) {
+            if (request.proxy) |proxy| if (proxy.len != 0) return error.UnsupportedProxyWithPublicAddressGuard;
+        }
         if (request.output == .file and request.cache_path != null) return error.FileCacheUnsupported;
         if (!(std.mem.startsWith(u8, request.url, "http://") or std.mem.startsWith(u8, request.url, "https://"))) return error.InvalidUrl;
         self.mutex.lockUncancelable(self.io);
@@ -381,11 +408,12 @@ pub const Service = struct {
         t.callback_error = null;
         try set(e, c.CURLOPT_URL, t.url.ptr);
         try set(e, c.CURLOPT_NOSIGNAL, @as(c_long, 1));
-        try set(e, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
+        try set(e, c.CURLOPT_FOLLOWLOCATION, @as(c_long, if (t.request.follow_redirects and !t.request.require_public_address) 1 else 0));
         try set(e, c.CURLOPT_MAXREDIRS, @as(c_long, 10));
-        try set(e, c.CURLOPT_PROTOCOLS_STR, @as([*:0]const u8, "http,https"));
-        try set(e, c.CURLOPT_REDIR_PROTOCOLS_STR, @as([*:0]const u8, "http,https"));
-        try set(e, c.CURLOPT_TIMEOUT_MS, @as(c_long, t.request.timeout_ms));
+        const protocols: [*:0]const u8 = if (t.request.https_only) "https" else "http,https";
+        try set(e, c.CURLOPT_PROTOCOLS_STR, protocols);
+        try set(e, c.CURLOPT_REDIR_PROTOCOLS_STR, protocols);
+        try set(e, c.CURLOPT_TIMEOUT_MS, try timeoutAsLong(t.request.timeout_ms));
         try set(e, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_long, @min(t.request.timeout_ms, 30_000)));
         try set(e, c.CURLOPT_WRITEFUNCTION, &writeCallback);
         try set(e, c.CURLOPT_WRITEDATA, t);
@@ -394,7 +422,13 @@ pub const Service = struct {
         try set(e, c.CURLOPT_NOPROGRESS, @as(c_long, 0));
         try set(e, c.CURLOPT_XFERINFOFUNCTION, &progressCallback);
         try set(e, c.CURLOPT_XFERINFODATA, t);
-        if (t.proxy) |p| try set(e, c.CURLOPT_PROXY, p.ptr);
+        if (t.request.require_public_address) {
+            try set(e, c.CURLOPT_OPENSOCKETFUNCTION, &public_network.openSocket);
+            try set(e, c.CURLOPT_FRESH_CONNECT, @as(c_long, 1));
+            try set(e, c.CURLOPT_FORBID_REUSE, @as(c_long, 1));
+            try set(e, c.CURLOPT_OPENSOCKETDATA, &t.callback_error);
+            try set(e, c.CURLOPT_PROXY, @as([*:0]const u8, ""));
+        } else if (t.proxy) |p| try set(e, c.CURLOPT_PROXY, p.ptr);
         if (t.ca) |p| {
             try set(e, c.CURLOPT_CAINFO, p.ptr);
         } else {

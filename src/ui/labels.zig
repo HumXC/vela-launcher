@@ -1,0 +1,23 @@
+// Shared Chinese labels for the launcher state and DVUI views.
+pub const Labels = struct {
+    choosePlayer: []const u8 = "选择玩家",
+    avatar: []const u8 = "玩家头像",
+    gameVersion: []const u8 = "游戏版本",
+    chooseVersion: []const u8 = "选择游戏版本",
+    settings: []const u8 = "设置",
+    more: []const u8 = "更多",
+    ready: []const u8 = "准备开始",
+    currentVersion: []const u8 = "当前版本：",
+    homeHint: []const u8 = "从左侧选择玩家和游戏版本。",
+    launchUnavailable: []const u8 = "启动功能尚未接入",
+    selectionRequired: []const u8 = "请先选择有效的玩家和游戏版本。",
+    start: []const u8 = "开始游戏",
+    back: []const u8 = "返回",
+    playerList: []const u8 = "玩家列表",
+    noPlayers: []const u8 = "暂无玩家",
+    current: []const u8 = "当前",
+    versionList: []const u8 = "游戏版本列表",
+    noVersions: []const u8 = "暂无版本",
+    home: []const u8 = "主页",
+    unavailable: []const u8 = "该功能尚未接入",
+};

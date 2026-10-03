@@ -30,6 +30,30 @@ fn success(t: *dl.Task) !dl.Snapshot {
     try expect(state.result != null);
     return state;
 }
+
+test "HTTPS-only requests never dispatch plaintext HTTP" {
+    const base = try baseUrl();
+    defer a.free(base);
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    const service = try dl.Service.init(a, io, 2);
+    defer service.deinit();
+    const blocked_url = try url(base, "/https-only-must-not-reach-server");
+    defer a.free(blocked_url);
+    const blocked = try service.submit(.{ .url = blocked_url, .https_only = true, .timeout_ms = 1000 });
+    defer blocked.release() catch unreachable;
+    const result = try wait(blocked);
+    try eq(dl.Phase.failed, result.progress.phase);
+    try eq(error.TransferFailed, result.failure.?);
+    try eq(@as(u16, 0), result.http_status);
+    try expect(result.result == null);
+    const stats_url = try url(base, "/stats");
+    defer a.free(stats_url);
+    const stats = try service.submit(.{ .url = stats_url, .output = .json });
+    defer stats.release() catch unreachable;
+    const counts = (try success(stats)).result.?.json.object;
+    try expect(counts.get("/https-only-must-not-reach-server") == null);
+}
 fn put(path: []const u8, data: []const u8) !void {
     const f = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
@@ -81,6 +105,13 @@ test "streamed file SHA1, mismatch preserves destination, redirect body ignored"
     defer a.free(redirect);
     const r = try s.submit(.{ .url = redirect, .output = .{ .file = path }, .expected_sha1 = digest });
     _ = try success(r);
+    const blocked = try s.submit(.{ .url = redirect, .output = .{ .file = path }, .expected_sha1 = digest, .follow_redirects = false });
+    const blocked_result = try wait(blocked);
+    try eq(@as(u16, 302), blocked_result.http_status);
+    try eq(error.HttpStatus, blocked_result.failure.?);
+    const after_blocked = try tmp.dir.readFileAlloc(io, "artifact.jar", a, .limited(100));
+    defer a.free(after_blocked);
+    try std.testing.expectEqualStrings(body, after_blocked);
 }
 test "JSON parsing, malformed JSON, limits, HTTP errors and explicit proxy" {
     const base = try baseUrl();
