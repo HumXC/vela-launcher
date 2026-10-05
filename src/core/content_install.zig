@@ -130,11 +130,11 @@ const Roots = struct {
         if (!fs.safeComponent(id) or !fs.safeComponent(name)) return error.UnsafeInstance;
         const root = try fs.openAbsolute(io, paths.root);
         defer root.close(io);
-        const minecraft = try fs.child(root, io, ".minecraft", create, false);
+        const minecraft = try fs.child(root, io, ".minecraft", false, false);
         defer minecraft.close(io);
-        const versions = try fs.child(minecraft, io, "versions", create, false);
+        const versions = try fs.child(minecraft, io, "versions", false, false);
         defer versions.close(io);
-        const game = try fs.child(versions, io, name, create, false);
+        const game = try fs.child(versions, io, name, false, false);
         errdefer game.close(io);
         const vela = try fs.child(root, io, ".vela", create, false);
         defer vela.close(io);
@@ -243,14 +243,33 @@ fn findInstall(files: []const manifest.InstallFile, desired: manifest.ManagedFil
     };
     return error.MissingDownload;
 }
-fn validateOptions(options: Options) !void {
+fn validateOptionPaths(options: Options) !void {
+    if (options.plan.actions.len > providers.max_items * 2 or options.files.len > providers.max_items or
+        options.manual_files.len > providers.max_items or options.plan.conflicts.len > providers.max_items * 2) return error.TooManyItems;
+    if (options.pack) |pack| {
+        if (pack.files.len > providers.max_items) return error.TooManyItems;
+    }
+    if (options.instance_id.len == 0 or options.instance_id.len > manifest.max_path_bytes or
+        options.instance_name.len == 0 or options.instance_name.len > manifest.max_path_bytes) return error.UnsafeInstance;
     if (!fs.safeComponent(options.instance_id) or !fs.safeComponent(options.instance_name)) return error.UnsafeInstance;
+    try manifest.validatePathsForInstance(options.plan.next_manifest, options.instance_name);
+    for (options.files) |file| try manifest.checkedPathForInstance(file.record.path, options.instance_name);
+    for (options.manual_files) |file| try manifest.checkedPathForInstance(file.path, options.instance_name);
+    if (options.pack) |pack| for (pack.files) |file| try manifest.checkedPathForInstance(file.record.path, options.instance_name);
+    for (options.plan.actions) |action| {
+        try manifest.checkedPathForInstance(action.path, options.instance_name);
+        if (action.previous) |file| try manifest.checkedPathForInstance(file.path, options.instance_name);
+        if (action.desired) |file| try manifest.checkedPathForInstance(file.path, options.instance_name);
+    }
+    for (options.plan.conflicts) |conflict| try manifest.checkedPathForInstance(conflict.path, options.instance_name);
+}
+fn validateOptions(options: Options) !void {
+    try validateOptionPaths(options);
     if (!options.plan.ready) return error.UnresolvedConflicts;
     if (!options.plan.fully_applied and !options.allow_partial) return error.PartialPlanNeedsConsent;
     try manifest.validate(options.plan.next_manifest);
     if (options.plan.next_manifest.schema_version == manifest.schema_version and !options.allow_manifest_v2) return error.ReceiptUpgradeRequired;
     if (!std.mem.eql(u8, options.instance_id, options.plan.next_manifest.instance_id)) return error.InstanceMismatch;
-    if (options.plan.actions.len > providers.max_items * 2 or options.files.len > providers.max_items) return error.TooManyItems;
     for (options.files, 0..) |file, index| {
         try manifest.validate(.{ .instance_id = options.instance_id, .pack_version = options.plan.next_manifest.pack_version, .files = &.{file.record} });
         if (!safeManagedPath(file.record.path)) return error.ProtectedPath;
@@ -479,6 +498,7 @@ fn transactionPending(a: A, io: Io, transactions: Dir, id: []const u8, name: []c
     const parsed = try std.json.parseFromSlice(Journal, a, bytes, .{ .allocate = .alloc_always, .max_value_len = max_journal_bytes });
     defer parsed.deinit();
     try validateJournal(parsed.value, id, name, transaction_id);
+    try validateJournalManifests(a, io, txn, parsed.value);
     if (committed and rolled_back) return error.RecoveryRequired;
     if (!committed and !rolled_back) return true;
     const marker = try fs.read(a, txn, io, if (committed) "committed" else "rolled-back", 2);
@@ -489,25 +509,34 @@ fn transactionPending(a: A, io: Io, transactions: Dir, id: []const u8, name: []c
 
 fn scanPending(a: A, io: Io, transactions: Dir, id: []const u8, name: []const u8, pending: ?*std.ArrayList([]const u8)) !void {
     var count: usize = 0;
+    var recovery_required = false;
     var iterator = transactions.iterate();
     while (try iterator.next(io)) |entry| {
         count += 1;
-        if (count > providers.max_items or !validTransactionId(entry.name)) return error.RecoveryRequired;
+        if (count > providers.max_items) return error.RecoveryRequired;
+        if (!validTransactionId(entry.name)) {
+            recovery_required = true;
+            continue;
+        }
         const unresolved = transactionPending(a, io, transactions, id, name, entry.name) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.RecoveryRequired,
+            error.OutOfMemory, error.ProtectedPath => return err,
+            else => {
+                recovery_required = true;
+                continue;
+            },
         };
         if (unresolved) {
             if (pending) |list| {
                 try list.append(a, try a.dupe(u8, entry.name));
-            } else return error.RecoveryRequired;
+            } else recovery_required = true;
         }
     }
+    if (recovery_required) return error.RecoveryRequired;
 }
 
 fn ensureNoPending(a: A, io: Io, transactions: Dir, id: []const u8, name: []const u8) !void {
     scanPending(a, io, transactions, id, name, null) catch |err| switch (err) {
-        error.OutOfMemory => return err,
+        error.OutOfMemory, error.ProtectedPath => return err,
         else => return error.RecoveryRequired,
     };
 }
@@ -528,18 +557,46 @@ pub fn listPendingTransactions(a: A, io: Io, paths: *const instances.Paths, inst
     if (try openRecoveryTransactions(io, paths, instance_id, instance_name)) |transactions| {
         defer transactions.close(io);
         scanPending(aa, io, transactions, instance_id, instance_name, &pending) catch |err| switch (err) {
-            error.OutOfMemory => return err,
+            error.OutOfMemory, error.ProtectedPath => return err,
             else => return error.RecoveryRequired,
         };
     }
     const value = try pending.toOwnedSlice(aa);
     return .{ .arena = arena, .value = value };
 }
+/// Inspect the persisted receipt without creating metadata or a transaction namespace.
+fn validatePersistedPaths(a: A, io: Io, options: Options) !void {
+    var current = try fs.openAbsolute(io, options.paths.root);
+    defer current.close(io);
+    for ([_][]const u8{ ".vela", "instances", options.instance_id }) |part| {
+        const next = fs.child(current, io, part, false, false) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        current.close(io);
+        current = next;
+    }
+    const bytes = fs.read(a, current, io, "content.json", providers.max_json_bytes) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer a.free(bytes);
+    var previous = try manifest.parseForInstance(a, bytes, options.instance_name);
+    defer previous.deinit();
+    if (!std.mem.eql(u8, previous.value.instance_id, options.instance_id)) return error.InstanceMismatch;
+}
+
 pub fn execute(a: A, io: Io, options: Options) !Report {
+    try validateOptionPaths(options);
+    try validatePersistedPaths(a, io, options);
+    try requireRecoveryClear(a, io, options.paths, options.instance_id, options.instance_name);
     try validateOptions(options);
     try options.lease.acquire(options.lease.context, options.instance_id);
     defer options.lease.release(options.lease.context, options.instance_id);
     try options.lease.recheck(options.lease.context, options.instance_id);
+    // Repeat under the actual per-ID lease before any directories can be created.
+    try validatePersistedPaths(a, io, options);
+    try requireRecoveryClear(a, io, options.paths, options.instance_id, options.instance_name);
     try fs.cancelled(io, options.cancel, options.deadline_ns);
     var arena: std.heap.ArenaAllocator = .init(a);
     defer arena.deinit();
@@ -566,7 +623,7 @@ pub fn execute(a: A, io: Io, options: Options) !Report {
     defer if (previous) |*value| value.deinit();
     if (manifest_before) |before| {
         const bytes = try fs.read(aa, roots.metadata, io, "content.json", providers.max_json_bytes);
-        previous = try manifest.parse(aa, bytes);
+        previous = try manifest.parseForInstance(aa, bytes, options.instance_name);
         if (!std.mem.eql(u8, previous.?.value.instance_id, options.instance_id)) return error.InstanceMismatch;
         const copied = try copyPath(roots.metadata, "content.json", txn, "manifest-before", io, providers.max_json_bytes, options.cancel, options.deadline_ns);
         if (!copied.eql(before)) return error.LocalFileChanged;
@@ -729,6 +786,8 @@ fn commit(a: A, io: Io, options: Options, roots: Roots, txn: Dir, journal: Journ
 }
 
 fn rollback(a: A, io: Io, roots: Roots, txn: Dir, journal: Journal, lease: Lease, fault: ?Fault) !void {
+    try validateJournal(journal, journal.instance_id, journal.instance_name, journal.transaction_id);
+    try validateJournalManifests(a, io, txn, journal);
     var index = journal.entries.len;
     while (index > 0) {
         index -= 1;
@@ -807,7 +866,28 @@ fn validTransactionId(id: []const u8) bool {
     for (id[4..]) |byte| if (!std.ascii.isHex(byte)) return false;
     return true;
 }
+fn validateJournalPaths(journal: Journal, instance_name: []const u8) !void {
+    if (journal.entries.len > providers.max_items) return error.InvalidJournal;
+    for (journal.entries) |entry| {
+        try manifest.checkedPathForInstance(entry.path, instance_name);
+        if (entry.destination) |destination| try manifest.checkedPathForInstance(destination, instance_name);
+    }
+}
+fn validateJournalManifests(a: A, io: Io, txn: Dir, journal: Journal) !void {
+    const names = [_][]const u8{ "manifest-before", "manifest-after" };
+    const expected = [_]?Fingerprint{ journal.manifest_before, journal.manifest_after };
+    for (names, expected) |name, fingerprint| {
+        const value = fingerprint orelse continue;
+        const bytes = try fs.read(a, txn, io, name, providers.max_json_bytes);
+        defer a.free(bytes);
+        var document = try manifest.parseForInstance(a, bytes, journal.instance_name);
+        defer document.deinit();
+        if (!std.mem.eql(u8, document.value.instance_id, journal.instance_id)) return error.InstanceMismatch;
+        try requireCurrent(txn, io, name, value, null, null);
+    }
+}
 fn validateJournal(journal: Journal, instance_id: []const u8, instance_name: []const u8, transaction_id: []const u8) !void {
+    try validateJournalPaths(journal, instance_name);
     if (journal.schema_version != 1 and journal.schema_version != 2) return error.UnsupportedJournalVersion;
     if (!std.mem.eql(u8, journal.instance_id, instance_id) or !std.mem.eql(u8, journal.instance_name, instance_name) or
         !std.mem.eql(u8, journal.transaction_id, transaction_id)) return error.InstanceMismatch;
@@ -845,12 +925,24 @@ fn validateJournal(journal: Journal, instance_id: []const u8, instance_name: []c
 }
 pub fn recover(a: A, io: Io, options: RecoverOptions) !Report {
     if (!validTransactionId(options.transaction_id)) return error.InvalidTransaction;
-    try options.lease.acquire(options.lease.context, options.instance_id);
-    defer options.lease.release(options.lease.context, options.instance_id);
-    try options.lease.recheck(options.lease.context, options.instance_id);
     var arena: std.heap.ArenaAllocator = .init(a);
     defer arena.deinit();
     const aa = arena.allocator();
+    // Read-only priority preflight. Actual recovery reopens and rereads under its lease.
+    {
+        const preflight_roots = try Roots.open(io, options.paths, options.instance_id, options.instance_name, false);
+        defer preflight_roots.deinit(io);
+        const preflight_txn = try fs.child(preflight_roots.transactions, io, options.transaction_id, false, true);
+        defer preflight_txn.close(io);
+        const preflight_bytes = try fs.read(aa, preflight_txn, io, "journal.json", max_journal_bytes);
+        const preflight = try std.json.parseFromSlice(Journal, aa, preflight_bytes, .{ .allocate = .alloc_always, .max_value_len = max_journal_bytes });
+        defer preflight.deinit();
+        try validateJournal(preflight.value, options.instance_id, options.instance_name, options.transaction_id);
+        try validateJournalManifests(aa, io, preflight_txn, preflight.value);
+    }
+    try options.lease.acquire(options.lease.context, options.instance_id);
+    defer options.lease.release(options.lease.context, options.instance_id);
+    try options.lease.recheck(options.lease.context, options.instance_id);
     const roots = try Roots.open(io, options.paths, options.instance_id, options.instance_name, false);
     defer roots.deinit(io);
     const txn = try fs.child(roots.transactions, io, options.transaction_id, false, true);
@@ -860,6 +952,7 @@ pub fn recover(a: A, io: Io, options: RecoverOptions) !Report {
     defer parsed.deinit();
     const journal = parsed.value;
     try validateJournal(journal, options.instance_id, options.instance_name, options.transaction_id);
+    try validateJournalManifests(aa, io, txn, journal);
     const game_path = try options.paths.instanceDirectory(options.instance_name);
     defer options.paths.allocator.free(game_path);
     const backup_path = try std.fs.path.join(a, &.{ game_path, transaction_directory, options.transaction_id });
@@ -935,9 +1028,11 @@ fn testCFInstallFile() manifest.InstallFile {
     return .{ .record = .{ .path = "mods/a.jar", .provider = .curseforge, .project_id = "12", .version_id = "34", .hashes = .{ .sha1 = test_cf_sha1 }, .size = 3, .identity_provenance = .official_file }, .download = .{ .remote = url }, .authorization = .{ .project_id = "12", .file_id = "34", .filename = "a.jar", .url = url, .sha1 = test_cf_sha1, .size = 3, .official_page = "https://www.curseforge.com/minecraft/mc-mods/example", .distribution_allowed = true, .available = true, .approved_download_hosts = test_cf_hosts } };
 }
 test "CF remote requires opt-in and exact transient authorization before any lease or fetch" {
+    var fixture = try ReceiptFixture.init();
+    defer fixture.deinit();
     var lease_state: TestLease = .{};
     var file = testCFInstallFile();
-    var options: Options = .{ .paths = undefined, .instance_id = "instance", .instance_name = "Test", .plan = emptyTestPlan(.{ .schema_version = 2, .instance_id = "instance", .pack_version = "v2", .files = &.{file.record} }), .files = &.{file}, .lease = lease_state.lease(), .allow_manifest_v2 = true, .approved_download_hosts = test_cf_hosts };
+    var options: Options = .{ .paths = &fixture.paths, .instance_id = "instance", .instance_name = "Test", .plan = emptyTestPlan(.{ .schema_version = 2, .instance_id = "instance", .pack_version = "v2", .files = &.{file.record} }), .files = &.{file}, .lease = lease_state.lease(), .allow_manifest_v2 = true, .approved_download_hosts = test_cf_hosts };
     const action: manifest.Action = .{ .kind = .install, .path = file.record.path, .desired = file.record };
     options.plan.actions = &.{action};
     try std.testing.expectError(error.CurseForgeManualRequired, execute(std.testing.allocator, std.testing.io, options));
@@ -962,6 +1057,8 @@ test "CF remote requires opt-in and exact transient authorization before any lea
     options.allow_manifest_v2 = false;
     try std.testing.expectError(error.ReceiptUpgradeRequired, execute(std.testing.allocator, std.testing.io, options));
     try std.testing.expectEqual(@as(usize, 0), lease_state.acquired);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, ".minecraft/versions/Test/.vela-content", .{}));
 }
 test "record matching includes provenance and standalone ownership and partial updates cannot claim a new pack" {
     var file = testCFInstallFile().record;
@@ -1090,4 +1187,22 @@ test "authorized CF download uses only fake CDN fetcher and persists no authoriz
     defer parsed.deinit();
     try std.testing.expectEqualStrings("12", parsed.value.files[0].project_id);
     try std.testing.expectEqual(manifest.IdentityProvenance.official_file, parsed.value.files[0].identity_provenance);
+}
+test "journal path preflight bounds precede uninitialized entries" {
+    const a = std.testing.allocator;
+    const entries = try a.alloc(Entry, providers.max_items + 1);
+    defer a.free(entries);
+    const transaction_id = "txn-" ++ "1" ** 32;
+    const journal: Journal = .{
+        .instance_id = "instance",
+        .instance_name = "Test",
+        .transaction_id = transaction_id,
+        .fully_applied = true,
+        .kept_local = 0,
+        .entries = entries,
+        .manifest_before = null,
+        .manifest_after = .{ .size = 0, .sha1 = .{'0'} ** 40, .sha256 = .{'0'} ** 64, .sha512 = .{'0'} ** 128 },
+        .manifest_temp = ".content-" ++ transaction_id ++ ".next",
+    };
+    try std.testing.expectError(error.InvalidJournal, validateJournal(journal, "instance", "Test", transaction_id));
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const w = @import("worlds.zig");
 const instances = @import("instances.zig");
+const instance_leases = @import("instance_leases.zig");
 const config = @import("config.zig");
 const compression = @import("nbt_compression");
 const a = std.testing.allocator;
@@ -36,12 +37,13 @@ test "world listing normal missing corrupt and portable names" {
     defer tmp.cleanup();
     var paths = try fixturePaths(tmp);
     defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
     const gzip = try compression.compress(a, plain, .gzip, 1024 * 1024);
     defer a.free(gzip);
     try write(tmp.dir, ".minecraft/versions/One/saves/Normal/level.dat", gzip);
     try write(tmp.dir, ".minecraft/versions/One/saves/Corrupt/level.dat", "invalid");
     try write(tmp.dir, ".minecraft/versions/One/saves/Missing/region/data", "world");
-    var result = try w.list(a, io, &paths, one, null, .{});
+    var result = try w.list(a, io, &paths, one, null, .{ .scope = coordinator.worldScope(3) });
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 3), result.items.len);
     var valid: usize = 0;
@@ -63,26 +65,28 @@ test "world backup restore copy rename delete recovery and guards" {
     defer tmp.cleanup();
     var paths = try fixturePaths(tmp);
     defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
     try write(tmp.dir, ".minecraft/versions/One/saves/World/region/data", "world payload");
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Two");
     const ref: w.WorldRef = .{ .instance = one, .folder = "World" };
     const target: w.WorldRef = .{ .instance = two, .folder = "Copied" };
-    try std.testing.expectError(error.InstanceRunning, w.copy(a, io, &paths, ref, target, .{ .guard = .{ .running_ids = &.{"one"} } }));
-    try std.testing.expectError(error.InstanceRunning, w.copy(a, io, &paths, ref, target, .{ .guard = .{ .running_ids = &.{"two"} } }));
-    var backup = try w.backup(a, io, &paths, ref, .{});
+    try std.testing.expectError(error.InstanceRunning, w.copy(a, io, &paths, ref, target, .{ .scope = coordinator.worldScope(3), .guard = .{ .running_ids = &.{"one"} } }));
+    try std.testing.expectError(error.InstanceRunning, w.copy(a, io, &paths, ref, target, .{ .scope = coordinator.worldScope(3), .guard = .{ .running_ids = &.{"two"} } }));
+    var backup = try w.backup(a, io, &paths, ref, .{ .scope = coordinator.worldScope(3) });
     defer backup.deinit();
     try std.testing.expectEqual(.committed, backup.state);
-    var copied = try w.copy(a, io, &paths, ref, target, .{});
+    var copied = try w.copy(a, io, &paths, ref, target, .{ .scope = coordinator.worldScope(3) });
     defer copied.deinit();
     try std.testing.expectEqual(.committed, copied.state);
-    try std.testing.expectError(error.ConfirmationRequired, w.copy(a, io, &paths, ref, target, .{}));
-    var renamed = try w.rename(a, io, &paths, target, "Renamed", .{});
+    try std.testing.expectError(error.ConfirmationRequired, w.copy(a, io, &paths, ref, target, .{ .scope = coordinator.worldScope(3) }));
+    var renamed = try w.rename(a, io, &paths, target, "Renamed", .{ .scope = coordinator.worldScope(3) });
     defer renamed.deinit();
     try std.testing.expectEqual(.committed, renamed.state);
-    try std.testing.expectError(error.ConfirmationRequired, w.delete(a, io, &paths, ref, .{}));
-    var deleted = try w.delete(a, io, &paths, ref, .{ .confirmed_destructive = true });
+    try std.testing.expectError(error.ConfirmationRequired, w.delete(a, io, &paths, ref, .{ .scope = coordinator.worldScope(3) }));
+    var deleted = try w.delete(a, io, &paths, ref, .{ .scope = coordinator.worldScope(3), .confirmed_destructive = true });
     defer deleted.deinit();
     try std.testing.expectEqual(.committed, deleted.state);
-    var restored = try w.restore(a, io, &paths, .{ .instance = one, .id = deleted.recovery_id }, ref, .{});
+    var restored = try w.restore(a, io, &paths, .{ .instance = one, .id = deleted.recovery_id }, ref, .{ .scope = coordinator.worldScope(3) });
     defer restored.deinit();
     try std.testing.expectEqual(.committed, restored.state);
 }
@@ -106,15 +110,16 @@ test "display rename preserves full document and UTF-8 plus recovery" {
     defer tmp.cleanup();
     var paths = try fixturePaths(tmp);
     defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
     try write(tmp.dir, ".minecraft/versions/One/saves/World/level.dat", gzip);
     const ref: w.WorldRef = .{ .instance = one, .folder = "World" };
-    var outcome = try w.renameDisplayName(a, io, &paths, ref, "M\xc3\xbcnchen", .{ .confirmed_destructive = true });
+    var outcome = try w.renameDisplayName(a, io, &paths, ref, "M\xc3\xbcnchen", .{ .scope = coordinator.worldScope(3), .confirmed_destructive = true });
     defer outcome.deinit();
     try std.testing.expectEqual(.committed, outcome.state);
-    var listing = try w.list(a, io, &paths, one, null, .{});
+    var listing = try w.list(a, io, &paths, one, null, .{ .scope = coordinator.worldScope(3) });
     defer listing.deinit();
     try std.testing.expectEqualStrings("M\xc3\xbcnchen", listing.items[0].metadata.level_name.?);
-    var restored = try w.restore(a, io, &paths, .{ .instance = one, .id = outcome.recovery_id }, .{ .instance = one, .folder = "Original" }, .{});
+    var restored = try w.restore(a, io, &paths, .{ .instance = one, .id = outcome.recovery_id }, .{ .instance = one, .folder = "Original" }, .{ .scope = coordinator.worldScope(3) });
     defer restored.deinit();
     try std.testing.expectEqual(.committed, restored.state);
 }
@@ -135,32 +140,36 @@ test "cancel bounds unsafe links and integrity failure leave worlds untouched" {
     defer tmp.cleanup();
     var paths = try fixturePaths(tmp);
     defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
     try write(tmp.dir, ".minecraft/versions/One/saves/World/region/data", "world payload");
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Two");
     const ref: w.WorldRef = .{ .instance = one, .folder = "World" };
     const target: w.WorldRef = .{ .instance = two, .folder = "Target" };
     var cancel: Cancel = .{};
-    try std.testing.expectError(error.Canceled, w.copy(a, io, &paths, ref, target, .{ .hooks = .{ .context = &cancel, .canceled = Cancel.canceled, .progress = Cancel.progress } }));
+    try std.testing.expectError(error.Canceled, w.copy(a, io, &paths, ref, target, .{ .scope = coordinator.worldScope(3), .hooks = .{ .context = &cancel, .canceled = Cancel.canceled, .progress = Cancel.progress } }));
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/Two/saves/Target", .{}));
-    try std.testing.expectError(error.ResourceLimit, w.backup(a, io, &paths, ref, .{ .limits = .{ .max_bytes = 1 } }));
-    try std.testing.expectError(error.ResourceLimit, w.backup(a, io, &paths, ref, .{ .limits = .{ .max_files = 1 } }));
-    try std.testing.expectError(error.ResourceLimit, w.backup(a, io, &paths, ref, .{ .limits = .{ .max_depth = 0 } }));
-    var backed = try w.backup(a, io, &paths, ref, .{});
+    try std.testing.expectError(error.ResourceLimit, w.backup(a, io, &paths, ref, .{ .scope = coordinator.worldScope(3), .limits = .{ .max_bytes = 1 } }));
+    try std.testing.expectError(error.ResourceLimit, w.backup(a, io, &paths, ref, .{ .scope = coordinator.worldScope(3), .limits = .{ .max_files = 1 } }));
+    try std.testing.expectError(error.ResourceLimit, w.backup(a, io, &paths, ref, .{ .scope = coordinator.worldScope(3), .limits = .{ .max_depth = 0 } }));
+    var backed = try w.backup(a, io, &paths, ref, .{ .scope = coordinator.worldScope(3) });
     defer backed.deinit();
     const corrupt_path = try std.fmt.allocPrint(a, ".minecraft/versions/One/saves/.vela-worlds/{s}/payload/region/data", .{backed.recovery_id});
     defer a.free(corrupt_path);
     try write(tmp.dir, corrupt_path, "tampered");
-    try std.testing.expectError(error.IntegrityMismatch, w.restore(a, io, &paths, .{ .instance = one, .id = backed.recovery_id }, target, .{}));
+    try std.testing.expectError(error.IntegrityMismatch, w.restore(a, io, &paths, .{ .instance = one, .id = backed.recovery_id }, target, .{ .scope = coordinator.worldScope(3) }));
     try tmp.dir.symLink(io, "region/data", ".minecraft/versions/One/saves/World/link", .{});
-    try std.testing.expectError(error.UnsafeFileType, w.backup(a, io, &paths, ref, .{}));
+    try std.testing.expectError(error.UnsafeFileType, w.backup(a, io, &paths, ref, .{ .scope = coordinator.worldScope(3) }));
 }
 test "late cancellation preserves committed success" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var paths = try fixturePaths(tmp);
     defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
     try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "world payload");
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Two");
     var cancel: Cancel = .{};
-    var result = try w.copy(a, io, &paths, .{ .instance = one, .folder = "World" }, .{ .instance = two, .folder = "Target" }, .{ .hooks = .{ .context = &cancel, .canceled = Cancel.canceled, .committed = Cancel.committed } });
+    var result = try w.copy(a, io, &paths, .{ .instance = one, .folder = "World" }, .{ .instance = two, .folder = "Target" }, .{ .scope = coordinator.worldScope(3), .hooks = .{ .context = &cancel, .canceled = Cancel.canceled, .committed = Cancel.committed } });
     defer result.deinit();
     try std.testing.expectEqual(.committed, result.state);
     try std.testing.expect(cancel.value);
@@ -171,8 +180,9 @@ fn failBackup(allocator: std.mem.Allocator) !void {
     defer tmp.cleanup();
     var paths = try fixturePaths(tmp);
     defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
     try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "world payload");
-    var outcome = try w.backup(allocator, io, &paths, .{ .instance = one, .folder = "World" }, .{});
+    var outcome = try w.backup(allocator, io, &paths, .{ .instance = one, .folder = "World" }, .{ .scope = coordinator.worldScope(3) });
     defer outcome.deinit();
 }
 test "world backup cleans up every allocation failure" {
@@ -184,21 +194,22 @@ test "confirmed overwrite retains previous world and case collisions fail" {
     defer tmp.cleanup();
     var paths = try fixturePaths(tmp);
     defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
     try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "new");
     try write(tmp.dir, ".minecraft/versions/Two/saves/Target/data", "old");
     const ref: w.WorldRef = .{ .instance = one, .folder = "World" };
     const target: w.WorldRef = .{ .instance = two, .folder = "Target" };
-    var overwrite = try w.copy(a, io, &paths, ref, target, .{ .confirmed_destructive = true });
+    var overwrite = try w.copy(a, io, &paths, ref, target, .{ .scope = coordinator.worldScope(3), .confirmed_destructive = true });
     defer overwrite.deinit();
     try std.testing.expectEqual(.committed, overwrite.state);
-    var recovery = try w.restore(a, io, &paths, .{ .instance = two, .id = overwrite.recovery_id, .part = .overwritten }, .{ .instance = two, .folder = "Old" }, .{});
+    var recovery = try w.restore(a, io, &paths, .{ .instance = two, .id = overwrite.recovery_id, .part = .overwritten }, .{ .instance = two, .folder = "Old" }, .{ .scope = coordinator.worldScope(3) });
     defer recovery.deinit();
     const file = try tmp.dir.openFile(io, ".minecraft/versions/Two/saves/Old/data", .{});
     defer file.close(io);
     var buffer: [3]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 3), try file.readPositionalAll(io, &buffer, 0));
     try std.testing.expectEqualStrings("old", &buffer);
-    try std.testing.expectError(error.NameCollision, w.copy(a, io, &paths, ref, .{ .instance = two, .folder = "target" }, .{ .confirmed_destructive = true }));
+    try std.testing.expectError(error.NameCollision, w.copy(a, io, &paths, ref, .{ .instance = two, .folder = "target" }, .{ .scope = coordinator.worldScope(3), .confirmed_destructive = true }));
 }
 
 test "display-name rewrite preserves unknown mod compounds lists and arrays" {
@@ -248,6 +259,7 @@ test "world preview uses validated real icon path and rejects corrupted CRC" {
     defer tmp.cleanup();
     var paths = try fixturePaths(tmp);
     defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
     var png: std.Io.Writer.Allocating = .init(a);
     defer png.deinit();
     try png.writer.writeAll("\x89PNG\r\n\x1a\n");
@@ -258,14 +270,14 @@ test "world preview uses validated real icon path and rejects corrupted CRC" {
     try pngChunk(&png, "IDAT", pixels);
     try pngChunk(&png, "IEND", "");
     try write(tmp.dir, ".minecraft/versions/One/saves/World/icon.png", png.written());
-    var result = try w.list(a, io, &paths, one, null, .{});
+    var result = try w.list(a, io, &paths, one, null, .{ .scope = coordinator.worldScope(3) });
     defer result.deinit();
     const expected = try std.fs.path.join(a, &.{ paths.minecraft, "versions", "One", "saves", "World", "icon.png" });
     defer a.free(expected);
     try std.testing.expectEqualStrings(expected, result.items[0].icon_path.?);
     png.written()[png.written().len - 1] ^= 1;
     try write(tmp.dir, ".minecraft/versions/One/saves/World/icon.png", png.written());
-    var invalid = try w.list(a, io, &paths, one, null, .{});
+    var invalid = try w.list(a, io, &paths, one, null, .{ .scope = coordinator.worldScope(3) });
     defer invalid.deinit();
     try std.testing.expect(invalid.items[0].icon_path == null);
 }
@@ -275,11 +287,12 @@ test "recovery enumeration survives restart and exposes overwritten records" {
     defer tmp.cleanup();
     var paths = try fixturePaths(tmp);
     defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
     try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "new");
     try write(tmp.dir, ".minecraft/versions/Two/saves/Target/data", "old");
-    var operation = try w.copy(a, io, &paths, .{ .instance = one, .folder = "World" }, .{ .instance = two, .folder = "Target" }, .{ .confirmed_destructive = true });
+    var operation = try w.copy(a, io, &paths, .{ .instance = one, .folder = "World" }, .{ .instance = two, .folder = "Target" }, .{ .scope = coordinator.worldScope(3), .confirmed_destructive = true });
     defer operation.deinit();
-    var items = try w.listBackups(a, io, &paths, two, .{});
+    var items = try w.listBackups(a, io, &paths, two, .{ .scope = coordinator.worldScope(3) });
     defer items.deinit();
     try std.testing.expectEqual(@as(usize, 2), items.items.len);
     var originals: usize = 0;
@@ -322,6 +335,7 @@ test "rename failures rollback or explicitly retain uncertain committed state" {
         defer tmp.cleanup();
         var paths = try fixturePaths(tmp);
         defer paths.deinit();
+        var coordinator = instance_leases.Coordinator.init(io);
         try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "world payload");
         Fault.mode = @enumFromInt(field.value);
         Fault.candidate_committed = false;
@@ -329,7 +343,7 @@ test "rename failures rollback or explicitly retain uncertain committed state" {
         table.dirRenamePreserve = Fault.rename;
         table.fileSync = Fault.sync;
         const injected: std.Io = .{ .userdata = io.userdata, .vtable = &table };
-        var result = try w.renameFolder(a, injected, &paths, .{ .instance = one, .folder = "World" }, "New", .{});
+        var result = try w.renameFolder(a, injected, &paths, .{ .instance = one, .folder = "World" }, "New", .{ .scope = coordinator.worldScope(3) });
         defer result.deinit();
         try std.testing.expectEqual(if (Fault.mode == .candidate_fail) @TypeOf(result.state).rolled_back else @TypeOf(result.state).uncertain, result.state);
         try std.testing.expect(result.cause != null);
@@ -346,6 +360,7 @@ test "file-sync failure stays fatal before commit on every platform" {
     defer tmp.cleanup();
     var paths = try fixturePaths(tmp);
     defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
     try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "original");
     const Failure = struct {
         fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
@@ -357,9 +372,251 @@ test "file-sync failure stays fatal before commit on every platform" {
     var table = io.vtable.*;
     table.fileSync = Failure.sync;
     const injected: std.Io = .{ .userdata = io.userdata, .vtable = &table };
-    try std.testing.expectError(error.Unexpected, w.backup(a, injected, &paths, .{ .instance = one, .folder = "World" }, .{}));
+    try std.testing.expectError(error.Unexpected, w.backup(a, injected, &paths, .{ .instance = one, .folder = "World" }, .{ .scope = coordinator.worldScope(3) }));
     _ = try tmp.dir.statFile(io, ".minecraft/versions/One/saves/World/data", .{});
-    var recovery = try w.listBackups(a, io, &paths, one, .{});
+    var recovery = try w.listBackups(a, io, &paths, one, .{ .scope = coordinator.worldScope(3) });
     defer recovery.deinit();
     try std.testing.expectEqual(@as(usize, 0), recovery.items.len);
+}
+
+// The injected Io retains the real userdata for every original vtable entry.
+// This pointer is test instrumentation only; callers still supply their scope.
+const LeaseIo = struct {
+    coordinator: *instance_leases.Coordinator,
+    source: []const u8 = "one",
+    target: ?[]const u8 = null,
+    calls: usize = 0,
+    inspect: bool = false,
+    failed: bool = false,
+    guard_called: bool = false,
+    var active: ?*LeaseIo = null;
+
+    const OpenDir = @typeInfo(@typeInfo(@TypeOf(io.vtable.dirOpenDir)).pointer.child).@"fn";
+    const OpenFile = @typeInfo(@typeInfo(@TypeOf(io.vtable.dirOpenFile)).pointer.child).@"fn";
+
+    fn busy(self: *LeaseIo, id: []const u8) bool {
+        self.coordinator.reserveLaunch(id) catch |err| return err == error.InstanceBusy;
+        self.coordinator.releaseLaunch();
+        self.coordinator.tick();
+        return false;
+    }
+    fn observe() bool {
+        const self = active.?;
+        self.calls += 1;
+        if (!self.inspect) return true;
+        if (!w.transaction_gate.tryLock()) {
+            self.failed = true;
+            return false;
+        }
+        w.transaction_gate.unlock(io);
+        if (!self.busy(self.source)) self.failed = true;
+        if (self.target) |target| {
+            if (!self.busy(target)) self.failed = true;
+        }
+        self.coordinator.reserveLaunch("unrelated") catch {
+            self.failed = true;
+            return false;
+        };
+        self.coordinator.releaseLaunch();
+        self.coordinator.tick();
+        return !self.failed;
+    }
+    fn openDir(userdata: ?*anyopaque, dir: OpenDir.params[1].type.?, path: OpenDir.params[2].type.?, options: OpenDir.params[3].type.?) OpenDir.return_type.? {
+        if (!observe()) return error.Unexpected;
+        return io.vtable.dirOpenDir(userdata, dir, path, options);
+    }
+    fn openFile(userdata: ?*anyopaque, dir: OpenFile.params[1].type.?, path: OpenFile.params[2].type.?, options: OpenFile.params[3].type.?) OpenFile.return_type.? {
+        if (!observe()) return error.Unexpected;
+        return io.vtable.dirOpenFile(userdata, dir, path, options);
+    }
+    fn rename(userdata: ?*anyopaque, old: std.Io.Dir, old_name: []const u8, new: std.Io.Dir, new_name: []const u8) std.Io.Dir.RenamePreserveError!void {
+        if (!observe()) return error.Unexpected;
+        return io.vtable.dirRenamePreserve(userdata, old, old_name, new, new_name);
+    }
+    fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        if (!observe()) return error.Unexpected;
+        return io.vtable.fileSync(userdata, file);
+    }
+    fn dynamicGuard(context: ?*anyopaque, _: []const u8) bool {
+        const self: *LeaseIo = @ptrCast(@alignCast(context.?));
+        self.guard_called = true;
+        return false;
+    }
+    fn expectObserved(self: *LeaseIo) !void {
+        try std.testing.expect(self.calls > 0);
+        try std.testing.expect(!self.failed);
+        self.calls = 0;
+    }
+};
+
+fn expectDeniedBeforeFilesystem(expected: anyerror, injected: std.Io, paths: *instances.Paths, options: w.Options) !void {
+    const source: w.WorldRef = .{ .instance = one, .folder = "World" };
+    const target: w.WorldRef = .{ .instance = two, .folder = "Target" };
+    try std.testing.expectError(expected, w.list(a, injected, paths, one, null, options));
+    try std.testing.expectError(expected, w.listBackups(a, injected, paths, one, options));
+    try std.testing.expectError(expected, w.backup(a, injected, paths, source, options));
+    try std.testing.expectError(expected, w.copy(a, injected, paths, source, target, options));
+    try std.testing.expectError(expected, w.restore(a, injected, paths, .{ .instance = one, .id = "00000000000000000000000000000000" }, target, options));
+    try std.testing.expectError(expected, w.rename(a, injected, paths, source, "Renamed", options));
+    try std.testing.expectError(expected, w.renameFolder(a, injected, paths, source, "Renamed", options));
+    try std.testing.expectError(expected, w.renameDisplayName(a, injected, paths, source, "New name", options));
+    try std.testing.expectError(expected, w.delete(a, injected, paths, source, options));
+}
+
+test "missing target copy and restore do not create instance namespaces" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "world payload");
+    const source: w.WorldRef = .{ .instance = one, .folder = "World" };
+    const target: w.WorldRef = .{ .instance = two, .folder = "Target" };
+    var backup = try w.backup(a, io, &paths, source, .{ .scope = coordinator.worldScope(3) });
+    defer backup.deinit();
+    try std.testing.expectError(error.FileNotFound, w.copy(a, io, &paths, source, target, .{ .scope = coordinator.worldScope(3) }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/Two", .{}));
+    try std.testing.expectError(error.FileNotFound, w.restore(a, io, &paths, .{ .instance = one, .id = backup.recovery_id }, target, .{ .scope = coordinator.worldScope(3) }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/Two", .{}));
+    _ = try tmp.dir.statFile(io, ".minecraft/versions/One/saves/World/data", .{});
+    for ([_][]const u8{ one.id, two.id }) |id| {
+        try coordinator.reserveLaunch(id);
+        coordinator.releaseLaunch();
+        coordinator.tick();
+    }
+}
+
+test "existing target without saves admits copy and restore" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "world payload");
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Two");
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Three");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/Two/saves", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/Three/saves", .{}));
+    const three: config.Instance = .{ .id = "three", .name = "Three", .minecraft_version = "1.21" };
+    const source: w.WorldRef = .{ .instance = one, .folder = "World" };
+    var backup = try w.backup(a, io, &paths, source, .{ .scope = coordinator.worldScope(3) });
+    defer backup.deinit();
+    var copied = try w.copy(a, io, &paths, source, .{ .instance = two, .folder = "Copied" }, .{ .scope = coordinator.worldScope(3) });
+    defer copied.deinit();
+    try std.testing.expectEqual(.committed, copied.state);
+    var restored = try w.restore(a, io, &paths, .{ .instance = one, .id = backup.recovery_id }, .{ .instance = three, .folder = "Restored" }, .{ .scope = coordinator.worldScope(3) });
+    defer restored.deinit();
+    try std.testing.expectEqual(.committed, restored.state);
+    for ([_][]const u8{ ".minecraft/versions/Two/saves/Copied/data", ".minecraft/versions/Three/saves/Restored/data" }) |path| {
+        const file = try tmp.dir.openFile(io, path, .{});
+        defer file.close(io);
+        var buffer: [13]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, buffer.len), try file.readPositionalAll(io, &buffer, 0));
+        try std.testing.expectEqualStrings("world payload", &buffer);
+    }
+}
+
+test "actual world I/O releases gate while scope excludes source and target launches" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "world payload");
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Two");
+    var observer: LeaseIo = .{ .coordinator = &coordinator, .inspect = true };
+    LeaseIo.active = &observer;
+    defer LeaseIo.active = null;
+    var table = io.vtable.*;
+    table.dirOpenDir = LeaseIo.openDir;
+    table.dirOpenFile = LeaseIo.openFile;
+    table.dirRenamePreserve = LeaseIo.rename;
+    table.fileSync = LeaseIo.sync;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &table };
+    const source: w.WorldRef = .{ .instance = one, .folder = "World" };
+    const target: w.WorldRef = .{ .instance = two, .folder = "Target" };
+
+    var listing = try w.list(a, injected, &paths, one, null, .{ .scope = coordinator.worldScope(3) });
+    defer listing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listing.items.len);
+    try observer.expectObserved();
+
+    var backup = try w.backup(a, injected, &paths, source, .{ .scope = coordinator.worldScope(3) });
+    defer backup.deinit();
+    try std.testing.expectEqual(.committed, backup.state);
+    try observer.expectObserved();
+
+    var recovery = try w.listBackups(a, injected, &paths, one, .{ .scope = coordinator.worldScope(3) });
+    defer recovery.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recovery.items.len);
+    try std.testing.expectEqualStrings(backup.recovery_id, recovery.items[0].id);
+    try observer.expectObserved();
+
+    observer.target = two.id;
+    var copied = try w.copy(a, injected, &paths, source, target, .{ .scope = coordinator.worldScope(3) });
+    defer copied.deinit();
+    try std.testing.expectEqual(.committed, copied.state);
+    try observer.expectObserved();
+
+    var restored = try w.restore(a, injected, &paths, .{ .instance = one, .id = backup.recovery_id }, .{ .instance = two, .folder = "Restored" }, .{ .scope = coordinator.worldScope(3) });
+    defer restored.deinit();
+    try std.testing.expectEqual(.committed, restored.state);
+    try observer.expectObserved();
+    _ = try tmp.dir.statFile(io, ".minecraft/versions/Two/saves/Target/data", .{});
+    _ = try tmp.dir.statFile(io, ".minecraft/versions/Two/saves/Restored/data", .{});
+    for ([_][]const u8{ one.id, two.id }) |id| {
+        try coordinator.reserveLaunch(id);
+        coordinator.releaseLaunch();
+        coordinator.tick();
+    }
+}
+
+test "missing scope and dynamic guard deny all world filesystem entry points" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    var observer: LeaseIo = .{ .coordinator = &coordinator };
+    LeaseIo.active = &observer;
+    defer LeaseIo.active = null;
+    var table = io.vtable.*;
+    table.dirOpenDir = LeaseIo.openDir;
+    table.dirOpenFile = LeaseIo.openFile;
+    table.dirRenamePreserve = LeaseIo.rename;
+    table.fileSync = LeaseIo.sync;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &table };
+    try expectDeniedBeforeFilesystem(error.MissingWorldScope, injected, &paths, .{ .confirmed_destructive = true });
+    try std.testing.expectEqual(@as(usize, 0), observer.calls);
+    try expectDeniedBeforeFilesystem(error.UnsupportedWorldGuard, injected, &paths, .{
+        .scope = coordinator.worldScope(3),
+        .confirmed_destructive = true,
+        .guard = .{ .context = &observer, .is_running = LeaseIo.dynamicGuard },
+    });
+    try std.testing.expectEqual(@as(usize, 0), observer.calls);
+    try std.testing.expect(!observer.guard_called);
+}
+
+test "held transaction gate rejects all scoped world entry points before filesystem I/O" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    var observer: LeaseIo = .{ .coordinator = &coordinator };
+    LeaseIo.active = &observer;
+    defer LeaseIo.active = null;
+    var table = io.vtable.*;
+    table.dirOpenDir = LeaseIo.openDir;
+    table.dirOpenFile = LeaseIo.openFile;
+    table.dirRenamePreserve = LeaseIo.rename;
+    table.fileSync = LeaseIo.sync;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &table };
+    try std.testing.expect(w.transaction_gate.tryLock());
+    defer w.transaction_gate.unlock(io);
+    try expectDeniedBeforeFilesystem(error.InstanceBusy, injected, &paths, .{
+        .scope = coordinator.worldScope(3),
+        .confirmed_destructive = true,
+    });
+    try std.testing.expectEqual(@as(usize, 0), observer.calls);
 }

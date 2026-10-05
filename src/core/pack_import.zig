@@ -109,6 +109,11 @@ pub fn prepare(a: Allocator, io: Io, paths: *const instances.Paths, instance: co
 pub fn prepareInspected(a: Allocator, io: Io, paths: *const instances.Paths, instance: config.Instance, inspection: *const Inspection, cancel: ?*const CancelToken) !Prepared {
     try fs.cancelled(io, cancel, null);
     if (!fs.safeComponent(instance.id) or !fs.safeComponent(instance.name)) return error.UnsafeInstance;
+    const extracted_path = try std.fs.path.join(a, &.{ inspection.stage_absolute_path, "extracted" });
+    defer a.free(extracted_path);
+    const extracted = try fs.openAbsolute(io, extracted_path);
+    defer extracted.close(io);
+    try validatePackTargets(a, io, extracted, inspection.pack, instance.name, cancel);
     try compatible(instance, inspection.pack);
     var next = try inspectArchive(a, io, paths, inspection.archive_absolute_path, inspection.provider, inspection.source_sha256, cancel);
     var owned = true;
@@ -180,6 +185,7 @@ fn inspectArchive(a: Allocator, io: Io, paths: *const instances.Paths, archive_a
     // The nested owner must not retain an allocator pointing at our movable arena.
     var parsed = if (provider == .modrinth) try manifest.parseMrpack(a, bytes, identity, .client) else try manifest.parseCurseForgePack(a, bytes, identity);
     errdefer parsed.deinit();
+    try validatePackTargets(aa, io, extracted, parsed.value, null, cancel);
     return .{
         .arena = arena,
         .parsed = parsed,
@@ -193,13 +199,14 @@ fn inspectArchive(a: Allocator, io: Io, paths: *const instances.Paths, archive_a
 
 fn finishPrepare(io: Io, instance: config.Instance, inspection: *Inspection, cancel: ?*const CancelToken) !Prepared {
     try fs.cancelled(io, cancel, null);
-    try compatible(instance, inspection.pack);
     const aa = inspection.arena.allocator();
     const parsed = inspection.parsed;
     const stage_path = inspection.stage_absolute_path;
     const extracted_path = try std.fs.path.join(aa, &.{ stage_path, "extracted" });
     const extracted = try fs.openAbsolute(io, extracted_path);
     defer extracted.close(io);
+    try validatePackTargets(aa, io, extracted, inspection.pack, instance.name, cancel);
+    try compatible(instance, inspection.pack);
     const identity = inspection.pack.identity;
     var files: std.ArrayList(manifest.InstallFile) = .empty;
     try files.appendSlice(aa, parsed.value.files);
@@ -223,7 +230,9 @@ fn finishPrepare(io: Io, instance: config.Instance, inspection: *Inspection, can
     const merged = try files.toOwnedSlice(aa);
     var pack = parsed.value;
     pack.files = merged;
-    try manifest.validate(.{ .instance_id = instance.id, .pack_version = pack.version, .files = try records(aa, merged) });
+    const document: manifest.Manifest = .{ .instance_id = instance.id, .pack_version = pack.version, .files = try records(aa, merged) };
+    try manifest.validatePathsForInstance(document, instance.name);
+    try manifest.validate(document);
     return .{
         .arena = inspection.arena,
         .parsed = parsed,
@@ -249,10 +258,49 @@ fn compatible(instance: config.Instance, pack: manifest.PackPlan) !void {
     } else if (pack.loader_version != null) return error.LoaderVersionMismatch;
 }
 fn safeTarget(path: []const u8) !void {
-    if (!manifest.safeRelativePath(path)) return error.UnsafeRelativePath;
-    if (manifest.protectedPath(path) or manifest.pathsCollide(path, ".vela-content")) return error.ProtectedPath;
+    try manifest.checkedPathForInstance(path, null);
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| if (!fs.safeComponent(part)) return error.UnsafeRelativePath;
+}
+/// Inspect every override path before merging, compatibility checks, or publication.
+fn validateOverrideTargets(a: Allocator, io: Io, dir: Io.Dir, prefix: []const u8, instance_name: ?[]const u8, cancel: ?*const CancelToken, visited: *usize) anyerror!void {
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        try fs.cancelled(io, cancel, null);
+        visited.* += 1;
+        if (visited.* > 32_768) return error.TooManyItems;
+        const path = if (prefix.len == 0) try a.dupe(u8, entry.name) else try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, entry.name });
+        defer a.free(path);
+        try manifest.checkedPathForInstance(path, instance_name);
+        try safeTarget(path);
+        const stat = (try fs.inspectEntry(dir, io, entry.name)) orelse return error.MissingOverride;
+        switch (stat.kind) {
+            .directory => {
+                const child = try fs.child(dir, io, entry.name, false, false);
+                defer child.close(io);
+                try validateOverrideTargets(a, io, child, path, instance_name, cancel, visited);
+            },
+            .file => {},
+            else => return error.UnsafeFileType,
+        }
+    }
+}
+fn validatePackTargets(a: Allocator, io: Io, extracted: Io.Dir, pack: manifest.PackPlan, instance_name: ?[]const u8, cancel: ?*const CancelToken) !void {
+    if (pack.files.len > providers.max_items or pack.unresolved.len > providers.max_items) return error.TooManyItems;
+    for (pack.files) |file| {
+        try manifest.checkedPathForInstance(file.record.path, instance_name);
+        try safeTarget(file.record.path);
+    }
+    var visited: usize = 0;
+    for (pack.override_layers) |layer| {
+        try safeTarget(layer);
+        const dir = fs.descend(extracted, io, layer, false) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer dir.close(io);
+        try validateOverrideTargets(a, io, dir, "", instance_name, cancel, &visited);
+    }
 }
 const Walk = struct {
     a: Allocator,
@@ -757,4 +805,89 @@ test "pack inspection cancellation and allocation failure leave no private stage
     try std.testing.expect(try iterator.next(io) == null);
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft", .{}));
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".vela/config.json", .{}));
+}
+
+test "target-free inspection rejects launcher receipts in indexes and override layers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    const path = try fixture.path("local.mrpack");
+    defer a.free(path);
+    for ([_][]const u8{ ".vela-instance.json", ".VeLa-InStAnCe.JsOn/child", ".vela-loader.json", ".VELA-LOADER.JSON/child" }) |target| {
+        const index = try testRemoteIndex(a, &.{target});
+        defer a.free(index);
+        try testZip(fixture.tmp.dir, "local.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = index }});
+        try std.testing.expectError(error.ProtectedPath, inspect(a, io, &fixture.paths, path, null));
+        const override_path = try std.fmt.allocPrint(a, "overrides/{s}", .{target});
+        defer a.free(override_path);
+        try testZip(fixture.tmp.dir, "local.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = test_mrpack }, .{ .path = override_path, .bytes = "receipt" } });
+        try std.testing.expectError(error.ProtectedPath, inspect(a, io, &fixture.paths, path, null));
+    }
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft", .{}));
+}
+
+test "preparation protects exact target JSON and JAR before compatibility in indexes and overrides" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    const path = try fixture.path("local.mrpack");
+    defer a.free(path);
+    var incompatible = test_instance;
+    incompatible.minecraft_version = "wrong-version";
+    for ([_][]const u8{ "Exact Name.json", "eXaCt NaMe.JsOn/child", "Exact Name.jar", "EXACT NAME.JAR/child" }) |target| {
+        for ([_]bool{ false, true }) |override| {
+            const index = if (override) try a.dupe(u8, test_mrpack) else try testRemoteIndex(a, &.{target});
+            defer a.free(index);
+            const override_path = try std.fmt.allocPrint(a, "client-overrides/{s}", .{target});
+            defer a.free(override_path);
+            const entries = [_]TestEntry{ .{ .path = "modrinth.index.json", .bytes = index }, .{ .path = override_path, .bytes = "launcher-owned" } };
+            try testZip(fixture.tmp.dir, "local.mrpack", entries[0..if (override) @as(usize, 2) else 1]);
+            // Target-free inspection intentionally permits an otherwise ordinary root JSON/JAR.
+            var inspected = try inspect(a, io, &fixture.paths, path, null);
+            defer inspected.deinit();
+            defer inspected.cleanup(io) catch {};
+            try std.testing.expectError(error.ProtectedPath, prepareInspected(a, io, &fixture.paths, incompatible, &inspected, null));
+            try std.testing.expectError(error.ProtectedPath, prepare(a, io, &fixture.paths, incompatible, path, null));
+        }
+    }
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft", .{}));
+}
+
+test "inspection and preparation retain ordinary root configuration JSON" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    try testZip(fixture.tmp.dir, "local.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = test_mrpack }, .{ .path = "overrides/settings.json", .bytes = "settings" }, .{ .path = "client-overrides/Other.json", .bytes = "other" } });
+    const path = try fixture.path("local.mrpack");
+    defer a.free(path);
+    var inspected = try inspect(a, io, &fixture.paths, path, null);
+    defer inspected.deinit();
+    defer inspected.cleanup(io) catch {};
+    var prepared = try prepareInspected(a, io, &fixture.paths, test_instance, &inspected, null);
+    defer prepared.deinit();
+    defer prepared.cleanup(io) catch {};
+    try std.testing.expectEqual(@as(usize, 2), prepared.files.len);
+    for (prepared.files) |file| {
+        try manifest.checkedPathForInstance(file.record.path, test_instance.name);
+        try std.testing.expect(std.mem.eql(u8, file.record.path, "settings.json") or std.mem.eql(u8, file.record.path, "Other.json"));
+    }
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft", .{}));
+}
+test "pack target preflight bounds precede uninitialized inspection collections" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const files = try a.alloc(manifest.InstallFile, providers.max_items + 1);
+    defer a.free(files);
+    const references = try a.alloc(manifest.PackReference, providers.max_items + 1);
+    defer a.free(references);
+    var pack: manifest.PackPlan = .{ .identity = .{ .provider = .modrinth, .project_id = "project", .version_id = "v1" }, .name = "Pack", .version = "v1", .minecraft_version = "1.20.1", .files = files };
+    try std.testing.expectError(error.TooManyItems, validatePackTargets(a, io, tmp.dir, pack, "Test", null));
+    pack.files = &.{};
+    pack.unresolved = references;
+    try std.testing.expectError(error.TooManyItems, validatePackTargets(a, io, tmp.dir, pack, "Test", null));
 }

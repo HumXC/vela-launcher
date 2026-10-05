@@ -8,6 +8,7 @@ const loader = @import("metadata_loader.zig");
 const loader_install = @import("loader_install.zig");
 const loaders = @import("loaders.zig");
 const instances = @import("../instances.zig");
+const namespace = @import("../instance_namespace.zig");
 const fs = @import("safe_fs.zig");
 const builtin = @import("builtin");
 const A = std.mem.Allocator;
@@ -21,6 +22,12 @@ pub const Config = struct {
     natives_directory: ?[]const u8 = null,
     /// False prepares artifacts/aliases only; caller owns descriptor publication.
     publish_metadata: bool = true,
+    /// Protects namespace name/reference scans only; it does not exclude launch.
+    /// Managed callers must independently hold the stable-ID instance lease.
+    /// Borrowed reservations remain owned by the caller through all cleanup.
+    namespace_token: ?namespace.Token = null,
+    /// Worker admission may wait for the short namespace stamp gate.
+    worker_checks: bool = false,
     cpu_arch: ?[]const u8 = null,
     metadata_path: ?[]const u8 = null,
     metadata_limits: m.version.inheritance.Limits = .{},
@@ -50,19 +57,27 @@ pub const Installed = struct {
 /// Returned metadata and plan own their data independently of download handles.
 pub fn run(a: A, io: std.Io, service: *dl.Service, config: Config) !Installed {
     try validateConfig(config);
+    const token = try reserveNamespace(io, config.namespace_token, config.worker_checks);
+    defer if (config.namespace_token == null) token.release();
+    var reserved_config = config;
+    reserved_config.namespace_token = token;
     const manifest_bytes = try fetch(a, io, service, config, config.manifest_url, null, null);
     defer a.free(manifest_bytes);
     var manifest = try m.manifest.parseSlice(a, manifest_bytes);
     defer manifest.deinit();
     var fetch_context: FetchContext = .{ .service = service, .config = config };
     const loaded = try loader.load(a, io, .{ .root = config.root, .version_id = config.version_id, .manifest = manifest.value, .metadata_path = config.metadata_path, .cancel = config.cancel, .limits = config.metadata_limits }, .{ .context = &fetch_context, .fetch = fetchMetadata });
-    return installLoaded(a, io, service, config, loaded, null);
+    return installLoaded(a, io, service, reserved_config, loaded, null);
 }
 
 /// Replays an independently owned base without refetching version/loader metadata.
 /// The caller retains prepared through subsequent loader installation and join.
 pub fn runPrepared(a: A, io: std.Io, service: *dl.Service, config: Config, prepared: *const loader_install.PreparedMetadata, target: loader_install.MetadataTarget, control: loaders.Control) !Installed {
     try validateConfig(config);
+    const token = try reserveNamespace(io, config.namespace_token, config.worker_checks);
+    defer if (config.namespace_token == null) token.release();
+    var reserved_config = config;
+    reserved_config.namespace_token = token;
     try control.check();
     if (!std.mem.eql(u8, config.version_id, target.selection.base_id)) return error.PreparedMetadataMismatch;
     var expected_paths = try instances.Paths.init(a, io, target.root);
@@ -74,12 +89,16 @@ pub fn runPrepared(a: A, io: std.Io, service: *dl.Service, config: Config, prepa
     var bound_target = target;
     bound_target.environment = config.environment;
     const loaded = try prepared.replayBase(a, io, bound_target, control);
-    return installLoaded(a, io, service, config, loaded, control);
+    return installLoaded(a, io, service, reserved_config, loaded, control);
 }
 
 /// Replays a sealed vanilla base without manifest or version metadata refetch.
 pub fn runVanillaPrepared(a: A, io: std.Io, service: *dl.Service, config: Config, prepared: *const loader.PreparedVanilla, target: loader.VanillaTarget) !Installed {
     try validateConfig(config);
+    const token = try reserveNamespace(io, config.namespace_token, config.worker_checks);
+    defer if (config.namespace_token == null) token.release();
+    var reserved_config = config;
+    reserved_config.namespace_token = token;
     if (!std.mem.eql(u8, config.version_id, target.version_id)) return error.PreparedMetadataMismatch;
     var expected_paths = try instances.Paths.init(a, io, target.root);
     defer expected_paths.deinit();
@@ -89,7 +108,15 @@ pub fn runVanillaPrepared(a: A, io: std.Io, service: *dl.Service, config: Config
     var bound_target = target;
     bound_target.environment = config.environment;
     const loaded = try prepared.replayBase(a, io, bound_target, config.cancel);
-    return installLoaded(a, io, service, config, loaded, null);
+    return installLoaded(a, io, service, reserved_config, loaded, null);
+}
+
+fn reserveNamespace(io: std.Io, borrowed: ?namespace.Token, worker: bool) !namespace.Token {
+    if (borrowed) |token| {
+        if (worker) try token.recheckWaiting() else try token.recheck();
+        return token;
+    }
+    return if (worker) namespace.acquireWaiting(io) else namespace.acquire(io);
 }
 
 fn validateConfig(config: Config) !void {
@@ -101,6 +128,13 @@ fn validateConfig(config: Config) !void {
 
 // Consumes both loaded owners: sources always release; version moves on success.
 fn installLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_loaded: loader.Loaded, loader_control: ?loaders.Control) !Installed {
+    const token = reserveNamespace(io, config.namespace_token, config.worker_checks) catch |err| {
+        var failed_loaded = owned_loaded;
+        failed_loaded.deinit();
+        return err;
+    };
+    // Registered first so task drain, native cleanup and every close finish first.
+    defer if (config.namespace_token == null) token.release();
     var loaded = owned_loaded;
     defer loaded.sources.deinit();
     var version = loaded.version;
@@ -119,6 +153,7 @@ fn installLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
     errdefer plan.deinit();
     try control.check();
     var publication_config = config;
+    publication_config.namespace_token = token;
     publication_config.version_id = version.value.id;
     publication_config.instance_name = config.instance_name orelse config.version_id;
     const descriptor: ?Publication = if (config.publish_metadata) try preparePublicationControlled(a, io, publication_config, loaded.sources.value, control) else null;
@@ -338,6 +373,8 @@ fn preparePublication(a: A, io: std.Io, config: Config, sources: []const loader.
     return preparePublicationControlled(a, io, config, sources, .{ .cancel = config.cancel });
 }
 fn preparePublicationControlled(a: A, io: std.Io, config: Config, sources: []const loader.Source, control: InstallControl) !Publication {
+    const token = try reserveNamespace(io, config.namespace_token, config.worker_checks);
+    defer if (config.namespace_token == null) token.release();
     try control.check();
     const name = config.instance_name orelse config.version_id;
     try m.version.validateId(name);
@@ -363,6 +400,8 @@ fn publishMetadata(a: A, io: std.Io, config: Config, sources: []const loader.Sou
     return publishMetadataControlled(a, io, config, sources, descriptor, .{ .cancel = config.cancel });
 }
 fn publishMetadataControlled(a: A, io: std.Io, config: Config, sources: []const loader.Source, descriptor: Publication, control: InstallControl) !void {
+    const token = try reserveNamespace(io, config.namespace_token, config.worker_checks);
+    defer if (config.namespace_token == null) token.release();
     try control.check();
     _ = try existingMatchesControlled(a, io, descriptor.path, descriptor.bytes, control);
     for (sources) |source| {
@@ -1022,4 +1061,89 @@ test "prepared executor retains deadline and distinct cancellation flags after r
     try prepared.validateBinding(a, io, target);
     try std.testing.expectEqual(vanilla_calls, fixture.vanilla_calls);
     try std.testing.expectEqual(loader_calls, fixture.loader_calls);
+}
+
+test "installer namespace blocker rejects artifacts-only runs before any IO" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const token = try namespace.acquire(io);
+    defer token.release();
+    var service: dl.Service = undefined;
+    const config: Config = .{ .version_id = "1.20.1", .root = root, .publish_metadata = false, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
+    try std.testing.expectError(error.InstanceNamespaceBusy, run(std.testing.allocator, io, &service, config));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "versions", .{ .follow_symlinks = false }));
+    try token.recheck();
+}
+
+test "installer prepared entry validates namespace stamps and never releases a borrower" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var service: dl.Service = undefined;
+    var prepared: loader.PreparedVanilla = undefined;
+    var config: Config = .{ .version_id = "1.20.1", .publish_metadata = false, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
+    const target: loader.VanillaTarget = .{ .root = ".", .instance_id = "fixture", .instance_name = "Pack", .version_id = "other", .generation = 1, .environment = config.environment };
+    try std.testing.expectError(error.PreparedMetadataMismatch, runVanillaPrepared(a, io, &service, config, &prepared, target));
+    const token = try namespace.acquire(io);
+    defer token.release();
+    config.namespace_token = token;
+    try std.testing.expectError(error.PreparedMetadataMismatch, runVanillaPrepared(a, io, &service, config, &prepared, target));
+    try token.recheck();
+    try std.testing.expectError(error.InstanceNamespaceBusy, namespace.acquire(io));
+    token.release();
+    const current = try namespace.acquire(io);
+    defer current.release();
+    try std.testing.expectError(error.InstanceNamespaceLeaseLost, runVanillaPrepared(a, io, &service, config, &prepared, target));
+    try current.recheck();
+}
+
+test "artifacts-only consuming executor releases direct namespace and retains borrowed namespace on error" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var fixture: PreparedRunFixture = .{};
+    var prepared = try fixture.prepare(a, io, root);
+    defer prepared.deinit();
+    const minecraft = try std.fs.path.join(a, &.{ root, ".minecraft" });
+    defer a.free(minecraft);
+    var config = preparedRunConfig(minecraft);
+    config.publish_metadata = false;
+    const target = preparedRunTarget(&prepared);
+    var service: dl.Service = undefined;
+    try std.testing.expectError(error.MissingAssetIndex, runPrepared(a, io, &service, config, &prepared, target, prepared_run_control));
+    const token = try namespace.acquire(io);
+    defer token.release();
+    config.namespace_token = token;
+    try std.testing.expectError(error.MissingAssetIndex, runPrepared(a, io, &service, config, &prepared, target, prepared_run_control));
+    try token.recheck();
+    try std.testing.expectError(error.InstanceNamespaceBusy, namespace.acquire(io));
+    try std.testing.expectEqual(@as(usize, 1), fixture.vanilla_calls);
+    try std.testing.expectEqual(@as(usize, 2), fixture.loader_calls);
+}
+
+test "worker installer admission preserves active namespace busy and stale borrowed stamp errors before IO" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var service: dl.Service = undefined;
+    var config: Config = .{ .version_id = "1.20.1", .root = root, .publish_metadata = false, .worker_checks = true, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
+    const old = try namespace.acquire(io);
+    defer old.release();
+    try std.testing.expectError(error.InstanceNamespaceBusy, run(a, io, &service, config));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "versions", .{ .follow_symlinks = false }));
+    old.release();
+    const current = try namespace.acquire(io);
+    defer current.release();
+    config.namespace_token = old;
+    try std.testing.expectError(error.InstanceNamespaceLeaseLost, run(a, io, &service, config));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "versions", .{ .follow_symlinks = false }));
+    try current.recheck();
 }

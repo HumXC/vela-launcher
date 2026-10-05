@@ -4,6 +4,7 @@ const dvui = @import("dvui");
 const config = @import("../core/config.zig");
 const accounts_manager = @import("accounts_manager.zig");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const Allocator = std.mem.Allocator;
 const Manager = accounts_manager.Manager;
 const R = dvui.Rect;
@@ -116,10 +117,10 @@ fn iconButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const 
     dvui.icon(@src(), name, asset, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0), .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .role = .none }));
     button.drawFocus();
     const clicked = enabled and button.clicked();
-    const hovered = button.hovered();
-    const rect = button.data().rectScale().r;
+    const control_id = button.data().id;
+    const rect = button.data().borderRectScale().r;
     button.deinit();
-    if (hovered) dvui.tooltip(src, .{ .active_rect = rect }, "{s}", .{name}, .{ .id_extra = 1 });
+    components.tooltip(src, control_id, rect, name);
     return clicked;
 }
 fn command(src: std.builtin.SourceLocation, text: []const u8, enabled: bool) bool {
@@ -185,7 +186,7 @@ pub fn draw(ui: *Ui, store: *config.Store, manager: *Manager) void {
     if (snapshot.failure) |err| wrapped(@src(), errorText(err), danger);
     if (snapshot.busy and !ui.login_open and !ui.remember_probe) {
         wrapped(@src(), phaseText(snapshot.phase), theme.accent);
-        if (command(@src(), "取消", true)) ui.queue(.cancel, null, null);
+        if (command(@src(), "取消登录", true)) ui.queue(.cancel, null, null);
     }
     if (doc.accounts.len == 0) wrapped(@src(), "暂无账户", theme.muted);
     for (doc.accounts, 0..) |account, index| {
@@ -234,18 +235,23 @@ pub fn draw(ui: *Ui, store: *config.Store, manager: *Manager) void {
 }
 
 fn drawEditor(ui: *Ui, busy: bool) void {
-    const window = modal(@src(), if (ui.draft.id == null) "添加离线账户" else "编辑离线账户", 250);
+    const font = (dvui.Options{}).fontGet();
+    // Budget the title, field, wrapped validation and footer using actual font
+    // metrics. The modal clamps to the viewport; excess body text remains scrollable.
+    const height = @max(@as(f32, 320), 120 + 7 * font.lineHeight());
+    const window = modal(@src(), if (ui.draft.id == null) "添加离线账户" else "编辑离线账户", height);
     defer window.deinit();
+    const action = components.formActions(@src(), .{ .save_enabled = validName(std.mem.sliceTo(&ui.draft.name, 0)) and !busy });
+    if (action == .cancel) ui.queue(.close_editor, null, null);
     const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
     defer scroll.deinit();
     dvui.labelNoFmt(@src(), "玩家名称", .{}, .{ .padding = R.all(0), .margin = .{ .h = 6 } });
-    const input = dvui.textEntry(@src(), .{ .text = .{ .buffer = &ui.draft.name } }, .{ .label = .{ .text = "玩家名称" }, .expand = .horizontal, .padding = R.all(8), .corners = .all(4) });
+    const input = dvui.textEntry(@src(), .{ .text = .{ .buffer = &ui.draft.name } }, .{ .label = .{ .text = "玩家名称" }, .expand = .horizontal, .min_size_content = .{ .h = font.textHeight() }, .max_size_content = .height(font.textHeight()), .padding = R.all(8), .corners = .all(4) });
     input.deinit();
     const name = std.mem.sliceTo(&ui.draft.name, 0);
     if (!validName(name)) wrapped(@src(), "名称须为 3–16 位字母、数字或下划线", danger);
     if (ui.failure) |err| wrapped(@src(), errorText(err), danger);
-    if (command(@src(), "保存", validName(name) and !busy)) ui.queue(.save, ui.draft.id, name);
-    if (command(@src(), "取消", true)) ui.queue(.close_editor, null, null);
+    if (action == .save and validName(name) and !busy) ui.queue(.save, ui.draft.id, name);
 }
 fn drawConfirmation(ui: *Ui, doc: *const config.Document, busy: bool) void {
     const confirmation = ui.confirmation.?;

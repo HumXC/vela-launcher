@@ -6,6 +6,8 @@ pub const muted = dvui.Color.fromHex("B3BFB4");
 pub const accent = dvui.Color.fromHex("A8C49C");
 
 pub fn install(win: *dvui.Window) void {
+    // Hover and unhover colors switch immediately without DVUI interpolation.
+    dvui.hover_fade_secs = 0;
     var value = dvui.Theme.builtin.adwaita_dark;
     value.name = "Vela";
     value.fill = background;

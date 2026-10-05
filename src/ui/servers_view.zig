@@ -4,10 +4,11 @@ const config = @import("../core/config.zig");
 const servers = @import("../core/servers.zig");
 const server_manager = @import("server_manager.zig");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const R = dvui.Rect;
 const Allocator = std.mem.Allocator;
 
-const Action = enum { add, edit, select, clear_server, refresh, cancel_query, save, cancel_edit, ask_delete, delete, cancel_delete };
+const Action = enum { add, edit, select, select_sidebar, clear_server, refresh, cancel_query, save, cancel_edit, ask_delete, delete, cancel_delete };
 const Pending = struct { action: Action, id: ?[]u8 = null };
 const Draft = struct {
     id: ?[]u8 = null,
@@ -148,9 +149,7 @@ pub fn drawHomeWithOptions(ui: *Ui, doc: *const config.Document, compact: bool) 
     }
 }
 fn wrapped(src: std.builtin.SourceLocation, value: []const u8, color: dvui.Color) void {
-    const layout = dvui.textLayout(src, .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = 6 }, .color_text = .{ .color = color } });
-    layout.addText(value, .{});
-    layout.deinit();
+    components.text(src, value, color);
 }
 fn fmt(comptime format: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), format, args) catch "";
@@ -163,10 +162,10 @@ fn iconButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const 
     dvui.icon(@src(), name, asset, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0), .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .role = .none }));
     button.drawFocus();
     const clicked = button.clicked();
-    const hovered = button.hovered();
-    const rect = button.data().rectScale().r;
+    const control_id = button.data().id;
+    const rect = button.data().borderRectScale().r;
     button.deinit();
-    if (hovered) dvui.tooltip(src, .{ .active_rect = rect }, "{s}", .{name}, .{ .id_extra = 1 });
+    components.tooltip(src, control_id, rect, name);
     return clicked;
 }
 fn entry(src: std.builtin.SourceLocation, name: []const u8, buffer: []u8, numeric: bool) void {
@@ -177,9 +176,17 @@ fn entry(src: std.builtin.SourceLocation, name: []const u8, buffer: []u8, numeri
     input.deinit();
 }
 fn drawEditor(ui: *Ui, doc: *const config.Document) void {
-    const editor = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = .{ .y = 12 }, .margin = .{ .h = 12 }, .border = .{ .y = 1 } });
+    const editor = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .{ .y = 12 }, .margin = R.all(0), .border = .{ .y = 1 } });
     defer editor.deinit();
     dvui.labelNoFmt(@src(), if (ui.draft.id == null) "添加服务器" else "编辑服务器", .{}, .{ .padding = R.all(0), .margin = .{ .h = 6 } });
+    switch (components.formActions(@src(), .{})) {
+        .save => ui.queue(.save, null),
+        .cancel => ui.queue(.cancel_edit, null),
+        .none => {},
+    }
+    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .background = false, .padding = R.all(0), .margin = R.all(0), .border = R.all(0) });
+    defer scroll.deinit();
+    if (ui.failure) |err| wrapped(@src(), fmt("操作失败：{s}", .{@errorName(err)}), dvui.Color.fromHex("F0A6A1"));
     entry(@src(), "名称", &ui.draft.name, false);
     entry(@src(), "地址", &ui.draft.address, false);
     entry(@src(), "端口", &ui.draft.port, true);
@@ -206,23 +213,30 @@ fn drawEditor(ui: *Ui, doc: *const config.Document) void {
         }
     } else wrapped(@src(), "暂无实例", theme.muted);
     _ = dvui.checkbox(@src(), &ui.draft.show_on_home, "显示在首页", .{ .margin = .{ .y = 8, .h = 8 } });
-    const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0) });
-    if (iconButton(@src(), "保存", dvui.entypo.save)) ui.queue(.save, null);
-    if (iconButton(@src(), "取消编辑", dvui.entypo.cross)) ui.queue(.cancel_edit, null);
-    actions.deinit();
 }
 
+/// The caller owns the utility menu shell and footer; actions remain deferred.
+pub fn drawSidebar(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) void {
+    _ = manager;
+    const doc = store.snapshot();
+    if (components.sidebarItem(@src(), "add-server", "添加服务器", .{ .icon = dvui.entypo.plus, .selected = ui.editor_open and ui.draft.id == null })) ui.queue(.add, null);
+    components.section(@src(), "已配置");
+    const list = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .background = false, .label = .{ .text = "已配置服务器" } });
+    defer list.deinit();
+    if (doc.servers.len == 0) components.emptyState(@src(), "暂无服务器");
+    for (doc.servers) |server| {
+        if (components.sidebarItem(@src(), server.id, server.name, .{ .selected = sameId(doc.selected_server, server.id) })) ui.queue(.select_sidebar, server.id);
+    }
+}
+
+/// Right-hand content. Store and manager snapshots stay borrowed until finish.
 pub fn draw(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) void {
     const doc = store.snapshot();
-    const scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false, .padding = R.all(0), .border = R.all(0) });
-    defer scroll.deinit();
-    const column = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0) });
-    defer column.deinit();
-    const heading = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 12 } });
-    dvui.labelNoFmt(@src(), "服务器", .{}, .{ .expand = .horizontal, .padding = R.all(0), .gravity_y = 0.5 });
-    if (iconButton(@src(), "添加服务器", dvui.entypo.plus)) ui.queue(.add, null);
-    heading.deinit();
-    if (ui.failure) |err| wrapped(@src(), fmt("操作失败：{s}", .{@errorName(err)}), dvui.Color.fromHex("F0A6A1"));
+    const page = dvui.box(@src(), .{}, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
+    defer page.deinit();
+    if (!ui.editor_open) {
+        if (ui.failure) |err| wrapped(@src(), fmt("操作失败：{s}", .{@errorName(err)}), dvui.Color.fromHex("F0A6A1"));
+    }
     if (ui.deleting_id) |id| {
         if (findServer(doc, id)) |server| wrapped(@src(), fmt("删除服务器「{s}」？", .{server.name}), theme.accent);
         const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 8 } });
@@ -230,35 +244,45 @@ pub fn draw(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) voi
         if (iconButton(@src(), "取消删除", dvui.entypo.cross)) ui.queue(.cancel_delete, null);
         actions.deinit();
     }
-    if (ui.editor_open) drawEditor(ui, doc);
-    if (doc.servers.len == 0) wrapped(@src(), "暂无服务器", theme.muted);
-    for (doc.servers, 0..) |server, index| {
-        const row = dvui.box(@src(), .{}, .{ .id_extra = index, .expand = .horizontal, .padding = .{ .y = 10, .h = 10 }, .border = .{ .h = 1 }, .margin = R.all(0) });
-        const narrow = row.data().contentRect().w < 450;
-        const top = dvui.box(@src(), .{ .dir = if (narrow) .vertical else .horizontal }, .{ .expand = .horizontal, .padding = R.all(0) });
-        wrapped(@src(), fmt("{s}{s}", .{ server.name, if (sameId(doc.selected_server, server.id)) " · 当前" else "" }), if (sameId(doc.selected_server, server.id)) theme.accent else dvui.Color.fromHex("E8ECE9"));
-        const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0) });
-        if (iconButton(@src(), "选择服务器", dvui.entypo.check)) ui.queue(.select, server.id);
-        if (iconButton(@src(), "刷新状态", dvui.entypo.cw)) ui.queue(.refresh, server.id);
-        if (iconButton(@src(), "编辑服务器", dvui.entypo.pencil)) ui.queue(.edit, server.id);
-        if (iconButton(@src(), "删除服务器", dvui.entypo.trash)) ui.queue(.ask_delete, server.id);
-        actions.deinit();
-        top.deinit();
-        wrapped(@src(), fmt("{s}:{d}", .{ server.address, server.port }), theme.muted);
-        var instance_name: []const u8 = "实例不存在";
-        for (doc.instances) |instance| if (std.mem.eql(u8, instance.id, server.instance_id)) {
-            instance_name = instance.name;
-            break;
-        };
-        wrapped(@src(), fmt("{s}{s}", .{ instance_name, if (server.show_on_home) " · 首页" else "" }), theme.muted);
-        if (manager.snapshot().server) |requested| {
-            if (std.mem.eql(u8, requested.id, server.id)) {
-                drawStatus(manager);
-                if (manager.snapshot().state == .querying and iconButton(@src(), "取消查询", dvui.entypo.cross)) ui.queue(.cancel_query, null);
-            }
-        }
-        row.deinit();
+    if (ui.editor_open) {
+        drawEditor(ui, doc);
+        return;
     }
+    const scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false, .padding = R.all(0), .border = R.all(0) });
+    defer scroll.deinit();
+    const column = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0) });
+    defer column.deinit();
+    const selected_id = doc.selected_server orelse {
+        wrapped(@src(), if (doc.servers.len == 0) "暂无服务器，请从左侧添加服务器" else "从左侧选择服务器", theme.muted);
+        return;
+    };
+    const server = findServer(doc, selected_id) orelse {
+        wrapped(@src(), "所选服务器不存在，请从左侧重新选择", theme.muted);
+        return;
+    };
+    dvui.labelNoFmt(@src(), server.name, .{}, .{ .font = dvui.themeGet().font_title, .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 12 } });
+    const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 12 } });
+    if (iconButton(@src(), "刷新状态", dvui.entypo.cw)) ui.queue(.refresh, server.id);
+    if (iconButton(@src(), "编辑服务器", dvui.entypo.pencil)) ui.queue(.edit, server.id);
+    if (iconButton(@src(), "删除服务器", dvui.entypo.trash)) ui.queue(.ask_delete, server.id);
+    actions.deinit();
+    wrapped(@src(), fmt("{s}:{d}", .{ server.address, server.port }), theme.muted);
+    var instance_name: []const u8 = "实例不存在";
+    for (doc.instances) |instance| if (std.mem.eql(u8, instance.id, server.instance_id)) {
+        instance_name = instance.name;
+        break;
+    };
+    wrapped(@src(), fmt("绑定实例：{s}", .{instance_name}), theme.muted);
+    wrapped(@src(), if (server.show_on_home) "显示在首页 · 启动时自动连接" else "未显示在首页 · 启动时自动连接", theme.muted);
+    const snapshot = manager.snapshot();
+    if (snapshot.server) |requested| {
+        if (std.mem.eql(u8, requested.id, server.id)) {
+            drawStatus(manager);
+            if (snapshot.state == .querying and iconButton(@src(), "取消查询", dvui.entypo.cross)) ui.queue(.cancel_query, null);
+            return;
+        }
+    }
+    wrapped(@src(), "尚未查询", theme.muted);
 }
 
 /// Inline and read-only. Untrusted PNGs must pass both backend checks and stb.
@@ -387,6 +411,13 @@ fn apply(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, pendin
             ui.editor_open = true;
         },
         .select, .refresh => try select(ui, store, manager, pending.id.?),
+        .select_sidebar => {
+            try select(ui, store, manager, pending.id.?);
+            ui.draft.deinit(ui.allocator);
+            ui.editor_open = false;
+            if (ui.deleting_id) |id| ui.allocator.free(id);
+            ui.deleting_id = null;
+        },
         .clear_server => {
             var document = store.snapshot().*;
             document.selected_server = null;

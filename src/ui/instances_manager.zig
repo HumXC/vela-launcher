@@ -5,6 +5,7 @@ const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
 const tasks = @import("../core/tasks.zig");
 const worlds = @import("../core/worlds.zig");
+const namespace = @import("../core/instance_namespace.zig");
 const transactions = @import("../core/instance_transactions.zig");
 const content = @import("../core/content_install.zig");
 const loader_install = @import("../core/minecraft/loader_install.zig");
@@ -37,6 +38,7 @@ pub const CreateRequest = struct {
     root: []const u8,
     instance: config.Instance,
     lease: content.Lease,
+    namespace_token: ?namespace.Token = null,
     download_connections: u16 = 8,
     installer_java: ?[]const u8 = null,
     /// Borrowed immutable owner (including matcher context), only until worker JOIN.
@@ -78,6 +80,11 @@ pub const LoaderCatalogue = struct {
         self.arena.deinit();
         self.* = undefined;
     }
+};
+/// UI-thread admission for creation only; context must outlive the manager.
+pub const CreationAdmission = struct {
+    context: ?*anyopaque = null,
+    check: *const fn (?*anyopaque) anyerror!void,
 };
 pub const Installer = struct {
     context: ?*anyopaque = null,
@@ -122,7 +129,7 @@ fn sameIdentity(a: config.Instance, b: config.Instance) bool {
     }
     return b.origin == null;
 }
-fn sameInstance(a: config.Instance, b: config.Instance) bool {
+pub fn sameInstance(a: config.Instance, b: config.Instance) bool {
     return sameIdentity(a, b) and sameOptional(a.java_path, b.java_path) and a.max_memory_mb == b.max_memory_mb and a.debug_launch == b.debug_launch;
 }
 fn validateRequest(instance: config.Instance, imported: bool) !void {
@@ -142,9 +149,13 @@ const Job = struct {
     operation: Operation,
     request: config.Instance,
     new_name: ?[]const u8 = null,
+    /// Owned before worker launch; apply options to the committed rename result.
+    renamed_options: ?config.Instance = null,
     guard: worlds.Guard,
     lease: content.Lease,
+    worker_recheck: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
     leased: bool = false,
+    namespace_token: ?namespace.Token = null,
     installer: ?Installer,
     catalogue_adapter: ?CatalogueAdapter,
     vanilla_preparation: VanillaPreparationAdapter,
@@ -183,7 +194,10 @@ const Job = struct {
         const a = std.heap.page_allocator;
         const control: Control = .{ .cancel = self.flag(), .task = self.task };
         try control.check();
-        const options: transactions.Options = .{ .cancel = self.flag(), .guard = self.guard };
+        // Workers use the frozen waiting checker; the owner lease stays nonblocking.
+        var worker_lease = self.lease;
+        worker_lease.recheck = self.worker_recheck orelse self.lease.recheck;
+        const options: transactions.Options = .{ .cancel = self.flag(), .guard = .{ .running_ids = self.guard.running_ids }, .lease = .{ .context = worker_lease.context, .recheck = worker_lease.recheck }, .namespace_token = self.namespace_token, .worker_checks = true };
         switch (self.operation) {
             .importing => {
                 control.report(.scanning, 0, null);
@@ -196,12 +210,17 @@ const Job = struct {
                     self.import_prepared = try self.vanilla_preparation.prepare(self.vanilla_preparation.context, self.allocator, self.io, target, control);
                     const proof = &self.import_prepared.?;
                     try control.check();
-                    break :blk try transactions.importExisting(a, self.io, self.root, self.request, .{ .cancel = options.cancel, .guard = options.guard, .trusted_vanilla = .{ .prepared = proof, .generation = target.generation, .environment = target.environment } });
+                    break :blk try transactions.importExisting(a, self.io, self.root, self.request, .{ .cancel = options.cancel, .guard = options.guard, .lease = options.lease, .namespace_token = options.namespace_token, .worker_checks = options.worker_checks, .trusted_vanilla = .{ .prepared = proof, .generation = target.generation, .environment = target.environment } });
                 };
             },
             .renaming => {
                 control.report(.backing_up, 0, null);
                 self.result = try transactions.rename(a, self.io, self.root, self.request, self.new_name.?, options);
+                if (self.renamed_options) |edited| {
+                    self.result.?.instance.java_path = edited.java_path;
+                    self.result.?.instance.max_memory_mb = edited.max_memory_mb;
+                    self.result.?.instance.debug_launch = edited.debug_launch;
+                }
             },
             .deleting => {
                 control.report(.backing_up, 0, null);
@@ -209,7 +228,7 @@ const Job = struct {
             },
             .creating => {
                 const adapter = self.installer orelse return error.InstallAdapterUnavailable;
-                self.installed = try adapter.run(adapter.context, a, self.io, .{ .root = self.root, .instance = self.request, .lease = self.lease, .download_connections = self.download_connections, .installer_java = self.installer_java, .prepared = self.prepared, .vanilla_prepared = self.vanilla_prepared, .prepared_generation = self.prepared_generation }, control);
+                self.installed = try adapter.run(adapter.context, a, self.io, .{ .root = self.root, .instance = self.request, .lease = worker_lease, .namespace_token = self.namespace_token, .download_connections = self.download_connections, .installer_java = self.installer_java, .prepared = self.prepared, .vanilla_prepared = self.vanilla_prepared, .prepared_generation = self.prepared_generation }, control);
                 // Adapter success is a committed transaction: a late token cannot undo it.
             },
             .loading_loaders => {
@@ -238,7 +257,9 @@ pub const Manager = struct {
     registry: *tasks.Registry,
     guard: worlds.Guard,
     lease: content.Lease,
+    worker_recheck: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
     installer: ?Installer = null,
+    creation_admission: ?CreationAdmission = null,
     download_connections: u16 = 8,
     default_java: ?[]const u8 = null,
     operation: Operation = .none,
@@ -265,6 +286,13 @@ pub const Manager = struct {
         owned_guard.running_ids = ids;
         const owned_root = try g.dupe(u8, paths.root);
         return .{ .allocator = a, .io = io, .arena = arena, .root = owned_root, .registry = registry, .guard = owned_guard, .lease = lease };
+    }
+    /// Optional worker checker uses the owner lease context and is frozen per job.
+    pub fn setWorkerRecheck(self: *Manager, recheck: ?*const fn (?*anyopaque, []const u8) anyerror!void) void {
+        self.worker_recheck = recheck;
+    }
+    pub fn setCreationAdmission(self: *Manager, admission: CreationAdmission) void {
+        self.creation_admission = admission;
     }
     pub fn setInstaller(self: *Manager, adapter: Installer) void {
         self.installer = adapter;
@@ -338,19 +366,19 @@ pub const Manager = struct {
     /// Success, cancellation, and failure all require JOIN before owner teardown.
     pub fn startCreatePrepared(self: *Manager, instance: config.Instance, prepared: *const loader_install.PreparedMetadata, generation: u64) !void {
         if (self.installer == null) return error.InstallAdapterUnavailable;
-        try self.startWithPrepared(.creating, instance, null, prepared, null, generation, false, null);
+        try self.startWithPrepared(.creating, instance, null, prepared, null, generation, false, null, null);
     }
     /// Same prepared-owner JOIN contract, but installer_java is exact: null disables
     /// fallback to both instance runtime Java and the Manager default. Path is cloned.
     pub fn startCreatePreparedWithJava(self: *Manager, instance: config.Instance, prepared: *const loader_install.PreparedMetadata, generation: u64, installer_java: ?[]const u8) !void {
         if (self.installer == null) return error.InstallAdapterUnavailable;
-        try self.startWithPrepared(.creating, instance, null, prepared, null, generation, true, installer_java);
+        try self.startWithPrepared(.creating, instance, null, prepared, null, generation, true, installer_java, null);
     }
     /// Borrow immutable vanilla metadata and matcher context until tick JOIN
     /// (active == null), or until deinit returns. Never transfers owner teardown.
     pub fn startCreateVanillaPrepared(self: *Manager, instance: config.Instance, prepared: *const metadata_loader.PreparedVanilla, generation: u64) !void {
         if (self.installer == null) return error.InstallAdapterUnavailable;
-        try self.startWithPrepared(.creating, instance, null, null, prepared, generation, true, null);
+        try self.startWithPrepared(.creating, instance, null, null, prepared, generation, true, null, null);
     }
     pub fn startImport(self: *Manager, instance: config.Instance) !void {
         try self.start(.importing, instance, null);
@@ -359,6 +387,15 @@ pub const Manager = struct {
         if (!config.validId(new_name)) return error.InvalidInstanceName;
         if (std.ascii.eqlIgnoreCase(instance.name, new_name)) return error.InstanceNameUnchanged;
         try self.start(.renaming, instance, new_name);
+    }
+    /// Rename and launch options publish together; request remains the stale-check baseline.
+    pub fn startRenameWithOptions(self: *Manager, original: config.Instance, updated: config.Instance) !void {
+        try validateRequest(updated, false);
+        var identity = updated;
+        identity.name = original.name;
+        if (!sameIdentity(original, identity)) return error.OptionsCannotChangeIdentity;
+        if (std.ascii.eqlIgnoreCase(original.name, updated.name)) return error.InstanceNameUnchanged;
+        try self.startWithPrepared(.renaming, original, updated.name, null, null, 0, false, null, updated);
     }
     pub fn startDelete(self: *Manager, instance: config.Instance) !void {
         try self.start(.deleting, instance, null);
@@ -369,13 +406,16 @@ pub const Manager = struct {
         try self.start(.loading_loaders, .{ .id = "catalogue", .name = "catalogue", .minecraft_version = base, .loader = kind, .loader_version = "catalogue" }, null);
     }
     fn start(self: *Manager, operation: Operation, instance: config.Instance, new_name: ?[]const u8) !void {
-        try self.startWithPrepared(operation, instance, new_name, null, null, 0, false, null);
+        try self.startWithPrepared(operation, instance, new_name, null, null, 0, false, null, null);
     }
-    fn startWithPrepared(self: *Manager, operation: Operation, instance: config.Instance, new_name: ?[]const u8, prepared: ?*const loader_install.PreparedMetadata, vanilla_prepared: ?*const metadata_loader.PreparedVanilla, generation: u64, explicit_java: bool, installer_java: ?[]const u8) !void {
+    fn startWithPrepared(self: *Manager, operation: Operation, instance: config.Instance, new_name: ?[]const u8, prepared: ?*const loader_install.PreparedMetadata, vanilla_prepared: ?*const metadata_loader.PreparedVanilla, generation: u64, explicit_java: bool, installer_java: ?[]const u8, renamed_options: ?config.Instance) !void {
         if (self.isBusy()) return error.Busy;
+        if (operation == .creating) if (self.creation_admission) |admission| try admission.check(admission.context);
         try validateRequest(instance, operation == .importing);
         if (operation == .importing and self.import_generation == std.math.maxInt(u64)) return error.PreparedMetadataGenerationExhausted;
         if (prepared != null and vanilla_prepared != null) return error.ConflictingPreparedMetadata;
+        const namespace_token = if (operation != .loading_loaders) try namespace.acquire(self.io) else null;
+        errdefer if (namespace_token) |token| token.release();
         if (prepared) |owner| {
             const target = try metadataTarget(self.root, instance, generation, try environment());
             try owner.validateBinding(self.allocator, self.io, target);
@@ -385,7 +425,7 @@ pub const Manager = struct {
             try owner.validateBinding(self.allocator, self.io, target);
         }
         const job = try self.allocator.create(Job);
-        job.* = .{ .allocator = self.allocator, .arena = .init(self.allocator), .io = self.io, .root = self.root, .operation = operation, .request = instance, .guard = self.guard, .lease = self.lease, .installer = self.installer, .catalogue_adapter = self.catalogue_adapter, .vanilla_preparation = self.vanilla_preparation, .import_generation = if (operation == .importing) self.import_generation + 1 else 0, .download_connections = self.download_connections, .prepared = prepared, .vanilla_prepared = vanilla_prepared, .prepared_generation = generation };
+        job.* = .{ .allocator = self.allocator, .arena = .init(self.allocator), .io = self.io, .root = self.root, .operation = operation, .request = instance, .guard = self.guard, .lease = self.lease, .worker_recheck = self.worker_recheck, .namespace_token = namespace_token, .installer = self.installer, .catalogue_adapter = self.catalogue_adapter, .vanilla_preparation = self.vanilla_preparation, .import_generation = if (operation == .importing) self.import_generation + 1 else 0, .download_connections = self.download_connections, .prepared = prepared, .vanilla_prepared = vanilla_prepared, .prepared_generation = generation };
         errdefer job.destroy();
         job.request = try cloneInstance(job.arena.allocator(), instance);
         const java_snapshot = if (explicit_java) installer_java else instance.java_path orelse self.default_java;
@@ -394,6 +434,7 @@ pub const Manager = struct {
             job.installer_java = try job.arena.allocator().dupe(u8, java);
         }
         if (new_name) |name| job.new_name = try job.arena.allocator().dupe(u8, name);
+        if (renamed_options) |edited| job.renamed_options = try cloneInstance(job.arena.allocator(), edited);
         if (operation != .loading_loaders) {
             try self.lease.acquire(self.lease.context, job.request.id);
             job.leased = true;
@@ -455,6 +496,12 @@ pub const Manager = struct {
         job.task = null;
     }
     fn release(self: *Manager, job: *Job) void {
+        // Close all filesystem evidence before releasing either reservation.
+        if (job.result) |*result| result.releasePublicationProof();
+        if (job.import_prepared) |*proof| proof.deinit();
+        job.import_prepared = null;
+        if (job.namespace_token) |token| token.release();
+        job.namespace_token = null;
         if (job.leased) {
             self.lease.release(self.lease.context, job.request.id);
             job.leased = false;
@@ -509,14 +556,12 @@ pub const Manager = struct {
         if (matches != 1) return error.InstanceConfigurationChanged;
         if (!job.leased) return error.PublicationLeaseLost;
         try self.lease.recheck(self.lease.context, job.request.id);
-        {
-            try worlds.transaction_gate.lock(self.io);
-            defer worlds.transaction_gate.unlock(self.io);
-            if (job.result) |*result| result.recheckPublication(self.root) catch |err| {
-                self.failure = err;
-                return err;
-            };
-        }
+        const token = job.namespace_token orelse return error.PublicationLeaseLost;
+        try token.recheck();
+        if (job.result) |*result| result.recheckPublication(self.root) catch |err| {
+            self.failure = err;
+            return err;
+        };
         self.completePublication(job);
     }
     fn pendingPublication(self: *const Manager) !*Job {
@@ -549,8 +594,8 @@ pub const Manager = struct {
         if (store.publicationUncertain()) return error.ConfigPublicationUncertain;
         if (!job.leased) return error.PublicationLeaseLost;
         try self.lease.recheck(self.lease.context, job.request.id);
-        try worlds.transaction_gate.lock(self.io);
-        defer worlds.transaction_gate.unlock(self.io);
+        const token = job.namespace_token orelse return error.PublicationLeaseLost;
+        try token.recheck();
         if (job.result) |*result| try result.recheckPublication(self.root);
         const doc = store.snapshot();
         var updated = doc.*;
@@ -583,6 +628,8 @@ pub const Manager = struct {
             updated.servers = servers.items;
             if (sameOptional(updated.selected_instance, job.request.id)) updated.selected_instance = null;
         }
+        try self.lease.recheck(self.lease.context, job.request.id);
+        try token.recheck();
         if (job.result) |*result| try result.recheckPublication(self.root);
         store.update(updated) catch |err| {
             if ((job.operation == .creating or job.operation == .importing) and store.publicationUncertain()) job.uncertain_publication_store = store;
@@ -590,7 +637,15 @@ pub const Manager = struct {
         };
     }
     pub fn saveOptions(self: *Manager, store: *config.Store, updated: config.Instance) !void {
+        try self.saveOptionsInner(store, null, updated);
+    }
+    /// Reject external edits against the form's owned baseline before publication.
+    pub fn saveOptionsChecked(self: *Manager, store: *config.Store, original: config.Instance, updated: config.Instance) !void {
+        try self.saveOptionsInner(store, original, updated);
+    }
+    fn saveOptionsInner(self: *Manager, store: *config.Store, original: ?config.Instance, updated: config.Instance) !void {
         if (self.isBusy()) return error.Busy;
+        if (store.publicationUncertain()) return error.ConfigPublicationUncertain;
         try validateRequest(updated, false);
         const doc = store.snapshot();
         const entries = try self.allocator.dupe(config.Instance, doc.instances);
@@ -598,6 +653,7 @@ pub const Manager = struct {
         var found = false;
         for (entries) |*entry| if (std.mem.eql(u8, entry.id, updated.id)) {
             if (!sameIdentity(entry.*, updated)) return error.OptionsCannotChangeIdentity;
+            if (original) |baseline| if (!sameInstance(entry.*, baseline)) return error.InstanceConfigurationChanged;
             entry.* = updated;
             found = true;
             break;
@@ -749,6 +805,10 @@ fn productionRun(_: ?*anyopaque, a: A, io: Io, request: CreateRequest, control: 
     if (request.download_connections == 0 or request.download_connections > 64) return error.InvalidConnections;
     try control.check();
     if (request.prepared != null and request.vanilla_prepared != null) return error.ConflictingPreparedMetadata;
+    const owns_namespace = request.namespace_token == null;
+    const namespace_token = request.namespace_token orelse try namespace.acquireWaiting(io);
+    defer if (owns_namespace) namespace_token.release();
+    try namespace_token.recheckWaiting();
     try request.lease.recheck(request.lease.context, request.instance.id);
     const prepared_target: ?loader_install.MetadataTarget = if (request.prepared) |owner| blk: {
         const target = try metadataTarget(request.root, request.instance, request.prepared_generation, try environment());
@@ -797,7 +857,7 @@ fn productionRun(_: ?*anyopaque, a: A, io: Io, request: CreateRequest, control: 
     defer production_task = null;
     control.report(.metadata, 0, null);
     const prepared_control: ?loaders.Control = if (request.prepared != null) loaderControl(&io, control, 30 * 60 * 1000) else null;
-    const base_config: minecraft.Config = .{ .root = minecraft_root, .version_id = request.instance.minecraft_version, .instance_name = stage_name, .game_directory = stage_path, .natives_directory = natives, .publish_metadata = false, .environment = if (prepared_target) |target| target.environment else if (vanilla_target) |target| target.environment else try environment(), .window = request.download_connections, .cancel = control.cancel, .progress = installProgress };
+    const base_config: minecraft.Config = .{ .root = minecraft_root, .version_id = request.instance.minecraft_version, .instance_name = stage_name, .game_directory = stage_path, .natives_directory = natives, .publish_metadata = false, .namespace_token = namespace_token, .worker_checks = true, .environment = if (prepared_target) |target| target.environment else if (vanilla_target) |target| target.environment else try environment(), .window = request.download_connections, .cancel = control.cancel, .progress = installProgress };
     var base = if (request.prepared) |owner|
         try minecraft.runPrepared(a, io, service, base_config, owner, prepared_target.?, prepared_control.?)
     else if (request.vanilla_prepared) |owner|
@@ -817,7 +877,7 @@ fn productionRun(_: ?*anyopaque, a: A, io: Io, request: CreateRequest, control: 
         };
         control.report(.installing, 0, null);
         var lease = request.lease;
-        const options: loader.Options = .{ .root = request.root, .instance_id = request.instance.id, .instance_name = request.instance.name, .selection = .{ .kind = kind, .base_id = request.instance.minecraft_version, .loader_id = request.instance.loader_version.? }, .base = base.version.value, .base_plan = base.plan.value, .base_directory = stage_path, .environment = base_config.environment, .java = request.installer_java, .lease = .{ .context = &lease, .acquire = HeldLease.acquire, .release = HeldLease.release, .recheck = HeldLease.recheck } };
+        const options: loader.Options = .{ .root = request.root, .instance_id = request.instance.id, .instance_name = request.instance.name, .namespace_token = namespace_token, .worker_checks = true, .selection = .{ .kind = kind, .base_id = request.instance.minecraft_version, .loader_id = request.instance.loader_version.? }, .base = base.version.value, .base_plan = base.plan.value, .base_directory = stage_path, .environment = base_config.environment, .java = request.installer_java, .lease = .{ .context = &lease, .acquire = HeldLease.acquire, .release = HeldLease.release, .recheck = HeldLease.recheck } };
         var installed = (if (request.prepared) |owner|
             loader.installPrepared(a, io, options, owner, request.prepared_generation, load_control)
         else
@@ -882,6 +942,7 @@ fn productionRun(_: ?*anyopaque, a: A, io: Io, request: CreateRequest, control: 
     try safe.writeAtomic(g, io, try std.fs.path.join(g, &.{ stage_path, ".vela-instance.json" }), receipt, control.cancel);
     try tree.syncDir(io, stage);
     try control.check();
+    try namespace_token.recheckWaiting();
     try request.lease.recheck(request.lease.context, request.instance.id);
     try absent(io, versions, request.instance.name);
     const before = try stage.statFile(io, ".", .{ .follow_symlinks = false });

@@ -5,6 +5,7 @@ const config = @import("../core/config.zig");
 const worlds = @import("../core/worlds.zig");
 const worlds_manager = @import("worlds_manager.zig");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const A = std.mem.Allocator;
 const R = dvui.Rect;
 const Part = @FieldType(worlds.BackupRef, "part");
@@ -145,6 +146,7 @@ pub const Ui = struct {
     select_queued: bool = false,
     refresh_queued: bool = false,
     cancel_queued: bool = false,
+    draft_action: components.FormAction = .none,
     requests: std.ArrayList(OwnedRequest) = .empty,
     synced_id: ?[]u8 = null,
     synced_name: ?[]u8 = null,
@@ -201,6 +203,20 @@ pub const Ui = struct {
         try self.requests.append(self.allocator, owned);
     }
 
+    fn queueDraft(self: *Ui, doc: *const config.Document) !void {
+        const draft = &(self.draft orelse return error.NoDraft);
+        const request = try draft.request(doc);
+        try self.queueRequest(draft.source, request);
+        self.draft_action = .save;
+    }
+
+    fn finishDraft(self: *Ui, action: components.FormAction, accepted: bool) void {
+        if (action == .cancel or (action == .save and accepted)) {
+            self.closeDraft();
+            self.failure = null;
+        }
+    }
+
     fn selectWorld(self: *Ui, folder: []const u8) !void {
         const next = try self.allocator.dupe(u8, folder);
         if (self.selected_world) |old| self.allocator.free(old);
@@ -242,13 +258,9 @@ fn sameId(a: ?[]const u8, b: ?[]const u8) bool {
 fn fmt(comptime format: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), format, args) catch "";
 }
-fn wrapped(src: std.builtin.SourceLocation, value: []const u8, color: dvui.Color) void {
-    const text = dvui.textLayout(src, .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = 4 }, .color_text = .{ .color = color } });
-    text.addText(value, .{});
-    text.deinit();
-}
 fn line(src: std.builtin.SourceLocation, value: []const u8, color: dvui.Color) void {
-    const text = dvui.textLayout(src, .{ .break_lines = false }, .{ .expand = .horizontal, .min_size_content = .{ .h = 20 }, .max_size_content = .{ .w = 0, .h = 20 }, .padding = R.all(0), .margin = R.all(0), .color_text = .{ .color = color } });
+    const height = @max(@as(f32, 20), (dvui.Options{}).fontGet().textHeight());
+    const text = dvui.textLayout(src, .{}, .{ .expand = .horizontal, .min_size_content = .{ .h = height }, .max_size_content = .width(0), .background = false, .padding = R.all(0), .margin = R.all(0), .color_text = .{ .color = color } });
     text.addText(value, .{});
     text.deinit();
 }
@@ -260,24 +272,10 @@ fn iconButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const 
     dvui.icon(src, name, asset, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0), .min_size_content = .{ .w = 16, .h = 16 }, .max_size_content = .{ .w = 16, .h = 16 }, .role = .none }));
     button.drawFocus();
     const clicked = enabled and button.clicked();
-    const hovered = button.hovered();
-    const rect = button.data().rectScale().r;
+    const control_id = button.data().id;
+    const rect = button.data().borderRectScale().r;
     button.deinit();
-    if (hovered) dvui.tooltip(src, .{ .active_rect = rect }, "{s}", .{name}, .{ .id_extra = 1 });
-    return clicked;
-}
-fn command(src: std.builtin.SourceLocation, label: []const u8, asset: []const u8, enabled: bool) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{}, .{ .label = .{ .text = label }, .padding = .{ .x = 8, .y = 6, .w = 8, .h = 6 }, .margin = .{ .x = 4 }, .corners = .all(4), .min_size_content = .{ .h = 20 }, .max_size_content = .height(20) });
-    if (enabled) button.processEvents();
-    button.drawBackground();
-    const row = dvui.box(src, .{ .dir = .horizontal }, .{ .padding = R.all(0), .margin = R.all(0) });
-    dvui.icon(src, label, asset, .{}, .{ .min_size_content = .{ .w = 16, .h = 16 }, .max_size_content = .{ .w = 16, .h = 16 }, .padding = R.all(0), .margin = .{ .w = 6 }, .color_text = .{ .color = if (enabled) theme.accent else theme.muted } });
-    dvui.labelNoFmt(src, label, .{}, .{ .padding = R.all(0), .margin = R.all(0), .color_text = .{ .color = if (enabled) theme.accent else theme.muted } });
-    row.deinit();
-    button.drawFocus();
-    const clicked = enabled and button.clicked();
-    button.deinit();
+    components.tooltip(src, control_id, rect, name);
     return clicked;
 }
 
@@ -336,29 +334,15 @@ fn queueSidebarSelect(ui: *Ui, id: []const u8, snapshot: worlds_manager.Snapshot
     if (sidebarEnabled(ui, snapshot, enabled)) try ui.queueSelect(id);
 }
 
-fn sidebarRow(src: std.builtin.SourceLocation, instance: config.Instance, selected: bool, enabled: bool) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, instance.id))), .label = .{ .text = instance.name }, .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .h = 20 }, .padding = R.all(6), .margin = .{ .h = 4 }, .corners = .all(4), .style = if (selected) .highlight else .control, .tab_index = if (enabled) null else 0 });
-    defer button.deinit();
-    if (enabled) button.processEvents();
-    button.drawBackground();
-    const label = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .{ .w = 0, .h = 40 }, .min_size_content = .{ .h = 20 }, .padding = R.all(0), .margin = R.all(0) });
-    label.addText(instance.name, .{});
-    label.deinit();
-    if (enabled) button.drawFocus();
-    if (button.hovered()) dvui.tooltip(src, .{ .active_rect = button.data().rectScale().r }, "{s}", .{instance.name}, .{ .id_extra = 1 });
-    return enabled and button.clicked();
-}
-
 pub fn drawSidebar(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.Manager, enabled: bool) void {
     const snapshot = manager.snapshot();
     const allowed = sidebarEnabled(ui, snapshot, enabled);
     const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .background = false });
     defer scroll.deinit();
-    if (doc.instances.len == 0) wrapped(@src(), "尚无实例", theme.muted);
+    if (doc.instances.len == 0) components.emptyState(@src(), "尚无实例");
     for (doc.instances) |instance| {
         const selected = sameId(doc.selected_instance, instance.id);
-        if (sidebarRow(@src(), instance, selected, allowed) and !selected) queueSidebarSelect(ui, instance.id, snapshot, enabled) catch |err| {
+        if (components.sidebarItem(@src(), instance.id, instance.name, .{ .selected = selected, .enabled = allowed }) and !selected) queueSidebarSelect(ui, instance.id, snapshot, enabled) catch |err| {
             ui.failure = err;
         };
     }
@@ -367,7 +351,7 @@ pub fn drawSidebar(ui: *Ui, doc: *const config.Document, manager: *worlds_manage
 fn drawHeader(ui: *Ui, doc: *const config.Document, snapshot: worlds_manager.Snapshot, enabled: bool) void {
     const header = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 8 } });
     defer header.deinit();
-    wrapped(@src(), if (selectedInstance(doc)) |instance| fmt("{s} · 存档", .{instance.name}) else "存档", dvui.themeGet().text);
+    components.text(@src(), if (selectedInstance(doc)) |instance| fmt("{s} · 存档", .{instance.name}) else "存档", dvui.themeGet().text);
     const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0), .margin = R.all(0) });
     defer actions.deinit();
     if (iconButton(@src(), "刷新世界与恢复记录", dvui.entypo.cw, enabled and !snapshot.worker_active and snapshot.instance != null and !ui.select_queued and ui.draft == null)) ui.refresh_queued = true;
@@ -379,14 +363,14 @@ fn drawOutcome(outcome: *const worlds.Outcome) void {
         .rolled_back => warning,
         .uncertain => danger,
     };
-    wrapped(@src(), switch (outcome.state) {
+    components.text(@src(), switch (outcome.state) {
         .committed => "已提交",
         .rolled_back => "操作已回滚",
         .uncertain => "提交状态不确定，请检查保留路径",
     }, color);
-    if (outcome.cause) |err| wrapped(@src(), fmt("原因：{s}", .{@errorName(err)}), color);
-    wrapped(@src(), fmt("恢复路径：{s}", .{outcome.recovery_directory}), theme.muted);
-    if (outcome.staging_directory) |path| wrapped(@src(), fmt("暂存路径：{s}", .{path}), color);
+    if (outcome.cause) |err| components.text(@src(), fmt("原因：{s}", .{@errorName(err)}), color);
+    components.text(@src(), fmt("恢复路径：{s}", .{outcome.recovery_directory}), theme.muted);
+    if (outcome.staging_directory) |path| components.text(@src(), fmt("暂存路径：{s}", .{path}), color);
 }
 
 /// Draw only borrows Store/Manager snapshots and queues owned intents.
@@ -402,27 +386,27 @@ pub fn drawWithEnabled(ui: *Ui, doc: *const config.Document, manager: *worlds_ma
     drawHeader(ui, doc, snapshot, controls_enabled);
     const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
     defer scroll.deinit();
-    if (ui.failure) |err| wrapped(@src(), fmt("操作失败：{s}", .{@errorName(err)}), danger);
-    if (snapshot.failure) |err| wrapped(@src(), fmt("任务失败：{s}", .{@errorName(err)}), danger);
+    if (ui.failure) |err| components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), danger);
+    if (snapshot.failure) |err| components.text(@src(), fmt("任务失败：{s}", .{@errorName(err)}), danger);
     if (snapshot.outcome) |outcome| drawOutcome(outcome);
-    if (snapshot.worker_active) wrapped(@src(), if (snapshot.loading) "正在读取世界与恢复记录…" else "世界任务进行中…", theme.muted);
+    if (snapshot.worker_active) components.text(@src(), if (snapshot.loading) "正在读取世界与恢复记录…" else "世界任务进行中…", theme.muted);
     const source = snapshot.instance orelse {
-        wrapped(@src(), if (doc.instances.len == 0) "尚无实例" else "未选择实例", theme.muted);
+        components.emptyState(@src(), if (doc.instances.len == 0) "尚无实例" else "未选择实例");
         return;
     };
     const desired = selectedInstance(doc);
     const current = if (desired) |v| sameInstance(v, source) else false;
     const running = manager.isRunning(source.id);
-    if (running) wrapped(@src(), "实例正在运行，世界操作已锁定", warning);
+    if (running) components.text(@src(), "实例正在运行，世界操作已锁定", warning);
     if (!current) {
-        wrapped(@src(), "正在切换实例…", theme.muted);
+        components.text(@src(), "正在切换实例…", theme.muted);
         return;
     }
     const enabled = controls_enabled and current and !running and !snapshot.worker_active and !ui.select_queued and ui.draft == null;
     var budget: usize = preview_limit;
-    if (snapshot.worlds.len == 0 and !snapshot.loading) wrapped(@src(), "此实例暂无世界", theme.muted);
+    if (snapshot.worlds.len == 0 and !snapshot.loading) components.emptyState(@src(), "此实例暂无世界");
     for (snapshot.worlds, 0..) |world, index| {
-        const row = dvui.box(@src(), .{}, .{ .id_extra = index, .expand = .horizontal, .min_size_content = .{ .h = 124 }, .max_size_content = .height(124), .padding = .{ .y = 6, .h = 6 }, .margin = R.all(0) });
+        const row = dvui.box(@src(), .{}, .{ .id_extra = index, .expand = .horizontal, .min_size_content = .{ .h = 124 }, .padding = .{ .y = 6, .h = 6 }, .margin = R.all(0) });
         {
             const details = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
             drawPreview(world.folder, snapshot.previews, &budget);
@@ -462,9 +446,9 @@ pub fn drawWithEnabled(ui: *Ui, doc: *const config.Document, manager: *worlds_ma
         row.deinit();
         _ = dvui.separator(@src(), .{ .id_extra = index, .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
     }
-    wrapped(@src(), fmt("恢复记录 · {d}", .{snapshot.backups.len}), theme.accent);
+    components.text(@src(), fmt("恢复记录 · {d}", .{snapshot.backups.len}), theme.accent);
     for (snapshot.backups, 0..) |backup, index| {
-        const row = dvui.box(@src(), .{}, .{ .id_extra = index, .expand = .horizontal, .min_size_content = .{ .h = 100 }, .max_size_content = .height(100), .padding = .{ .y = 6, .h = 6 }, .margin = R.all(0) });
+        const row = dvui.box(@src(), .{}, .{ .id_extra = index, .expand = .horizontal, .min_size_content = .{ .h = 100 }, .padding = .{ .y = 6, .h = 6 }, .margin = R.all(0) });
         line(@src(), fmt("{s} · {s}", .{ backup.source_folder orelse "来源未知", if (backup.part == .original) "原始数据" else "被替换数据" }), theme.muted);
         line(@src(), fmt("{s} · {s}", .{ backup.id, timestamp(backup.created_ms) }), theme.muted);
         if (backup.manifest_error) |err| line(@src(), fmt("清单不可用：{s}", .{@errorName(err)}), danger) else line(@src(), operationText(backup.operation), theme.muted);
@@ -523,7 +507,6 @@ fn draftBlocked(draft: *const Draft, doc: *const config.Document, manager: *worl
 /// Call outside the page root. Only Ui-owned drafts are retained across frames.
 pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.Manager) !void {
     if (ui.draft == null) return;
-    var submitted = false;
     const draft = &ui.draft.?;
     const window = dvui.windowRect();
     const width = @max(0, @min(460, window.w - 24));
@@ -532,13 +515,20 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.
         const modal = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &draft.open, .resize = .none, .window_avoid = .none }, .{ .rect = .{ .x = window.x + (window.w - width) / 2, .y = window.y + (window.h - height) / 2, .w = width, .h = height }, .min_size_content = .{ .w = @max(0, width - 26), .h = @max(0, height - 26) }, .max_size_content = .{ .w = @max(0, width - 26), .h = @max(0, height - 26) }, .padding = R.all(12), .margin = R.all(0), .border = R.all(1), .corners = .all(8), .label = .{ .text = title(draft.operation) } });
         defer modal.deinit();
         modal.dragAreaSet(dvui.windowHeader(title(draft.operation), "", &draft.open));
+        const action = components.formActions(@src(), .{ .save_label = switch (draft.operation) {
+            .copy => "复制",
+            .restore => "恢复",
+            .delete => "确认删除",
+            .rename_display, .rename_folder => "保存",
+        }, .save_enabled = draftBlocked(draft, doc, manager) == null and draft.confirmed and !ui.select_queued and ui.draft_action == .none });
+        if (action == .cancel) draft.open = false;
         const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
         defer scroll.deinit();
-        wrapped(@src(), fmt("世界：{s}", .{draft.display_name}), theme.accent);
-        wrapped(@src(), fmt("源实例：{s}", .{draft.source.name}), theme.muted);
+        components.text(@src(), fmt("世界：{s}", .{draft.display_name}), theme.accent);
+        components.text(@src(), fmt("源实例：{s}", .{draft.source.name}), theme.muted);
         if (draft.operation == .restore) {
-            wrapped(@src(), fmt("恢复记录：{s} · {s}", .{ draft.backup_id, if (draft.part == .original) "原始数据" else "被替换数据" }), theme.muted);
-        } else wrapped(@src(), fmt("文件夹：{s}", .{draft.folder}), theme.muted);
+            components.text(@src(), fmt("恢复记录：{s} · {s}", .{ draft.backup_id, if (draft.part == .original) "原始数据" else "被替换数据" }), theme.muted);
+        } else components.text(@src(), fmt("文件夹：{s}", .{draft.folder}), theme.muted);
         if (draft.operation == .copy) {
             const a = dvui.currentWindow().arena();
             const labels = try a.alloc([]const u8, doc.instances.len + 1);
@@ -554,7 +544,7 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.
                 if (sameId(draft.target_id, instance.id)) selected = count;
                 count += 1;
             }
-            dvui.labelNoFmt(@src(), "目标实例", .{}, .{ .padding = R.all(0), .margin = .{ .h = 4 } });
+            dvui.labelNoFmt(@src(), "目标实例", .{}, .{ .background = false, .padding = R.all(0), .margin = .{ .h = 4 } });
             var choice: ?usize = selected;
             if (dvui.dropdown(@src(), labels[0..count], .{ .choice_nullable = &choice }, .{ .placeholder = "选择目标实例", .null_selectable = false }, .{ .label = .{ .text = "目标实例" }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(6), .corners = .all(4) })) {
                 const index = choice orelse 0;
@@ -567,7 +557,7 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.
         }
         if (draft.operation != .delete) {
             const label = if (draft.operation == .rename_display) "新显示名称" else if (draft.operation == .rename_folder) "新文件夹名" else "目标世界文件夹";
-            dvui.labelNoFmt(@src(), label, .{}, .{ .padding = R.all(0), .margin = .{ .y = 6, .h = 4 } });
+            dvui.labelNoFmt(@src(), label, .{}, .{ .background = false, .padding = R.all(0), .margin = .{ .y = 6, .h = 4 } });
             const input = dvui.textEntry(@src(), .{ .text = .{ .buffer = &draft.name } }, .{ .label = .{ .text = label }, .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .h = 20 }, .padding = R.all(6), .margin = .{ .h = 4 }, .corners = .all(4) });
             if (input.text_changed) {
                 draft.confirmed = false;
@@ -576,11 +566,11 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.
             }
             input.deinit();
         }
-        if (draft.name_too_long) wrapped(@src(), "名称过长，请重新输入", danger);
+        if (draft.name_too_long) components.text(@src(), "名称过长，请重新输入", danger);
         if (draft.operation == .copy or draft.operation == .restore or draft.operation == .rename_folder) {
             _ = dvui.checkbox(@src(), &draft.replace_backed_up, "目标存在时，先备份再替换", .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .y = 6, .h = 6 } });
         }
-        if (draft.operation == .delete) wrapped(@src(), "世界将从 saves 移除，删除前数据保留在恢复记录中。", warning);
+        if (draft.operation == .delete) components.text(@src(), "世界将从 saves 移除，删除前数据保留在恢复记录中。", warning);
         _ = dvui.checkbox(@src(), &draft.confirmed, switch (draft.operation) {
             .delete => "确认删除此世界",
             .rename_display => "确认修改显示名称并保留恢复数据",
@@ -589,24 +579,16 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.
             .restore => "确认恢复所选数据",
         }, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .y = 4, .h = 8 } });
         const blocked = draftBlocked(draft, doc, manager);
-        if (blocked) |err| wrapped(@src(), fmt("暂不可执行：{s}", .{@errorName(err)}), warning);
-        if (ui.failure) |err| wrapped(@src(), fmt("操作失败：{s}", .{@errorName(err)}), danger);
-        const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0), .margin = R.all(0) });
-        defer actions.deinit();
-        if (command(@src(), "取消", dvui.entypo.cross, true)) draft.open = false;
-        if (command(@src(), "确认", dvui.entypo.check, blocked == null and draft.confirmed and !ui.select_queued)) {
-            const request = draft.request(doc) catch |err| {
+        if (blocked) |err| components.text(@src(), fmt("暂不可执行：{s}", .{@errorName(err)}), warning);
+        if (ui.failure) |err| components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), danger);
+        if (action == .save and draft.open and blocked == null and draft.confirmed and !ui.select_queued) {
+            ui.queueDraft(doc) catch |err| {
                 ui.failure = err;
                 return;
             };
-            ui.queueRequest(draft.source, request) catch |err| {
-                ui.failure = err;
-                return;
-            };
-            submitted = true;
         }
     }
-    if (submitted or !draft.open) ui.closeDraft();
+    if (!draft.open) ui.draft_action = .cancel;
 }
 
 fn syncSelection(ui: *Ui, store: *config.Store, manager: *worlds_manager.Manager) !void {
@@ -651,6 +633,12 @@ fn applyRequest(owned: *const OwnedRequest, store: *config.Store, manager: *worl
 /// Every queued request is released even when Store/Manager rejects it; never auto-retry.
 pub fn finish(ui: *Ui, store: *config.Store, manager: *worlds_manager.Manager) void {
     defer ui.releaseRequests();
+    const draft_action = ui.draft_action;
+    ui.draft_action = .none;
+    if (draft_action == .cancel) {
+        ui.releaseRequests();
+        ui.finishDraft(draft_action, false);
+    }
     defer ui.releaseDirectoryOpen();
     const refresh = ui.refresh_queued;
     ui.refresh_queued = false;
@@ -691,6 +679,7 @@ pub fn finish(ui: *Ui, store: *config.Store, manager: *worlds_manager.Manager) v
             ui.failure = err;
             continue;
         };
+        ui.finishDraft(draft_action, true);
         ui.failure = null;
     }
     if (ui.directory_open) |*intent| {
@@ -734,6 +723,35 @@ test "world view owns deferred selection and request strings" {
     try std.testing.expectEqualStrings("different-folder", ui.requests.items[0].source.name);
     ui.releaseRequests();
     try std.testing.expectEqual(@as(usize, 0), ui.requests.items.len);
+}
+
+test "world form submission retains rejected draft and cancel only discards draft" {
+    const a = std.testing.allocator;
+    const source: config.Instance = .{ .id = "source", .name = "source-folder", .minecraft_version = "1.21" };
+    const doc: config.Document = .{ .instances = &.{source}, .selected_instance = source.id };
+    var ui = try Ui.init(a);
+    defer ui.deinit();
+    ui.draft = try Draft.init(a, .rename_display, source, "world", "Old", "New");
+    try std.testing.expectError(error.ConfirmationRequired, ui.queueDraft(&doc));
+    try std.testing.expect(ui.draft != null and ui.requests.items.len == 0);
+    ui.draft.?.confirmed = true;
+    try ui.queueDraft(&doc);
+    try std.testing.expect(ui.draft != null and ui.draft_action == .save);
+    try std.testing.expectEqualStrings("New", ui.requests.items[0].value.rename_display.name);
+    ui.failure = error.PublicationUncertain;
+    ui.finishDraft(.save, false);
+    try std.testing.expect(ui.draft != null);
+    try std.testing.expectEqual(@as(?anyerror, error.PublicationUncertain), ui.failure);
+    ui.releaseRequests();
+    try ui.queueDraft(&doc);
+    ui.finishDraft(.save, true);
+    try std.testing.expect(ui.draft == null and ui.failure == null);
+    ui.releaseRequests();
+    ui.draft = try Draft.init(a, .rename_display, source, "world", "Old", "Discard");
+    ui.draft_action = .cancel;
+    try std.testing.expect(ui.draft != null);
+    ui.finishDraft(.cancel, false);
+    try std.testing.expect(ui.draft == null and ui.requests.items.len == 0 and !ui.cancel_queued);
 }
 
 test "modal consent never implies collision replacement" {

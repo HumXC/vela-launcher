@@ -5,6 +5,7 @@ const state = @import("ui/model.zig");
 const view = @import("ui/view.zig");
 const theme = @import("ui/theme.zig");
 const fonts = @import("ui/fonts.zig");
+const window_control = @import("ui/window_control.zig");
 const config = @import("core/config.zig");
 const instances = @import("core/instances.zig");
 const tasks = @import("core/tasks.zig");
@@ -13,6 +14,7 @@ const java_backend = @import("core/java_download.zig");
 const nbt = @import("nbt");
 const compression = @import("nbt_compression");
 const games = @import("ui/game_library.zig");
+const logs = @import("core/logs.zig");
 const java = @import("ui/java_manager.zig");
 const java_view = @import("ui/java_view.zig");
 const game_launch = @import("ui/game_launch.zig");
@@ -50,12 +52,7 @@ const TickCounts = struct {
 };
 
 pub const dvui_app: dvui.App = .{
-    .config = .{ .options = .{
-        .size = .{ .w = 1280, .h = 720 },
-        .min_size = .{ .w = 640, .h = 400 },
-        .title = "Vela Acceptance Fixture",
-        .window_init_options = .{ .keybinds_zoom = true },
-    } },
+    .config = .{ .startFn = fixtureStart },
     .initFn = init,
     .frameFn = frame,
     .deinitFn = deinit,
@@ -67,7 +64,51 @@ pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
 const Panel = enum { home, settings, java, servers, logs, worlds, instances, content, player, shutdown };
 var fixture: ?*Fixture = null;
 
+var native_backend_configuration_error: ?anyerror = null;
+
+fn fixtureStart() dvui.App.StartOptions {
+    native_backend_configuration_error = null;
+    window_control.configureNativeBackend() catch |err| {
+        native_backend_configuration_error = err;
+    };
+    return .{
+        .size = .{ .w = 1280, .h = 720 },
+        .min_size = .{ .w = 640, .h = 400 },
+        .title = "Vela Acceptance Fixture",
+        .vsync = false,
+        .window_init_options = .{ .keybinds_zoom = true },
+    };
+}
+
+// Share production decoration policy without installing its lifecycle controller.
+fn configureFixtureFramePacing(win: *dvui.Window) !void {
+    if (comptime @import("builtin").os.tag != .linux) return;
+    const c = dvui.backend.c;
+    const driver = c.SDL_GetCurrentVideoDriver();
+    if (driver == null) return error.NativeVideoDriverUnavailable;
+    if (!std.mem.eql(u8, std.mem.span(driver), "wayland")) return;
+    const renderer = win.backend.impl.renderer;
+    if (!c.SDL_SetRenderVSync(renderer, 0)) return error.NativeFramePacingConfigurationFailed;
+    var render_vsync: c_int = -1;
+    if (!c.SDL_GetRenderVSync(renderer, &render_vsync)) return error.NativeFramePacingQueryUnavailable;
+    if (render_vsync != 0) return error.NativeFramePacingNotDisabled;
+    const name = c.SDL_GetRendererName(renderer);
+    if (name == null) return error.NativeRendererNameUnavailable;
+    const renderer_name = std.mem.span(name);
+    if (std.mem.eql(u8, renderer_name, "opengl") or
+        std.mem.eql(u8, renderer_name, "opengles") or
+        std.mem.eql(u8, renderer_name, "opengles2"))
+    {
+        var swap_interval: c_int = -1;
+        if (!c.SDL_GL_GetSwapInterval(&swap_interval)) return error.NativeSwapIntervalQueryUnavailable;
+        if (swap_interval != 0) return error.NativeSwapIntervalNotDisabled;
+    }
+    win.max_fps = win.max_fps orelse 60;
+}
+
 pub fn init(win: *dvui.Window) !void {
+    if (native_backend_configuration_error) |err| return err;
+    try configureFixtureFramePacing(win);
     const app = dvui.App.main_init orelse return error.MissingAppInit;
     const root = app.environ_map.get("VELA_FIXTURE_ROOT") orelse return error.MissingFixtureRoot;
     if (!std.fs.path.isAbsolute(root) or std.mem.indexOfScalar(u8, root, 0) != null)
@@ -85,7 +126,12 @@ pub fn init(win: *dvui.Window) !void {
     const hold = std.meta.stringToEnum(pack_fixture.Hold, app.environ_map.get("VELA_FIXTURE_PACK_HOLD") orelse "none") orelse return error.InvalidFixtureHold;
     const retry_text = app.environ_map.get("VELA_FIXTURE_PACK_ADOPTION_RETRY") orelse "0";
     const retry = if (std.mem.eql(u8, retry_text, "1")) true else if (std.mem.eql(u8, retry_text, "0")) false else return error.InvalidFixtureRetry;
-    const owned = try Fixture.createScene(app.gpa, app.io, root, panel, viewport, scene);
+    const scenario = std.meta.stringToEnum(pack_fixture.Scenario, app.environ_map.get("VELA_FIXTURE_PACK_SCENARIO") orelse "default") orelse return error.InvalidFixtureScenario;
+    if (scenario != .default) {
+        const cf = scenario == .@"cf-restricted" or scenario == .@"cf-manual";
+        if (scene != .pack or hold != .none or retry or (archive == .curseforge) != cf) return error.InvalidFixtureScenarioProfile;
+    }
+    const owned = try Fixture.createScenario(app.gpa, app.io, root, panel, viewport, scene, scenario);
     errdefer owned.destroy();
     try owned.choosePackArchive(archive);
     try owned.armPackScene(hold, retry);
@@ -101,6 +147,9 @@ pub fn frame() !dvui.App.Result {
     const f = fixture orelse return error.MissingFixture;
     dvui.currentWindow().backend.impl.log_events = false;
     try f.tickServices();
+    // Cage need not provide a compositor Alt-F4 binding. Return through App so
+    // the same ordinary deinit path releases holds and JOINs fixture workers.
+    if (fixtureCloseRequested(dvui.events())) return .close;
     // Constrain window bounds without an open wrapper around deferred publication.
     const win = dvui.currentWindow();
     const old_rect = win.data().rect;
@@ -135,6 +184,7 @@ pub fn frame() !dvui.App.Result {
         .content = &f.content,
         .content_ui = &f.content_ui,
     });
+    f.pack_data.observeContent(&f.content, &f.content_ui);
     if (f.shutdown_prompt) {
         if (shutdown_view.draw(activeFixtureTasks(&f.registry))) |choice| switch (choice) {
             .keep_open => f.shutdown_prompt = false,
@@ -151,7 +201,7 @@ pub fn frame() !dvui.App.Result {
         };
     }
     dvui.currentWindow().backend.impl.log_events = false;
-    if (f.library.snapshot().phase == .loading or f.java_manager.isSearching() or f.servers.isBusy() or f.worlds.snapshot().worker_active or f.accounts.snapshot().busy or f.instance_manager.isBusy() or f.content.isBusy() or f.cf_credentials.isBusy() or f.shutdown_prompt)
+    if (f.library.snapshot().phase == .loading or f.java_manager.isSearching() or f.java_download_controller.isBusy() or f.servers.isBusy() or f.worlds.snapshot().worker_active or f.accounts.snapshot().busy or f.instance_manager.isBusy() or f.content.isBusy() or view.packWorkflowPinned(&f.pack_core) or f.pack_ui.isBusy() or f.cf_credentials.isBusy() or f.shutdown_prompt)
         dvui.refresh(null, @src(), null);
     return .ok;
 }
@@ -253,10 +303,12 @@ const Fixture = struct {
     pack_core: pack_controller.Controller,
     pack_ui: pack_view.Ui,
     pack_retry_once: bool = false,
+    scoped_content_hold: bool = false,
     ticks: TickCounts = .{},
     accounts: accounts_manager.Manager,
     accounts_ui: accounts_view.Ui,
     instance_fingerprint: u64,
+    catalogue_seeded: bool = false,
     shutdown_prompt: bool,
     fixture_task_last_id: u64,
 
@@ -284,6 +336,8 @@ const Fixture = struct {
         if (hold == .installer and f.scene != .@"pack-prepared") return error.FixtureControlRequiresPreparedScene;
         f.pack_data.hold_inspection.store(hold == .inspection, .release);
         f.pack_data.hold_content.store(hold == .content, .release);
+        f.scoped_content_hold = hold == .content;
+        f.content.options.worker_recheck = if (f.scoped_content_hold) pack_fixture.Context.workerRecheckUnheld else pack_fixture.Context.workerRecheck;
         f.pack_data.hold_installer.store(hold == .installer, .release);
         f.pack_retry_once = retry;
         if (retry) f.content.options.fixture_spawn_failure = error.FixtureAdoptionSpawnFailure;
@@ -305,6 +359,7 @@ const Fixture = struct {
         if (f.pack_ui.stopping or f.pack_core.snapshot().phase == .cleaning) f.pack_data.releaseHolds();
         f.coordinator.tick();
         f.library.tick();
+        try seedFixtureCatalogue(f);
         if (!f.pack_core.ownsJavaDiscovery()) {
             f.java_manager.tick();
             f.ticks.java += 1;
@@ -321,7 +376,16 @@ const Fixture = struct {
             f.instance_manager.tick();
             f.ticks.instances += 1;
         }
+        if (f.scoped_content_hold) {
+            // Jobs freeze this callback before spawn. The preceding selection
+            // refresh keeps its unheld callback; only adoption captures the hold.
+            f.content.options.worker_recheck = if (f.pack_core.snapshot().phase == .selecting_content and !f.content.isBusy())
+                pack_fixture.Context.workerRecheck
+            else
+                pack_fixture.Context.workerRecheckUnheld;
+        }
         f.pack_core.tick(f.packServices());
+        if (f.scoped_content_hold) f.content.options.worker_recheck = pack_fixture.Context.workerRecheckUnheld;
         f.ticks.pack_core += 1;
         if (f.pack_retry_once and f.pack_core.snapshot().phase == .awaiting_adoption) {
             f.pack_retry_once = false;
@@ -329,7 +393,9 @@ const Fixture = struct {
         }
         f.pack_ui.tick(&f.pack_core);
         f.ticks.pack_ui += 1;
+        f.pack_data.observeContent(&f.content, &f.content_ui);
         f.content.tick();
+        f.pack_data.observeContent(&f.content, &f.content_ui);
         f.ticks.content += 1;
         f.cf_credentials.tick(&f.configuration);
         const snapshot = f.content.snapshot();
@@ -351,7 +417,7 @@ const Fixture = struct {
         }
         if (f.pack_ui.takeReviewRequest()) {
             f.model.panel = .content;
-            f.content_ui.review_requested = true;
+            f.content_ui.requestReview(f.content.snapshot());
         }
         const fingerprint = instanceFingerprint(f.configuration.snapshot());
         if (fingerprint != f.instance_fingerprint) {
@@ -371,6 +437,11 @@ const Fixture = struct {
     }
 
     fn createScene(a: std.mem.Allocator, io: std.Io, root: []const u8, panel: Panel, viewport: dvui.Size, scene: pack_fixture.Scene) !*Fixture {
+        return createScenario(a, io, root, panel, viewport, scene, .default);
+    }
+
+    fn createScenario(a: std.mem.Allocator, io: std.Io, root: []const u8, panel: Panel, viewport: dvui.Size, scene: pack_fixture.Scene, scenario: pack_fixture.Scenario) !*Fixture {
+        if (scenario != .default and scene != .pack) return error.InvalidFixtureScenarioProfile;
         const f = try a.create(Fixture);
         errdefer a.destroy(f);
         f.allocator = a;
@@ -379,14 +450,18 @@ const Fixture = struct {
         f.scene = scene;
         f.ticks = .{};
         f.pack_retry_once = false;
+        f.scoped_content_hold = false;
+        f.catalogue_seeded = false;
         f.shutdown_prompt = panel == .shutdown;
         f.paths = try instances.Paths.init(a, io, root);
         errdefer f.paths.deinit();
-        f.pack_data = try pack_fixture.Context.init(a, io, root);
+        f.pack_data = try pack_fixture.Context.initScenario(a, io, root, scenario);
         errdefer f.pack_data.deinit();
         if (scene == .@"pack-prepared") try pack_fixture.initPrepared(&f.pack_data, a, io, root);
         f.configuration = try config.Store.init(a, io, root);
         errdefer f.configuration.deinit();
+        const initial_document = f.configuration.snapshot();
+        const fresh_configuration = initial_document.instances.len == 0 and initial_document.accounts.len == 0 and initial_document.servers.len == 0;
         try seedConfiguration(&f.configuration);
         f.registry = tasks.Registry.init(a);
         errdefer f.registry.deinit();
@@ -411,6 +486,7 @@ const Fixture = struct {
         f.java_manager = try java.Manager.init(a, io, root);
         errdefer f.java_manager.deinit();
         if (scene == .@"pack-prepared") try pack_fixture.registerMarkers(&f.pack_data, &f.java_manager);
+        if (scene == .layout) try seedOwnedJava(f);
         f.java_ui = java_view.Ui.init(a);
         errdefer f.java_ui.deinit();
         f.launcher = try game_launch.Controller.initWithOptions(a, io, f.paths.minecraft, .{
@@ -419,6 +495,7 @@ const Fixture = struct {
         });
         errdefer f.launcher.deinit();
         f.launcher.setLaunchAllowed(false);
+        if (scene == .layout) try seedFixtureLogs(&f.launcher.buffer);
         f.settings = try settings_view.Ui.init(a, f.configuration.snapshot().settings);
         errdefer f.settings.deinit();
         f.java_download_controller = try java_download.Controller.initWithOptions(a, io, .{
@@ -434,7 +511,7 @@ const Fixture = struct {
         f.servers_ui = servers_view.Ui.init(a);
         errdefer f.servers_ui.deinit();
         f.logs_ui = .{};
-        f.worlds = try worlds_manager.Manager.init(a, io, &f.paths, &f.registry, f.coordinator.guard(null));
+        f.worlds = try worlds_manager.Manager.init(a, io, &f.paths, &f.registry, f.coordinator.worldScope(3));
         errdefer f.worlds.deinit();
         f.worlds_ui = try worlds_view.Ui.init(a);
         errdefer f.worlds_ui.deinit();
@@ -456,19 +533,21 @@ const Fixture = struct {
             .release = instance_leases.Mutation.releaseCallback,
         });
         errdefer f.instance_manager.deinit();
+        f.instance_manager.setWorkerRecheck(instance_leases.Mutation.workerRecheckCallback);
         f.instance_manager.setInstaller(if (scene == .@"pack-prepared") pack_fixture.preparedInstaller(&f.pack_data) else .{ .context = f, .run = disabledInstanceInstall });
-        f.instance_manager.setLoaderCatalogue(.{ .context = f, .fetch = disabledLoaderCatalogue });
+        f.instance_manager.setLoaderCatalogue(.{ .context = f, .fetch = if (scene == .layout) fixtureLoaderCatalogue else disabledLoaderCatalogue });
         f.instances_ui = instances_view.Ui.init(a);
         errdefer f.instances_ui.deinit();
         f.content = try content_manager.Manager.initOptions(a, io, &f.paths, &f.registry, .{
-            .lease = f.pack_data.contentLease(.{ .context = content_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback }),
-            .transport_options = .{ .fixture_http = pack_fixture.Context.denyHttp, .fixture_context = &f.pack_data, .allow_curseforge = scene == .pack, .approved_download_hosts = &.{} },
+            .lease = f.pack_data.contentLease(.{ .context = content_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback }, instance_leases.Mutation.workerRecheckCallback),
+            .worker_recheck = pack_fixture.Context.workerRecheck,
+            .transport_options = .{ .fixture_http = pack_fixture.Context.contentHttp, .fixture_context = &f.pack_data, .allow_curseforge = scene == .pack, .approved_download_hosts = &.{} },
             .fixture_credential_store = f.cf_vault.store(),
             .fixture_fault = if (scene != .layout) null else .{ .context = f, .boundary = disabledContentMutation },
             .allow_manifest_v2 = scene != .layout,
         });
         errdefer f.content.deinit();
-        f.content_ui = try content_view.Ui.init(a);
+        f.content_ui = try content_view.Ui.initOptions(a, .{ .picker_runner = f.pack_data.contentPicker() });
         errdefer f.content_ui.deinit();
         f.pack_core = try pack_controller.Controller.init(a, io, root, .{ .task_registry = &f.registry, .runner = f.pack_data.runner() });
         var pack_ui_initialized = false;
@@ -492,7 +571,8 @@ const Fixture = struct {
             },
             .java => {
                 f.model.panel = .java;
-                f.java_ui.modal_open = true;
+                f.java_ui.search_started = true;
+                f.java_ui.acquisition_open = true;
             },
             .servers => f.model.panel = .servers,
             .logs => f.model.panel = .logs,
@@ -506,10 +586,11 @@ const Fixture = struct {
         }
         const path_len = @min(root.len, f.java_ui.path_buffer.len - 1);
         @memcpy(f.java_ui.path_buffer[0..path_len], root[0..path_len]);
-        try seedWorlds(f);
+        try seedWorlds(f, fresh_configuration);
+        try f.pack_data.seedScenario(io, &f.paths, fresh_configuration);
         f.instance_fingerprint = instanceFingerprint(f.configuration.snapshot());
         try f.library.refreshInstalled();
-        if (scene != .layout) pack_view.open(&f.pack_ui);
+        if (scene != .layout and scenario == .default) pack_view.open(&f.pack_ui);
         return f;
     }
 
@@ -519,6 +600,9 @@ const Fixture = struct {
         f.pack_core.deinit(f.packServices());
         f.pack_ui.deinit();
         f.launcher.deinit();
+        f.pack_data.observeContent(&f.content, &f.content_ui);
+        f.content.cancelAndJoin();
+        f.pack_data.observeContent(&f.content, &f.content_ui);
         f.content.deinit();
         f.content_ui.deinit();
         f.instance_manager.deinit();
@@ -540,6 +624,7 @@ const Fixture = struct {
         for (f.registry.tasks()) |task| f.registry.finish(task, .canceled);
         f.registry.deinit();
         f.configuration.deinit();
+        f.pack_data.writeJoinedTrace(f.io) catch |err| std.log.err("deep fixture joined trace: {s}", .{@errorName(err)});
         f.pack_data.deinit();
         f.paths.deinit();
         a.destroy(f);
@@ -748,7 +833,243 @@ fn disabledJavaDownload(_: *anyopaque, _: std.Io, _: *const java_backend.Runtime
     return error.FixtureNetworkDisabled;
 }
 
-fn seedWorlds(f: *Fixture) !void {
+const fixture_catalogue = [_]games.CatalogEntry{
+    .{ .id = "1.21.4", .kind = "release" },
+    .{ .id = "1.20.1", .kind = "release" },
+    .{ .id = "fixture-snapshot", .kind = "snapshot" },
+};
+
+test "offline fixture loader catalogue is bounded owns strings and honors cancellation" {
+    const a = std.testing.allocator;
+    var cancel = std.atomic.Value(bool).init(false);
+    const control: instances_manager.Control = .{ .cancel = &cancel };
+    inline for (.{ config.Loader.fabric, config.Loader.forge, config.Loader.neoforge, config.Loader.quilt }) |kind| {
+        var catalogue = try fixtureLoaderCatalogue(null, a, std.testing.io, "1.21.4", kind, control);
+        defer catalogue.deinit();
+        try std.testing.expectEqual(kind, catalogue.kind);
+        try std.testing.expectEqualStrings("1.21.4", catalogue.base);
+        try std.testing.expectEqual(@as(usize, 2), catalogue.entries.len);
+        try std.testing.expect(catalogue.entries[0].stable and !catalogue.entries[1].stable);
+        try std.testing.expect(std.mem.startsWith(u8, catalogue.entries[0].id, "fixture-"));
+    }
+    try std.testing.expectError(error.UnknownFixtureMinecraftVersion, fixtureLoaderCatalogue(null, a, std.testing.io, "unknown", .fabric, control));
+    try std.testing.expectError(error.InvalidLoader, fixtureLoaderCatalogue(null, a, std.testing.io, "1.21.4", .vanilla, control));
+    cancel.store(true, .release);
+    try std.testing.expectError(error.Canceled, fixtureLoaderCatalogue(null, a, std.testing.io, "1.21.4", .fabric, control));
+}
+
+test "finite fixture log feed supplies both sources all severities and clear stays empty" {
+    var buffer = try logs.Buffer.init(std.testing.allocator, .{}, &.{});
+    defer buffer.deinit();
+    try seedFixtureLogs(&buffer);
+    try std.testing.expectEqual(@as(usize, 52), buffer.lineCount());
+    var severity_seen = [_]bool{false} ** 6;
+    var stdout_seen = false;
+    var stderr_seen = false;
+    for (buffer.lines()) |line| {
+        severity_seen[@intFromEnum(line.severity)] = true;
+        stdout_seen = stdout_seen or line.source == .stdout;
+        stderr_seen = stderr_seen or line.source == .stderr;
+    }
+    for (severity_seen) |seen| try std.testing.expect(seen);
+    try std.testing.expect(stdout_seen and stderr_seen and buffer.errorIds().len > 0);
+    buffer.clear();
+    try std.testing.expectEqual(@as(usize, 0), buffer.lineCount());
+}
+
+test "fixture Alt-F4 requests ordinary close only on modified key down" {
+    var events = [_]dvui.Event{.{ .evt = .{ .key = .{ .code = .f4, .action = .down, .mod = .none } } }};
+    try std.testing.expect(!fixtureCloseRequested(&events));
+    events[0].evt.key.mod = .lalt;
+    try std.testing.expect(fixtureCloseRequested(&events));
+    events[0].evt.key.action = .up;
+    try std.testing.expect(!fixtureCloseRequested(&events));
+    events[0].evt.key.action = .down;
+    events[0].evt.key.code = .escape;
+    try std.testing.expect(!fixtureCloseRequested(&events));
+}
+
+test "synthetic owned Java passes actual storage gate and is never reseeded after hide forget or delete" {
+    const owned_storage = @import("ui/java_owned_storage.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var f: Fixture = undefined;
+    f.allocator = a;
+    f.io = io;
+    f.paths = try instances.Paths.init(a, io, root);
+    defer f.paths.deinit();
+    f.java_manager = try java.Manager.init(a, io, root);
+    defer f.java_manager.deinit();
+    try seedOwnedJava(&f);
+    try std.testing.expectEqual(@as(usize, 1), f.java_manager.entries().len);
+    const java_path = try a.dupe(u8, f.java_manager.entries()[0].path);
+    defer a.free(java_path);
+    try owned_storage.check(a, io, f.paths.jdks, java_path);
+    try f.java_manager.hide(java_path);
+    try seedOwnedJava(&f);
+    try std.testing.expectEqual(@as(usize, 0), f.java_manager.entries().len);
+    try std.testing.expectEqual(@as(usize, 1), f.java_manager.hiddenEntries().len);
+    try f.java_manager.unhide(java_path);
+    try f.java_manager.forget(java_path);
+    try seedOwnedJava(&f);
+    try std.testing.expectEqual(@as(usize, 0), f.java_manager.entries().len);
+    try owned_storage.check(a, io, f.paths.jdks, java_path);
+    var cancel = std.atomic.Value(bool).init(false);
+    try owned_storage.delete(a, io, f.paths.jdks, java_path, &cancel);
+    try seedOwnedJava(&f);
+    try std.testing.expectEqual(@as(usize, 0), f.java_manager.entries().len);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, java_path, .{ .follow_symlinks = false }));
+}
+
+test "world initialization marker preserves a deleted seeded folder and adopts existing configuration" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var f: Fixture = undefined;
+    f.allocator = a;
+    f.io = io;
+    f.paths = try instances.Paths.init(a, io, root);
+    defer f.paths.deinit();
+    f.configuration = try config.Store.init(a, io, root);
+    defer f.configuration.deinit();
+    try seedConfiguration(&f.configuration);
+    // Migration of an existing fixture config must not invent missing worlds.
+    try seedWorlds(&f, false);
+    const world_path = try f.paths.instancePath(f.configuration.snapshot().instances[0], "saves/fixture-survival");
+    defer a.free(world_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, world_path, .{}));
+    var seed_dir = try std.Io.Dir.cwd().openDir(io, f.paths.vela, .{});
+    defer seed_dir.close(io);
+    try seed_dir.deleteFile(io, fixture_world_seed);
+    try seedWorlds(&f, true);
+    try std.Io.Dir.cwd().deleteTree(io, world_path);
+    try seedWorlds(&f, true);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, world_path, .{}));
+}
+
+/// Populate only a JOINed job, using its own arena. This is fixture data,
+/// not evidence that the production network catalogue was fetched or parsed.
+fn seedFixtureCatalogue(f: *Fixture) !void {
+    if (f.scene != .layout or f.library.active != null) return;
+    const job = f.library.published orelse return;
+    if (job.thread != null) return;
+    if (f.library.phase == .failed and job.operation == .catalogue and (if (job.failure) |failure| failure == error.InvalidUrl else false)) {
+        // The intentionally disabled fixture transport has now JOINed. Replace
+        // its catalogue result only; cancellation/install failures stay visible.
+        job.failure = null;
+        f.library.failure = null;
+        f.library.phase = .complete;
+    }
+    if (f.library.phase != .complete) return;
+    if (job.available.len == fixture_catalogue.len) {
+        var matching = true;
+        for (fixture_catalogue, job.available) |entry, owned| {
+            if (!std.mem.eql(u8, entry.id, owned.id) or !std.mem.eql(u8, entry.kind, owned.kind)) matching = false;
+        }
+        if (matching) return;
+    }
+    const a = job.arena.allocator();
+    const available = try a.alloc(games.CatalogEntry, fixture_catalogue.len);
+    for (fixture_catalogue, available) |entry, *owned| {
+        owned.* = .{ .id = try a.dupe(u8, entry.id), .kind = try a.dupe(u8, entry.kind) };
+    }
+    job.available = available;
+    f.catalogue_seeded = true;
+}
+
+fn fixtureLoaderCatalogue(_: ?*anyopaque, a: std.mem.Allocator, _: std.Io, base: []const u8, kind: config.Loader, control: instances_manager.Control) !instances_manager.LoaderCatalogue {
+    try control.check();
+    if (kind == .vanilla) return error.InvalidLoader;
+    var known = false;
+    for (fixture_catalogue) |entry| if (std.mem.eql(u8, base, entry.id)) {
+        known = true;
+        break;
+    };
+    if (!known) return error.UnknownFixtureMinecraftVersion;
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    const entries = try owned.alloc(instances_manager.LoaderEntry, 2);
+    entries[0] = .{ .id = try std.fmt.allocPrint(owned, "fixture-{s}-stable", .{@tagName(kind)}), .stable = true };
+    entries[1] = .{ .id = try std.fmt.allocPrint(owned, "fixture-{s}-preview", .{@tagName(kind)}), .stable = false };
+    const owned_base = try owned.dupe(u8, base);
+    try control.check();
+    return .{ .arena = arena, .base = owned_base, .kind = kind, .entries = entries };
+}
+
+fn fixtureSeedExists(dir: std.Io.Dir, io: std.Io, name: []const u8) !bool {
+    const stat = dir.statFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    if (stat.kind != .file or stat.size != 1) return error.InvalidFixtureSeedMarker;
+    return true;
+}
+
+const fixture_java_hash = "0" ** 64;
+const fixture_java_directory = "microsoft-21-linux-x64-" ++ fixture_java_hash;
+const fixture_java_seed = "gui-acceptance-owned-java-v1.seeded";
+const fixture_world_seed = "gui-acceptance-worlds-v1.seeded";
+
+/// A non-executable marker with a structurally valid ownership receipt. It is
+/// deliberately synthetic: no genuine JDK, archive hash or download is claimed.
+fn seedOwnedJava(f: *Fixture) !void {
+    var seed_dir = try std.Io.Dir.cwd().createDirPathOpen(f.io, f.paths.vela, .{});
+    defer seed_dir.close(f.io);
+    if (try fixtureSeedExists(seed_dir, f.io, fixture_java_seed)) return;
+    const path = try std.fs.path.join(f.allocator, &.{ f.paths.jdks, fixture_java_directory });
+    defer f.allocator.free(path);
+    var directory = try std.Io.Dir.cwd().createDirPathOpen(f.io, path, .{});
+    defer directory.close(f.io);
+    try directory.createDirPath(f.io, "bin");
+    try writeFixtureFile(directory, f.io, "bin/java", "Synthetic GUI ownership marker; not an executable JDK.\n");
+    const receipt = "{\"schema\":1,\"vendor\":\"microsoft\",\"major\":21,\"version\":\"fixture-21\",\"os\":\"linux\",\"arch\":\"x64\",\"url\":\"https://aka.ms/download-jdk/fixture.zip\",\"sha256\":\"" ++ fixture_java_hash ++ "\",\"java\":\"bin/java\"}\n";
+    try writeFixtureFile(directory, f.io, ".vela-runtime.json", receipt);
+    const java_path = try std.fs.path.join(f.allocator, &.{ path, "bin", "java" });
+    defer f.allocator.free(java_path);
+    try f.java_manager.addDownloaded(.{ .path = java_path, .major = 21, .vendor = "Synthetic Fixture Owned Java" });
+    // Registration is persistent; this independent marker preserves hide/forget/
+    // file-delete outcomes even when no corresponding runtime remains registered.
+    try writeFixtureFile(seed_dir, f.io, fixture_java_seed, "1");
+}
+
+fn seedFixtureLogs(buffer: *logs.Buffer) !void {
+    const severities = [_][]const u8{ "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL" };
+    var row: [192]u8 = undefined;
+    for (0..48) |index| {
+        const text = try std.fmt.bufPrint(&row, "[12:00:{d:0>2}] [Fixture thread/{s}]: Fixture checkpoint {d:0>2}; offline synthetic log message.\n", .{ index, severities[index % severities.len], index });
+        try buffer.feed(if (index % 2 == 0) .stdout else .stderr, text);
+    }
+    try buffer.feed(.stderr, "[ERROR] Fixture exception context\njava.lang.IllegalStateException: synthetic fixture failure\n    at fixture.Main.run(Main.java:42)\nCaused by: java.io.IOException: offline fixture cause\n");
+    try buffer.finish(.stdout);
+    try buffer.finish(.stderr);
+}
+
+fn fixtureCloseRequested(events: []const dvui.Event) bool {
+    for (events) |event| switch (event.evt) {
+        .key => |key| if (key.action == .down and key.code == .f4 and key.mod.alt()) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn seedWorlds(f: *Fixture, fresh_configuration: bool) !void {
+    var seed_dir = try std.Io.Dir.cwd().createDirPathOpen(f.io, f.paths.vela, .{});
+    defer seed_dir.close(f.io);
+    if (try fixtureSeedExists(seed_dir, f.io, fixture_world_seed)) return;
+    // A root from an older fixture already owns its current worlds. Adopt it
+    // without recreating deleted folders or overwriting display/folder renames.
+    if (!fresh_configuration) {
+        try writeFixtureFile(seed_dir, f.io, fixture_world_seed, "1");
+        return;
+    }
     const a = f.allocator;
     const document = f.configuration.snapshot();
     if (document.instances.len == 0) return;
@@ -773,6 +1094,7 @@ fn seedWorlds(f: *Fixture) !void {
         try writeFixtureFile(dir, f.io, "level.dat", level);
         try writeFixtureFile(dir, f.io, "icon.png", preview);
     }
+    try writeFixtureFile(seed_dir, f.io, fixture_world_seed, "1");
 }
 
 fn makeLevelDat(a: std.mem.Allocator, name: []const u8, game_type: i32) ![]u8 {
@@ -867,8 +1189,12 @@ test "acceptance private descriptors and clients pass actual installed receipt i
     defer f.configuration.deinit();
     try seedConfiguration(&f.configuration);
     try seedGames(&f);
+    var coordinator = instance_leases.Coordinator.init(io);
+    const mutation = coordinator.mutation(0);
     for (f.configuration.snapshot().instances) |instance| {
-        var proof = try instance_tx.inspectInstalled(a, io, root, instance, .{});
+        try mutation.acquire(instance.id);
+        defer mutation.release(instance.id);
+        var proof = try instance_tx.inspectInstalled(a, io, root, instance, .{ .lease = .{ .context = mutation, .recheck = instance_leases.Mutation.recheckCallback } });
         defer proof.deinit();
         try std.testing.expectEqualStrings(instance.name, proof.instance.name);
         try std.testing.expectEqualStrings("1.21.4", proof.instance.minecraft_version);
@@ -948,6 +1274,164 @@ test "acceptance fixture seeds twenty active and three terminal tasks" {
     try std.testing.expectEqual(tasks.State.succeeded, entries[20].state);
     try std.testing.expectEqual(tasks.State.failed, entries[21].state);
     try std.testing.expectEqual(tasks.State.canceled, entries[22].state);
+}
+
+fn testFixtureTasksRunning(f: *Fixture) !void {
+    const entries = f.registry.tasks();
+    try std.testing.expect(entries.len >= 23);
+    for (entries[0..20], 0..) |task, index| {
+        try std.testing.expectEqual(@as(u64, index + 1), task.id);
+        try std.testing.expectEqual(tasks.State.running, task.state);
+    }
+}
+
+fn testFixturePrimaryWorlds(f: *Fixture) !void {
+    const snapshot = f.worlds.snapshot();
+    try std.testing.expect(!snapshot.worker_active and !snapshot.loading);
+    try std.testing.expect(snapshot.failure == null);
+    try std.testing.expectEqualStrings("fixture-primary", snapshot.instance.?.id);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.worlds.len);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.previews.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.backups.len);
+    for ([_][]const u8{ "fixture-survival", "fixture-creative" }, 0..) |folder, index| {
+        var found_world = false;
+        for (snapshot.worlds) |world| {
+            if (!std.mem.eql(u8, folder, world.folder)) continue;
+            found_world = true;
+            try std.testing.expect(world.metadata_status == .valid);
+            const name = if (index == 0) "Fixture Survival" else "Fixture Creative";
+            try std.testing.expectEqualStrings(name, world.displayName());
+            try std.testing.expectEqualStrings(name, world.metadata.level_name.?);
+            try std.testing.expectEqual(@as(?i32, @intCast(index)), world.metadata.game_type);
+            try std.testing.expectEqualStrings("1.21.4", world.metadata.version_name.?);
+            try std.testing.expectEqual(@as(?i32, 4189), world.metadata.data_version);
+        }
+        try std.testing.expect(found_world);
+        var found_preview = false;
+        for (snapshot.previews) |preview| {
+            if (!std.mem.eql(u8, folder, preview.folder)) continue;
+            found_preview = true;
+            try std.testing.expect(preview.png.len >= 8);
+            try std.testing.expectEqualSlices(u8, &.{ 137, 80, 78, 71, 13, 10, 26, 10 }, preview.png[0..8]);
+        }
+        try std.testing.expect(found_preview);
+    }
+    try testFixtureTasksRunning(f);
+}
+
+test "acceptance Worlds refresh waits for real Content JOIN across primary and selected copy" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const f = try Fixture.create(a, io, root, .worlds, .{ .w = 1280, .h = 720 });
+    defer f.destroy();
+    try testFixtureTasksRunning(f);
+
+    f.pack_data.hold_content.store(true, .release);
+    worlds_view.finish(&f.worlds_ui, &f.configuration, &f.worlds);
+    content_view.finish(&f.content_ui, &f.configuration, &f.content);
+    try testWaitFixture(f, .content_held);
+    try std.testing.expect(f.content.isBusy());
+    try std.testing.expect(f.pack_data.content_entered.load(.acquire));
+    try std.testing.expectError(error.InstanceBusy, f.coordinator.reserveLaunch("fixture-primary"));
+    try std.testing.expect(f.worlds.pending != null);
+    try std.testing.expect(f.worlds.active == null);
+    try std.testing.expect(f.worlds.snapshot().worker_active and f.worlds.snapshot().loading);
+    try std.testing.expect(f.worlds.snapshot().failure == null);
+    try testFixtureTasksRunning(f);
+
+    f.pack_data.hold_content.store(false, .release);
+    try testWaitFixture(f, .content_idle);
+    // Content releases its scope during JOIN; Coordinator observes it next tick.
+    try f.tickServices();
+    try testWaitFixture(f, .worlds_idle);
+    try f.tickServices();
+    try std.testing.expect(f.worlds.pending == null);
+    try std.testing.expect(f.pack_data.content_released.load(.acquire));
+    try testFixturePrimaryWorlds(f);
+
+    f.pack_data.content_entered.store(false, .release);
+    f.pack_data.content_released.store(false, .release);
+    f.pack_data.hold_content.store(true, .release);
+    try f.instance_manager.select(&f.configuration, "fixture-copy");
+    worlds_view.finish(&f.worlds_ui, &f.configuration, &f.worlds);
+    content_view.finish(&f.content_ui, &f.configuration, &f.content);
+    try testWaitFixture(f, .content_held);
+    try std.testing.expect(f.content.isBusy());
+    try std.testing.expect(f.pack_data.content_entered.load(.acquire));
+    try std.testing.expectError(error.InstanceBusy, f.coordinator.reserveLaunch("fixture-copy"));
+    try std.testing.expectEqualStrings("fixture-copy", f.content.snapshot().instance.?.id);
+    try std.testing.expectEqualStrings("fixture-copy", f.worlds.snapshot().instance.?.id);
+    try std.testing.expect(f.worlds.pending != null);
+    try std.testing.expect(f.worlds.active == null);
+    try std.testing.expect(f.worlds.snapshot().worker_active and f.worlds.snapshot().loading);
+    try std.testing.expect(f.worlds.snapshot().failure == null);
+    f.pack_data.hold_content.store(false, .release);
+    try testWaitFixture(f, .content_idle);
+    try f.tickServices();
+    try testWaitFixture(f, .worlds_idle);
+    try f.tickServices();
+    const copy = f.worlds.snapshot();
+    try std.testing.expect(f.worlds.pending == null);
+    try std.testing.expect(!copy.worker_active and !copy.loading);
+    try std.testing.expect(copy.failure == null);
+    try std.testing.expectEqualStrings("fixture-copy", copy.instance.?.id);
+    try std.testing.expectEqual(@as(usize, 0), copy.worlds.len);
+    try std.testing.expectEqual(@as(usize, 0), copy.previews.len);
+    try std.testing.expectEqual(@as(usize, 0), copy.backups.len);
+    try std.testing.expect(f.pack_data.content_released.load(.acquire));
+    try testFixtureTasksRunning(f);
+}
+
+test "acceptance Worlds refresh ends matching launch denial and admits unrelated launch" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const f = try Fixture.create(a, io, root, .worlds, .{ .w = 1280, .h = 720 });
+    defer f.destroy();
+    worlds_view.finish(&f.worlds_ui, &f.configuration, &f.worlds);
+    content_view.finish(&f.content_ui, &f.configuration, &f.content);
+    try testWaitFixture(f, .content_idle);
+    try f.tickServices();
+    try testWaitFixture(f, .worlds_idle);
+    try f.tickServices();
+    try testFixturePrimaryWorlds(f);
+
+    try f.coordinator.reserveLaunch("fixture-primary");
+    {
+        defer f.coordinator.releaseLaunch();
+        f.worlds_ui.refresh_queued = true;
+        worlds_view.finish(&f.worlds_ui, &f.configuration, &f.worlds);
+        try testWaitFixture(f, .worlds_idle);
+        const denied = f.worlds.snapshot();
+        try std.testing.expectEqual(@as(?anyerror, error.InstanceRunning), denied.failure);
+        try std.testing.expect(!denied.worker_active and !denied.loading);
+        try std.testing.expect(f.worlds.active == null and f.worlds.pending == null);
+        // Further ticks must leave the denial terminal rather than retrying it.
+        for (0..3) |_| try f.tickServices();
+        try std.testing.expectEqual(@as(?anyerror, error.InstanceRunning), f.worlds.snapshot().failure);
+        try std.testing.expect(f.worlds.active == null and f.worlds.pending == null);
+    }
+    try f.tickServices();
+    f.worlds_ui.refresh_queued = true;
+    worlds_view.finish(&f.worlds_ui, &f.configuration, &f.worlds);
+    try testWaitFixture(f, .worlds_idle);
+    try f.tickServices();
+    try testFixturePrimaryWorlds(f);
+
+    try f.coordinator.reserveLaunch("fixture-copy");
+    defer f.coordinator.releaseLaunch();
+    f.worlds_ui.refresh_queued = true;
+    worlds_view.finish(&f.worlds_ui, &f.configuration, &f.worlds);
+    try testWaitFixture(f, .worlds_idle);
+    try f.tickServices();
+    try testFixturePrimaryWorlds(f);
 }
 
 test "acceptance world fixture parses with production metadata reader" {
@@ -1035,7 +1519,7 @@ test "acceptance CF vault is memory-only and wipes replaced removed and retired 
     }
 }
 
-const FixtureWait = enum { preview, content_idle, content_held, inspection_held, installer_held, review, adoption, canceled, failed };
+const FixtureWait = enum { preview, content_idle, content_held, worlds_idle, inspection_held, installer_held, review, adoption, canceled, failed };
 const FixtureCheckpoint = enum {
     setup,
     wait_tick,
@@ -1144,6 +1628,7 @@ fn testWaitFixture(f: *Fixture, wanted: FixtureWait) !void {
         const done = switch (wanted) {
             .preview => if (f.pack_ui.preview) |preview| preview.inspection != null and preview.thread == null else false,
             .content_idle => !f.content.isBusy(),
+            .worlds_idle => !f.worlds.snapshot().worker_active,
             .content_held => f.pack_data.content_entered.load(.acquire),
             .inspection_held => f.pack_data.inspection_entered.load(.acquire),
             .installer_held => f.pack_data.installer_entered.load(.acquire),
@@ -1458,6 +1943,71 @@ test "acceptance cancellation retains private preview until actual held preparat
     try std.testing.expect(f.content.snapshot().proposal == null);
     checkpoint = .no_http;
     try std.testing.expectEqual(@as(usize, 0), f.pack_data.http_requests.load(.monotonic));
+}
+
+test "deep ordinary teardown records a real independent canceled import after JOIN" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    // Manager borrows its registry. Keeping this real registry outside Fixture
+    // lets us inspect terminal task state and detect shutdown task creation.
+    var observed_registry = tasks.Registry.init(a);
+    defer observed_registry.deinit();
+    const f = try Fixture.createScenario(a, io, root, .content, .{ .w = 1280, .h = 720 }, .pack, .@"update-keep");
+    var destroyed = false;
+    defer if (!destroyed) f.destroy();
+    try f.content.select(instances.findById(f.configuration.snapshot(), "fixture-primary").?.*);
+    try testWaitFixture(f, .content_idle);
+    // Preserve task-ID monotonicity across the borrowed registry handoff.
+    observed_registry.next_id = f.registry.next_id;
+    f.content.registry = &observed_registry;
+    var released: std.atomic.Value(bool) = .init(false);
+    f.pack_data.content_release_observer = &released;
+    f.pack_data.hold_content.store(true, .release);
+    try f.content.importPackFor(f.pack_data.path(), .{ .provider = .modrinth, .project_id = "DraftAlpha42", .version_id = "WorldDraftAlpha42" });
+    try testWaitFixture(f, .content_held);
+    const job = f.content.active orelse return error.ContentWorkerMissing;
+    const task = job.task orelse return error.ContentTaskMissing;
+    try std.testing.expect(job.request == .import_pack and job.held);
+    try std.testing.expect(!f.pack_core.core.content_owned);
+    try std.testing.expect(!job.done.load(.acquire));
+    f.pack_data.observeContent(&f.content, &f.content_ui);
+    const next_task_id = observed_registry.next_id;
+    try std.testing.expectEqual(@as(usize, 1), observed_registry.tasks().len);
+    // The existing hold waits even after cancellation. Request cancel before
+    // destroy releases it, so Canceled does not depend on thread scheduling.
+    f.content.cancel();
+    try std.testing.expect(task.canceled());
+    try std.testing.expect(!job.done.load(.acquire));
+    f.destroy();
+    destroyed = true;
+    try std.testing.expect(released.load(.acquire));
+    try std.testing.expectEqual(tasks.State.canceled, task.state);
+    try std.testing.expectEqual(@as(usize, 1), observed_registry.tasks().len);
+    try std.testing.expectEqual(next_task_id, observed_registry.next_id);
+    const bytes = try tmp.dir.readFileAlloc(io, "native-pack-deep-trace.json", a, .limited(64 * 1024));
+    defer a.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
+    const trace = parsed.value.object;
+    try std.testing.expectEqual(@as(usize, 15), trace.count());
+    try std.testing.expectEqual(@as(i64, 1), trace.get("schema_version").?.integer);
+    try std.testing.expectEqualStrings(root, trace.get("fixture_root").?.string);
+    try std.testing.expectEqualStrings("update-keep", trace.get("scenario").?.string);
+    try std.testing.expectEqualStrings("fixture-primary", trace.get("instance_id").?.string);
+    try std.testing.expectEqualStrings("joined", trace.get("phase").?.string);
+    try std.testing.expect(trace.get("workers_joined").?.bool);
+    const errors = trace.get("errors").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), errors.len);
+    try std.testing.expectEqualStrings("Canceled", errors[0].string);
+    const imported = trace.get("import").?.object;
+    try std.testing.expect(imported.get("attempted").?.bool and imported.get("rejected").?.bool);
+    const committed = trace.get("commit").?.object;
+    try std.testing.expect(!committed.get("attempted").?.bool and !committed.get("completed").?.bool);
+    try std.testing.expect(!trace.get("review").?.object.get("observed").?.bool);
 }
 
 test "acceptance Root teardown releases held real lease and joins worker before freeing context" {
@@ -1847,4 +2397,239 @@ test "prepared teardown JOIN and deterministic owned-stage failure roll back wit
     const after = try testPrimaryWorld(f);
     defer a.free(after);
     try std.testing.expectEqualSlices(u8, before, after);
+}
+
+/// Renderer entry reuses the real pack workers and one-shot Root handoff.
+/// Kept here so the layout suite does not duplicate private fixture ownership.
+pub fn testFirstContentReviewHandoff() !void {
+    try testPackFirstNavigation(.none);
+}
+
+/// CLI content holds must spare startup refreshes and hold the adopted proposal.
+pub fn testPackContentHoldFirstNavigation() !void {
+    try testPackFirstNavigation(.content);
+}
+
+fn testPackFirstNavigation(hold: pack_fixture.Hold) !void {
+    if (comptime dvui.Backend.kind != .testing) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const f = try Fixture.createScene(a, io, root, .home, .{ .w = 1280, .h = 720 }, .pack);
+    defer f.destroy();
+    try f.armPackScene(hold, false);
+    const Frame = struct {
+        var owner: *Fixture = undefined;
+        var review_id: ?dvui.Id = null;
+        var title_visible: bool = false;
+
+        fn drainSelections() !void {
+            try testWaitFixture(owner, .worlds_idle);
+            try testWaitFixture(owner, .content_idle);
+            // Either list may retry after the other releases its instance lease.
+            // Two ordinary polls also drain the last completed worker release.
+            const deadline = std.Io.Clock.awake.now(owner.io).nanoseconds + 10 * std.time.ns_per_s;
+            var idle_polls: usize = 0;
+            while (std.Io.Clock.awake.now(owner.io).nanoseconds < deadline) {
+                try owner.tickServices();
+                const idle = owner.worlds.active == null and owner.worlds.pending == null and
+                    owner.content.active == null and !owner.content.pending_refresh;
+                idle_polls = if (idle) idle_polls + 1 else 0;
+                if (idle_polls == 2) {
+                    try std.testing.expect(owner.worlds.active == null and owner.worlds.pending == null);
+                    try std.testing.expect(!owner.worlds.snapshot().worker_active);
+                    try std.testing.expect(owner.content.active == null and !owner.content.pending_refresh);
+                    try std.testing.expect(!owner.content.isBusy());
+                    return;
+                }
+                std.Thread.yield() catch {};
+            }
+            testFixtureFailure(owner, .wait_timeout, .worlds_idle, error.TestTimeout);
+            return error.TestTimeout;
+        }
+
+        fn draw() !dvui.App.Result {
+            try owner.tickServices();
+            const win = dvui.currentWindow();
+            var commands: std.ArrayList(dvui.RenderCommand) = .empty;
+            defer commands.deinit(win.arena());
+            const previous_commands = win.defer_render_cmds;
+            const previous_rendering = win.render_target.rendering;
+            win.defer_render_cmds = &commands;
+            win.render_target.rendering = false;
+            dvui.debug.captureScopeBegin(win.gpa);
+            defer {
+                dvui.debug.captureScopeEnd();
+                win.defer_render_cmds = previous_commands;
+                win.render_target.rendering = previous_rendering;
+            }
+            review_id = null;
+            title_visible = false;
+            try view.draw(&owner.model, &owner.library, &owner.java_manager, &owner.java_ui, &owner.launcher, .{
+                .pack_import = &owner.pack_core,
+                .pack_import_ui = &owner.pack_ui,
+                .configuration = &owner.configuration,
+                .tasks = &owner.registry,
+                .task_viewport_height = owner.viewport.h,
+                .settings = &owner.settings,
+                .cf_credentials = &owner.cf_credentials,
+                .java_download = &owner.java_download_controller,
+                .java_download_ui = &owner.java_download_ui,
+                .servers = &owner.servers,
+                .servers_ui = &owner.servers_ui,
+                .logs = &owner.logs_ui,
+                .worlds = &owner.worlds,
+                .worlds_ui = &owner.worlds_ui,
+                .accounts = &owner.accounts,
+                .accounts_ui = &owner.accounts_ui,
+                .instances = &owner.instance_manager,
+                .instances_ui = &owner.instances_ui,
+                .content = &owner.content,
+                .content_ui = &owner.content_ui,
+            });
+            const capture = dvui.debug.lastCapture() orelse return error.ContentReviewCaptureMissing;
+            for (capture.widgets.items) |widget| {
+                if (!std.mem.eql(u8, widget.name orelse continue, "FloatingWindow") or
+                    !std.mem.eql(u8, widget.src_fn, "drawModal") or
+                    !std.mem.endsWith(u8, widget.src_file, "content_view.zig")) continue;
+                try std.testing.expect(review_id == null);
+                review_id = widget.id;
+            }
+            if (review_id) |id| {
+                const modal = win.subwindows.get(id) orelse return error.ContentReviewModalMissing;
+                try std.testing.expect(modal.modal and modal.used);
+                try std.testing.expect(modal.rect_pixels.w > 0 and modal.rect_pixels.h > 0);
+                for ([_][]const dvui.RenderCommand{ commands.items, modal.render_cmds.items, modal.render_cmds_after.items }) |batch| {
+                    for (batch) |command| switch (command.cmd) {
+                        .text => |rendered| {
+                            const visible = rendered.rs.r.intersect(command.clip);
+                            if (std.mem.eql(u8, rendered.text, "Content review") and command.alpha > 0.99 and visible.w > 0 and visible.h > 0) title_visible = true;
+                        },
+                        else => {},
+                    };
+                }
+            }
+            return .ok;
+        }
+    };
+    Frame.owner = f;
+    var window = try dvui.testing.init(.{ .window_size = f.viewport });
+    defer window.deinit();
+    window.backend.size_pixels = .{ .w = f.viewport.w, .h = f.viewport.h };
+    window.window.themeSet(dvui.Theme.builtin.adwaita_dark);
+    // Visit Home and Instances, but never Content, before the real pack handoff.
+    try dvui.testing.settle(Frame.draw);
+    try Frame.drainSelections();
+    f.model.panel = .instances;
+    try dvui.testing.settle(Frame.draw);
+    try Frame.drainSelections();
+    try std.testing.expectEqual(@as(u64, 0), f.content_ui.policy_generation);
+    try std.testing.expect(f.content_ui.draft == null and !f.content_ui.review_requested);
+    if (hold == .content) {
+        try std.testing.expect(f.scoped_content_hold);
+        try std.testing.expect(f.pack_data.hold_content.load(.acquire));
+        try std.testing.expect(!f.pack_data.content_entered.load(.acquire));
+    }
+    const world_before = try testPrimaryWorld(f);
+    defer a.free(world_before);
+    try testPackPreview(f);
+    if (hold == .content) {
+        const initial_instances = f.configuration.snapshot().instances.len;
+        const initial_installed = f.content.snapshot().installed.len;
+        const source = f.content.snapshot().instance orelse return error.FixturePrimaryMissing;
+        const override_path = try f.paths.instancePath(source, "config/fixture-pack.cfg");
+        defer a.free(override_path);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, override_path, .{}));
+        // Admission goes through the ordinary full-view finish with its busy guards.
+        f.pack_ui.pending = .confirm;
+        _ = try dvui.testing.step(Frame.draw);
+        try std.testing.expect(f.pack_ui.failure == null);
+        try testWaitFixture(f, .content_held);
+        const job = f.content.active orelse return error.FixtureContentWorkerMissing;
+        try std.testing.expect(job.request == .inspected_pack and job.inspection != null);
+        try std.testing.expect(job.options.worker_recheck == pack_fixture.Context.workerRecheck);
+        const task = job.task orelse return error.FixtureContentTaskMissing;
+        try std.testing.expect(!task.canceled());
+        try std.testing.expect(f.pack_core.snapshot().phase == .reviewing_content);
+        try std.testing.expect(f.pack_core.core.content_owned and f.content.isBusy());
+        try std.testing.expect(f.pack_data.hold_content.load(.acquire));
+        try std.testing.expect(!f.pack_data.content_released.load(.acquire));
+        try std.testing.expect(f.content.snapshot().proposal == null and f.content_ui.draft == null);
+        try std.testing.expect(!f.content_ui.review_requested and !f.pack_ui.takeReviewRequest());
+        try std.testing.expectEqual(initial_instances, f.configuration.snapshot().instances.len);
+        try std.testing.expectEqual(initial_installed, f.content.snapshot().installed.len);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, override_path, .{}));
+        const world_held = try testPrimaryWorld(f);
+        defer a.free(world_held);
+        try std.testing.expectEqualSlices(u8, world_before, world_held);
+        // The public owned Cancel is dispatched by the same full-view finish.
+        try f.pack_ui.queueOwned(.cancel, &f.pack_core);
+        _ = try dvui.testing.step(Frame.draw);
+        try std.testing.expect(task.canceled());
+        try testWaitFixture(f, .canceled);
+        try std.testing.expect(!f.pack_data.hold_content.load(.acquire));
+        try std.testing.expect(f.pack_data.content_released.load(.acquire));
+        try std.testing.expect(f.content.active == null and !f.content.isBusy());
+        try std.testing.expect(task.state == .canceled);
+        try std.testing.expect(!f.packPinned() and !f.pack_ui.isBusy());
+        try std.testing.expect(!f.pack_core.core.content_owned);
+        try std.testing.expect(f.content.snapshot().proposal == null and f.content_ui.draft == null);
+        try std.testing.expect(!f.content_ui.review_requested and !f.pack_ui.takeReviewRequest());
+        // Ordinary navigation remains usable after the owner releases and JOINs.
+        f.model.panel = .home;
+        try dvui.testing.settle(Frame.draw);
+        try Frame.drainSelections();
+        f.model.panel = .instances;
+        try dvui.testing.settle(Frame.draw);
+        try Frame.drainSelections();
+        try std.testing.expect(f.content.snapshot().proposal == null and f.content_ui.draft == null);
+        try std.testing.expect(!f.content_ui.review_requested and !f.pack_ui.takeReviewRequest());
+        try std.testing.expectEqual(initial_instances, f.configuration.snapshot().instances.len);
+        try std.testing.expectEqual(initial_installed, f.content.snapshot().installed.len);
+        try std.testing.expectEqual(@as(usize, 0), f.pack_data.http_requests.load(.monotonic));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, override_path, .{}));
+        const world_after = try testPrimaryWorld(f);
+        defer a.free(world_after);
+        try std.testing.expectEqualSlices(u8, world_before, world_after);
+        return;
+    }
+    try testConfirmPack(f);
+    try testWaitFixture(f, .review);
+    const snapshot = f.content.snapshot();
+    const proposal = snapshot.proposal orelse return error.ContentReviewProposalMissing;
+    const source = snapshot.instance orelse return error.ContentReviewSourceMissing;
+    const installed_count = snapshot.installed.len;
+    const override_path = try f.paths.instancePath(source, "config/fixture-pack.cfg");
+    defer a.free(override_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, override_path, .{}));
+    try std.testing.expect(snapshot.policy_generation != 0 and proposal.ready);
+    try std.testing.expect(f.model.panel == .content and f.content_ui.review_requested);
+    try std.testing.expect(!f.pack_ui.takeReviewRequest());
+    // This first draw executes sidebar sync, content draft creation, and the modal.
+    _ = try dvui.testing.step(Frame.draw);
+    try std.testing.expect(f.content_ui.draft != null and !f.content_ui.review_requested);
+    try std.testing.expectEqual(snapshot.policy_generation, f.content_ui.policy_generation);
+    try std.testing.expectEqual(snapshot.provider, f.content_ui.provider);
+    try std.testing.expectEqualDeep(source, f.content_ui.draft.?.source);
+    try std.testing.expectEqualDeep(proposal.plan, f.content_ui.draft.?.proposal.plan);
+    try std.testing.expect(f.content_ui.draft.?.source.id.ptr != source.id.ptr);
+    try std.testing.expect(Frame.review_id != null);
+    const epoch = f.content_ui.draft_epoch;
+    try dvui.testing.settle(Frame.draw);
+    try std.testing.expect(Frame.title_visible);
+    const modal_id = Frame.review_id orelse return error.ContentReviewModalMissing;
+    _ = try dvui.testing.step(Frame.draw);
+    try std.testing.expectEqual(modal_id, Frame.review_id.?);
+    try std.testing.expect(Frame.title_visible and f.content_ui.draft.?.open);
+    try std.testing.expectEqual(epoch, f.content_ui.draft_epoch);
+    try std.testing.expect(!f.content_ui.review_requested and f.content_ui.pending == null and f.content_ui.failure == null);
+    try std.testing.expect(!f.content.isBusy() and f.content.snapshot().proposal == proposal);
+    try std.testing.expectEqual(installed_count, f.content.snapshot().installed.len);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, override_path, .{}));
+    const world_after = try testPrimaryWorld(f);
+    defer a.free(world_after);
+    try std.testing.expectEqualSlices(u8, world_before, world_after);
 }

@@ -121,6 +121,13 @@ const PublicationFaultIo = struct {
     renames: usize = 0,
     writes: usize = 0,
     fail_sync: ?usize = null,
+    gate_checks: usize = 0,
+    gate_unavailable: usize = 0,
+    require_namespace: bool = false,
+    namespace_checks: usize = 0,
+    namespace_unavailable: usize = 0,
+    stats: usize = 0,
+    opens: usize = 0,
 
     const Counts = struct { syncs: usize, renames: usize, writes: usize };
 
@@ -131,6 +138,8 @@ const PublicationFaultIo = struct {
         self.vtable.fileSync = sync;
         self.vtable.dirRename = rename;
         self.vtable.operate = operate;
+        self.vtable.fileStat = stat;
+        self.vtable.dirOpenFile = open;
         return .{ .userdata = self.real.userdata, .vtable = &self.vtable };
     }
     fn stop(self: *PublicationFaultIo) void {
@@ -142,25 +151,67 @@ const PublicationFaultIo = struct {
         self.renames = 0;
         self.writes = 0;
         self.fail_sync = null;
+        self.gate_checks = 0;
+        self.gate_unavailable = 0;
+        self.namespace_checks = 0;
+        self.namespace_unavailable = 0;
+        self.stats = 0;
+        self.opens = 0;
     }
     fn counts(self: *const PublicationFaultIo) Counts {
         return .{ .syncs = self.syncs, .renames = self.renames, .writes = self.writes };
     }
+    fn probe(self: *PublicationFaultIo) void {
+        const gate = &@import("core/worlds.zig").transaction_gate;
+        self.gate_checks += 1;
+        if (gate.tryLock()) gate.unlock(self.real) else self.gate_unavailable += 1;
+        if (self.require_namespace) {
+            self.namespace_checks += 1;
+            if (@import("core/instance_namespace.zig").acquire(self.real)) |token| {
+                token.release();
+                self.namespace_unavailable += 1;
+            } else |err| {
+                if (err != error.InstanceNamespaceBusy) self.namespace_unavailable += 1;
+            }
+        }
+    }
+    fn stat(ctx: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+        const self = active.?;
+        self.probe();
+        self.stats += 1;
+        return self.real.vtable.fileStat(ctx, file);
+    }
+    fn open(ctx: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+        const self = active.?;
+        self.probe();
+        self.opens += 1;
+        return self.real.vtable.dirOpenFile(ctx, dir, path, options);
+    }
+    fn expectPublicationProtected(self: *const PublicationFaultIo) !void {
+        try std.testing.expect(self.gate_checks > 0 and self.namespace_checks > 0);
+        try std.testing.expectEqual(@as(usize, 0), self.gate_unavailable);
+        try std.testing.expectEqual(@as(usize, 0), self.namespace_unavailable);
+    }
     fn sync(ctx: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
         const self = active.?;
+        self.probe();
         self.syncs += 1;
         if (self.fail_sync == self.syncs) return error.InputOutput;
         return self.real.vtable.fileSync(ctx, file);
     }
     fn rename(ctx: ?*anyopaque, old_dir: std.Io.Dir, old_path: []const u8, new_dir: std.Io.Dir, new_path: []const u8) std.Io.Dir.RenameError!void {
         const self = active.?;
+        self.probe();
         self.renames += 1;
         return self.real.vtable.dirRename(ctx, old_dir, old_path, new_dir, new_path);
     }
     fn operate(ctx: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
         const self = active.?;
         switch (operation) {
-            .file_write_streaming => self.writes += 1,
+            .file_write_streaming => {
+                self.probe();
+                self.writes += 1;
+            },
             else => {},
         }
         return self.real.vtable.operate(ctx, operation);
@@ -178,6 +229,7 @@ fn expectRetained(manager: *module.Manager, fixture: *Fixture, registry: *tasks.
     try std.testing.expect(job.leased and job.task != null and registry.hasActive());
     try std.testing.expect(fixture.held.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), fixture.releases);
+    try std.testing.expectError(error.InstanceNamespaceBusy, @import("core/instance_namespace.zig").acquire(io));
 }
 
 test "instance manager owns queued strings and publishes only after completed join" {
@@ -247,8 +299,11 @@ test "instance manager pre-rename config failure reconciles baseline before expl
     try settle(&manager);
     const job = manager.pending.?;
     fault.reset();
+    fault.require_namespace = true;
     fault.fail_sync = 1;
     try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
+    try fault.expectPublicationProtected();
+    try std.testing.expect(fault.writes > 0 and fault.syncs > 0);
     try std.testing.expect(env.store.publicationUncertain());
     try std.testing.expect(job.uncertain_publication_store == &env.store);
     try std.testing.expectEqual(@as(usize, 0), fault.renames);
@@ -297,8 +352,11 @@ test "instance manager acknowledges its reconciled creation once without rewriti
     try settle(&manager);
     const job = manager.pending.?;
     fault.reset();
+    fault.require_namespace = true;
     fault.fail_sync = 3;
     try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
+    try fault.expectPublicationProtected();
+    try std.testing.expect(fault.writes > 0 and fault.syncs > 0 and fault.renames > 0);
     try std.testing.expectEqual(@as(usize, 1), fault.renames);
     try std.testing.expectEqual(@as(usize, 1), env.store.snapshot().instances.len);
     try expectRetained(&manager, &fixture, &registry);
@@ -431,6 +489,137 @@ test "instance manager pins recovery required and never publishes uncertain file
     try std.testing.expectEqual(@as(usize, 0), env.store.snapshot().instances.len);
     manager.deinit();
     try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+}
+
+fn editableFixture(dir: std.Io.Dir) !void {
+    try dir.createDirPath(io, ".minecraft/versions/1.21");
+    try dir.createDirPath(io, ".minecraft/versions/Play/saves/World");
+    try dir.createDirPath(io, ".minecraft/versions/Play/config");
+    try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/1.21/1.21.json", .data = "{\"id\":\"1.21\",\"mainClass\":\"net.minecraft.client.main.Main\",\"downloads\":{\"client\":{\"url\":\"https://example.invalid/client\",\"size\":4}},\"arguments\":{\"game\":[],\"jvm\":[]}}" });
+    try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/Play.json", .data = "{\"id\":\"Play\",\"inheritsFrom\":\"1.21\"}" });
+    try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/saves/World/level.dat", .data = "world" });
+    try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/config/options.txt", .data = "options" });
+}
+
+// Transaction recovery is deliberately sealed; restore only test directories for cleanup.
+fn writableFixture(dir: std.Io.Dir) void {
+    dir.setPermissions(io, .fromMode(0o700)) catch return;
+    var iterator = dir.iterate();
+    while (iterator.next(io) catch null) |entry| {
+        const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch continue;
+        if (stat.kind != .directory) continue;
+        const child = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        defer child.close(io);
+        writableFixture(child);
+    }
+}
+
+const editable: config.Instance = .{ .id = "stable-editable", .name = "Play", .minecraft_version = "1.21", .java_path = "/old/java", .max_memory_mb = 2048, .origin = .{ .kind = .modrinth, .project_id = "project", .version_id = "release" } };
+
+test "combined rename options publishes one complete config update after JOIN and retries as one result" {
+    try requireSyncFaults();
+    for ([_]bool{ false, true }) |fail_first| {
+        var env = try Environment.init();
+        defer env.deinit();
+        defer writableFixture(env.tmp.dir);
+        try editableFixture(env.tmp.dir);
+        try env.store.update(.{ .instances = &.{editable}, .selected_instance = editable.id, .servers = &.{.{ .id = "bound", .name = "Bound server", .address = "localhost", .instance_id = editable.id }}, .selected_server = "bound" });
+        var registry = tasks.Registry.init(std.testing.allocator);
+        defer registry.deinit();
+        var fixture: Fixture = .{};
+        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+        defer manager.deinit();
+        var updated = editable;
+        updated.name = "New Play";
+        updated.java_path = "/new/java";
+        updated.max_memory_mb = 8192;
+        updated.debug_launch = true;
+        try manager.startRenameWithOptions(editable, updated);
+        try settle(&manager);
+        try std.testing.expectEqual(module.Phase.awaiting_publication, manager.snapshot().phase);
+        const job = manager.pending orelse return error.ExpectedPendingPublication;
+        try std.testing.expect(job.future == null and job.done.load(.acquire));
+        try std.testing.expect(module.sameInstance(editable, job.request));
+        try std.testing.expect(module.sameInstance(updated, job.result.?.instance));
+        try std.testing.expect(module.sameInstance(editable, env.store.snapshot().instances[0]));
+        try std.testing.expectError(error.FileNotFound, env.tmp.dir.access(io, ".minecraft/versions/Play", .{}));
+        try env.tmp.dir.access(io, ".minecraft/versions/New Play/New Play.json", .{});
+        const world = try env.tmp.dir.readFileAlloc(io, ".minecraft/versions/New Play/saves/World/level.dat", std.testing.allocator, .limited(1024));
+        defer std.testing.allocator.free(world);
+        try std.testing.expectEqualStrings("world", world);
+        var fault: PublicationFaultIo = .{ .require_namespace = true };
+        env.store.io = fault.start();
+        defer fault.stop();
+        if (fail_first) {
+            fault.fail_sync = 1;
+            try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
+            try std.testing.expect(module.sameInstance(editable, env.store.snapshot().instances[0]));
+            try expectRetained(&manager, &fixture, &registry);
+            try fault.expectPublicationProtected();
+            fault.reset();
+            try std.testing.expect(env.store.publicationUncertain());
+            try env.store.reconcile();
+            try std.testing.expect(module.sameInstance(editable, env.store.snapshot().instances[0]));
+            fault.reset();
+        }
+        try manager.publish(&env.store);
+        try std.testing.expectEqual(module.Phase.complete, manager.snapshot().phase);
+        try std.testing.expect(manager.pending == null and !registry.hasActive());
+        try std.testing.expect(module.sameInstance(updated, env.store.snapshot().instances[0]));
+        try std.testing.expectEqualStrings(editable.id, env.store.snapshot().selected_instance.?);
+        try std.testing.expectEqualStrings(editable.id, env.store.snapshot().servers[0].instance_id);
+        try std.testing.expectEqualStrings("bound", env.store.snapshot().selected_server.?);
+        try std.testing.expectEqualStrings("project", env.store.snapshot().instances[0].origin.?.project_id);
+        try std.testing.expectEqual(@as(usize, 1), fault.renames);
+        try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+        try fault.expectPublicationProtected();
+    }
+}
+
+test "checked options save rejects stale launch fields before acquiring lease or publishing" {
+    var env = try Environment.init();
+    defer env.deinit();
+    try env.store.update(.{ .instances = &.{editable} });
+    var fixture: Fixture = .{};
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+    defer manager.deinit();
+    var stale = editable;
+    stale.debug_launch = true;
+    var updated = editable;
+    updated.java_path = "/new/java";
+    try std.testing.expectError(error.InstanceConfigurationChanged, manager.saveOptionsChecked(&env.store, stale, updated));
+    try std.testing.expect(!fixture.held.load(.acquire) and fixture.releases == 0);
+    try std.testing.expect(module.sameInstance(editable, env.store.snapshot().instances[0]));
+    try manager.saveOptionsChecked(&env.store, editable, updated);
+    try std.testing.expect(module.sameInstance(updated, env.store.snapshot().instances[0]));
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+}
+
+test "rename publication rejects an external options edit against the original whole config fingerprint" {
+    var env = try Environment.init();
+    defer env.deinit();
+    defer writableFixture(env.tmp.dir);
+    try editableFixture(env.tmp.dir);
+    try env.store.update(.{ .instances = &.{editable} });
+    var fixture: Fixture = .{};
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+    defer manager.deinit();
+    var updated = editable;
+    updated.name = "New Play";
+    updated.max_memory_mb = 8192;
+    try manager.startRenameWithOptions(editable, updated);
+    try settle(&manager);
+    @constCast(env.store.state.value.instances)[0].debug_launch = true;
+    try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
+    try std.testing.expect(manager.pending != null and fixture.releases == 0);
+    try std.testing.expectEqualStrings("Play", env.store.snapshot().instances[0].name);
+    try std.testing.expectEqual(@as(?u32, 2048), env.store.snapshot().instances[0].max_memory_mb);
+    try std.testing.expect(env.store.snapshot().instances[0].debug_launch);
+    try std.testing.expectError(error.InstanceNamespaceBusy, @import("core/instance_namespace.zig").acquire(io));
 }
 
 test "instance manager options preserve identity and default Java is cloned into worker" {
@@ -784,6 +973,107 @@ fn expectPreparedRejected(manager: *module.Manager, fixture: *Fixture, registry:
     try std.testing.expect(!fixture.held.load(.acquire) and !fixture.entered.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), fixture.releases);
     try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
+}
+
+test "creation admission blocks every create variant before allocation lease task or borrowed owner and permits retry" {
+    const Admission = struct {
+        blocked: bool = true,
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.blocked) return error.JavaDeletionBusy;
+        }
+    };
+    const Variant = enum { ordinary, prepared, prepared_java, vanilla };
+    for ([_]Variant{ .ordinary, .prepared, .prepared_java, .vanilla }) |variant| {
+        var env = try Environment.init();
+        defer env.deinit();
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var source: PreparedFixture = .{};
+        var prepared = try source.prepare(env.root);
+        defer prepared.deinit();
+        var vanilla = try source.prepareVanilla(env.root, env.paths.minecraft);
+        defer vanilla.deinit();
+        const vanilla_calls = source.vanilla_calls;
+        const loader_calls = source.loader_calls;
+        var fixture: Fixture = .{};
+        fixture.blocked.store(true, .release);
+        var admission: Admission = .{};
+        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+        defer manager.deinit();
+        manager.setInstaller(fixture.installer());
+        manager.setCreationAdmission(.{ .context = &admission, .check = Admission.check });
+        try manager.setDefaultJava("/default/java");
+        const default_java = manager.default_java.?;
+        // A failing allocator proves rejection occurs before even validating/cloning
+        // the prepared owners, request strings, or the default Java snapshot.
+        {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            manager.allocator = failing.allocator();
+            defer manager.allocator = a;
+            try std.testing.expectError(error.JavaDeletionBusy, switch (variant) {
+                .ordinary => manager.startCreate(example),
+                .prepared => manager.startCreatePrepared(prepared_example, &prepared, 7),
+                .prepared_java => manager.startCreatePreparedWithJava(prepared_example, &prepared, 7, "/installer/java"),
+                .vanilla => manager.startCreateVanillaPrepared(example, &vanilla, 7),
+            });
+        }
+        try std.testing.expectEqual(@as(usize, 1), admission.checks);
+        try std.testing.expect(manager.active == null and manager.pending == null and manager.published == null);
+        try std.testing.expectEqual(module.Phase.idle, manager.snapshot().phase);
+        try std.testing.expectEqual(module.Operation.none, manager.snapshot().operation);
+        try std.testing.expect(manager.default_java.?.ptr == default_java.ptr);
+        try std.testing.expect(!fixture.held.load(.acquire) and !fixture.entered.load(.acquire));
+        try std.testing.expect(fixture.observed_prepared == null and fixture.observed_vanilla_prepared == null);
+        try std.testing.expectEqual(@as(u64, 0), fixture.observed_generation);
+        try std.testing.expectEqual(@as(usize, 0), fixture.rechecks);
+        try std.testing.expectEqual(@as(usize, 0), fixture.releases);
+        try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
+        try std.testing.expectEqual(vanilla_calls, source.vanilla_calls);
+        try std.testing.expectEqual(loader_calls, source.loader_calls);
+        admission.blocked = false;
+        try switch (variant) {
+            .ordinary => manager.startCreate(example),
+            .prepared => manager.startCreatePrepared(prepared_example, &prepared, 7),
+            .prepared_java => manager.startCreatePreparedWithJava(prepared_example, &prepared, 7, "/installer/java"),
+            .vanilla => manager.startCreateVanillaPrepared(example, &vanilla, 7),
+        };
+        try waitEntered(&fixture);
+        try std.testing.expectEqual(@as(usize, 2), admission.checks);
+        try std.testing.expect(fixture.held.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), registry.tasks().len);
+        const active = manager.active.?;
+        switch (variant) {
+            .ordinary => {
+                try std.testing.expect(active.prepared == null and active.vanilla_prepared == null);
+                try std.testing.expectEqualStrings("/default/java", active.installer_java.?);
+            },
+            .prepared, .prepared_java => {
+                try std.testing.expect(active.prepared.? == &prepared and fixture.observed_prepared.? == &prepared);
+                try std.testing.expectEqual(@as(u64, 7), active.prepared_generation);
+                try std.testing.expectEqualStrings(if (variant == .prepared_java) "/installer/java" else "/default/java", active.installer_java.?);
+            },
+            .vanilla => {
+                try std.testing.expect(active.vanilla_prepared.? == &vanilla and fixture.observed_vanilla_prepared.? == &vanilla);
+                try std.testing.expect(active.installer_java == null);
+                try std.testing.expectEqual(@as(u64, 7), active.prepared_generation);
+            },
+        }
+        // Existing ownership still wins over the live admission callback.
+        try std.testing.expectError(error.Busy, manager.startCreate(example));
+        try std.testing.expectEqual(@as(usize, 2), admission.checks);
+        fixture.blocked.store(false, .release);
+        try settle(&manager);
+        const joined = manager.pending.?;
+        try std.testing.expect(joined.future == null and joined.prepared == null and joined.vanilla_prepared == null);
+        try std.testing.expectEqual(@as(u64, 0), joined.prepared_generation);
+        try manager.publish(&env.store);
+        try std.testing.expect(!fixture.held.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+        try std.testing.expectEqual(@as(usize, 1), env.store.snapshot().instances.len);
+    }
 }
 
 test "prepared create rejects default foreign stale tampered and environment bindings before lease or task" {
@@ -1443,12 +1733,19 @@ test "canonical reconciled publication checks freshness without rewriting author
         try manager.startImport(canonical_import);
         try settle(&manager);
         const job = manager.pending.?;
+        job.result.?.publication_proof.?.io = store_io;
         fault.reset();
+        fault.require_namespace = true;
         fault.fail_sync = 3;
         try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
+        try fault.expectPublicationProtected();
+        try std.testing.expect(fault.stats > 0 and fault.writes > 0 and fault.syncs > 0 and fault.renames > 0);
+        try std.testing.expectError(error.InstanceNamespaceBusy, @import("core/instance_namespace.zig").acquire(io));
         try std.testing.expect(job.uncertain_publication_store == &env.store and job.import_prepared != null);
         fault.reset();
         try env.store.reconcile();
+        try fault.expectPublicationProtected();
+        try std.testing.expect(fault.opens > 0);
         try std.testing.expectEqual(@as(usize, 1), env.store.snapshot().instances.len);
         const before = try std.json.Stringify.valueAlloc(a, env.store.snapshot().*, .{});
         defer a.free(before);
@@ -1468,6 +1765,13 @@ test "canonical reconciled publication checks freshness without rewriting author
         defer a.free(after);
         try std.testing.expectEqualStrings(before, after);
         try std.testing.expectEqualDeep(counts, fault.counts());
+        try fault.expectPublicationProtected();
+        if (changed) {
+            try std.testing.expectError(error.InstanceNamespaceBusy, @import("core/instance_namespace.zig").acquire(io));
+        } else {
+            const token = try @import("core/instance_namespace.zig").acquire(io);
+            token.release();
+        }
     }
 }
 
@@ -1526,4 +1830,133 @@ test "canonical manager allocation failures release request prepared proof handl
     try seedCanonicalImport(env.tmp.dir);
     try std.testing.checkAllAllocationFailures(a, canonicalManagerAllocationFailure, .{&env.paths});
     try expectCanonicalData(env.tmp.dir);
+}
+
+fn expectRealPublicationLease(coordinator: *@import("core/instance_leases.zig").Coordinator, id: []const u8) !void {
+    try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(id));
+    try coordinator.reserveLaunch("unrelated-instance");
+    coordinator.releaseLaunch();
+    coordinator.tick();
+    try std.testing.expectError(error.InstanceNamespaceBusy, @import("core/instance_namespace.zig").acquire(io));
+}
+
+const PublicationAllocator = struct {
+    enabled: bool = false,
+    calls: usize = 0,
+    gate_unavailable: usize = 0,
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    fn allocator(self: *PublicationAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn probe(self: *PublicationAllocator) void {
+        if (!self.enabled) return;
+        self.calls += 1;
+        const gate = &@import("core/worlds.zig").transaction_gate;
+        if (gate.tryLock()) gate.unlock(io) else self.gate_unavailable += 1;
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PublicationAllocator = @ptrCast(@alignCast(raw));
+        self.probe();
+        return a.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+        const self: *PublicationAllocator = @ptrCast(@alignCast(raw));
+        self.probe();
+        return a.rawResize(memory, alignment, len, ret_addr);
+    }
+    fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *PublicationAllocator = @ptrCast(@alignCast(raw));
+        self.probe();
+        return a.rawRemap(memory, alignment, len, ret_addr);
+    }
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PublicationAllocator = @ptrCast(@alignCast(raw));
+        self.probe();
+        a.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "manager real lease excludes same ID through JOIN uncertain save reconcile and acknowledgment" {
+    try requireSyncFaults();
+    const leases = @import("core/instance_leases.zig");
+    const namespace = @import("core/instance_namespace.zig");
+    var fault: PublicationFaultIo = .{};
+    const store_io = fault.start();
+    defer fault.stop();
+    var env = try Environment.initWithStoreIo(store_io);
+    defer env.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var coordinator = leases.Coordinator.init(io);
+    defer coordinator.tick();
+    const mutation = coordinator.mutation(0);
+    var fixture: Fixture = .{};
+    fixture.blocked.store(true, .release);
+    var allocation_probe: PublicationAllocator = .{};
+    var manager = try module.Manager.init(allocation_probe.allocator(), io, &env.paths, &registry, .{}, .{
+        .context = mutation,
+        .acquire = leases.Mutation.acquireCallback,
+        .recheck = leases.Mutation.recheckCallback,
+        .release = leases.Mutation.releaseCallback,
+    });
+    defer manager.deinit();
+    manager.setInstaller(fixture.installer());
+    try manager.startCreate(example);
+    try waitEntered(&fixture);
+    try expectRealPublicationLease(&coordinator, example.id);
+    try mutation.recheck(example.id);
+
+    const competing_mutation = coordinator.mutation(1);
+    var competitor = try module.Manager.init(a, io, &env.paths, &registry, .{}, .{
+        .context = competing_mutation,
+        .acquire = leases.Mutation.acquireCallback,
+        .recheck = leases.Mutation.recheckCallback,
+        .release = leases.Mutation.releaseCallback,
+    });
+    defer competitor.deinit();
+    competitor.setInstaller(fixture.installer());
+    const other: Instance = .{ .id = "competing-instance", .name = "Competing", .minecraft_version = "1.20.1" };
+    try std.testing.expectError(error.InstanceNamespaceBusy, competitor.startCreate(other));
+    try std.testing.expect(!competitor.isBusy());
+    try std.testing.expectError(error.LeaseNotHeld, competing_mutation.recheck(other.id));
+    try coordinator.reserveLaunch(other.id);
+    coordinator.releaseLaunch();
+    coordinator.tick();
+
+    fixture.blocked.store(false, .release);
+    try settle(&manager);
+    const job = manager.pending.?;
+    try std.testing.expect(job.future == null and job.done.load(.acquire));
+    try expectRealPublicationLease(&coordinator, example.id);
+    fault.reset();
+    fault.require_namespace = true;
+    allocation_probe.enabled = true;
+    fault.fail_sync = 3;
+    try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
+    try fault.expectPublicationProtected();
+    try std.testing.expect(allocation_probe.calls > 0);
+    try std.testing.expectEqual(@as(usize, 0), allocation_probe.gate_unavailable);
+    try std.testing.expect(fault.writes > 0 and fault.syncs > 0 and fault.renames > 0);
+    try std.testing.expect(env.store.publicationUncertain());
+    try std.testing.expect(manager.pending.? == job and job.leased and job.namespace_token != null);
+    try expectRealPublicationLease(&coordinator, example.id);
+    const blocked = fault.counts();
+    try std.testing.expectError(error.ConfigPublicationUncertain, manager.acknowledgeReconciledCreation(&env.store));
+    try std.testing.expectEqualDeep(blocked, fault.counts());
+
+    fault.reset();
+    try env.store.reconcile();
+    try std.testing.expect(fault.opens > 0);
+    try fault.expectPublicationProtected();
+    try expectRealPublicationLease(&coordinator, example.id);
+    const reconciled = fault.counts();
+    try manager.acknowledgeReconciledCreation(&env.store);
+    try std.testing.expectEqualDeep(reconciled, fault.counts());
+    try std.testing.expect(!manager.isBusy() and job.namespace_token == null and !job.leased);
+    try coordinator.reserveLaunch(example.id);
+    coordinator.releaseLaunch();
+    coordinator.tick();
+    const token = try namespace.acquire(io);
+    token.release();
 }

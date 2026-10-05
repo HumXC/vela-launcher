@@ -684,6 +684,19 @@ fn fatFixture(wide: bool, endian: std.builtin.Endian) [136]u8 {
     return data;
 }
 
+test "LWJGL metadata sidecars remain resources while renamed binaries retain CPU checks" {
+    const metadata = "META-INF/linux/x64/org/lwjgl/freetype/libfreetype.so";
+    try architecture.validate("0a0221a1347e2f1e", metadata ++ ".git", "x86_64");
+    try architecture.validate("da3f35a8c9dbf22b\n", metadata ++ ".sha1", "x86_64");
+    try std.testing.expectError(error.InvalidNativePayload, architecture.validate("text", "lib.so.1", "x86_64"));
+    try std.testing.expectError(error.InvalidNativePayload, architecture.validate("text", "linux/x64/lib.so.sha1", "x86_64"));
+    const matching = elfFixture(62);
+    const wrong_cpu = elfFixture(183);
+    try architecture.validate(&matching, "linux/x64/libfreetype.so", "x86_64");
+    try std.testing.expectError(error.NativeArchitectureMismatch, architecture.validate(&wrong_cpu, metadata ++ ".git", "x86_64"));
+    try std.testing.expectError(error.InvalidNativePayload, architecture.validate(matching[0..20], metadata ++ ".sha1", "x86_64"));
+}
+
 test "actual ELF PE Mach-O and universal headers determine native CPU" {
     const elf_x64 = elfFixture(62);
     const elf_arm = elfFixture(183);

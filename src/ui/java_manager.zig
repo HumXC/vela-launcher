@@ -324,11 +324,15 @@ pub fn probe(a: Allocator, io: std.Io, path: []const u8, canceled: ?*const std.a
 }
 
 const Choice = struct { game: []const u8, path: []const u8 };
-const Document = struct { version: u32 = 1, runtimes: []const Runtime = &.{}, choices: []const Choice = &.{} };
+const Document = struct { version: u32 = 1, runtimes: []const Runtime = &.{}, choices: []const Choice = &.{}, hidden: []const Runtime = &.{} };
 const State = struct {
     arena: std.heap.ArenaAllocator,
     runtimes: std.ArrayList(Runtime) = .empty,
     choices: std.ArrayList(Choice) = .empty,
+    hidden: std.ArrayList(Runtime) = .empty,
+    visible: std.ArrayList(Runtime) = .empty,
+    search_visible: std.ArrayList(Runtime) = .empty,
+    forgotten: std.ArrayList([]const u8) = .empty,
     fn create(a: Allocator) !*State {
         const state = try a.create(State);
         state.* = .{ .arena = .init(a) };
@@ -348,7 +352,36 @@ const State = struct {
         for (self.runtimes.items) |r| try next.copy(r);
         const na = next.arena.allocator();
         for (self.choices.items) |c| try next.choices.append(na, .{ .game = try na.dupe(u8, c.game), .path = try na.dupe(u8, c.path) });
+        for (self.hidden.items) |r| try next.copyHidden(r);
+        for (self.forgotten.items) |path| try next.forgotten.append(na, try na.dupe(u8, path));
         return next;
+    }
+    fn copyHidden(self: *State, runtime: Runtime) !void {
+        const a = self.arena.allocator();
+        try self.hidden.append(a, .{ .path = try a.dupe(u8, runtime.path), .major = runtime.major, .vendor = try a.dupe(u8, runtime.vendor) });
+    }
+    fn hiddenIndex(self: *const State, path: []const u8) ?usize {
+        for (self.hidden.items, 0..) |r, i| if (std.mem.eql(u8, r.path, path)) return i;
+        return null;
+    }
+    fn isForgotten(self: *const State, path: []const u8) bool {
+        for (self.forgotten.items) |old| if (std.mem.eql(u8, old, path)) return true;
+        return false;
+    }
+    fn refresh(self: *State, results: []const Runtime) !void {
+        const a = self.arena.allocator();
+        self.visible = .empty;
+        self.search_visible = .empty;
+        for (self.runtimes.items) |r| if (self.hiddenIndex(r.path) == null) try self.visible.append(a, r);
+        for (results) |r| if (self.hiddenIndex(r.path) == null and !self.isForgotten(r.path)) try self.search_visible.append(a, r);
+    }
+    fn clearReferences(self: *State, path: []const u8) void {
+        var i: usize = 0;
+        while (i < self.choices.items.len) {
+            if (std.mem.eql(u8, self.choices.items[i].path, path)) {
+                _ = self.choices.orderedRemove(i);
+            } else i += 1;
+        }
     }
     fn find(self: *const State, path: []const u8) ?usize {
         for (self.runtimes.items, 0..) |r, i| if (std.mem.eql(u8, r.path, path)) return i;
@@ -470,6 +503,7 @@ pub const Manager = struct {
         errdefer state.destroy(a);
         var manager: Manager = .{ .a = a, .io = io, .file = absolute, .state = state };
         try manager.load();
+        try manager.state.refresh(&.{});
         return manager;
     }
     pub fn deinit(self: *Manager) void {
@@ -488,16 +522,90 @@ pub const Manager = struct {
         if (!job.done.load(.acquire)) return;
         if (job.thread) |thread| thread.join();
         job.thread = null;
+        var visible: std.ArrayList(Runtime) = .empty;
+        for (job.results) |runtime| {
+            if (self.isHidden(runtime.path)) continue;
+            visible.append(job.arena.allocator(), runtime) catch |err| {
+                self.active = null;
+                self.failure = err;
+                job.destroy();
+                return;
+            };
+        }
+        // Publish only after the complete filtered array exists; registry strings stay intact.
+        self.state.search_visible = visible;
+        self.state.forgotten = .empty;
         if (self.published) |old| old.destroy();
         self.active = null;
         self.published = job;
         self.failure = job.failure;
     }
-    pub fn entries(self: *const Manager) []const Runtime {
+    pub fn allEntries(self: *const Manager) []const Runtime {
         return self.state.runtimes.items;
     }
+    pub fn hiddenEntries(self: *const Manager) []const Runtime {
+        return self.state.hidden.items;
+    }
+    pub fn isHidden(self: *const Manager, path: []const u8) bool {
+        return self.state.hiddenIndex(path) != null;
+    }
+    pub fn hide(self: *Manager, path: []const u8) !void {
+        if (!validText(path, max_path)) return error.InvalidJavaPath;
+        if (self.isHidden(path)) return;
+        var runtime: ?Runtime = null;
+        if (self.state.find(path)) |index| runtime = self.state.runtimes.items[index];
+        if (runtime == null) {
+            for (self.searchResults()) |r| {
+                if (std.mem.eql(u8, path, r.path)) {
+                    runtime = r;
+                    break;
+                }
+            }
+        }
+        const r = runtime orelse return error.JavaNotRegistered;
+        if (self.state.hidden.items.len >= max_entries) return error.TooManyHiddenRuntimes;
+        const next = try self.state.clone(self.a);
+        errdefer next.destroy(self.a);
+        try next.copyHidden(r);
+        next.clearReferences(path);
+        try self.commit(next);
+    }
+    pub fn unhide(self: *Manager, path: []const u8) !void {
+        const index = self.state.hiddenIndex(path) orelse return error.JavaNotHidden;
+        const next = try self.state.clone(self.a);
+        errdefer next.destroy(self.a);
+        _ = next.hidden.orderedRemove(index);
+        var forgotten_index: usize = 0;
+        while (forgotten_index < next.forgotten.items.len) {
+            if (std.mem.eql(u8, next.forgotten.items[forgotten_index], path)) {
+                _ = next.forgotten.orderedRemove(forgotten_index);
+            } else forgotten_index += 1;
+        }
+        try self.commit(next);
+    }
+    /// Forgets a registry/search entry, never Java files. Hidden suppression is preserved.
+    pub fn forget(self: *Manager, path: []const u8) !void {
+        if (self.state.find(path) != null) return self.remove(path);
+        if (!validText(path, max_path)) return error.InvalidJavaPath;
+        var known = self.isHidden(path);
+        for (self.searchResults()) |r| {
+            if (std.mem.eql(u8, path, r.path)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return error.JavaNotRegistered;
+        const next = try self.state.clone(self.a);
+        errdefer next.destroy(self.a);
+        if (!next.isForgotten(path)) try next.forgotten.append(next.arena.allocator(), try next.arena.allocator().dupe(u8, path));
+        next.clearReferences(path);
+        try self.commit(next);
+    }
+    pub fn entries(self: *const Manager) []const Runtime {
+        return self.state.visible.items;
+    }
     pub fn searchResults(self: *const Manager) []const Runtime {
-        return if (self.published) |job| job.results else &.{};
+        return self.state.search_visible.items;
     }
     pub fn isSearching(self: *const Manager) bool {
         return self.active != null;
@@ -535,6 +643,7 @@ pub const Manager = struct {
         const next = try self.state.clone(self.a);
         errdefer next.destroy(self.a);
         for (paths) |path| {
+            if (self.isHidden(path)) return error.JavaHidden;
             var verified: ?Runtime = null;
             for (self.searchResults()) |r| {
                 if (std.mem.eql(u8, path, r.path)) {
@@ -552,6 +661,7 @@ pub const Manager = struct {
     /// Main-thread only. Copies an already-probed runtime; ownership stays with caller.
     /// The downloader validates expected major and publisher before calling this.
     pub fn addDownloaded(self: *Manager, runtime: Runtime) !void {
+        if (self.isHidden(runtime.path)) return error.JavaHidden;
         if (!validText(runtime.path, max_path) or !std.fs.path.isAbsolute(runtime.path) or
             !validText(runtime.vendor, 256) or std.ascii.eqlIgnoreCase(runtime.vendor, "Unknown") or
             runtime.major == 0 or runtime.major > 1000) return error.InvalidJavaRuntime;
@@ -573,18 +683,15 @@ pub const Manager = struct {
         const next = try self.state.clone(self.a);
         errdefer next.destroy(self.a);
         const removed = next.runtimes.orderedRemove(index);
-        var i: usize = 0;
-        while (i < next.choices.items.len) {
-            if (std.mem.eql(u8, next.choices.items[i].path, removed.path)) {
-                _ = next.choices.orderedRemove(i);
-            } else i += 1;
-        }
+        next.clearReferences(removed.path);
+        if (!next.isForgotten(removed.path)) try next.forgotten.append(next.arena.allocator(), try next.arena.allocator().dupe(u8, removed.path));
         try self.commit(next);
     }
     pub fn choose(self: *Manager, game: []const u8, path: []const u8, required: u32) !void {
         if (!validText(game, 512)) return error.InvalidGameId;
         const index = try self.lookup(path) orelse return error.JavaNotRegistered;
         const r = self.state.runtimes.items[index];
+        if (self.isHidden(path)) return error.JavaHidden;
         if (!compatible(r.major, required)) return error.IncompatibleJava;
         const next = try self.state.clone(self.a);
         errdefer next.destroy(self.a);
@@ -604,7 +711,7 @@ pub const Manager = struct {
         try self.commit(next);
     }
     pub fn selectedPath(self: *const Manager, game: []const u8) ?[]const u8 {
-        for (self.state.choices.items) |c| if (std.mem.eql(u8, c.game, game)) return c.path;
+        for (self.state.choices.items) |c| if (std.mem.eql(u8, c.game, game) and !self.isHidden(c.path)) return c.path;
         return null;
     }
     pub fn resolve(self: *const Manager, game: []const u8, required: u32) ?Runtime {
@@ -621,7 +728,8 @@ pub const Manager = struct {
         return self.state.find(path);
     }
     fn commit(self: *Manager, next: *State) !void {
-        const json = try std.json.Stringify.valueAlloc(self.a, Document{ .runtimes = next.runtimes.items, .choices = next.choices.items }, .{ .whitespace = .indent_2 });
+        try next.refresh(if (self.published) |job| job.results else &.{});
+        const json = try std.json.Stringify.valueAlloc(self.a, Document{ .runtimes = next.runtimes.items, .choices = next.choices.items, .hidden = next.hidden.items }, .{ .whitespace = .indent_2 });
         defer self.a.free(json);
         if (json.len > max_json) return error.RegistryTooLarge;
         var atomic = try Dir.cwd().createFileAtomic(self.io, self.file, .{ .make_path = true, .replace = true });
@@ -647,15 +755,21 @@ pub const Manager = struct {
         const parsed = try std.json.parseFromSlice(Document, self.a, bytes, .{ .allocate = .alloc_always, .max_value_len = max_path });
         defer parsed.deinit();
         const doc = parsed.value;
-        if (doc.version != 1 or doc.runtimes.len > max_entries or doc.choices.len > max_choices) return error.InvalidJavaRegistry;
+        if (doc.version != 1 or doc.runtimes.len > max_entries or doc.choices.len > max_choices or doc.hidden.len > max_entries) return error.InvalidJavaRegistry;
         const a = self.state.arena.allocator();
         for (doc.runtimes) |r| {
             if (!validText(r.path, max_path) or !std.fs.path.isAbsolute(r.path) or !validText(r.vendor, 256) or r.major == 0 or r.major > 1000) return error.InvalidJavaRegistry;
             if (self.state.find(r.path) == null) try self.state.copy(r);
         }
+        for (doc.hidden) |r| {
+            if (!validText(r.path, max_path) or !std.fs.path.isAbsolute(r.path) or !validText(r.vendor, 256) or r.major == 0 or r.major > 1000) return error.InvalidJavaRegistry;
+            if (self.state.hiddenIndex(r.path) != null) return error.InvalidJavaRegistry;
+            try self.state.copyHidden(r);
+        }
         for (doc.choices) |c| {
             if (!validText(c.game, 512) or !validText(c.path, max_path)) return error.InvalidJavaRegistry;
             const index = self.state.find(c.path) orelse continue;
+            if (self.isHidden(c.path)) continue;
             for (self.state.choices.items) |old| if (std.mem.eql(u8, old.game, c.game)) return error.InvalidJavaRegistry;
             try self.state.choices.append(a, .{ .game = try a.dupe(u8, c.game), .path = self.state.runtimes.items[index].path });
         }
@@ -1098,4 +1212,120 @@ test "search cancelAndJoin consumes late results without rewriting successful di
     try std.testing.expectEqual(job, manager.published.?);
     try std.testing.expectEqual(state, manager.state);
     try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
+}
+
+test "hidden metadata persists filters choices and survives forgetting until explicit restore" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const first_path = try std.fs.path.join(a, &.{ root, "first", "bin", java_name });
+    defer a.free(first_path);
+    const second_path = try std.fs.path.join(a, &.{ root, "second", "bin", java_name });
+    defer a.free(second_path);
+    const first: Runtime = .{ .path = first_path, .major = 21, .vendor = "OpenJDK" };
+    const second: Runtime = .{ .path = second_path, .major = 21, .vendor = "Zulu" };
+    var manager = try Manager.init(a, io, root);
+    defer manager.deinit();
+    try manager.addDownloaded(first);
+    try manager.addDownloaded(second);
+    try manager.choose("game", first_path, 21);
+    try manager.hide(first_path);
+    try std.testing.expect(manager.isHidden(first_path));
+    try std.testing.expectEqual(@as(usize, 2), manager.allEntries().len);
+    try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+    try std.testing.expect(manager.selectedPath("game") == null);
+    try std.testing.expectEqualStrings(second_path, manager.resolve("game", 21).?.path);
+    try std.testing.expectError(error.JavaHidden, manager.choose("game", first_path, 21));
+    try std.testing.expectError(error.JavaHidden, manager.add(&.{first_path}));
+    try std.testing.expectError(error.JavaHidden, manager.addDownloaded(first));
+    {
+        var loaded = try Manager.init(a, io, root);
+        defer loaded.deinit();
+        try std.testing.expect(loaded.isHidden(first_path));
+        try std.testing.expectEqual(@as(usize, 1), loaded.entries().len);
+        try std.testing.expect(loaded.selectedPath("game") == null);
+        try std.testing.expectEqualStrings(second_path, loaded.resolve("game", 21).?.path);
+    }
+    try manager.forget(first_path);
+    try std.testing.expect(manager.isHidden(first_path));
+    try std.testing.expectEqual(@as(usize, 1), manager.allEntries().len);
+    {
+        var loaded = try Manager.init(a, io, root);
+        defer loaded.deinit();
+        try std.testing.expect(loaded.isHidden(first_path));
+        try std.testing.expectEqual(@as(usize, 1), loaded.allEntries().len);
+    }
+    try manager.unhide(first_path);
+    try std.testing.expect(!manager.isHidden(first_path));
+    try std.testing.expectEqual(@as(usize, 0), manager.hiddenEntries().len);
+    try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+    try std.testing.expectError(error.JavaNotRegistered, manager.choose("game", first_path, 21));
+}
+
+test "scanned hidden paths stay suppressed on fresh publication without auto registration" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const path = try std.fs.path.join(a, &.{ root, "scanned", java_name });
+    defer a.free(path);
+    const runtime: Runtime = .{ .path = path, .major = 25, .vendor = "Zulu" };
+    var manager = try Manager.init(a, io, root);
+    defer manager.deinit();
+    const results = [_]Runtime{runtime};
+    const first = try std.heap.page_allocator.create(Job);
+    first.* = .{ .io = io, .path = "", .results = &results };
+    first.done.store(true, .release);
+    manager.active = first;
+    manager.tick();
+    try std.testing.expectEqual(@as(usize, 1), manager.searchResults().len);
+    try manager.hide(path);
+    try std.testing.expectEqual(@as(usize, 0), manager.searchResults().len);
+    try std.testing.expect(manager.resolve("unselected", 25) == null);
+    try manager.forget(path);
+    const next = try std.heap.page_allocator.create(Job);
+    next.* = .{ .io = io, .path = "", .results = &results };
+    next.done.store(true, .release);
+    manager.active = next;
+    manager.tick();
+    try std.testing.expectEqual(@as(usize, 0), manager.searchResults().len);
+    try std.testing.expectEqual(@as(usize, 0), manager.allEntries().len);
+    try manager.unhide(path);
+    try std.testing.expectEqual(@as(usize, 1), manager.searchResults().len);
+    try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
+    try manager.add(&.{path});
+    try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+}
+
+test "failed hidden save leaves registry choices and visible snapshots intact" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const path = try std.fs.path.join(a, &.{ root, "bin", java_name });
+    defer a.free(path);
+    var manager = try Manager.init(a, io, root);
+    defer manager.deinit();
+    try manager.addDownloaded(.{ .path = path, .major = 21, .vendor = "OpenJDK" });
+    try manager.choose("game", path, 21);
+    try tmp.dir.createDir(io, "blocked", .default_dir);
+    const original_file = manager.file;
+    manager.file = try std.fs.path.join(a, &.{ root, "blocked" });
+    defer {
+        a.free(manager.file);
+        manager.file = original_file;
+    }
+    const original_state = manager.state;
+    if (manager.hide(path)) |_| return error.ExpectedSaveFailure else |_| {}
+    try std.testing.expectEqual(original_state, manager.state);
+    try std.testing.expect(!manager.isHidden(path));
+    try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+    try std.testing.expectEqualStrings(path, manager.selectedPath("game").?);
 }

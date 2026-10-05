@@ -3,6 +3,7 @@ const dvui = @import("dvui");
 const logs = @import("../core/logs.zig");
 const game_launch = @import("game_launch.zig");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const R = dvui.Rect;
 const row_height: f32 = 24;
 const clipboard_limit = 1024 * 1024;
@@ -17,8 +18,8 @@ const Filters = struct {
     }
 };
 
-/// Initialize with .{}. draw borrows only until it returns; finish must run
-/// after the application's outer Root closes, even when this view is hidden.
+/// Initialize with .{}. Drawing borrows only until each call returns; finish must
+/// run after the application's outer Root closes, even when this view is hidden.
 pub const View = struct {
     filters: Filters = .{},
     query: [256]u8 = @splat(0),
@@ -60,7 +61,8 @@ pub const View = struct {
         self.copy_status = .none;
     }
 
-    pub fn draw(self: *View, controller: *game_launch.Controller) !void {
+    // Both entry points synchronize before using selection or search state.
+    fn synchronize(self: *View, controller: *game_launch.Controller) void {
         const snapshot = controller.snapshot();
         if (self.attempt == null or self.attempt.? != snapshot.attempt_id) {
             self.resetNavigation();
@@ -75,18 +77,65 @@ pub const View = struct {
             self.cursor = null;
             self.search_status = .none;
         };
-        const arena = dvui.currentWindow().arena();
-        const column = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
-        defer column.deinit();
-        self.header(controller);
-        const filters_changed = self.filterBar();
-        if (filters_changed) {
+    }
+
+    /// Draw inside the parent's utility menu, before draw renders the viewport.
+    pub fn drawSidebar(self: *View, controller: *game_launch.Controller) !void {
+        self.synchronize(controller);
+        const buffer = controller.logBuffer();
+        const snap = controller.snapshot();
+        // Keep controls reachable in short windows; the parent's footer stays outside.
+        const area = dvui.scrollArea(@src(), .{ .vertical_bar = .auto, .horizontal_bar = .auto }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .corners = .all(0) });
+        defer area.deinit();
+        const controls = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
+        defer controls.deinit();
+
+        components.section(@src(), "View");
+        _ = dvui.checkbox(@src(), &self.follow_tail, "Follow latest output", .{ .expand = .horizontal, .padding = R.all(6), .margin = R.all(0) });
+        if (components.sidebarItem(@src(), "jump-latest", "Jump to latest", .{ .icon = dvui.entypo.chevron_down, .enabled = buffer.lineCount() != 0 })) {
+            self.jump = null;
+            self.follow_tail = true;
+            self.scroll.velocity = .{};
+        }
+
+        if (self.filterBar()) {
             self.anchor = null;
             self.cursor = null;
             self.search_status = .none;
             self.scroll.viewport.y = 0;
         }
+
+        components.section(@src(), "Search");
         self.searchBar(buffer);
+        const message: []const u8 = switch (self.search_status) {
+            .none => "Search retained output",
+            .found => "Match selected",
+            .no_match => "No matches in enabled filters",
+            .boundary => "No more matches",
+        };
+        statusText(@src(), message, theme.muted, .{ .y = 4 }, 0);
+
+        components.section(@src(), "Output");
+        if (components.sidebarItem(@src(), "copy-line", "Copy selected line", .{ .icon = dvui.entypo.copy, .enabled = self.selected != null })) self.copySelected(buffer);
+        if (components.sidebarItem(@src(), "copy-output", "Copy retained output", .{ .icon = dvui.entypo.documents, .enabled = buffer.lineCount() != 0 })) self.copyRetained(buffer);
+        if (self.copy_status != .none) statusText(@src(), if (self.copy_status == .limited) "Copied first 1 MiB" else "Copied", theme.muted, .{ .y = 4 }, 0);
+        if (components.sidebarItem(@src(), "clear-output", "Clear retained output", .{ .icon = dvui.entypo.trash, .enabled = buffer.lineCount() != 0 })) {
+            self.pending_clear = true;
+            self.pending_attempt = snap.attempt_id;
+        }
+        if (components.sidebarItem(@src(), "stop-game", "Stop game", .{ .icon = dvui.entypo.controller_stop, .enabled = snap.phase == .preparing or snap.phase == .running })) {
+            self.pending_stop = true;
+            self.pending_attempt = snap.attempt_id;
+        }
+    }
+
+    pub fn draw(self: *View, controller: *game_launch.Controller) !void {
+        self.synchronize(controller);
+        const buffer = controller.logBuffer();
+        const arena = dvui.currentWindow().arena();
+        const column = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
+        defer column.deinit();
+        self.header(controller);
         const lines = buffer.lines();
         const storage = try arena.alloc(usize, lines.len);
         var count: usize = 0;
@@ -150,44 +199,30 @@ pub const View = struct {
     }
 
     fn header(self: *View, controller: *game_launch.Controller) void {
-        const snap = controller.snapshot();
         const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .min_size_content = .{ .h = 36 }, .padding = R.all(0), .margin = .{ .h = 4 } });
         defer row.deinit();
-        dvui.labelNoFmt(@src(), "Logs", .{ .align_y = 0.5 }, .{ .font = dvui.themeGet().font_heading, .margin = .{ .w = 12 } });
-        _ = dvui.checkbox(@src(), &self.follow_tail, "Follow", .{ .gravity_y = 0.5, .margin = .{ .w = 8 } });
-        if (tool(@src(), "Copy selected line", dvui.entypo.copy, self.selected == null)) self.copySelected(controller.logBuffer());
-        if (tool(@src(), "Copy retained output", dvui.entypo.documents, controller.logBuffer().lineCount() == 0)) self.copyRetained(controller.logBuffer());
-        if (tool(@src(), "Clear retained output", dvui.entypo.trash, controller.logBuffer().lineCount() == 0)) {
-            self.pending_clear = true;
-            self.pending_attempt = snap.attempt_id;
-        }
-        if (tool(@src(), "Stop game", dvui.entypo.controller_stop, snap.phase != .preparing and snap.phase != .running)) {
-            self.pending_stop = true;
-            self.pending_attempt = snap.attempt_id;
-        }
+        dvui.labelNoFmt(@src(), if (self.follow_tail) "Live output" else "Retained output", .{ .align_y = 0.5 }, .{ .font = dvui.themeGet().font_heading, .background = false, .margin = .{ .w = 12 } });
+        dvui.labelNoFmt(@src(), if (self.follow_tail) "Following latest" else "Scroll paused", .{ .align_y = 0.5 }, .{ .color_text = .{ .color = if (self.follow_tail) theme.accent else theme.muted }, .background = false, .padding = R.all(0), .margin = R.all(0) });
+        dvui.label(@src(), "{d} errors", .{controller.logBuffer().errorIds().len}, .{ .gravity_x = 1, .gravity_y = 0.5, .color_text = .{ .color = severityColor(.@"error") }, .background = false, .padding = R.all(0), .margin = .{ .w = 8 } });
     }
 
     fn filterBar(self: *View) bool {
         var changed = false;
-        const wrap = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
-        defer wrap.deinit();
-        const sources = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
-        {
-            defer sources.deinit();
-            inline for (.{ "stdout", "stderr" }, 0..) |name, i| changed = dvui.checkbox(@src(), &self.filters.sources[i], name, .{ .id_extra = i, .margin = .{ .w = 8 }, .padding = R.all(2) }) or changed;
+        components.section(@src(), "Sources");
+        inline for (.{ "stdout", "stderr" }, 0..) |name, i| {
+            changed = dvui.checkbox(@src(), &self.filters.sources[i], name, .{ .id_extra = i, .expand = .horizontal, .padding = R.all(6), .margin = R.all(0) }) or changed;
         }
-        const severity_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
-        {
-            defer severity_row.deinit();
-            inline for (.{ "TRC", "DBG", "INF", "WRN", "ERR", "FTL" }, 0..) |name, i| changed = dvui.checkbox(@src(), &self.filters.severities[i], name, .{ .id_extra = i, .font = dvui.Font.theme(.mono).withSize(12), .color_text = .{ .color = severityColor(@enumFromInt(i)) }, .margin = .{ .w = 6 }, .padding = R.all(2) }) or changed;
+        components.section(@src(), "Severity");
+        inline for (.{ "Trace", "Debug", "Info", "Warning", "Error", "Fatal" }, 0..) |name, i| {
+            changed = dvui.checkbox(@src(), &self.filters.severities[i], name, .{ .id_extra = i, .expand = .horizontal, .font = dvui.Font.theme(.mono).withSize(13), .color_text = .{ .color = severityColor(@enumFromInt(i)) }, .padding = R.all(6), .margin = R.all(0) }) or changed;
         }
         return changed;
     }
 
     fn searchBar(self: *View, buffer: *const logs.Buffer) void {
-        const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 4 } });
-        defer row.deinit();
-        const entry = dvui.textEntry(@src(), .{ .text = .{ .buffer = &self.query }, .placeholder = "Search" }, .{ .label = .{ .text = "Search logs" }, .expand = .horizontal, .min_size_content = .{ .h = 20 }, .padding = R.all(6), .margin = R.all(0), .corners = .all(4) });
+        const column = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
+        defer column.deinit();
+        const entry = dvui.textEntry(@src(), .{ .text = .{ .buffer = &self.query }, .placeholder = "Search logs" }, .{ .label = .{ .text = "Search logs" }, .expand = .horizontal, .min_size_content = .{ .h = 20 }, .padding = R.all(6), .margin = R.all(0), .corners = .all(4) });
         const changed = entry.text_changed;
         const empty = entry.getText().len == 0;
         entry.deinit();
@@ -196,8 +231,11 @@ pub const View = struct {
             self.search_status = .none;
             if (!empty) self.search(buffer, .forward);
         }
+        const navigation = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = 4 } });
+        defer navigation.deinit();
         if (tool(@src(), "Previous match", dvui.entypo.chevron_up, empty)) self.search(buffer, .backward);
         if (tool(@src(), "Next match", dvui.entypo.chevron_down, empty)) self.search(buffer, .forward);
+        dvui.labelNoFmt(@src(), "Previous / next match", .{ .align_y = 0.5 }, .{ .font = dvui.themeGet().font_body.withSize(12), .color_text = .{ .color = theme.muted }, .background = false, .padding = R.all(0), .margin = .{ .x = 4 } });
     }
 
     fn search(self: *View, buffer: *const logs.Buffer, direction: logs.Direction) void {
@@ -237,7 +275,7 @@ pub const View = struct {
         defer button.deinit();
         button.processEvents();
         button.drawBackground();
-        const opts: dvui.Options = .{ .font = dvui.Font.theme(.mono).withSize(13), .padding = R.all(0), .margin = R.all(0), .role = .none };
+        const opts: dvui.Options = .{ .font = dvui.Font.theme(.mono).withSize(13), .background = false, .padding = R.all(0), .margin = R.all(0), .role = .none };
         dvui.labelNoFmt(@src(), if (line.source == .stdout) "OUT" else "ERR", .{ .align_y = 0.5 }, opts.override(.{ .rect = .{ .x = 6, .y = 0, .w = 32, .h = row_height }, .color_text = .{ .color = if (line.source == .stdout) theme.muted else dvui.Color.fromHex("E2AF80") } }));
         dvui.labelNoFmt(@src(), @tagName(line.severity), .{ .align_y = 0.5 }, opts.override(.{ .rect = .{ .x = 44, .y = 0, .w = 48, .h = row_height }, .color_text = .{ .color = severityColor(line.severity) } }));
         dvui.labelNoFmt(@src(), if (line.truncated) "CUT" else if (line.invalid_utf8) "UTF" else "", .{ .align_y = 0.5 }, opts.override(.{ .rect = .{ .x = 98, .y = 0, .w = 28, .h = row_height }, .color_text = .{ .color = theme.muted } }));
@@ -264,7 +302,7 @@ pub const View = struct {
             marker.processEvents();
             marker.drawBackground();
             marker.drawFocus();
-            dvui.tooltip(@src(), .{ .active_rect = marker.data().borderRectScale().r }, "{s}", .{name}, .{});
+            components.tooltip(@src(), marker.data().id, marker.data().borderRectScale().r, name);
             if (marker.clicked()) {
                 self.selected = id;
                 self.jump = id;
@@ -305,7 +343,7 @@ pub const View = struct {
         self.copy_status = if (limited) .limited else .copied;
     }
 
-    fn status(self: *View, controller: *game_launch.Controller, visible_count: usize) !void {
+    fn status(_: *View, controller: *game_launch.Controller, visible_count: usize) !void {
         const buffer = controller.logBuffer();
         const snap = controller.snapshot();
         const health = controller.logStatus();
@@ -320,18 +358,11 @@ pub const View = struct {
             }
         }
         if (snap.exit_code) |code| dvui.label(@src(), "Exit code: {d}", .{code}, .{ .color_text = .{ .color = theme.muted }, .padding = R.all(0) });
-        const message: []const u8 = switch (self.search_status) {
-            .none, .found => "",
-            .no_match => "No matches",
-            .boundary => "No more matches",
-        };
-        if (message.len != 0) dvui.labelNoFmt(@src(), message, .{}, .{ .color_text = .{ .color = theme.muted }, .padding = R.all(0) });
-        if (self.copy_status != .none) dvui.labelNoFmt(@src(), if (self.copy_status == .limited) "Copied first 1 MiB" else "Copied", .{}, .{ .color_text = .{ .color = theme.muted }, .padding = R.all(0) });
     }
 };
 
 fn statusText(src: std.builtin.SourceLocation, text: []const u8, color: dvui.Color, margin: R, id: usize) void {
-    const layout = dvui.textLayout(src, .{}, .{ .id_extra = id, .expand = .horizontal, .max_size_content = .width(0), .font = dvui.Font.theme(.mono).withSize(12), .color_text = .{ .color = color }, .padding = R.all(0), .margin = margin });
+    const layout = dvui.textLayout(src, .{}, .{ .id_extra = id, .expand = .horizontal, .max_size_content = .width(0), .font = dvui.Font.theme(.mono).withSize(12), .color_text = .{ .color = color }, .background = false, .padding = R.all(0), .margin = margin });
     layout.addText(text, .{});
     layout.deinit();
 }
@@ -344,7 +375,7 @@ fn tool(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8, di
     button.drawBackground();
     dvui.icon(@src(), name, asset, .{}, button.style().override(.{ .min_size_content = .{ .w = 18, .h = 18 }, .padding = R.all(0), .margin = R.all(0), .gravity_x = 0.5, .gravity_y = 0.5, .role = .none }));
     if (!disabled) button.drawFocus();
-    dvui.tooltip(@src(), .{ .active_rect = button.data().borderRectScale().r }, "{s}", .{name}, .{});
+    components.tooltip(src, button.data().id, button.data().borderRectScale().r, name);
     return !disabled and button.clicked();
 }
 

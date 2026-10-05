@@ -1399,8 +1399,13 @@ test "guarded launch blocks pending and malformed journals before probing but ac
     const txn_id = "txn-" ++ "1" ** 32;
     const txn_path = "versions/fixture/.vela-content/" ++ txn_id;
     _ = try minecraft.createDirPathStatus(io, txn_path, .fromMode(0o700));
-    const txn = try minecraft.openDir(io, txn_path, .{});
+    const txn = try minecraft.openDir(io, txn_path, .{ .iterate = true });
     defer txn.close(io);
+    const manifest = @import("../core/content_manifest.zig");
+    const manifest_after = try manifest.serialize(a, .{ .instance_id = "instance", .pack_version = "fixture" });
+    defer a.free(manifest_after);
+    try fs.write(txn, io, "manifest-after", manifest_after);
+    const manifest_fingerprint = (try fs.fingerprint(txn, io, "manifest-after", null, null)).?;
     const journal = try std.json.Stringify.valueAlloc(a, .{
         .schema_version = @as(u32, 1),
         .instance_id = "instance",
@@ -1410,7 +1415,7 @@ test "guarded launch blocks pending and malformed journals before probing but ac
         .kept_local = @as(usize, 0),
         .entries = @as([]const struct {}, &.{}),
         .manifest_before = @as(?fs.Fingerprint, null),
-        .manifest_after = fs.Fingerprint{ .size = 0, .sha1 = .{'0'} ** 40, .sha256 = .{'0'} ** 64, .sha512 = .{'0'} ** 128 },
+        .manifest_after = manifest_fingerprint,
         .manifest_temp = ".content-" ++ txn_id ++ ".next",
     }, .{});
     defer a.free(journal);

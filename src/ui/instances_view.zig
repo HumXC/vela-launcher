@@ -3,19 +3,28 @@ const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("../core/config.zig");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const manager_module = @import("instances_manager.zig");
 const library = @import("game_library.zig");
+const java_module = @import("java_manager.zig");
 const Allocator = std.mem.Allocator;
 const R = dvui.Rect;
 
 pub const Mode = enum { none, create, import_folder, options, rename, delete_confirm };
-pub const Action = enum { create, import_folder, edit, ask_rename, ask_delete, select, submit, confirm, close, cancel, retry_publication, choose_base, choose_loader_kind, choose_loader, load_loaders };
+pub const CreateStep = enum { version, loader };
+pub const VersionFilter = enum { release, snapshot };
+pub const Action = enum { create, import_folder, import_pack, edit, ask_rename, ask_delete, select, submit, confirm, close, cancel, retry_publication, choose_base, choose_loader_kind, choose_loader, load_loaders, next_step, previous_step, save_navigation, discard_navigation, cancel_navigation, leave };
 const Pending = struct { action: Action, text: ?[]u8 = null, kind: config.Loader = .vanilla };
 
 pub const Draft = struct {
     id: ?[]u8 = null,
     name: [201]u8 = @splat(0),
     original_name: [201]u8 = @splat(0),
+    original_java_path: [4097]u8 = @splat(0),
+    original_memory: ?u32 = null,
+    original_debug: bool = false,
+    installed: bool = false,
+    /// Launch-options persistence; the editor chooses a registered runtime.
     java_path: [4097]u8 = @splat(0),
     memory: [11]u8 = @splat(0),
     debug_launch: bool = false,
@@ -47,6 +56,10 @@ pub const Draft = struct {
         if (instance.java_path) |s| try setText(&draft.java_path, s);
         if (instance.max_memory_mb) |m| _ = try std.fmt.bufPrint(draft.memory[0 .. draft.memory.len - 1], "{d}", .{m});
         draft.debug_launch = instance.debug_launch;
+        draft.installed = true;
+        if (instance.java_path) |s| try setText(&draft.original_java_path, s);
+        draft.original_memory = instance.max_memory_mb;
+        draft.original_debug = instance.debug_launch;
         if (instance.origin) |o| {
             const project = try a.dupe(u8, o.project_id);
             errdefer a.free(project);
@@ -67,14 +80,30 @@ pub const Draft = struct {
     pub fn value(self: *const Draft, mode: Mode, doc: *const config.Document) !config.Instance {
         const name = text(&self.name);
         try validateName(doc, name, if (mode == .options or mode == .rename) self.id else null);
+        // Import accepts a directory name; the backend derives its version and loader.
+        // Launch options are configured only after publication in Installed.
+        if (mode == .import_folder) return .{ .id = self.id orelse return error.InvalidId, .name = name, .minecraft_version = "" };
         const java = text(&self.java_path);
         if (!validText(java, true)) return error.InvalidJavaPath;
         const memory = try parseMemory(text(&self.memory));
-        const base = self.base orelse if (mode == .import_folder) "" else return error.MinecraftVersionRequired;
-        if (mode != .import_folder and !validText(base, false)) return error.InvalidMinecraftVersion;
-        if (mode != .import_folder and self.loader != .vanilla and self.loader_version == null) return error.LoaderVersionRequired;
+        const base = self.base orelse return error.MinecraftVersionRequired;
+        if (!validText(base, false)) return error.InvalidMinecraftVersion;
+        if (self.loader != .vanilla and self.loader_version == null) return error.LoaderVersionRequired;
         if (self.loader_version) |version| if (!validText(version, false)) return error.InvalidLoaderVersion;
         return .{ .id = self.id orelse return error.InvalidId, .name = name, .minecraft_version = base, .loader = self.loader, .loader_version = self.loader_version, .java_path = if (java.len == 0) null else java, .max_memory_mb = memory, .debug_launch = self.debug_launch, .origin = self.origin };
+    }
+    pub fn original(self: *const Draft) !config.Instance {
+        if (!self.installed) return error.InvalidAction;
+        const java = text(&self.original_java_path);
+        return .{ .id = self.id orelse return error.InvalidId, .name = text(&self.original_name), .minecraft_version = self.base orelse return error.MinecraftVersionRequired, .loader = self.loader, .loader_version = self.loader_version, .java_path = if (java.len == 0) null else java, .max_memory_mb = self.original_memory, .debug_launch = self.original_debug, .origin = self.origin };
+    }
+
+    pub fn dirty(self: *const Draft) bool {
+        if (!self.installed) return false;
+        const memory = parseMemory(text(&self.memory)) catch return true;
+        return !std.mem.eql(u8, text(&self.name), text(&self.original_name)) or
+            !std.mem.eql(u8, text(&self.java_path), text(&self.original_java_path)) or
+            memory != self.original_memory or self.debug_launch != self.original_debug;
     }
 };
 
@@ -84,10 +113,23 @@ pub const Ui = struct {
     mode: Mode = .none,
     rename_confirmed: bool = false,
     pending: ?Pending = null,
+    navigation: ?Pending = null,
+    navigation_prompt: bool = false,
+    saving_navigation: bool = false,
+    form_focus: ?u64 = null,
+    form_subwindow: ?u64 = null,
+    restore_form_focus: bool = false,
+    /// Incremented only after an admitted navigation executes; modal clicks do not count.
+    navigation_serial: u64 = 0,
+    exit_requested: bool = false,
     failure: ?anyerror = null,
     publication_failed: bool = false,
     submitted: bool = false,
     pack_requested: bool = false,
+    catalogue_requested: bool = false,
+    create_step: CreateStep = .version,
+    version_filter: VersionFilter = .release,
+    search: [64]u8 = @splat(0),
 
     pub fn init(a: Allocator) Ui {
         return .{ .allocator = a };
@@ -96,6 +138,7 @@ pub const Ui = struct {
         self.draft.deinit(self.allocator);
         if (self.pending) |p| if (p.text) |s| self.allocator.free(s);
         self.pending = null;
+        self.clearNavigation();
     }
     pub fn queue(self: *Ui, action: Action, borrowed: ?[]const u8) void {
         const owned = if (borrowed) |s| self.allocator.dupe(u8, s) catch |err| {
@@ -105,11 +148,25 @@ pub const Ui = struct {
         if (self.pending) |p| if (p.text) |s| self.allocator.free(s);
         self.pending = .{ .action = action, .text = owned };
     }
+    pub fn blocksPackWorkflow(self: *const Ui) bool {
+        return (self.mode != .none and self.mode != .options) or self.pending != null or
+            self.navigation != null or self.submitted;
+    }
+    fn clearNavigation(self: *Ui) void {
+        if (self.navigation) |p| if (p.text) |s| self.allocator.free(s);
+        self.navigation = null;
+        self.navigation_prompt = false;
+        self.saving_navigation = false;
+    }
     fn reset(self: *Ui) void {
         self.draft.deinit(self.allocator);
         self.mode = .none;
         self.rename_confirmed = false;
         self.submitted = false;
+        self.create_step = .version;
+        self.catalogue_requested = false;
+        self.version_filter = .release;
+        self.search = @splat(0);
     }
 };
 
@@ -151,7 +208,88 @@ fn replaceOwned(a: Allocator, target: *?[]u8, borrowed: []const u8) !void {
     target.* = owned;
 }
 
+fn isNavigation(action: Action) bool {
+    return switch (action) {
+        .select, .create, .import_folder, .import_pack, .edit, .ask_rename, .leave => true,
+        else => false,
+    };
+}
+
+fn syncSelected(ui: *Ui, store: *config.Store) !void {
+    if (ui.submitted or ui.navigation != null or ui.pack_requested or ui.exit_requested) return;
+    const instance = selectedInstance(store.snapshot()) orelse return;
+    if (ui.mode == .options) {
+        if (ui.draft.dirty()) return;
+        if (ui.draft.id) |id| if (std.mem.eql(u8, id, instance.id)) return;
+    } else if (ui.mode != .none) return;
+    const draft = try Draft.fromInstance(ui.allocator, instance);
+    ui.reset();
+    ui.draft = draft;
+    ui.mode = .options;
+}
+
+fn saveInstalled(ui: *Ui, store: *config.Store, manager: anytype) !void {
+    if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
+    if (store.publicationUncertain()) return error.ConfigPublicationUncertain;
+    const original = try ui.draft.original();
+    if (!manager_module.sameInstance(original, try find(store.snapshot(), original.id))) return error.InstanceChanged;
+    const updated = try ui.draft.value(.options, store.snapshot());
+    if (!std.mem.eql(u8, original.name, updated.name)) {
+        if (comptime @hasDecl(@TypeOf(manager.*), "startRenameWithOptions")) {
+            try manager.startRenameWithOptions(original, updated);
+        } else {
+            // Keep the old fixture seam for name-only renames, never partially save options.
+            var name_only = updated;
+            name_only.name = original.name;
+            if (!manager_module.sameInstance(original, name_only)) return error.CombinedRenameUnavailable;
+            try manager.startRename(original, updated.name);
+        }
+        ui.submitted = true;
+        ui.publication_failed = false;
+        return;
+    }
+    var refreshed = try Draft.fromInstance(ui.allocator, updated);
+    errdefer refreshed.deinit(ui.allocator);
+    if (comptime @hasDecl(@TypeOf(manager.*), "saveOptionsChecked")) {
+        try manager.saveOptionsChecked(store, original, updated);
+    } else try manager.saveOptions(store, updated);
+    ui.reset();
+    ui.draft = refreshed;
+    ui.mode = .options;
+}
+
+fn resumeNavigation(ui: *Ui, store: *config.Store, manager: anytype) anyerror!void {
+    const destination = ui.navigation orelse return;
+    ui.navigation_prompt = false;
+    ui.saving_navigation = false;
+    // A completed save or explicit discard authorizes this destination only.
+    try performDirect(ui, store, manager, destination);
+    ui.navigation_serial +%= 1;
+    ui.clearNavigation();
+}
+
 fn perform(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !void {
+    if (isNavigation(p.action)) {
+        if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
+        if (ui.navigation != null) return error.NavigationPending;
+        const same_row = (p.action == .select or p.action == .edit) and ui.mode == .options and
+            if (p.text) |id| if (ui.draft.id) |current| std.mem.eql(u8, id, current) else false else false;
+        if (same_row) {
+            ui.navigation_serial +%= 1;
+            return;
+        }
+        if (ui.draft.installed and ui.draft.dirty()) {
+            const owned = if (p.text) |s| try ui.allocator.dupe(u8, s) else null;
+            ui.navigation = .{ .action = p.action, .text = owned, .kind = p.kind };
+            ui.navigation_prompt = true;
+            return;
+        }
+    }
+    try performDirect(ui, store, manager, p);
+    if (isNavigation(p.action)) ui.navigation_serial +%= 1;
+}
+
+fn performDirect(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !void {
     const doc = store.snapshot();
     switch (p.action) {
         .create, .import_folder => {
@@ -162,9 +300,21 @@ fn perform(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !void {
             ui.reset();
             ui.draft = draft;
             ui.mode = if (p.action == .create) .create else .import_folder;
+            ui.catalogue_requested = p.action == .create;
+        },
+        .import_pack => {
+            if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
+            ui.reset();
+            ui.pack_requested = true;
         },
         .edit, .ask_rename, .ask_delete => {
             if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
+            if (p.action == .ask_delete and ui.mode == .options) {
+                if (ui.draft.id) |id| if (std.mem.eql(u8, id, p.text orelse return error.InvalidId)) {
+                    ui.mode = .delete_confirm;
+                    return;
+                };
+            }
             const draft = try Draft.fromInstance(ui.allocator, try find(doc, p.text orelse return error.InvalidId));
             ui.reset();
             ui.draft = draft;
@@ -174,10 +324,41 @@ fn perform(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !void {
                 else => .delete_confirm,
             };
         },
-        .select => try manager.select(store, p.text orelse return error.InvalidId),
+        .select => {
+            if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
+            var draft = try Draft.fromInstance(ui.allocator, try find(doc, p.text orelse return error.InvalidId));
+            errdefer draft.deinit(ui.allocator);
+            try manager.select(store, draft.id.?);
+            ui.reset();
+            ui.draft = draft;
+            ui.mode = .options;
+        },
+        .save_navigation => {
+            if (ui.navigation == null) return error.NoPendingNavigation;
+            try saveInstalled(ui, store, manager);
+            if (ui.submitted) {
+                ui.saving_navigation = true;
+                ui.navigation_prompt = false;
+            } else try resumeNavigation(ui, store, manager);
+        },
+        .discard_navigation => {
+            if (ui.navigation == null) return error.NoPendingNavigation;
+            if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
+            try resumeNavigation(ui, store, manager);
+        },
+        .cancel_navigation => {
+            ui.clearNavigation();
+            ui.restore_form_focus = true;
+        },
+        .leave => {
+            ui.reset();
+            ui.exit_requested = true;
+        },
         .close => {
             if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
-            ui.reset();
+            if (ui.mode == .delete_confirm) {
+                ui.mode = .options;
+            } else ui.reset();
         },
         .cancel => manager.cancel(),
         .retry_publication => {
@@ -186,11 +367,23 @@ fn perform(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !void {
             try manager.publish(store);
             ui.publication_failed = false;
             if (ui.submitted) ui.reset();
+            if (ui.navigation != null) try resumeNavigation(ui, store, manager);
+        },
+        .next_step => {
+            if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
+            try advanceCreateStep(ui);
+        },
+        .previous_step => {
+            if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
+            if (ui.mode != .create) return error.InvalidAction;
+            ui.create_step = .version;
         },
         .choose_base => {
+            const default_name = text(&ui.draft.name).len == 0 or if (ui.draft.base) |base| std.mem.eql(u8, text(&ui.draft.name), base) else false;
             try replaceOwned(ui.allocator, &ui.draft.base, p.text orelse return error.MinecraftVersionRequired);
             if (ui.draft.loader_version) |old| ui.allocator.free(old);
             ui.draft.loader_version = null;
+            if (default_name) try setText(&ui.draft.name, ui.draft.base.?);
         },
         .choose_loader_kind => {
             ui.draft.loader = p.kind;
@@ -201,6 +394,7 @@ fn perform(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !void {
         .load_loaders => try manager.loadLoaders(ui.draft.base orelse return error.MinecraftVersionRequired, ui.draft.loader),
         .submit => {
             if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
+            if (ui.mode == .create and ui.create_step != .loader) return error.WizardStepRequired;
             if (ui.mode == .rename) {
                 try validateName(doc, text(&ui.draft.name), ui.draft.id);
                 ui.rename_confirmed = true;
@@ -215,8 +409,7 @@ fn perform(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !void {
                 },
                 .import_folder => try manager.startImport(instance),
                 .options => {
-                    try manager.saveOptions(store, instance);
-                    ui.reset();
+                    try saveInstalled(ui, store, manager);
                     return;
                 },
                 else => return error.InvalidAction,
@@ -227,7 +420,7 @@ fn perform(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !void {
         .confirm => {
             if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
             const original = try find(doc, ui.draft.id orelse return error.InvalidId);
-            if (!std.mem.eql(u8, original.name, text(&ui.draft.original_name))) return error.InstanceChanged;
+            if (!manager_module.sameInstance(original, try ui.draft.original())) return error.InstanceChanged;
             switch (ui.mode) {
                 .rename => {
                     if (!ui.rename_confirmed) return error.ConfirmationRequired;
@@ -250,11 +443,21 @@ pub fn finishWithManager(ui: *Ui, store: *config.Store, manager: anytype) void {
         defer if (p.text) |s| ui.allocator.free(s);
         perform(ui, store, manager, p) catch |err| {
             ui.failure = err;
+            if (ui.navigation != null and !ui.submitted) ui.navigation_prompt = true;
             return;
         };
         ui.failure = null;
     }
-    if (manager.snapshot().phase == .awaiting_publication and !ui.publication_failed) {
+    const snapshot = manager.snapshot();
+    if (ui.submitted and (snapshot.phase == .failed or snapshot.phase == .canceled)) {
+        ui.submitted = false;
+        if (comptime @hasField(@TypeOf(snapshot), "failure")) ui.failure = snapshot.failure;
+        if (ui.navigation != null) {
+            ui.saving_navigation = false;
+            ui.navigation_prompt = true;
+        }
+    }
+    if (snapshot.phase == .awaiting_publication and !ui.publication_failed) {
         manager.publish(store) catch |err| {
             ui.publication_failed = true;
             ui.failure = err;
@@ -262,7 +465,15 @@ pub fn finishWithManager(ui: *Ui, store: *config.Store, manager: anytype) void {
         };
         ui.failure = null;
         if (ui.submitted) ui.reset();
+        if (ui.navigation != null) resumeNavigation(ui, store, manager) catch |err| {
+            ui.failure = err;
+            ui.navigation_prompt = true;
+            return;
+        };
     }
+    syncSelected(ui, store) catch |err| {
+        ui.failure = err;
+    };
 }
 pub fn finish(ui: *Ui, store: *config.Store, manager: *manager_module.Manager) void {
     finishWithManager(ui, store, manager);
@@ -272,9 +483,7 @@ fn fmt(comptime format: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), format, args) catch "";
 }
 fn wrapped(src: std.builtin.SourceLocation, value: []const u8, color: dvui.Color) void {
-    const layout = dvui.textLayout(src, .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = 6 }, .color_text = .{ .color = color } });
-    layout.addText(value, .{});
-    layout.deinit();
+    components.text(src, value, color);
 }
 fn iconButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8) bool {
     return iconButtonWithEnabled(src, name, asset, true);
@@ -288,10 +497,10 @@ fn iconButtonWithEnabled(src: std.builtin.SourceLocation, name: []const u8, asse
     dvui.icon(@src(), name, asset, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0), .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .role = .none }));
     if (enabled) button.drawFocus();
     const clicked = enabled and button.clicked();
-    const hovered = button.hovered();
-    const rect = button.data().rectScale().r;
+    const control_id = button.data().id;
+    const rect = button.data().borderRectScale().r;
     button.deinit();
-    if (hovered) dvui.tooltip(src, .{ .active_rect = rect }, "{s}", .{name}, .{ .id_extra = 1 });
+    components.tooltip(src, control_id, rect, name);
     return clicked;
 }
 fn entry(src: std.builtin.SourceLocation, name: []const u8, buffer: []u8, numeric: bool) void {
@@ -317,10 +526,183 @@ fn dropdown(src: std.builtin.SourceLocation, labels: []const []const u8, selecte
     return null;
 }
 
-fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Manager, catalogue: library.Snapshot, enabled: bool) void {
+fn advanceCreateStep(ui: *Ui) !void {
+    if (ui.mode != .create or ui.create_step != .version) return error.InvalidAction;
+    const base = ui.draft.base orelse return error.MinecraftVersionRequired;
+    if (!validText(base, false)) return error.InvalidMinecraftVersion;
+    ui.create_step = .loader;
+}
+
+fn wizardButton(src: std.builtin.SourceLocation, label: []const u8, enabled: bool, primary: bool, right: bool) bool {
+    var button: dvui.ButtonWidget = undefined;
+    button.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, .{ .label = .{ .text = label }, .gravity_x = if (right) 1 else 0, .padding = R.all(12), .margin = .{ .w = 8 }, .corners = .all(8), .style = if (primary) .highlight else .control, .tab_index = if (enabled) null else 0 });
+    defer button.deinit();
+    if (enabled) button.processEvents();
+    button.drawBackground();
+    dvui.labelNoFmt(@src(), label, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0) }));
+    if (enabled) button.drawFocus();
+    return enabled and button.clicked();
+}
+
+fn catalogueMatches(kind: []const u8, filter: VersionFilter) bool {
+    return std.mem.eql(u8, kind, if (filter == .release) "release" else "snapshot");
+}
+
+fn drawAcquisition(ui: *Ui, doc: *const config.Document, manager: *manager_module.Manager, catalogue: library.Snapshot, registered_java: []const java_module.Runtime, enabled: bool) void {
+    const locked = !enabled or manager.isBusy() or manager.snapshot().phase == .awaiting_publication or ui.pending != null;
+    wrapped(@src(), if (ui.create_step == .version) "1 / 2 · 选择 Minecraft 版本" else "2 / 2 · 加载器与安装选项", theme.muted);
+    // Reserve the action strip before either scrolling step consumes the remainder.
+    {
+        const ready = !locked and ui.draft.base != null and (ui.create_step == .version or (text(&ui.draft.name).len != 0 and (ui.draft.loader == .vanilla or ui.draft.loader_version != null)));
+        switch (components.formActions(@src(), .{ .save_enabled = ready, .cancel_enabled = !locked, .save_label = if (ui.create_step == .version) "下一步" else "保存" })) {
+            .save => ui.queue(if (ui.create_step == .version) .next_step else .submit, null),
+            .cancel => ui.queue(.close, null),
+            .none => {},
+        }
+    }
+    if (ui.create_step == .loader and components.action(@src(), "上一步", !locked)) ui.queue(.previous_step, null);
+    if (ui.create_step == .loader) {
+        const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .background = false });
+        defer scroll.deinit();
+        drawEditor(ui, doc, manager, registered_java, enabled);
+        return;
+    }
+    {
+        const filters = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = 12, .h = 12 } });
+        defer filters.deinit();
+        if (wizardButton(@src(), "正式版", !locked, ui.version_filter == .release, false)) ui.version_filter = .release;
+        if (wizardButton(@src(), "快照", !locked, ui.version_filter == .snapshot, false)) ui.version_filter = .snapshot;
+        if (iconButtonWithEnabled(@src(), "刷新版本列表", dvui.entypo.cw, !locked and catalogue.phase != .loading)) ui.catalogue_requested = true;
+    }
+    const search = dvui.textEntry(@src(), .{ .text = .{ .buffer = &ui.search }, .placeholder = "搜索版本" }, .{ .expand = .horizontal, .label = .{ .text = "搜索版本" }, .margin = .{ .h = 12 } });
+    search.deinit();
+    if (catalogue.phase == .loading) wrapped(@src(), "正在获取官方版本列表…", theme.muted);
+    if (catalogue.failure) |err| wrapped(@src(), fmt("版本列表：{s}", .{@errorName(err)}), theme.muted);
+    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .background = false });
+    defer scroll.deinit();
+    var count: usize = 0;
+    for (catalogue.available, 0..) |version, index| {
+        if (!catalogueMatches(version.kind, ui.version_filter) or std.mem.indexOf(u8, version.id, text(&ui.search)) == null) continue;
+        count += 1;
+        const selected = if (ui.draft.base) |base| std.mem.eql(u8, base, version.id) else false;
+        const row = dvui.box(@src(), .{}, .{ .id_extra = index, .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 6 } });
+        defer row.deinit();
+        if (wizardButton(@src(), version.id, !locked, selected, false)) ui.queue(.choose_base, version.id);
+        if (selected) wrapped(@src(), "已选择", theme.accent);
+    }
+    if (count == 0 and catalogue.phase != .loading) wrapped(@src(), if (catalogue.available.len == 0) "暂无版本，请刷新列表" else "没有匹配的版本", theme.muted);
+}
+
+fn javaChoice(path: []const u8, registered_java: []const java_module.Runtime) ?usize {
+    if (path.len == 0) return 0;
+    for (registered_java, 0..) |runtime, index| if (std.mem.eql(u8, path, runtime.path)) return index + 1;
+    return null;
+}
+
+fn chooseJava(draft: *Draft, registered_java: []const java_module.Runtime, choice: usize) !void {
+    if (choice == 0) return setText(&draft.java_path, "");
+    if (choice > registered_java.len) return error.JavaNotRegistered;
+    const path = registered_java[choice - 1].path;
+    if (!validText(path, false)) return error.InvalidJavaPath;
+    // Registry commits replace its arena; only draft-owned bytes outlive this frame.
+    try setText(&draft.java_path, path);
+}
+
+fn javaPicker(ui: *Ui, src: std.builtin.SourceLocation, registered_java: []const java_module.Runtime, enabled: bool) void {
+    components.section(src, "Java 运行时");
+    const choice = javaChoice(text(&ui.draft.java_path), registered_java);
+    const label = if (choice) |index| if (index == 0) "使用默认 Java" else fmt("Java {d} · {s}", .{ registered_java[index - 1].major, registered_java[index - 1].vendor }) else "保留现有 Java 绑定";
+    if (choice == null) wrapped(@src(), if (std.mem.eql(u8, text(&ui.draft.java_path), text(&ui.draft.original_java_path))) "已保存的 Java 不在已登记列表中（可能已隐藏或移除）。保留现有绑定，或选择已登记的运行时。" else "所选 Java 已不在已登记列表中（可能已隐藏或移除）。保留当前选择，或重新选择运行时。", theme.muted);
+    if (registered_java.len == 0) wrapped(@src(), "暂无已登记的 Java，请先在 Java 管理中添加。", theme.muted);
+    if (!enabled) {
+        wrapped(@src(), label, theme.muted);
+        return;
+    }
+    var picker: dvui.DropdownWidget = undefined;
+    picker.init(src, .{ .selected_index = choice, .label = if (choice != null) label else null, .placeholder = "保留现有 Java 绑定" }, .{ .id_extra = 1, .label = .{ .text = "Java 运行时" }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(8), .corners = .all(4), .margin = .{ .h = 8 } });
+    defer picker.deinit();
+    if (dvui.focusedWidgetId() == picker.menuItem.data().id) {
+        ui.form_focus = @intFromEnum(picker.menuItem.data().id);
+        ui.form_subwindow = @intFromEnum(dvui.focusedSubwindowId());
+    }
+    if (picker.dropped()) {
+        if (picker.addChoiceLabel("使用默认 Java")) chooseJava(&ui.draft, registered_java, 0) catch |err| {
+            ui.failure = err;
+        };
+        for (registered_java, 0..) |runtime, index| {
+            if (picker.addChoiceLabel(fmt("Java {d} · {s}", .{ runtime.major, runtime.vendor }))) chooseJava(&ui.draft, registered_java, index + 1) catch |err| {
+                ui.failure = err;
+            };
+        }
+    }
+}
+
+fn installedEntry(ui: *Ui, src: std.builtin.SourceLocation, name: []const u8, buffer: []u8, numeric: bool, enabled: bool) void {
+    components.section(src, name);
+    var input: dvui.TextEntryWidget = undefined;
+    input.init(src, .{ .text = .{ .buffer = buffer } }, .{ .id_extra = 1, .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .w = 0, .h = (dvui.Options{}).fontGet().textHeight() }, .padding = R.all(8), .margin = .{ .h = 8 }, .tab_index = if (enabled) null else 0 });
+    defer input.deinit();
+    if (enabled) input.processEvents();
+    if (numeric and enabled) input.filterIn("0123456789");
+    input.draw();
+    if (enabled and dvui.focusedWidgetId() == input.data().id) {
+        ui.form_focus = @intFromEnum(input.data().id);
+        ui.form_subwindow = @intFromEnum(dvui.focusedSubwindowId());
+    }
+}
+
+fn debugSwitch(src: std.builtin.SourceLocation, value: *bool, enabled: bool) void {
+    const row = dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = 8, .h = 12 } });
+    defer row.deinit();
+    dvui.labelNoFmt(@src(), "调试启动", .{}, .{ .gravity_y = 0.5, .padding = R.all(0) });
+    var button: dvui.ButtonWidget = undefined;
+    button.init(@src(), .{ .grayed = !enabled, .draw_focus = enabled }, .{ .label = .{ .text = "调试启动" }, .role = .ak_switch, .gravity_x = 1, .min_size_content = .{ .w = 42, .h = 24 }, .max_size_content = .{ .w = 42, .h = 24 }, .padding = R.all(0), .corners = .all(12), .border = R.all(0), .color_fill = .{ .color = if (value.*) theme.accent else theme.muted }, .tab_index = if (enabled) null else 0 });
+    defer button.deinit();
+    if (enabled) button.processEvents();
+    if (enabled and button.clicked()) value.* = !value.*;
+    button.drawBackground();
+    const knob = dvui.box(@src(), .{}, .{ .rect = .{ .x = if (value.*) 21 else 3, .y = 3, .w = 18, .h = 18 }, .padding = R.all(0), .background = true, .border = R.all(0), .corners = .all(9), .color_fill = .{ .color = .white } });
+    knob.deinit();
+    if (enabled) button.drawFocus();
+}
+
+/// Draw after page roots close; transitions remain deferred to finish.
+pub fn drawModal(ui: *Ui, enabled: bool) void {
+    if (ui.restore_form_focus) {
+        ui.restore_form_focus = false;
+        if (ui.form_subwindow) |id| dvui.focusSubwindow(@enumFromInt(id), null);
+        if (ui.form_focus) |id| dvui.focusWidget(@enumFromInt(id), if (ui.form_subwindow) |s| @enumFromInt(s) else null, null);
+    }
+    if (!ui.navigation_prompt) return;
+    const dialog = dvui.floatingWindow(@src(), .{ .modal = true }, .{ .min_size_content = .{ .w = 360 }, .max_size_content = .width(460), .padding = R.all(18), .background = true, .color_fill = .{ .color = theme.surface }, .corners = .all(6) });
+    defer dialog.deinit();
+    dvui.labelNoFmt(@src(), "保存实例更改？", .{}, .{ .padding = R.all(0), .margin = .{ .h = 12 } });
+    wrapped(@src(), "当前实例有未保存的更改。保存后继续，或放弃更改。", theme.muted);
+    if (ui.failure) |err| wrapped(@src(), fmt("保存未完成：{s}", .{@errorName(err)}), theme.accent);
+    const actions = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = 16 } });
+    defer actions.deinit();
+    const allowed = enabled and ui.pending == null and !ui.submitted;
+    if (components.action(@src(), "保存并继续", allowed)) ui.queue(.save_navigation, null);
+    if (components.action(@src(), "放弃更改", allowed)) ui.queue(.discard_navigation, null);
+    if (components.action(@src(), "取消", allowed)) ui.queue(.cancel_navigation, null);
+}
+
+fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Manager, registered_java: []const java_module.Runtime, enabled: bool) void {
     const section = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = .{ .y = 12 }, .border = .{ .y = 1 }, .margin = .{ .h = 12 } });
     defer section.deinit();
-    const locked = !enabled or manager.isBusy() or manager.snapshot().phase == .awaiting_publication;
+    const locked = !enabled or ui.submitted or ui.navigation != null or manager.isBusy() or manager.snapshot().phase == .awaiting_publication;
+    if (ui.mode == .options or ui.mode == .delete_confirm) {
+        const editable = !locked and ui.mode == .options;
+        installedEntry(ui, @src(), "实例名称", &ui.draft.name, false, editable);
+        components.section(@src(), "启动选项");
+        javaPicker(ui, @src(), registered_java, editable);
+        installedEntry(ui, @src(), "内存上限（MiB）", &ui.draft.memory, true, editable);
+        debugSwitch(@src(), &ui.draft.debug_launch, editable);
+        if (ui.mode == .options) {
+            if (components.action(@src(), "移至恢复区", editable)) ui.queue(.ask_delete, ui.draft.id);
+            return;
+        }
+    }
     if (ui.mode == .delete_confirm) {
         wrapped(@src(), fmt("将实例「{s}」的独立目录移至恢复区？", .{text(&ui.draft.original_name)}), theme.accent);
         var count: usize = 0;
@@ -362,16 +744,12 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Man
         else => "实例",
     }, .{}, .{ .padding = R.all(0) });
     if (ui.mode != .options) entry(@src(), if (ui.mode == .import_folder) "目录名称" else "实例名称", &ui.draft.name, false);
-    if (ui.mode == .import_folder) wrapped(@src(), fmt(".minecraft/versions/{s}", .{text(&ui.draft.name)}), theme.muted);
+    if (ui.mode == .import_folder) {
+        wrapped(@src(), fmt(".minecraft/versions/{s}", .{text(&ui.draft.name)}), theme.muted);
+        return;
+    }
     if (ui.mode == .create) {
-        dvui.labelNoFmt(@src(), "Minecraft 版本", .{}, .{ .padding = R.all(0), .margin = .{ .y = 8, .h = 4 } });
-        const labels = dvui.currentWindow().arena().alloc([]const u8, catalogue.available.len) catch {
-            ui.failure = error.OutOfMemory;
-            return;
-        };
-        for (catalogue.available, 0..) |version, index| labels[index] = version.id;
-        if (dropdown(@src(), labels, ui.draft.base, "暂无 Minecraft 目录")) |index| ui.queue(.choose_base, labels[index]);
-        if (catalogue.failure) |err| wrapped(@src(), fmt("Minecraft 目录：{s}", .{@errorName(err)}), theme.muted);
+        wrapped(@src(), fmt("Minecraft {s}", .{ui.draft.base orelse ""}), theme.muted);
         dvui.labelNoFmt(@src(), "加载器", .{}, .{ .padding = R.all(0), .margin = .{ .y = 8, .h = 4 } });
         const kinds = [_]config.Loader{ .vanilla, .fabric, .forge, .neoforge, .quilt };
         const names = [_][]const u8{ "原版", "Fabric", "Forge", "NeoForge", "Quilt" };
@@ -401,20 +779,16 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Man
             if (matches) if (loaders.failure) |err| wrapped(@src(), fmt("加载器目录：{s}", .{@errorName(err)}), theme.muted);
         }
     }
-    if (ui.mode == .options or ui.mode == .create or ui.mode == .import_folder) {
-        entry(@src(), "Java 路径（留空使用默认）", &ui.draft.java_path, false);
+    if (ui.mode == .create) {
+        javaPicker(ui, @src(), registered_java, !locked);
         entry(@src(), "内存 MiB（留空使用默认）", &ui.draft.memory, true);
         _ = dvui.checkbox(@src(), &ui.draft.debug_launch, "调试启动", .{ .margin = .{ .y = 8, .h = 8 } });
     }
-    const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0) });
-    if (iconButton(@src(), switch (ui.mode) {
-        .create => "创建实例",
-        .import_folder => "验证并导入",
-        .rename => "继续重命名",
-        else => "保存启动选项",
-    }, if (ui.mode == .options) dvui.entypo.save else dvui.entypo.check)) ui.queue(.submit, null);
-    if (iconButton(@src(), "取消编辑", dvui.entypo.cross)) ui.queue(.close, null);
-    actions.deinit();
+    if (ui.mode == .create) return;
+    if (ui.mode == .rename) {
+        if (components.action(@src(), "继续重命名", !locked)) ui.queue(.submit, null);
+        if (components.action(@src(), "取消", !locked)) ui.queue(.close, null);
+    }
 }
 
 fn selectedInstance(doc: *const config.Document) ?config.Instance {
@@ -422,7 +796,7 @@ fn selectedInstance(doc: *const config.Document) ?config.Instance {
 }
 
 fn sidebarEnabled(ui: *const Ui, busy: bool, enabled: bool) bool {
-    return enabled and !busy and ui.mode == .none and ui.pending == null and !ui.pack_requested;
+    return enabled and !busy and !ui.submitted and ui.pending == null and ui.navigation == null and !ui.pack_requested;
 }
 
 fn queueSidebarAction(ui: *Ui, action: Action, id: ?[]const u8, busy: bool, enabled: bool) void {
@@ -430,58 +804,33 @@ fn queueSidebarAction(ui: *Ui, action: Action, id: ?[]const u8, busy: bool, enab
 }
 
 fn queueSidebarPack(ui: *Ui, busy: bool, enabled: bool) void {
-    if (sidebarEnabled(ui, busy, enabled)) ui.pack_requested = true;
+    if (sidebarEnabled(ui, busy, enabled)) ui.queue(.import_pack, null);
 }
 
 fn sidebarRow(src: std.builtin.SourceLocation, instance: config.Instance, selected: bool, enabled: bool) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, instance.id))), .label = .{ .text = instance.name }, .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .h = 20 }, .padding = R.all(6), .margin = .{ .h = 4 }, .corners = .all(4), .style = if (selected) .highlight else .control, .tab_index = if (enabled) null else 0 });
-    defer button.deinit();
-    if (enabled) button.processEvents();
-    button.drawBackground();
-    const label = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .{ .w = 0, .h = 40 }, .min_size_content = .{ .h = 20 }, .padding = R.all(0), .margin = R.all(0) });
-    label.addText(instance.name, .{});
-    label.deinit();
-    if (enabled) button.drawFocus();
-    if (button.hovered()) dvui.tooltip(src, .{ .active_rect = button.data().rectScale().r }, "{s}", .{instance.name}, .{ .id_extra = 1 });
-    return enabled and button.clicked();
+    return components.sidebarItem(src, instance.id, instance.name, .{ .selected = selected, .enabled = enabled });
 }
 
 pub fn drawSidebar(ui: *Ui, store: *config.Store, manager: *manager_module.Manager, enabled: bool) void {
     const doc = store.snapshot();
     const busy = manager.isBusy() or manager.snapshot().phase == .awaiting_publication;
     const allowed = sidebarEnabled(ui, busy, enabled);
-    {
-        var create: dvui.ButtonWidget = undefined;
-        create.init(@src(), .{ .grayed = !allowed, .draw_focus = allowed }, .{ .label = .{ .text = "新建实例" }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(6), .margin = .{ .h = 6 }, .corners = .all(4), .tab_index = if (allowed) null else 0 });
-        if (allowed) create.processEvents();
-        create.drawBackground();
-        const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0), .margin = R.all(0) });
-        dvui.icon(@src(), "新建实例", dvui.entypo.plus, .{}, .{ .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .padding = R.all(0), .margin = .{ .w = 6 } });
-        dvui.labelNoFmt(@src(), "新建实例", .{}, .{ .padding = R.all(0), .margin = R.all(0), .gravity_y = 0.5 });
-        row.deinit();
-        if (allowed) create.drawFocus();
-        const clicked = allowed and create.clicked();
-        create.deinit();
-        if (clicked) queueSidebarAction(ui, .create, null, busy, enabled);
-    }
-    {
-        const imports = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0), .margin = .{ .h = 8 } });
-        if (iconButtonWithEnabled(@src(), "导入已有目录", dvui.entypo.folder, allowed)) queueSidebarAction(ui, .import_folder, null, busy, enabled);
-        if (iconButtonWithEnabled(@src(), "导入整合包", dvui.entypo.archive, allowed)) queueSidebarPack(ui, busy, enabled);
-        imports.deinit();
-    }
+    if (components.sidebarItem(@src(), "new-instance", "新建实例", .{ .icon = dvui.entypo.plus, .selected = ui.mode == .create, .enabled = allowed })) queueSidebarAction(ui, .create, null, busy, enabled);
+    if (components.sidebarItem(@src(), "import-folder", "导入已有目录", .{ .selected = ui.mode == .import_folder, .enabled = allowed })) queueSidebarAction(ui, .import_folder, null, busy, enabled);
+    if (components.sidebarItem(@src(), "import-pack", "导入整合包", .{ .enabled = allowed })) queueSidebarAction(ui, .import_pack, null, busy, enabled);
+    components.section(@src(), "已安装");
     const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .background = false });
     defer scroll.deinit();
     if (doc.instances.len == 0) wrapped(@src(), "暂无实例", theme.muted);
     for (doc.instances) |instance| {
         const selected = if (doc.selected_instance) |id| std.mem.eql(u8, id, instance.id) else false;
-        if (sidebarRow(@src(), instance, selected, allowed) and !selected) queueSidebarAction(ui, .select, instance.id, busy, enabled);
+        if (sidebarRow(@src(), instance, selected and ui.mode != .create and ui.mode != .import_folder, allowed)) queueSidebarAction(ui, .select, instance.id, busy, enabled);
     }
 }
 
-pub fn draw(ui: *Ui, store: *config.Store, manager: *manager_module.Manager, catalogue: library.Snapshot) void {
-    drawWithEnabled(ui, store, manager, catalogue, true);
+/// registered_java is a frame-local borrow of Java Manager.entries(), never searchResults().
+pub fn draw(ui: *Ui, store: *config.Store, manager: *manager_module.Manager, catalogue: library.Snapshot, registered_java: []const java_module.Runtime) void {
+    drawWithEnabled(ui, store, manager, catalogue, registered_java, true);
 }
 
 fn failureMessage(err: anyerror) []const u8 {
@@ -491,28 +840,35 @@ fn failureMessage(err: anyerror) []const u8 {
     };
 }
 
-pub fn drawWithEnabled(ui: *Ui, store: *config.Store, manager: *manager_module.Manager, catalogue: library.Snapshot, enabled: bool) void {
+/// Copy selected runtime paths into the draft before the registry can change.
+pub fn drawWithEnabled(ui: *Ui, store: *config.Store, manager: *manager_module.Manager, catalogue: library.Snapshot, registered_java: []const java_module.Runtime, enabled: bool) void {
+    syncSelected(ui, store) catch |err| {
+        ui.failure = err;
+    };
     const doc = store.snapshot();
     const snapshot = manager.snapshot();
     const busy = !enabled or manager.isBusy() or snapshot.phase == .awaiting_publication;
     const selected = selectedInstance(doc);
-    const scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false, .padding = R.all(0), .border = R.all(0) });
-    defer scroll.deinit();
-    const column = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0) });
+    // Reserve the shared footer before the body consumes the remaining height.
+    if (ui.mode == .options or ui.mode == .import_folder) {
+        const allowed = !busy and !ui.submitted and ui.navigation == null and ui.pending == null;
+        switch (components.formActions(@src(), .{ .save_enabled = allowed, .cancel_enabled = allowed, .save_label = if (ui.mode == .import_folder) "导入" else "保存" })) {
+            .save => ui.queue(.submit, null),
+            .cancel => ui.queue(.close, null),
+            .none => {},
+        }
+    }
+    // This scroll area stays within the right pane.
+    const scroll = if (ui.mode != .create) dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .background = false, .padding = R.all(0), .border = R.all(0) }) else null;
+    defer if (scroll) |area| area.deinit();
+    const column = dvui.box(@src(), .{}, .{ .expand = if (ui.mode == .create) .both else .horizontal, .padding = R.all(0) });
     defer column.deinit();
     {
         const heading = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 12 } });
-        wrapped(@src(), if (selected) |instance| instance.name else "实例", dvui.themeGet().text);
-        if (selected) |instance| {
+        wrapped(@src(), if (ui.mode == .create or ui.mode == .import_folder) "获取 / 导入实例" else if (selected) |instance| instance.name else "实例", dvui.themeGet().text);
+        if (ui.mode != .create and ui.mode != .import_folder) if (selected) |instance| {
             wrapped(@src(), fmt("Minecraft {s} · {s}{s}{s}", .{ instance.minecraft_version, @tagName(instance.loader), if (instance.loader_version != null) " " else "", instance.loader_version orelse "" }), theme.muted);
-            const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0) });
-            if (!busy and ui.mode == .none and ui.pending == null) {
-                if (iconButton(@src(), "编辑启动选项", dvui.entypo.cog)) ui.queue(.edit, instance.id);
-                if (iconButton(@src(), "重命名实例", dvui.entypo.pencil)) ui.queue(.ask_rename, instance.id);
-                if (iconButton(@src(), "移至恢复区", dvui.entypo.trash)) ui.queue(.ask_delete, instance.id);
-            }
-            actions.deinit();
-        }
+        };
         heading.deinit();
     }
     if (ui.failure) |err| wrapped(@src(), fmt("操作失败：{s}", .{failureMessage(err)}), dvui.Color.fromHex("F0A6A1"));
@@ -541,8 +897,71 @@ pub fn drawWithEnabled(ui: *Ui, store: *config.Store, manager: *manager_module.M
         else => {},
     }
     if (snapshot.recovery_directory) |path| wrapped(@src(), fmt("恢复目录：{s}", .{path}), theme.muted);
-    if (ui.mode != .none) drawEditor(ui, doc, manager, catalogue, enabled);
+    if (ui.mode == .create) {
+        drawAcquisition(ui, doc, manager, catalogue, registered_java, enabled);
+    } else if (ui.mode != .none) drawEditor(ui, doc, manager, registered_java, enabled);
     if (selected == null and ui.mode == .none) wrapped(@src(), if (doc.instances.len == 0) "暂无实例" else "未选择实例", theme.muted);
+}
+
+test "Java picker preserves legacy bindings and resolves registered choices by path" {
+    const a = std.testing.allocator;
+    var draft = try Draft.fromInstance(a, .{ .id = "stable", .name = "Play", .minecraft_version = "1.21", .java_path = "/legacy/java" });
+    defer draft.deinit(a);
+    var entries = [_]java_module.Runtime{
+        .{ .path = "/registered/java-a", .major = 21, .vendor = "Vendor" },
+        .{ .path = "/registered/java-b", .major = 21, .vendor = "Vendor" },
+    };
+    try std.testing.expect(javaChoice(text(&draft.java_path), &entries) == null);
+    try std.testing.expect(!draft.dirty());
+    try std.testing.expectEqualStrings("/legacy/java", (try draft.value(.options, &.{})).java_path.?);
+    try chooseJava(&draft, &entries, 2);
+    try std.testing.expect(draft.dirty());
+    std.mem.swap(java_module.Runtime, &entries[0], &entries[1]);
+    try std.testing.expectEqual(@as(?usize, 1), javaChoice(text(&draft.java_path), &entries));
+    try std.testing.expect(javaChoice(text(&draft.java_path), &.{}) == null);
+    try std.testing.expectEqualStrings("/registered/java-b", text(&draft.java_path));
+    try std.testing.expectEqualStrings("/legacy/java", text(&draft.original_java_path));
+    try chooseJava(&draft, &entries, 0);
+    try std.testing.expectEqual(@as(?usize, 0), javaChoice(text(&draft.java_path), &entries));
+    try std.testing.expect((try draft.value(.options, &.{})).java_path == null);
+}
+
+test "Java selection copies registry bytes and rejected choices preserve the draft" {
+    var draft: Draft = .{};
+    var path = "/registered/java".*;
+    const entries = [_]java_module.Runtime{.{ .path = &path, .major = 21, .vendor = "Vendor" }};
+    try chooseJava(&draft, &entries, 1);
+    @memset(&path, 'x');
+    try std.testing.expectEqualStrings("/registered/java", text(&draft.java_path));
+    try std.testing.expectError(error.JavaNotRegistered, chooseJava(&draft, &entries, 2));
+    const invalid = [_]java_module.Runtime{.{ .path = "bad\npath", .major = 21, .vendor = "Vendor" }};
+    try std.testing.expectError(error.InvalidJavaPath, chooseJava(&draft, &invalid, 1));
+    const oversized: [4097]u8 = @splat('x');
+    const too_long = [_]java_module.Runtime{.{ .path = &oversized, .major = 21, .vendor = "Vendor" }};
+    try std.testing.expectError(error.TextTooLong, chooseJava(&draft, &too_long, 1));
+    try std.testing.expectEqualStrings("/registered/java", text(&draft.java_path));
+}
+
+test "directory import derives its name and submits only default launch options" {
+    const a = std.testing.allocator;
+    var draft: Draft = .{ .loader = .fabric, .debug_launch = true };
+    defer draft.deinit(a);
+    try draft.ensureId(a, std.testing.io);
+    try setText(&draft.name, "Existing folder");
+    try setText(&draft.java_path, "/old/java");
+    try setText(&draft.memory, "invalid");
+    draft.base = try a.dupe(u8, "1.20");
+    draft.loader_version = try a.dupe(u8, "old-loader");
+    const imported = try draft.value(.import_folder, &.{});
+    try std.testing.expectEqualStrings("Existing folder", imported.name);
+    try std.testing.expectEqualStrings("", imported.minecraft_version);
+    try std.testing.expectEqual(config.Loader.vanilla, imported.loader);
+    try std.testing.expect(imported.loader_version == null and imported.java_path == null and imported.max_memory_mb == null and imported.origin == null);
+    try std.testing.expect(!imported.debug_launch);
+    const existing = [_]config.Instance{.{ .id = "other", .name = "Existing folder", .minecraft_version = "1.21" }};
+    try std.testing.expectError(error.DuplicateInstanceName, draft.value(.import_folder, &.{ .instances = &existing }));
+    try setText(&draft.name, "../outside");
+    try std.testing.expectError(error.InvalidInstanceName, draft.value(.import_folder, &.{}));
 }
 
 test "instance sidebar owns queued stable selection and right detail follows ID after reorder" {
@@ -570,7 +989,7 @@ test "instance sidebar owns queued stable selection and right detail follows ID 
     try std.testing.expect(selectedInstance(&doc) == null);
 }
 
-test "instance sidebar respects disabled draft worker pending and pack gates" {
+test "instance sidebar remains interactive for drafts and guards pending worker and pack transitions" {
     var ui = Ui.init(std.testing.allocator);
     defer ui.deinit();
     queueSidebarAction(&ui, .select, "other", false, false);
@@ -583,19 +1002,18 @@ test "instance sidebar respects disabled draft worker pending and pack gates" {
     for ([_]Mode{ .create, .import_folder, .options, .rename, .delete_confirm }) |mode| {
         ui.mode = mode;
         queueSidebarAction(&ui, .select, "other", false, true);
+        try std.testing.expectEqual(Action.select, ui.pending.?.action);
         queueSidebarPack(&ui, false, true);
-        try std.testing.expect(ui.pending == null and !ui.pack_requested);
+        try std.testing.expectEqual(Action.select, ui.pending.?.action);
         try std.testing.expectEqualStrings("Preserved draft", text(&ui.draft.name));
+        ui.allocator.free(ui.pending.?.text.?);
+        ui.pending = null;
     }
-    ui.mode = .none;
-    queueSidebarAction(&ui, .import_folder, null, false, true);
-    queueSidebarAction(&ui, .select, "other", false, true);
     queueSidebarPack(&ui, false, true);
-    try std.testing.expectEqual(Action.import_folder, ui.pending.?.action);
+    try std.testing.expectEqual(Action.import_pack, ui.pending.?.action);
     try std.testing.expect(!ui.pack_requested);
     ui.pending = null;
-    queueSidebarPack(&ui, false, true);
-    try std.testing.expect(ui.pack_requested);
+    ui.pack_requested = true;
     queueSidebarAction(&ui, .create, null, false, true);
     try std.testing.expect(ui.pending == null);
 }
@@ -623,4 +1041,38 @@ test "draft ID allocation failure remains empty and safely retries without repla
     try existing.ensureId(failing.allocator(), std.testing.io);
     try std.testing.expect(existing.id.?.ptr == existing_id.ptr);
     try std.testing.expectEqualStrings("pending-valid-id", existing.id.?);
+}
+
+test "acquisition wizard requires a selected base and preserves choices through both steps" {
+    const a = std.testing.allocator;
+    var ui = Ui.init(a);
+    defer ui.deinit();
+    try std.testing.expectError(error.InvalidAction, advanceCreateStep(&ui));
+    ui.mode = .create;
+    try std.testing.expectError(error.MinecraftVersionRequired, advanceCreateStep(&ui));
+    ui.draft.base = try a.dupe(u8, "1.21.1");
+    try advanceCreateStep(&ui);
+    try std.testing.expectEqual(CreateStep.loader, ui.create_step);
+    try std.testing.expectError(error.InvalidAction, advanceCreateStep(&ui));
+    ui.draft.loader = .fabric;
+    ui.draft.loader_version = try a.dupe(u8, "0.16.10");
+    ui.create_step = .version;
+    try advanceCreateStep(&ui);
+    try std.testing.expectEqualStrings("1.21.1", ui.draft.base.?);
+    try std.testing.expectEqualStrings("0.16.10", ui.draft.loader_version.?);
+    ui.catalogue_requested = true;
+    ui.reset();
+    try std.testing.expect(ui.mode == .none and ui.create_step == .version and !ui.catalogue_requested);
+    try std.testing.expect(ui.draft.base == null and ui.draft.loader_version == null);
+}
+
+test "official acquisition filters exclude legacy alpha and beta builds" {
+    try std.testing.expect(catalogueMatches("release", .release));
+    try std.testing.expect(catalogueMatches("snapshot", .snapshot));
+    try std.testing.expect(!catalogueMatches("release", .snapshot));
+    try std.testing.expect(!catalogueMatches("snapshot", .release));
+    for ([_][]const u8{ "old_alpha", "old_beta", "unknown" }) |kind| {
+        try std.testing.expect(!catalogueMatches(kind, .release));
+        try std.testing.expect(!catalogueMatches(kind, .snapshot));
+    }
 }

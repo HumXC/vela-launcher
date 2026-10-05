@@ -315,7 +315,7 @@ const Job = struct {
                     self.proof = .{ .vanilla = prepared };
                     self.runtime_major = try major(self.proof.?.vanilla.runtime_major);
                 } else {
-                    const prepared = try loader.prepareMetadata(self.a, self.io, .{ .root = self.paths.root, .instance_id = row.id, .instance_name = row.name, .generation = self.request.preparation_generation, .selection = try self.selection(), .environment = self.request.environment, .vanilla = base, .fetcher = fetcher, .http_options = self.options.http_options, .transport = self.options.runner.transport }, self.control());
+                    const prepared = try loader.prepareMetadata(self.a, self.io, .{ .root = self.paths.root, .worker_checks = true, .instance_id = row.id, .instance_name = row.name, .generation = self.request.preparation_generation, .selection = try self.selection(), .environment = self.request.environment, .vanilla = base, .fetcher = fetcher, .http_options = self.options.http_options, .transport = self.options.runner.transport }, self.control());
                     self.proof = .{ .loader = prepared };
                     self.runtime_major = try major(self.proof.?.loader.requirements.runtime_major);
                     if (self.proof.?.loader.requirements.installer_major != 0) self.installer_major = try major(self.proof.?.loader.requirements.installer_major);
@@ -501,6 +501,7 @@ const Core = struct {
     fn acquireJava(self: *Core, role: JavaRole) !void {
         const job = self.job.?;
         const services = self.services.?;
+        if (services.java_download.isDeleting()) return error.JavaDownloadBusy;
         try self.checkBinding(services, false);
         try job.validateProof();
         self.role = role;
@@ -520,7 +521,7 @@ const Core = struct {
             return;
         }
         if (role == .runtime and rowOf(job.request.target).java_path != null) return error.SelectedJavaUnavailable;
-        if (services.java_download.snapshot().phase == .running) return error.JavaDownloadBusy;
+        if (services.java_download.isBusy()) return error.JavaDownloadBusy;
         const required = if (role == .runtime) job.runtime_major.? else job.installer_major.?;
         const request: downloads.Request = .{ .vendor = self.options.java_vendor, .major = @intCast(required) };
         try services.java_download.start(request);
@@ -620,7 +621,7 @@ pub const Controller = struct {
         if (services.store.publicationUncertain()) return error.ConfigPublicationUncertain;
         if (services.instances.isBusy()) return error.InstanceWorkerBusy;
         if (services.java.isSearching()) return error.JavaDiscoveryBusy;
-        if (services.java_download.snapshot().phase == .running) return error.JavaDownloadBusy;
+        if (services.java_download.isBusy()) return error.JavaDownloadBusy;
         const content = services.content.snapshot();
         if (content.busy) return error.ContentWorkerBusy;
         if (content.recovery_required) return error.RecoveryRequired;
@@ -1191,6 +1192,88 @@ test "pack coordinator downloaded archive alone never proves a usable registered
     try validateDownload(snap);
 }
 
+test "pack coordinator owned deletion blocks start without preparation tasks or fixture side effects" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var value = try fixture.controller();
+    defer value.deinit(fixture.services());
+    var deleting: @TypeOf(fixture.download.active_delete.?.*) = .{ .io = std.testing.io };
+    defer deleting.arena.deinit();
+    fixture.download.active_delete = &deleting;
+    defer fixture.download.active_delete = null;
+    // A retained download completion is deliberately independent of deletion ownership.
+    fixture.download.phase = .complete;
+    const policy = fixture.content.snapshot().policy_generation;
+    const provider = fixture.content.snapshot().provider;
+    const request = try fixture.request(false);
+    for (0..3) |stage| {
+        if (stage == 1) fixture.download.cancel();
+        if (stage == 2) deleting.done.store(true, .release);
+        try std.testing.expect(fixture.download.isDeleting() and fixture.download.isBusy());
+        try std.testing.expectEqual(downloads.Phase.complete, fixture.download.snapshot().phase);
+        try std.testing.expectError(error.JavaDownloadBusy, value.start(request, fixture.services()));
+        try std.testing.expect(value.core.job == null and value.core.services == null);
+        try std.testing.expectEqual(Phase.idle, value.snapshot().phase);
+        try std.testing.expectEqual(@as(u64, 0), value.core.last_generation);
+        try std.testing.expectEqual(@as(u64, 0), value.core.serial);
+        try std.testing.expectEqual(@as(usize, 0), fixture.registry.tasks().len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.inspect_count);
+        try std.testing.expectEqual(@as(usize, 0), fixture.metadata_count);
+        try std.testing.expectEqual(@as(usize, 0), fixture.probe_count);
+        try std.testing.expectEqual(@as(usize, 0), fixture.create_count);
+        try std.testing.expectEqual(@as(usize, 0), fixture.cleanup_count);
+        try std.testing.expect(!fixture.java.isSearching() and !fixture.instances.isBusy() and !fixture.content.isBusy());
+        try std.testing.expect(!fixture.leased);
+        try std.testing.expectEqual(policy, fixture.content.snapshot().policy_generation);
+        try std.testing.expectEqual(provider, fixture.content.snapshot().provider);
+    }
+    fixture.download.active_delete = null;
+    try value.start(request, fixture.services());
+    try std.testing.expectEqual(Phase.preparing, value.snapshot().phase);
+    try std.testing.expectEqual(request.preparation_generation, value.core.last_generation);
+}
+
+test "pack coordinator registered Java cannot resolve or probe while deletion stays owned" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.registerRuntime(17);
+    var value = try fixture.controller();
+    defer value.deinit(fixture.services());
+    try value.start(try fixture.request(false), fixture.services());
+    Fixture.joinPrivate(&value);
+    // Publish the prepared proof locally without advancing to Java acquisition.
+    const job = value.core.job.?;
+    try std.testing.expect(job.proof != null and job.thread == null);
+    try std.testing.expect((try value.core.selected(.runtime)) != null);
+    const task_count = fixture.registry.tasks().len;
+    const inspected = fixture.inspect_count;
+    const metadata_requests = fixture.metadata_count;
+    var deleting: @TypeOf(fixture.download.active_delete.?.*) = .{ .io = std.testing.io };
+    defer deleting.arena.deinit();
+    fixture.download.active_delete = &deleting;
+    defer fixture.download.active_delete = null;
+    for (0..3) |stage| {
+        if (stage == 1) fixture.download.cancel();
+        if (stage == 2) deleting.done.store(true, .release);
+        try std.testing.expectError(error.JavaDownloadBusy, value.core.acquireJava(.runtime));
+        try std.testing.expect(value.core.role == null);
+        try std.testing.expectEqual(Phase.preparing, value.snapshot().phase);
+        try std.testing.expect(job.thread == null and job.probe_major == 0);
+        try std.testing.expectEqual(@as(usize, 0), job.probe_path.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.probe_count);
+        try std.testing.expectEqual(@as(usize, 0), fixture.create_count);
+        try std.testing.expectEqual(task_count, fixture.registry.tasks().len);
+        try std.testing.expectEqual(inspected, fixture.inspect_count);
+        try std.testing.expectEqual(metadata_requests, fixture.metadata_count);
+        try std.testing.expect(!fixture.java.isSearching() and !value.ownsJavaDownload());
+    }
+    fixture.download.active_delete = null;
+    try value.core.acquireJava(.runtime);
+    try std.testing.expectEqual(Phase.probing_java, value.snapshot().phase);
+    Fixture.joinPrivate(&value);
+    try std.testing.expectEqual(@as(usize, 1), fixture.probe_count);
+}
+
 test "pack coordinator fails closed on receipt capability stale generation and host environment" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -1339,8 +1422,17 @@ test "pack coordinator uncertainty requires external reconcile and late cancel p
     try std.testing.expectEqual(Phase.awaiting_reconciliation, value.snapshot().phase);
     value.cancel(fixture.services());
     try std.testing.expectError(error.ConfigPublicationUncertain, value.acknowledgeReconciled(fixture.services()));
-    try fixture.store.reconcile();
-    try value.acknowledgeReconciled(fixture.services());
+    const recovery: @import("pack_import_view.zig").Runner = .{};
+    const download_root = fixture.download.root;
+    defer fixture.download.root = download_root;
+    fixture.download.root = fixture.paths.root;
+    try std.testing.expectError(error.ConfigurationChanged, recovery.drain(null, .reconcile, &fixture.store, &value, fixture.services()));
+    try std.testing.expect(fixture.store.publicationUncertain());
+    try std.testing.expect(value.ownsInstancesPublication());
+    try std.testing.expect(fixture.instances.pending == pending);
+    fixture.download.root = download_root;
+    try std.testing.expectEqualStrings(fixture.paths.jdks, fixture.download.root);
+    try recovery.drain(null, .reconcile, &fixture.store, &value, fixture.services());
     fixture.advance(&value);
     try std.testing.expectEqual(Phase.canceled, value.snapshot().phase);
     try std.testing.expect(!value.ownsInstancesPublication());

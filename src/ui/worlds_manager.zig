@@ -1,9 +1,10 @@
 //! Main-thread owner. Selection/refresh only queue and cancel; tick joins done work.
-//! Paths, Registry and guard callback context must outlive deinit, which joins all work.
+//! Paths, Registry and WorldScope context outlive deinit, which joins before releasing.
 const std = @import("std");
 const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
 const worlds = @import("../core/worlds.zig");
+const instance_leases = @import("../core/instance_leases.zig");
 const tree = @import("../core/worlds_tree.zig");
 const tasks = @import("../core/tasks.zig");
 const A = std.mem.Allocator;
@@ -89,6 +90,7 @@ pub const Result = struct {
 pub const Worker = *const fn (A, Io, *const instances.Paths, config.Instance, ?Request, worlds.Options) anyerror!Result;
 pub const Options = struct {
     guard: worlds.Guard = .{},
+    scope: ?worlds.WorldScope = null,
     limits: worlds.Limits = .{},
     worker: Worker = runBackend,
 };
@@ -117,7 +119,6 @@ fn cloneGuard(a: A, guard: worlds.Guard) !worlds.Guard {
 }
 fn running(guard: worlds.Guard, id: []const u8) bool {
     for (guard.running_ids) |active| if (std.mem.eql(u8, active, id)) return true;
-    if (guard.is_running) |f| return f(guard.context, id);
     return false;
 }
 fn cloneRequest(a: A, request: Request) !Request {
@@ -226,7 +227,7 @@ const Job = struct {
     fn create(a: A, io: Io, paths: *const instances.Paths, instance: config.Instance, request: ?Request, options: Options) !*Job {
         const self = try a.create(Job);
         errdefer a.destroy(self);
-        self.* = .{ .allocator = a, .arena = .init(a), .io = io, .paths = paths, .instance = undefined, .request = null, .options = .{ .limits = options.limits }, .worker = options.worker };
+        self.* = .{ .allocator = a, .arena = .init(a), .io = io, .paths = paths, .instance = undefined, .request = null, .options = .{ .limits = options.limits, .scope = options.scope }, .worker = options.worker };
         errdefer self.arena.deinit();
         const owned = self.arena.allocator();
         self.instance = try cloneInstance(owned, instance);
@@ -234,6 +235,24 @@ const Job = struct {
         if (request) |v| self.request = try cloneRequest(owned, v);
         self.options.hooks = .{ .context = self, .canceled = canceled, .progress = progress };
         return self;
+    }
+    fn scopeIds(self: *const Job) worlds.ScopeIds {
+        const target: ?[]const u8 = if (self.request) |request| switch (request) {
+            .copy => |copy| copy.target.id,
+            else => null,
+        } else null;
+        return .{ .source = self.instance.id, .target = target };
+    }
+    fn acquireScope(self: *Job) !void {
+        const entry = try worlds.enterScope(self.options, self.scopeIds());
+        self.options.held_scope = entry.held;
+        self.options.scope = null;
+    }
+    fn releaseScope(self: *Job) void {
+        if (self.options.held_scope) |held| {
+            held.release();
+            self.options.held_scope = null;
+        }
     }
     fn canceled(context: ?*anyopaque) bool {
         const self: *Job = @ptrCast(@alignCast(context.?));
@@ -252,6 +271,7 @@ const Job = struct {
         };
     }
     fn destroy(self: *Job) void {
+        std.debug.assert(self.options.held_scope == null);
         const a = self.allocator;
         self.result.deinit();
         self.arena.deinit();
@@ -275,10 +295,12 @@ pub const Manager = struct {
     list_failure: ?anyerror = null,
     operation_failure: ?anyerror = null,
 
-    pub fn init(a: A, io: Io, paths: *const instances.Paths, registry: *tasks.Registry, guard: worlds.Guard) !Manager {
-        return initOptions(a, io, paths, registry, .{ .guard = guard });
+    pub fn init(a: A, io: Io, paths: *const instances.Paths, registry: *tasks.Registry, scope: worlds.WorldScope) !Manager {
+        return initOptions(a, io, paths, registry, .{ .scope = scope });
     }
     pub fn initOptions(a: A, io: Io, paths: *const instances.Paths, registry: *tasks.Registry, initial_options: Options) !Manager {
+        if (initial_options.guard.is_running != null) return error.UnsupportedWorldGuard;
+        if (initial_options.scope == null) return error.MissingWorldScope;
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         var options = initial_options;
@@ -305,6 +327,7 @@ pub const Manager = struct {
         }
         if (self.active) |job| {
             if (job.future) |*future| future.await(self.io);
+            job.releaseScope();
             self.finishTask(job);
             job.destroy();
         }
@@ -315,7 +338,10 @@ pub const Manager = struct {
         self.* = undefined;
     }
     pub fn isRunning(self: *const Manager, instance_id: []const u8) bool {
-        return running(self.options.guard, instance_id);
+        if (running(self.options.guard, instance_id)) return true;
+        const scope = self.options.scope orelse return false;
+        const state = scope.probe(scope.context, .{ .source = instance_id }) catch return false;
+        return state == .running;
     }
     pub fn snapshot(self: *const Manager) Snapshot {
         var result: Snapshot = .{
@@ -433,19 +459,30 @@ pub const Manager = struct {
         if (self.active) |job| {
             if (!job.done.load(.acquire)) return;
             if (job.future) |*future| future.await(self.io);
+            job.releaseScope();
             self.active = null;
             self.publish(job);
         }
         const job = self.pending orelse return;
-        self.pending = null;
         self.active_current = true;
         if (Job.canceled(job)) {
+            self.pending = null;
             job.failure = error.Canceled;
             self.publish(job);
             return;
         }
+        job.acquireScope() catch |err| {
+            // Retry only unread list work. A mutation is never replayed.
+            if (job.request == null and err == error.InstanceBusy) return;
+            self.pending = null;
+            job.failure = err;
+            self.publish(job);
+            return;
+        };
+        self.pending = null;
         if (job.task) |task| {
             self.registry.start(task) catch |err| {
+                job.releaseScope();
                 job.failure = err;
                 self.publish(job);
                 return;
@@ -453,6 +490,7 @@ pub const Manager = struct {
             task.report(stage(job.request.?), 0, null);
         }
         job.future = self.io.concurrent(Job.run, .{job}) catch |err| {
+            job.releaseScope();
             job.failure = err;
             self.publish(job);
             return;
@@ -490,7 +528,8 @@ fn runBackend(a: A, io: Io, paths: *const instances.Paths, instance: config.Inst
         };
         return .{ .outcome = outcome };
     }
-    if (running(options.guard, instance.id)) return error.InstanceRunning;
+    const held = options.held_scope orelse return error.MissingWorldScope;
+    try held.recheck();
     var result: Result = .{};
     errdefer result.deinit();
     result.world_list = try worlds.list(a, io, paths, instance, null, options);
@@ -529,15 +568,34 @@ fn runBackend(a: A, io: Io, paths: *const instances.Paths, instance: config.Inst
 
 const Fixture = struct {
     entered: std.atomic.Value(bool) = .init(false),
+    started: std.atomic.Value(u32) = .init(0),
     exited: std.atomic.Value(u32) = .init(0),
     state: @FieldType(worlds.Outcome, "state") = .committed,
+    block_copy: bool = false,
+    teardown_coordinator: ?*instance_leases.Coordinator = null,
+    teardown_source_blocked: std.atomic.Value(bool) = .init(false),
+    teardown_target_blocked: std.atomic.Value(bool) = .init(false),
+
+    fn launchBlocked(coordinator: *instance_leases.Coordinator, id: []const u8) bool {
+        coordinator.reserveLaunch(id) catch |err| return err == error.InstanceBusy;
+        coordinator.releaseLaunch();
+        return false;
+    }
     fn work(a: A, io: Io, _: *const instances.Paths, instance: config.Instance, request: ?Request, options: worlds.Options) anyerror!Result {
         const self: *Fixture = @ptrCast(@alignCast(options.guard.context.?));
+        _ = self.started.fetchAdd(1, .release);
         const value = request orelse return .{};
-        defer _ = self.exited.fetchAdd(1, .release);
+        defer {
+            if (self.teardown_coordinator) |coordinator| {
+                const held = options.held_scope.?;
+                self.teardown_source_blocked.store(launchBlocked(coordinator, held.ids.source), .release);
+                if (held.ids.target) |target| self.teardown_target_blocked.store(launchBlocked(coordinator, target), .release);
+            }
+            _ = self.exited.fetchAdd(1, .release);
+        }
         try options.hooks.check(io);
         if (!std.mem.eql(u8, instance.id, "source-id") or !std.mem.eql(u8, instance.name, "Source")) return error.BorrowedSelection;
-        if (value == .backup and std.mem.eql(u8, value.backup, "Block")) {
+        if ((value == .backup and std.mem.eql(u8, value.backup, "Block")) or (value == .copy and self.block_copy)) {
             self.entered.store(true, .release);
             while (true) {
                 try options.hooks.check(io);
@@ -564,7 +622,38 @@ const Fixture = struct {
         } };
     }
 };
+const CountingScope = struct {
+    inner: worlds.WorldScope,
+    acquire_calls: usize = 0,
+    acquired: usize = 0,
+    releases: usize = 0,
+
+    fn scope(self: *CountingScope) worlds.WorldScope {
+        return .{ .context = self, .probe = probe, .acquire = acquire, .recheck = recheck, .release = release };
+    }
+    fn probe(context: ?*anyopaque, ids: worlds.ScopeIds) anyerror!worlds.ScopeState {
+        const self: *CountingScope = @ptrCast(@alignCast(context.?));
+        return self.inner.probe(self.inner.context, ids);
+    }
+    fn acquire(context: ?*anyopaque, ids: worlds.ScopeIds) anyerror!worlds.ScopeStamp {
+        const self: *CountingScope = @ptrCast(@alignCast(context.?));
+        self.acquire_calls += 1;
+        const stamp = try self.inner.acquire(self.inner.context, ids);
+        self.acquired += 1;
+        return stamp;
+    }
+    fn recheck(context: ?*anyopaque, ids: worlds.ScopeIds, stamp: worlds.ScopeStamp) anyerror!void {
+        const self: *CountingScope = @ptrCast(@alignCast(context.?));
+        return self.inner.recheck(self.inner.context, ids, stamp);
+    }
+    fn release(context: ?*anyopaque, ids: worlds.ScopeIds, stamp: worlds.ScopeStamp) void {
+        const self: *CountingScope = @ptrCast(@alignCast(context.?));
+        self.releases += 1;
+        self.inner.release(self.inner.context, ids, stamp);
+    }
+};
 const test_instance: config.Instance = .{ .id = "source-id", .name = "Source", .minecraft_version = "1.21" };
+const test_target: config.Instance = .{ .id = "destination-id", .name = "Destination", .minecraft_version = "1.21" };
 fn settle(manager: *Manager) !void {
     for (0..5000) |_| {
         manager.tick();
@@ -590,7 +679,8 @@ test "queued workers own cloned instance and copy request strings" {
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var fixture: Fixture = .{};
-    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .guard = .{ .context = &fixture }, .worker = Fixture.work });
+    var coordinator = instance_leases.Coordinator.init(std.testing.io);
+    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture }, .worker = Fixture.work });
     defer manager.deinit();
     var id = "source-id".*;
     var name = "Source".*;
@@ -631,7 +721,8 @@ test "selection refresh and tick never join a live worker and token acknowledges
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var fixture: Fixture = .{};
-    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .guard = .{ .context = &fixture }, .worker = Fixture.work });
+    var coordinator = instance_leases.Coordinator.init(std.testing.io);
+    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture }, .worker = Fixture.work });
     var alive = true;
     defer if (alive) manager.deinit();
     try manager.select(test_instance);
@@ -676,7 +767,8 @@ test "commit wins late cancellation and rollback uncertainty retain recovery and
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var fixture: Fixture = .{};
-    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .guard = .{ .context = &fixture }, .worker = Fixture.work });
+    var coordinator = instance_leases.Coordinator.init(std.testing.io);
+    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture }, .worker = Fixture.work });
     defer manager.deinit();
     try manager.select(test_instance);
     try settle(&manager);
@@ -728,7 +820,8 @@ test "consent queued cancellation and running guard use exact owned config IDs" 
     defer registry.deinit();
     var fixture: Fixture = .{};
     var blocked = "destination-id".*;
-    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .guard = .{ .context = &fixture, .running_ids = &.{&blocked} }, .worker = Fixture.work });
+    var coordinator = instance_leases.Coordinator.init(std.testing.io);
+    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture, .running_ids = &.{&blocked} }, .worker = Fixture.work });
     defer manager.deinit();
     @memset(&blocked, 'x');
     try std.testing.expect(manager.isRunning("destination-id"));
@@ -755,7 +848,8 @@ fn allocationScenario(a: A) !void {
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var fixture: Fixture = .{};
-    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .guard = .{ .context = &fixture, .running_ids = &.{"another-id"} }, .worker = Fixture.work });
+    var coordinator = instance_leases.Coordinator.init(std.testing.io);
+    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture, .running_ids = &.{"another-id"} }, .worker = Fixture.work });
     defer manager.deinit();
     try manager.select(test_instance);
     manager.select(.{ .id = "next-id", .name = "Next", .minecraft_version = "1.20" }) catch |err| {
@@ -784,7 +878,8 @@ test "actual temporary world backup refreshes real recovery listing" {
     file.close(io);
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var manager = try Manager.init(a, io, &paths, &registry, .{});
+    var coordinator = instance_leases.Coordinator.init(io);
+    var manager = try Manager.init(a, io, &paths, &registry, coordinator.worldScope(3));
     defer manager.deinit();
     try manager.select(test_instance);
     try settle(&manager);
@@ -840,7 +935,8 @@ test "world directory validation is read only and rejects stale selection and sy
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     const source: config.Instance = .{ .id = "one", .name = "One", .minecraft_version = "1.21" };
-    var manager = try Manager.init(a, io, &paths, &registry, .{ .running_ids = &.{"one"} });
+    var coordinator = instance_leases.Coordinator.init(io);
+    var manager = try Manager.initOptions(a, io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .running_ids = &.{"one"} } });
     defer manager.deinit();
     try manager.select(source);
     try std.testing.expect(manager.isRunning(source.id));
@@ -875,6 +971,233 @@ test "world directory validation is read only and rejects stale selection and sy
             return error.SymlinkAccepted;
         } else |_| {}
     }
+}
+
+test "manager requires scope and rejects dynamic guards before allocation" {
+    const a = std.testing.allocator;
+    var paths = try instances.Paths.init(a, std.testing.io, ".");
+    defer paths.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var coordinator = instance_leases.Coordinator.init(std.testing.io);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.MissingWorldScope, Manager.initOptions(failing.allocator(), std.testing.io, &paths, &registry, .{ .guard = .{ .context = &fixture }, .worker = Fixture.work }));
+    const DynamicGuard = struct {
+        fn running(_: ?*anyopaque, _: []const u8) bool {
+            return false;
+        }
+    };
+    try std.testing.expectError(error.UnsupportedWorldGuard, Manager.initOptions(failing.allocator(), std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture, .is_running = DynamicGuard.running }, .worker = Fixture.work }));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "busy world list waits for content mutation release then succeeds" {
+    const a = std.testing.allocator;
+    var paths = try instances.Paths.init(a, std.testing.io, ".");
+    defer paths.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var coordinator = instance_leases.Coordinator.init(std.testing.io);
+    const content = coordinator.mutation(1);
+    try content.acquire(test_instance.id);
+    defer content.release(test_instance.id);
+    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture }, .worker = Fixture.work });
+    defer manager.deinit();
+    try manager.select(test_instance);
+    const pending = manager.pending.?;
+    for (0..4) |_| {
+        manager.tick();
+        try std.testing.expect(manager.pending.? == pending);
+        try std.testing.expect(manager.active == null);
+        try std.testing.expect(manager.snapshot().loading);
+        try std.testing.expect(manager.snapshot().failure == null);
+        try std.testing.expectEqual(@as(u32, 0), fixture.started.load(.acquire));
+    }
+    content.release(test_instance.id);
+    coordinator.tick();
+    try settle(&manager);
+    try std.testing.expect(!manager.snapshot().loading);
+    try std.testing.expect(manager.snapshot().failure == null);
+    try std.testing.expectEqual(@as(u32, 1), fixture.started.load(.acquire));
+}
+
+test "matching launch makes world list terminal until explicit refresh" {
+    const a = std.testing.allocator;
+    var paths = try instances.Paths.init(a, std.testing.io, ".");
+    defer paths.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var coordinator = instance_leases.Coordinator.init(std.testing.io);
+    try coordinator.reserveLaunch(test_instance.id);
+    defer coordinator.releaseLaunch();
+    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture }, .worker = Fixture.work });
+    defer manager.deinit();
+    try manager.select(test_instance);
+    manager.tick();
+    try std.testing.expect(manager.pending == null);
+    try std.testing.expect(manager.active == null);
+    try std.testing.expect(!manager.snapshot().loading);
+    try std.testing.expectEqual(error.InstanceRunning, manager.snapshot().failure.?);
+    try std.testing.expectEqual(@as(u32, 0), fixture.started.load(.acquire));
+    coordinator.releaseLaunch();
+    coordinator.tick();
+    for (0..4) |_| manager.tick();
+    try std.testing.expect(manager.pending == null);
+    try std.testing.expectEqual(error.InstanceRunning, manager.snapshot().failure.?);
+    try std.testing.expectEqual(@as(u32, 0), fixture.started.load(.acquire));
+    try manager.refresh();
+    try settle(&manager);
+    try std.testing.expect(manager.snapshot().failure == null);
+    try std.testing.expectEqual(@as(u32, 1), fixture.started.load(.acquire));
+}
+
+test "busy source or target mutation is terminal without spawn or replay" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ test_instance.id, test_target.id }) |blocked_id| {
+        var paths = try instances.Paths.init(a, std.testing.io, ".");
+        defer paths.deinit();
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var fixture: Fixture = .{};
+        var coordinator = instance_leases.Coordinator.init(std.testing.io);
+        var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture }, .worker = Fixture.work });
+        defer manager.deinit();
+        try manager.select(test_instance);
+        try settle(&manager);
+        const content = coordinator.mutation(1);
+        try content.acquire(blocked_id);
+        defer content.release(blocked_id);
+        try manager.perform(.{ .copy = .{ .folder = "World", .target = test_target, .target_folder = "Copied" } });
+        const task = registry.tasks()[0];
+        manager.tick();
+        try std.testing.expect(manager.active == null);
+        try std.testing.expectEqual(tasks.State.failed, task.state);
+        try std.testing.expectEqual(error.InstanceBusy, task.failure.?);
+        try std.testing.expectEqual(error.InstanceBusy, manager.snapshot().failure.?);
+        try std.testing.expectEqual(@as(u32, 1), fixture.started.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), fixture.exited.load(.acquire));
+        // Only the read-only refresh may remain queued after terminal failure.
+        try std.testing.expect(manager.pending.?.request == null);
+        for (0..4) |_| manager.tick();
+        try std.testing.expectEqual(@as(u32, 0), fixture.exited.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), registry.tasks().len);
+        content.release(blocked_id);
+        coordinator.tick();
+        try settle(&manager);
+        for (0..4) |_| manager.tick();
+        try std.testing.expect(manager.pending == null);
+        try std.testing.expect(manager.active == null);
+        try std.testing.expectEqual(@as(u32, 2), fixture.started.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), fixture.exited.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), registry.tasks().len);
+        try std.testing.expectEqual(tasks.State.failed, task.state);
+        try std.testing.expectEqual(error.InstanceBusy, task.failure.?);
+    }
+}
+
+test "cancellation retains source and target scope through worker teardown and join" {
+    const a = std.testing.allocator;
+    var paths = try instances.Paths.init(a, std.testing.io, ".");
+    defer paths.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var coordinator = instance_leases.Coordinator.init(std.testing.io);
+    var counted: CountingScope = .{ .inner = coordinator.worldScope(3) };
+    var fixture: Fixture = .{ .block_copy = true, .teardown_coordinator = &coordinator };
+    var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = counted.scope(), .guard = .{ .context = &fixture }, .worker = Fixture.work });
+    defer manager.deinit();
+    try manager.select(test_instance);
+    try settle(&manager);
+    try std.testing.expectEqual(@as(usize, 1), counted.acquired);
+    try std.testing.expectEqual(@as(usize, 1), counted.releases);
+    try manager.perform(.{ .copy = .{ .folder = "World", .target = test_target, .target_folder = "Copied" } });
+    manager.tick();
+    try waitWorker(&manager, &fixture.entered);
+    const task = registry.tasks()[0];
+    try std.testing.expectEqual(@as(usize, 2), counted.acquired);
+    try std.testing.expectEqual(@as(usize, 1), counted.releases);
+    try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(test_instance.id));
+    try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(test_target.id));
+    // Deselecting cancels the copy and avoids starting a list after its join.
+    try manager.select(null);
+    try waitWorker(&manager, null);
+    try std.testing.expect(fixture.teardown_source_blocked.load(.acquire));
+    try std.testing.expect(fixture.teardown_target_blocked.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), fixture.exited.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), counted.releases);
+    try std.testing.expect(manager.active.?.options.held_scope != null);
+    try std.testing.expectEqual(tasks.State.canceling, task.state);
+    try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(test_instance.id));
+    try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(test_target.id));
+    manager.tick();
+    try std.testing.expect(manager.active == null);
+    try std.testing.expect(manager.pending == null);
+    try std.testing.expectEqual(tasks.State.canceled, task.state);
+    try std.testing.expectEqual(@as(usize, 2), counted.releases);
+    coordinator.tick();
+    try coordinator.reserveLaunch(test_instance.id);
+    coordinator.releaseLaunch();
+    coordinator.tick();
+    try coordinator.reserveLaunch(test_target.id);
+    coordinator.releaseLaunch();
+    coordinator.tick();
+    for (0..4) |_| manager.tick();
+    try std.testing.expectEqual(@as(usize, 2), counted.releases);
+}
+
+test "concurrent spawn failure starts no worker and releases scope exactly once" {
+    const FailConcurrent = struct {
+        fn concurrent(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) Io.ConcurrentError!*Io.AnyFuture {
+            return error.ConcurrencyUnavailable;
+        }
+    };
+    const a = std.testing.allocator;
+    var vtable = std.testing.io.vtable.*;
+    vtable.concurrent = FailConcurrent.concurrent;
+    const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var paths = try instances.Paths.init(a, io, ".");
+    defer paths.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var coordinator = instance_leases.Coordinator.init(io);
+    var counted: CountingScope = .{ .inner = coordinator.worldScope(3) };
+    var manager = try Manager.initOptions(a, io, &paths, &registry, .{ .scope = counted.scope(), .guard = .{ .context = &fixture }, .worker = Fixture.work });
+    var alive = true;
+    defer if (alive) manager.deinit();
+    try manager.select(test_instance);
+    manager.cancel();
+    try manager.perform(.{ .copy = .{ .folder = "World", .target = test_target, .target_folder = "Copied" } });
+    const task = registry.tasks()[0];
+    manager.tick();
+    try std.testing.expect(manager.active == null);
+    try std.testing.expectEqual(tasks.State.failed, task.state);
+    try std.testing.expectEqual(error.ConcurrencyUnavailable, task.failure.?);
+    try std.testing.expectEqual(error.ConcurrencyUnavailable, manager.snapshot().failure.?);
+    try std.testing.expectEqual(@as(u32, 0), fixture.started.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), fixture.exited.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), counted.acquire_calls);
+    try std.testing.expectEqual(@as(usize, 1), counted.acquired);
+    try std.testing.expectEqual(@as(usize, 1), counted.releases);
+    // Discard the failed operation's list refresh before checking replay.
+    manager.cancel();
+    for (0..4) |_| manager.tick();
+    coordinator.tick();
+    try coordinator.reserveLaunch(test_instance.id);
+    coordinator.releaseLaunch();
+    coordinator.tick();
+    try coordinator.reserveLaunch(test_target.id);
+    coordinator.releaseLaunch();
+    coordinator.tick();
+    manager.deinit();
+    alive = false;
+    try std.testing.expectEqual(@as(usize, 1), counted.acquire_calls);
+    try std.testing.expectEqual(@as(usize, 1), counted.releases);
+    try std.testing.expectEqual(@as(u32, 0), fixture.started.load(.acquire));
 }
 
 test {

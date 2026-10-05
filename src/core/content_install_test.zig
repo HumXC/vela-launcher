@@ -884,3 +884,211 @@ test "disabled mod bytes update and remove at physical disabled path" {
     defer a.free(backup);
     try std.testing.expectEqualStrings("new", backup);
 }
+
+const protected_roots = [_][]const u8{ ".vela-instance.json", ".VeLa-InStAnCe.JsOn/child", ".vela-loader.json", ".VELA-LOADER.JSON/child", "Test.json", "tEsT.JsOn/child", "Test.jar", "TEST.JAR/child" };
+
+test "desired action source destination and download paths reject before conflicts or lease" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.seed();
+    var plan = try fixture.plan();
+    defer plan.deinit();
+    const files = fixture.files();
+    fixture.guard.running = true;
+    for (protected_roots) |path| {
+        const bad = record(&fixture.new_hash, path, "new");
+        for (0..8) |kind| {
+            var options = fixture.options(plan.value, &files);
+            options.plan.ready = false;
+            options.plan.fully_applied = false;
+            switch (kind) {
+                0 => options.plan.next_manifest.files = &.{bad},
+                1 => options.plan.actions = &.{.{ .kind = .remove, .path = path }},
+                2 => options.plan.actions = &.{.{ .kind = .remove, .path = "mods/replace.jar", .previous = bad }},
+                3 => options.plan.actions = &.{.{ .kind = .install, .path = "mods/replace.jar", .desired = bad }},
+                4 => options.files = &.{.{ .record = bad, .download = .{ .manual_required = .{ .official_page = "https://modrinth.com/mod/project", .reason = .missing_url } } }},
+                5 => options.manual_files = &.{.{ .path = path, .source_absolute_path = "/unused" }},
+                6 => options.pack = .{ .identity = .{ .provider = .modrinth, .project_id = "project", .version_id = "new" }, .name = "Pack", .version = "new", .minecraft_version = "1.20.1", .files = &.{.{ .record = bad, .download = .{ .manual_required = .{ .official_page = "https://modrinth.com/mod/project", .reason = .missing_url } } }} },
+                7 => options.plan.conflicts = &.{.{ .path = path, .reason = .unmanaged }},
+                else => unreachable,
+            }
+            try std.testing.expectError(error.ProtectedPath, install.execute(a, io, options));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.guard.acquired);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft/versions/Test/.vela-content", .{}));
+    try fixture.assertBefore();
+}
+
+test "persisted protected removals reject before conflicts lease or transaction creation" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.seed();
+    var plan = try fixture.plan();
+    defer plan.deinit();
+    const files = fixture.files();
+    fixture.guard.running = true;
+    for (protected_roots) |path| {
+        const old = record(&fixture.old_hash, path, "old");
+        const bytes = try std.json.Stringify.valueAlloc(a, manifest.Manifest{ .schema_version = manifest.schema_version, .instance_id = "instance", .pack_version = "old", .files = &.{old} }, .{});
+        defer a.free(bytes);
+        try fixture.write(".vela/instances/instance/content.json", bytes);
+        var options = fixture.options(plan.value, &files);
+        options.plan.ready = false;
+        options.plan.actions = &.{.{ .kind = .remove, .path = "mods/remove.jar" }};
+        try std.testing.expectError(error.ProtectedPath, install.execute(a, io, options));
+        const retained = try fixture.read(".vela/instances/instance/content.json");
+        defer a.free(retained);
+        try std.testing.expectEqualStrings(bytes, retained);
+        try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft/versions/Test/.vela-content", .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.guard.acquired);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+    try fixture.write(".vela/instances/instance/content.json", fixture.original_manifest.?);
+    try fixture.assertBefore();
+}
+
+test "recovery source destination and prior receipt protections precede lease and rollback" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.seed();
+    var plan = try fixture.plan();
+    defer plan.deinit();
+    const files = fixture.files();
+    var inject: Inject = .{ .point = .after_journal, .index = 0, .crash = true };
+    var options = fixture.options(plan.value, &files);
+    options.fault = inject.fault();
+    try std.testing.expectError(error.SimulatedCrash, install.execute(a, io, options));
+    var transactions = try install.listTransactions(a, io, &fixture.paths, "instance", "Test");
+    defer transactions.deinit();
+    try std.testing.expectEqual(@as(usize, 1), transactions.value.len);
+    const txn_path = try std.fs.path.join(a, &.{ fixture.paths.root, ".minecraft", "versions", "Test", ".vela-content", transactions.value[0] });
+    defer a.free(txn_path);
+    const txn = try fs.openAbsolute(io, txn_path);
+    defer txn.close(io);
+    const original = try fs.read(a, txn, io, "journal.json", 16 * 1024 * 1024);
+    defer a.free(original);
+    const acquired = fixture.guard.acquired;
+    fixture.guard.running = true;
+    for (protected_roots) |path| {
+        for ([_][]const u8{ "path", "destination" }) |field| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, original, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            const entry = &parsed.value.object.getPtr("entries").?.array.items[0];
+            entry.object.getPtr(field).?.* = .{ .string = path };
+            const bytes = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+            defer a.free(bytes);
+            try txn.deleteFile(io, "journal.json");
+            try fs.write(txn, io, "journal.json", bytes);
+            try std.testing.expectError(error.ProtectedPath, install.recover(a, io, fixture.recovery(transactions.value[0])));
+            try std.testing.expectError(error.ProtectedPath, install.requireRecoveryClear(a, io, &fixture.paths, "instance", "Test"));
+            try fixture.assertBefore();
+        }
+    }
+    try txn.deleteFile(io, "journal.json");
+    try fs.write(txn, io, "journal.json", original);
+    for ([_][]const u8{ "manifest-before", "manifest-after" }) |backup_name| {
+        const backup = try fs.read(a, txn, io, backup_name, providers.max_json_bytes);
+        defer a.free(backup);
+        for (protected_roots) |path| {
+            const bad = record(&fixture.old_hash, path, "old");
+            const bytes = try std.json.Stringify.valueAlloc(a, manifest.Manifest{ .schema_version = manifest.schema_version, .instance_id = "instance", .pack_version = "old", .files = &.{bad} }, .{});
+            defer a.free(bytes);
+            try txn.deleteFile(io, backup_name);
+            try fs.write(txn, io, backup_name, bytes);
+            try std.testing.expectError(error.ProtectedPath, install.recover(a, io, fixture.recovery(transactions.value[0])));
+            try fixture.assertBefore();
+        }
+        try txn.deleteFile(io, backup_name);
+        try fs.write(txn, io, backup_name, backup);
+    }
+    try std.testing.expectEqual(acquired, fixture.guard.acquired);
+    fixture.guard.running = false;
+    var recovered = try install.recover(a, io, fixture.recovery(transactions.value[0]));
+    defer recovered.deinit();
+    try fixture.assertBefore();
+}
+
+test "content install never creates a missing final game namespace" {
+    for ([_]?[]const u8{ null, ".minecraft", ".minecraft/versions" }) |parent| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        if (parent) |path| try fixture.tmp.dir.createDirPath(io, path);
+        const empty: manifest.UpdatePlan = .{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = "instance", .pack_version = "empty" }, .ready = true, .fully_applied = true };
+        try std.testing.expectError(error.FileNotFound, install.execute(a, io, fixture.options(empty, &.{})));
+        try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft/versions/Test", .{}));
+        try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".vela/instances/instance", .{}));
+        if (parent == null) try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft", .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+        try std.testing.expect(!fixture.guard.held);
+        try std.testing.expectEqual(fixture.guard.acquired, fixture.guard.released);
+    }
+}
+
+test "ordinary root configuration JSON installs and publishes a valid receipt" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.tmp.dir.createDirPath(io, ".minecraft/versions/Test");
+    fixture.new_hash = fingerprint("new");
+    var config_file = record(&fixture.new_hash, "settings.json", "new");
+    config_file.role = .configuration;
+    const desired: manifest.Manifest = .{ .instance_id = "instance", .pack_version = "new", .files = &.{config_file} };
+    const previous: manifest.Manifest = .{ .instance_id = "instance", .pack_version = "old" };
+    var plan = try manifest.buildUpdatePlan(a, previous, desired, &.{}, &.{}, .{ .instance_id = "instance", .instance_name = "Test", .running = false });
+    defer plan.deinit();
+    const files = [_]manifest.InstallFile{.{ .record = config_file, .download = .{ .remote = "https://cdn.modrinth.com/settings.json" } }};
+    var report = try install.execute(a, io, fixture.options(plan.value, &files));
+    defer report.deinit();
+    try std.testing.expect(report.committed and report.fully_applied);
+    const bytes = try fixture.read(".minecraft/versions/Test/settings.json");
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("new", bytes);
+    const receipt_bytes = try fixture.read(".vela/instances/instance/content.json");
+    defer a.free(receipt_bytes);
+    var receipt = try manifest.parseForInstance(a, receipt_bytes, "Test");
+    defer receipt.deinit();
+    try std.testing.expectEqualStrings("settings.json", receipt.value.files[0].path);
+    try std.testing.expectEqual(@as(usize, 1), fixture.fetches);
+}
+test "installer collection bounds reject uninitialized inputs before conflicts lease or mutation" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.seed();
+    var plan = try fixture.plan();
+    defer plan.deinit();
+    const files = fixture.files();
+    const oversized_files = try a.alloc(manifest.InstallFile, providers.max_items + 1);
+    defer a.free(oversized_files);
+    const oversized_manual = try a.alloc(install.ManualFile, providers.max_items + 1);
+    defer a.free(oversized_manual);
+    const oversized_actions = try a.alloc(manifest.Action, providers.max_items * 2 + 1);
+    defer a.free(oversized_actions);
+    const oversized_conflicts = try a.alloc(manifest.Conflict, providers.max_items * 2 + 1);
+    defer a.free(oversized_conflicts);
+    const oversized_records = try a.alloc(manifest.ManagedFile, providers.max_items + 1);
+    defer a.free(oversized_records);
+    const oversized_paths = try a.alloc([]const u8, providers.max_items + 1);
+    defer a.free(oversized_paths);
+    const identity: manifest.PackIdentity = .{ .provider = .modrinth, .project_id = "project", .version_id = "new" };
+    fixture.guard.running = true;
+    for (0..7) |kind| {
+        var options = fixture.options(plan.value, &files);
+        options.plan.ready = false;
+        switch (kind) {
+            0 => options.files = oversized_files,
+            1 => options.manual_files = oversized_manual,
+            2 => options.plan.actions = oversized_actions,
+            3 => options.plan.conflicts = oversized_conflicts,
+            4 => options.pack = .{ .identity = identity, .name = "Pack", .version = "new", .minecraft_version = "1.20.1", .files = oversized_files },
+            5 => options.plan.next_manifest.files = oversized_records,
+            6 => options.plan.next_manifest.pack_membership = .{ .identity = identity, .paths = oversized_paths },
+            else => unreachable,
+        }
+        try std.testing.expectError(error.TooManyItems, install.execute(a, io, options));
+        try fixture.assertBefore();
+        try std.testing.expectEqual(@as(usize, 0), fixture.guard.acquired);
+        try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+        try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft/versions/Test/.vela-content", .{}));
+    }
+}

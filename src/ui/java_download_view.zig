@@ -1,6 +1,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const java_download = @import("../core/java_download.zig");
 const java_download_controller = @import("java_download_controller.zig");
 const tasks = @import("../core/tasks.zig");
@@ -9,12 +10,11 @@ const R = dvui.Rect;
 const Command = union(enum) { start: java_download_controller.Request, cancel };
 
 pub const Ui = struct {
-    modal_open: bool = false,
+    start_admitted: bool = false,
     vendor: java_download.Vendor = .azul,
     major: u8 = 21,
     failure: ?anyerror = null,
     pending: ?Command = null,
-    was_open: bool = false,
     cancel_requested: bool = false,
 
     pub fn init(a: std.mem.Allocator) Ui {
@@ -36,6 +36,15 @@ pub const Ui = struct {
     }
 };
 
+/// Preserve the required game version when acquisition is opened from a chooser.
+pub fn suggestMajor(ui: *Ui, required: u32) void {
+    if (ui.pending != null or required > std.math.maxInt(u8)) return;
+    const major: u8 = @intCast(required);
+    if (!java_download.supported(.azul, major)) return;
+    ui.major = major;
+    if (!java_download.supported(ui.vendor, major)) ui.vendor = .azul;
+}
+
 fn frameFmt(comptime format: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), format, args) catch "";
 }
@@ -52,6 +61,7 @@ fn text(src: std.builtin.SourceLocation, value: []const u8, muted: bool) void {
         .margin = R.all(0),
         .font = if (muted) dvui.themeGet().font_body.withSize(14) else dvui.themeGet().font_body,
         .color_text = if (muted) .{ .color = theme.muted } else null,
+        .background = false,
     });
     defer layout.deinit();
     layout.addText(value, .{});
@@ -64,41 +74,10 @@ fn warning(src: std.builtin.SourceLocation, value: []const u8) void {
         .padding = R.all(0),
         .margin = .{ .y = 8 },
         .color_text = .{ .color = dvui.Color.fromHex("F0A6A1") },
+        .background = false,
     });
     defer layout.deinit();
     layout.addText(value, .{});
-}
-
-fn action(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8, disabled: bool, highlighted: bool) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{ .grayed = disabled }, .{
-        .min_size_content = .{ .h = 24 },
-        .padding = R.all(10),
-        .margin = .{ .w = 8, .h = 4 },
-        .corners = .all(8),
-        .border = R.all(1),
-        .style = if (highlighted) .highlight else .control,
-        .tab_index = if (disabled) 0 else null,
-        .label = .{ .text = name },
-    });
-    defer button.deinit();
-    if (!disabled) button.processEvents();
-    button.drawBackground();
-    {
-        const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .min_size_content = .{ .h = 24 }, .padding = R.all(0), .margin = R.all(0) });
-        defer row.deinit();
-        dvui.icon(@src(), name, asset, .{}, button.style().override(.{
-            .min_size_content = .{ .w = 18, .h = 18 },
-            .max_size_content = .{ .w = 18, .h = 18 },
-            .gravity_y = 0.5,
-            .padding = R.all(0),
-            .margin = .{ .w = 8 },
-            .role = .none,
-        }));
-        dvui.labelNoFmt(@src(), name, .{ .align_y = 0.5 }, button.style().override(.{ .min_size_content = .{ .h = 24 }, .padding = R.all(0), .margin = R.all(0) }));
-    }
-    if (!disabled) button.drawFocus();
-    return !disabled and button.clicked();
 }
 
 fn vendorName(vendor: java_download.Vendor) []const u8 {
@@ -238,66 +217,42 @@ fn status(snapshot: java_download_controller.Snapshot, cancel_requested: bool) v
     if (snapshot.registration_failure) |err| warning(@src(), frameFmt("添加到管理列表失败：{s}", .{@errorName(err)}));
 }
 
-pub fn draw(ui: *Ui, controller: *java_download_controller.Controller) void {
-    if (!ui.modal_open) {
-        if (ui.was_open) ui.queueCancel();
-        ui.was_open = false;
-        return;
-    }
-    ui.was_open = true;
+/// Reset presentation admission before drawing any page. Navigation does not cancel work.
+pub fn beginFrame(ui: *Ui) void {
+    ui.start_admitted = false;
+}
+
+/// The owning Java page supplies mutation gates; task lifetime is independent of visibility.
+pub fn drawInline(ui: *Ui, controller: *java_download_controller.Controller, enabled: bool) void {
+    ui.start_admitted = enabled;
+    drawBody(ui, controller, enabled);
+}
+
+fn drawBody(ui: *Ui, controller: *java_download_controller.Controller, enabled: bool) void {
     const snapshot = controller.snapshot();
     if (snapshot.phase != .running) ui.cancel_requested = false;
     const busy = snapshot.phase == .running or ui.pending != null;
-    const window = dvui.windowRect();
-    const width = @max(160, @min(600, window.w - 56));
-    const height = @max(140, @min(560, window.h - 56));
+    selectors(ui, !enabled or busy);
+    gap(@src(), 16);
+    text(@src(), "当前平台", true);
+    gap(@src(), 6);
+    const platform_supported = if (controller.hostPlatform()) |platform| supported: {
+        text(@src(), frameFmt("{s} · {s}", .{ @tagName(platform.os), @tagName(platform.arch) }), false);
+        break :supported true;
+    } else |err| unsupported: {
+        warning(@src(), frameFmt("当前平台不受支持：{s}", .{@errorName(err)}));
+        break :unsupported false;
+    };
+    gap(@src(), 12);
     {
-        const modal = dvui.floatingWindow(@src(), .{
-            .modal = true,
-            .open_flag = &ui.modal_open,
-            .resize = .none,
-            .window_avoid = .none,
-        }, .{
-            .rect = .{ .x = window.x + (window.w - width - 26) / 2, .y = window.y + (window.h - height - 26) / 2, .w = width + 26, .h = height + 26 },
-            .min_size_content = .{ .w = width, .h = height },
-            .max_size_content = .{ .w = width, .h = height },
-            .padding = R.all(12),
-            .margin = R.all(0),
-            .corners = .all(8),
-            .label = .{ .text = "下载 Java" },
-        });
-        defer modal.deinit();
-        modal.dragAreaSet(dvui.windowHeader("下载 Java", "", &ui.modal_open));
-        {
-            const actions = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .gravity_y = 1, .min_size_content = .{ .h = 48 }, .margin = .{ .y = 12 }, .padding = R.all(0) });
-            defer actions.deinit();
-            if (snapshot.phase == .running) {
-                if (action(@src(), "取消下载", dvui.entypo.cross, ui.cancel_requested, false)) ui.queueCancel();
-            } else {
-                if (action(@src(), "下载 Java", dvui.entypo.download, busy, true)) ui.queueStart();
-                if (action(@src(), "关闭", dvui.entypo.cross, false, false)) ui.modal_open = false;
-            }
-        }
-        const body = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .background = false });
-        defer body.deinit();
-        gap(@src(), 8);
-        selectors(ui, busy or ui.pending != null);
-        gap(@src(), 16);
-        text(@src(), "当前平台", true);
-        gap(@src(), 6);
-        if (controller.hostPlatform()) |platform| {
-            text(@src(), frameFmt("{s} · {s}", .{ @tagName(platform.os), @tagName(platform.arch) }), false);
-        } else |err| {
-            warning(@src(), frameFmt("当前平台不受支持：{s}", .{@errorName(err)}));
-        }
-        gap(@src(), 20);
-        if (ui.failure) |err| warning(@src(), frameFmt("无法开始下载：{s}", .{@errorName(err)}));
-        status(snapshot, ui.cancel_requested);
+        const actions = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
+        defer actions.deinit();
+        if (snapshot.phase == .running) {
+            if (components.action(@src(), "取消下载", enabled and !ui.cancel_requested)) ui.queueCancel();
+        } else if (components.action(@src(), "下载 Java", enabled and !busy and platform_supported)) ui.queueStart();
     }
-    if (!ui.modal_open) {
-        ui.queueCancel();
-        ui.was_open = false;
-    }
+    if (ui.failure) |err| warning(@src(), frameFmt("无法开始下载：{s}", .{@errorName(err)}));
+    status(snapshot, ui.cancel_requested);
 }
 
 fn validateRequest(request: java_download_controller.Request) !void {
@@ -306,10 +261,12 @@ fn validateRequest(request: java_download_controller.Request) !void {
 
 fn finishQueued(ui: *Ui, controller: anytype) void {
     const command = ui.pending orelse return;
+    const admitted = ui.start_admitted;
+    ui.start_admitted = false;
     ui.pending = null;
     switch (command) {
         .start => |request| {
-            if (!ui.modal_open) return;
+            if (!admitted) return;
             ui.failure = null;
             validateRequest(request) catch |err| {
                 ui.failure = err;
@@ -354,7 +311,7 @@ test "download queue owns scalar selection and finishes only once" {
     var ui = Ui.init(std.testing.allocator);
     defer ui.deinit();
     var controller: TestController = .{};
-    ui.modal_open = true;
+    ui.start_admitted = true;
     ui.queueStart();
     ui.vendor = .microsoft;
     ui.major = 17;
@@ -371,7 +328,7 @@ test "finish rejects unsupported Microsoft Java 8 without starting" {
     var ui = Ui.init(std.testing.allocator);
     defer ui.deinit();
     var controller: TestController = .{};
-    ui.modal_open = true;
+    ui.start_admitted = true;
     ui.vendor = .microsoft;
     ui.major = 8;
     ui.queueStart();
@@ -381,13 +338,12 @@ test "finish rejects unsupported Microsoft Java 8 without starting" {
     try std.testing.expect(ui.pending == null);
 }
 
-test "closing overrides queued start and cancellation stays deferred" {
+test "explicit cancellation overrides inline start and stays deferred" {
     var ui = Ui.init(std.testing.allocator);
     defer ui.deinit();
     var controller: TestController = .{};
-    ui.modal_open = true;
+    ui.start_admitted = true;
     ui.queueStart();
-    ui.modal_open = false;
     ui.queueCancel();
     try std.testing.expectEqual(@as(usize, 0), controller.cancels);
     finishQueued(&ui, &controller);
@@ -396,19 +352,37 @@ test "closing overrides queued start and cancellation stays deferred" {
     try std.testing.expect(ui.cancel_requested);
 }
 
-test "closed modal cannot execute a pending start and start errors remain visible" {
+test "navigation rejects an unseen start without cancelling ongoing work" {
+    var ui = Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    var controller: TestController = .{};
+    ui.start_admitted = true;
+    ui.queueStart();
+    finishQueued(&ui, &controller);
+    try std.testing.expectEqual(@as(usize, 1), controller.starts);
+    // An unseen acquisition view cannot admit another queued start.
+    ui.queueStart();
+    beginFrame(&ui);
+    finishQueued(&ui, &controller);
+    try std.testing.expectEqual(@as(usize, 1), controller.starts);
+    try std.testing.expectEqual(@as(usize, 0), controller.cancels);
+    try std.testing.expect(ui.pending == null);
+}
+
+test "inline start failure remains visible and retry needs fresh admission" {
     var ui = Ui.init(std.testing.allocator);
     defer ui.deinit();
     var controller: TestController = .{ .failure = error.Busy };
     ui.queueStart();
     finishQueued(&ui, &controller);
     try std.testing.expectEqual(@as(usize, 0), controller.starts);
-    ui.modal_open = true;
+    ui.start_admitted = true;
     ui.queueStart();
     finishQueued(&ui, &controller);
     try std.testing.expectEqual(@as(?anyerror, error.Busy), ui.failure);
     try std.testing.expect(ui.pending == null);
     controller.failure = null;
+    ui.start_admitted = true;
     ui.queueStart();
     finishQueued(&ui, &controller);
     try std.testing.expect(ui.failure == null);

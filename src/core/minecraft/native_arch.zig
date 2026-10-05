@@ -25,6 +25,13 @@ fn matches(actual: ?Cpu, wanted: Cpu) !void {
 
 fn nativeName(name: []const u8) bool {
     const base = std.fs.path.basename(name);
+    // LWJGL stores native build/hash metadata here, alongside actual ELF payloads.
+    // Binary magic is checked before this name classifier, including in sidecars.
+    if (std.mem.startsWith(u8, name, "META-INF/")) {
+        for ([_][]const u8{ ".git", ".sha1", ".sha256", ".md5" }) |suffix| {
+            if (std.mem.endsWith(u8, base, suffix)) return false;
+        }
+    }
     for ([_][]const u8{ ".dll", ".dylib", ".jnilib", ".so", ".exe" }) |suffix| {
         if (base.len >= suffix.len and std.ascii.eqlIgnoreCase(base[base.len - suffix.len ..], suffix)) return true;
     }

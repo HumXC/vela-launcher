@@ -64,12 +64,39 @@ pub fn safeRelativePath(path: []const u8) bool {
 }
 pub fn protectedPath(path: []const u8) bool {
     const end = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
-    for ([_][]const u8{ "saves", "world", "world_nether", "world_the_end", ".vela", ".minecraft", "assets", "libraries", "versions" }) |name| if (std.ascii.eqlIgnoreCase(path[0..end], name)) return true;
+    for ([_][]const u8{ "saves", "world", "world_nether", "world_the_end", ".vela", ".minecraft", "assets", "libraries", "versions", ".vela-content", ".vela-instance.json", ".vela-loader.json" }) |name| if (std.ascii.eqlIgnoreCase(path[0..end], name)) return true;
     return false;
 }
-fn checkedPath(path: []const u8) !void {
+/// Launcher receipts and the exact target metadata/JAR reserve their descendants too.
+pub fn protectedPathForInstance(path: []const u8, instance_name: []const u8) bool {
+    if (protectedPath(path)) return true;
+    const end = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
+    const root = path[0..end];
+    if (root.len <= instance_name.len or !std.ascii.eqlIgnoreCase(root[0..instance_name.len], instance_name)) return false;
+    const suffix = root[instance_name.len..];
+    return std.ascii.eqlIgnoreCase(suffix, ".json") or std.ascii.eqlIgnoreCase(suffix, ".jar");
+}
+pub fn checkedPathForInstance(path: []const u8, instance_name: ?[]const u8) !void {
+    if (path.len == 0 or path.len > max_path_bytes) return error.UnsafeRelativePath;
+    if (if (instance_name) |name| protectedPathForInstance(path, name) else protectedPath(path)) return error.ProtectedPath;
     if (!safeRelativePath(path)) return error.UnsafeRelativePath;
-    if (protectedPath(path)) return error.ProtectedPath;
+}
+fn checkedPath(path: []const u8) !void {
+    try checkedPathForInstance(path, null);
+}
+fn validateManifestBounds(document: Manifest) !void {
+    if (document.files.len > providers.max_items) return error.TooManyItems;
+    if (document.pack_membership) |membership| {
+        if (membership.paths.len > providers.max_items) return error.TooManyItems;
+    }
+}
+/// Run after structural bounds and before conflict, hash, or mutable-state checks.
+pub fn validatePathsForInstance(document: Manifest, instance_name: ?[]const u8) !void {
+    try validateManifestBounds(document);
+    for (document.files) |file| try checkedPathForInstance(file.path, instance_name);
+    if (document.pack_membership) |membership| {
+        for (membership.paths) |path| try checkedPathForInstance(path, instance_name);
+    }
 }
 pub fn pathsCollide(a: []const u8, b: []const u8) bool {
     const len = @min(a.len, b.len);
@@ -99,6 +126,7 @@ fn validateFile(file: ManagedFile) !void {
     if (!file.enabled and !toggleable(file)) return error.UnsupportedEnabledState;
 }
 pub fn validate(document: Manifest) !void {
+    try validatePathsForInstance(document, null);
     if (document.schema_version != schema_version and document.schema_version != legacy_schema_version) return error.UnsupportedSchema;
     if (document.schema_version == legacy_schema_version and document.pack_membership != null) return error.ReceiptUpgradeRequired;
     if (!config.validId(document.instance_id)) return error.InvalidInstanceId;
@@ -130,6 +158,9 @@ pub fn validate(document: Manifest) !void {
     }
 }
 pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Owned(Manifest) {
+    return parseForInstance(a, bytes, null);
+}
+pub fn parseForInstance(a: std.mem.Allocator, bytes: []const u8, instance_name: ?[]const u8) !Owned(Manifest) {
     var arena = std.heap.ArenaAllocator.init(a);
     errdefer arena.deinit();
     const aa = arena.allocator();
@@ -153,6 +184,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Owned(Manifest) {
         const parsed = try std.json.parseFromSlice(Manifest, aa, bytes, .{ .allocate = .alloc_always, .max_value_len = providers.max_string_bytes });
         break :modern parsed.value;
     } else return error.UnsupportedSchema;
+    try validatePathsForInstance(document, instance_name);
     try validate(document);
     return .{ .arena = arena, .value = document };
 }
@@ -265,6 +297,7 @@ fn validateIdentity(identity: PackIdentity) !void {
 }
 fn validateInstallFiles(files: []const InstallFile) !void {
     if (files.len > providers.max_items) return error.TooManyItems;
+    for (files) |file| try checkedPath(file.record.path);
     for (files, 0..) |file, i| {
         try validateFile(file.record);
         if (file.required and file.selected == false) return error.RequiredFileExcluded;
@@ -502,7 +535,7 @@ pub fn checkCompleteness(pack: PackPlan, probe: Probe, prerequisites: Completion
     return result;
 }
 
-pub const InstanceGuard = struct { instance_id: []const u8, running: bool };
+pub const InstanceGuard = struct { instance_id: []const u8, running: bool, instance_name: ?[]const u8 = null };
 pub const ObservedFile = struct { path: []const u8, hashes: ?providers.Hashes, size: u64, regular: bool = true };
 pub const ConflictReason = enum { modified_managed, unmanaged, unknown_hash };
 pub const ConflictChoice = enum { keep_local, replace };
@@ -530,6 +563,9 @@ pub const UpdatePlan = struct {
 
 /// An explicit local state override never approves replacing modified bytes.
 pub fn buildEnabledPlan(a: std.mem.Allocator, previous: Manifest, path: []const u8, enabled: bool, observed: []const ObservedFile, instance_guard: InstanceGuard) !Owned(UpdatePlan) {
+    if (observed.len > providers.max_items) return error.TooManyItems;
+    try validatePathsForInstance(previous, instance_guard.instance_name);
+    try checkedPathForInstance(path, instance_guard.instance_name);
     try validate(previous);
     const old = findManaged(previous.files, path) orelse return error.UnmanagedFile;
     if (!std.mem.eql(u8, old.path, path)) return error.PathCaseChanged;
@@ -556,11 +592,16 @@ pub fn buildEnabledPlan(a: std.mem.Allocator, previous: Manifest, path: []const 
 /// observations, reject symlinks, and rollback on failure/cancel. Never use this
 /// plan's ready bit as an installation-complete signal.
 pub fn buildUpdatePlan(a: std.mem.Allocator, previous: Manifest, desired: Manifest, observed: []const ObservedFile, decisions: []const ConflictDecision, instance_guard: InstanceGuard) !Owned(UpdatePlan) {
+    try validateManifestBounds(previous);
+    try validateManifestBounds(desired);
+    if (observed.len > providers.max_items or decisions.len > providers.max_items) return error.TooManyItems;
+    try validatePathsForInstance(previous, instance_guard.instance_name);
+    try validatePathsForInstance(desired, instance_guard.instance_name);
+    for (decisions) |decision| try checkedPathForInstance(decision.path, instance_guard.instance_name);
     try validate(previous);
     try validate(desired);
     if (instance_guard.running) return error.InstanceRunning;
     if (!std.mem.eql(u8, instance_guard.instance_id, previous.instance_id) or !std.mem.eql(u8, instance_guard.instance_id, desired.instance_id)) return error.InstanceMismatch;
-    if (observed.len > providers.max_items or decisions.len > providers.max_items) return error.TooManyItems;
     for (observed, 0..) |file, i| {
         if (!safeRelativePath(file.path)) return error.UnsafeRelativePath;
         if (file.hashes) |h| try providers.validateHashes(h);
@@ -1142,4 +1183,64 @@ test "enabled state plan preserves receipts and rejects unsafe or unowned reques
     try testing.expectError(error.LocalFileChanged, buildEnabledPlan(a, previous, file.path, false, &unsafe, instance_state_guard));
     try testing.expectError(error.InstanceRunning, buildEnabledPlan(a, previous, file.path, false, &observed, .{ .instance_id = "instance", .running = true }));
     try testing.expectError(error.InstanceMismatch, buildEnabledPlan(a, previous, file.path, false, &observed, .{ .instance_id = "another", .running = false }));
+}
+
+test "launcher root receipts and exact target metadata reserve case aliases and descendants" {
+    const a = testing.allocator;
+    const target_guard: InstanceGuard = .{ .instance_id = "instance", .instance_name = "Test", .running = true };
+    const empty = manifest(&.{}, "v1");
+    for ([_][]const u8{ ".vela-instance.json", ".VeLa-InStAnCe.JsOn/child", ".vela-loader.json", ".VELA-LOADER.JSON/child", "Test.json", "tEsT.JsOn/child", "Test.jar", "TEST.JAR/child" }) |path| {
+        try testing.expectError(error.ProtectedPath, checkedPathForInstance(path, "Test"));
+        const file = managed(path, sha1_a, "v1");
+        const document = manifest(&.{file}, "v1");
+        try testing.expectError(error.ProtectedPath, buildUpdatePlan(a, empty, document, &.{}, &.{}, target_guard));
+        try testing.expectError(error.ProtectedPath, buildUpdatePlan(a, document, empty, &.{}, &.{}, target_guard));
+        try testing.expectError(error.ProtectedPath, buildEnabledPlan(a, empty, path, false, &.{}, target_guard));
+        try testing.expectError(error.ProtectedPath, buildUpdatePlan(a, empty, empty, &.{}, &.{.{ .path = path, .choice = .replace }}, target_guard));
+        var wire_document = document;
+        wire_document.schema_version = schema_version;
+        const bytes = try std.json.Stringify.valueAlloc(a, wire_document, .{});
+        defer a.free(bytes);
+        try testing.expectError(error.ProtectedPath, parseForInstance(a, bytes, "Test"));
+        var membership_only: Manifest = .{ .schema_version = schema_version, .instance_id = "instance", .pack_version = "v1" };
+        membership_only.pack_membership = .{ .identity = .{ .provider = .modrinth, .project_id = "project", .version_id = "v1" }, .paths = &.{path} };
+        try testing.expectError(error.ProtectedPath, validatePathsForInstance(membership_only, "Test"));
+    }
+}
+
+test "root configuration JSON and unrelated instance names remain ordinary content" {
+    for ([_][]const u8{ "config.json", "settings.json", "Other.json", "Other.jar", "Test-options.json", "Test.json.backup", ".vela-loader.json.backup", "config/Test.json", "mods/Test.jar" }) |path| {
+        try checkedPathForInstance(path, "Test");
+        try validatePathsForInstance(manifest(&.{managed(path, sha1_a, "v1")}, "v1"), "Test");
+    }
+    // Inspection has no target name and must not blacklist every root JSON/JAR.
+    try checkedPathForInstance("Test.json", null);
+    try checkedPathForInstance("Test.jar", null);
+    for ([_][]const u8{ ".vela-instance.json", ".VELA-LOADER.JSON/child" }) |path| {
+        try testing.expectError(error.ProtectedPath, validate(manifest(&.{managed(path, sha1_a, "v1")}, "v1")));
+    }
+}
+test "path preflight bounds precede uninitialized collections and strings" {
+    const a = testing.allocator;
+    const files = try a.alloc(ManagedFile, providers.max_items + 1);
+    defer a.free(files);
+    try testing.expectError(error.TooManyItems, validatePathsForInstance(manifest(files, "v1"), "Test"));
+    const paths = try a.alloc([]const u8, providers.max_items + 1);
+    defer a.free(paths);
+    const identity: PackIdentity = .{ .provider = .modrinth, .project_id = "project", .version_id = "v1" };
+    const membership: Manifest = .{ .schema_version = schema_version, .instance_id = "instance", .pack_version = "v1", .pack_membership = .{ .identity = identity, .paths = paths } };
+    try testing.expectError(error.TooManyItems, validatePathsForInstance(membership, "Test"));
+    const installs = try a.alloc(InstallFile, providers.max_items + 1);
+    defer a.free(installs);
+    const pack: PackPlan = .{ .identity = identity, .name = "Pack", .version = "v1", .minecraft_version = "1.20.1", .files = installs };
+    try testing.expectError(error.TooManyItems, membershipForPack(a, pack));
+    const decisions = try a.alloc(ConflictDecision, providers.max_items + 1);
+    defer a.free(decisions);
+    const protected = manifest(&.{managed("Test.json", sha1_a, "v1")}, "v1");
+    const empty = manifest(&.{}, "v1");
+    const instance_guard: InstanceGuard = .{ .instance_id = "instance", .instance_name = "Test", .running = true };
+    try testing.expectError(error.TooManyItems, buildUpdatePlan(a, protected, empty, &.{}, decisions, instance_guard));
+    const oversized_path = try a.alloc(u8, max_path_bytes + 1);
+    defer a.free(oversized_path);
+    try testing.expectError(error.UnsafeRelativePath, checkedPathForInstance(oversized_path, "Test"));
 }

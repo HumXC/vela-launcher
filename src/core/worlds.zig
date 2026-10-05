@@ -8,8 +8,8 @@
 //! completed mutation returns uncertain / DirectoryDurabilityUnavailable. Do not
 //! automatically retry it; inspect both recovery_directory and staging_directory.
 //! Foreign targets are compile-checked only, not runtime/durability validated.
-//! Parent launch lifecycle must share transaction_gate and a stable-ID Guard.
-//! Never hold the gate for the running game; reserve and release under the gate.
+//! World data APIs require a shared per-instance WorldScope. The transaction gate
+//! protects reservation state only; filesystem work runs after releasing the gate.
 const std = @import("std");
 const config = @import("config.zig");
 const instances = @import("instances.zig");
@@ -29,7 +29,7 @@ pub const Limits = tree.Limits;
 pub const Hooks = tree.Hooks;
 
 /// The launch lifecycle must take this same gate when changing running state.
-/// All world/artifact transactions in this process share it, including reads.
+/// Reservation callbacks hold this gate only while inspecting or updating state.
 pub var transaction_gate: std.Io.Mutex = .init;
 pub const Guard = struct {
     context: ?*anyopaque = null,
@@ -40,14 +40,93 @@ pub const Guard = struct {
         if (self.is_running) |f| if (f(self.context, instance.id)) return error.InstanceRunning;
     }
 };
+pub const ScopeIds = struct {
+    source: []const u8,
+    target: ?[]const u8 = null,
+
+    pub fn normalized(self: ScopeIds) ScopeIds {
+        if (self.target) |target| if (std.mem.eql(u8, self.source, target)) return .{ .source = self.source };
+        return self;
+    }
+    pub fn contains(self: ScopeIds, id: []const u8) bool {
+        if (std.mem.eql(u8, self.source, id)) return true;
+        return if (self.target) |target| std.mem.eql(u8, target, id) else false;
+    }
+};
+pub const ScopeState = enum { available, busy, running };
+pub const ScopeStamp = struct {
+    source_generation: u64,
+    target_generation: ?u64 = null,
+};
+/// Provider contexts remain at their final address until every worker joins.
+pub const WorldScope = struct {
+    context: ?*anyopaque,
+    probe: *const fn (?*anyopaque, ScopeIds) anyerror!ScopeState,
+    acquire: *const fn (?*anyopaque, ScopeIds) anyerror!ScopeStamp,
+    recheck: *const fn (?*anyopaque, ScopeIds, ScopeStamp) anyerror!void,
+    release: *const fn (?*anyopaque, ScopeIds, ScopeStamp) void,
+
+    pub fn hold(self: WorldScope, requested: ScopeIds) !HeldWorldScope {
+        const ids = requested.normalized();
+        return .{ .scope = self, .ids = ids, .stamp = try self.acquire(self.context, ids) };
+    }
+};
+/// IDs are borrowed; managers keep their cloned storage alive until JOIN.
+pub const HeldWorldScope = struct {
+    scope: WorldScope,
+    ids: ScopeIds,
+    stamp: ScopeStamp,
+
+    pub fn covers(self: HeldWorldScope, requested: ScopeIds) bool {
+        if (!self.ids.contains(requested.source)) return false;
+        return if (requested.target) |target| self.ids.contains(target) else true;
+    }
+    pub fn recheck(self: HeldWorldScope) !void {
+        try self.scope.recheck(self.scope.context, self.ids, self.stamp);
+    }
+    pub fn release(self: HeldWorldScope) void {
+        self.scope.release(self.scope.context, self.ids, self.stamp);
+    }
+};
+pub const ScopeEntry = struct {
+    held: HeldWorldScope,
+    owned: bool,
+
+    pub fn deinit(self: ScopeEntry) void {
+        if (self.owned) self.held.release();
+    }
+};
 pub const Options = struct {
     limits: Limits = .{},
     hooks: Hooks = .{},
     guard: Guard = .{},
+    scope: ?WorldScope = null,
+    held_scope: ?HeldWorldScope = null,
     /// Set only after an explicit user confirmation; never inferred from a collision.
     confirmed_destructive: bool = false,
     display_name: ?[]const u8 = null,
 };
+/// Static owned IDs remain an additional veto; callback predicates are not leases.
+pub fn checkStaticGuard(guard: Guard, ids: ScopeIds) !void {
+    if (guard.is_running != null) return error.UnsupportedWorldGuard;
+    for (guard.running_ids) |id| if (ids.contains(id)) return error.InstanceRunning;
+}
+/// Enter before opening files and release after all descriptors and cleanup finish.
+pub fn enterScope(options: Options, requested: ScopeIds) !ScopeEntry {
+    const ids = requested.normalized();
+    if (!config.validId(ids.source)) return error.InvalidInstanceId;
+    if (ids.target) |target| if (!config.validId(target)) return error.InvalidInstanceId;
+    if (options.guard.is_running != null) return error.UnsupportedWorldGuard;
+    if (options.scope == null and options.held_scope == null) return error.MissingWorldScope;
+    if (options.scope != null and options.held_scope != null) return error.InvalidWorldScope;
+    try checkStaticGuard(options.guard, ids);
+    if (options.held_scope) |held| {
+        if (!held.covers(ids)) return error.LeaseNotHeld;
+        try held.recheck();
+        return .{ .held = held, .owned = false };
+    }
+    return .{ .held = try options.scope.?.hold(ids), .owned = true };
+}
 pub const MetadataStatus = enum { valid, missing, corrupt, unavailable };
 pub const Metadata = struct {
     level_name: ?[]const u8 = null,
@@ -135,11 +214,12 @@ fn saves(a: A, io: std.Io, paths: *const instances.Paths, instance: config.Insta
     try validateInstance(instance);
     const root = try tree.openAbsolute(io, paths.root);
     defer root.close(io);
-    const minecraft = try tree.child(io, root, ".minecraft", create);
+    // Instance namespace creation belongs to the registered-instance owner.
+    const minecraft = try tree.child(io, root, ".minecraft", false);
     defer minecraft.close(io);
-    const versions = try tree.child(io, minecraft, "versions", create);
+    const versions = try tree.child(io, minecraft, "versions", false);
     defer versions.close(io);
-    const version = try tree.child(io, versions, instance.name, create);
+    const version = try tree.child(io, versions, instance.name, false);
     defer version.close(io);
     return tree.child(io, version, "saves", create);
 }
@@ -153,8 +233,9 @@ fn recentFirst(_: void, x: World, y: World) bool {
     return std.mem.lessThan(u8, x.folder, y.folder);
 }
 pub fn list(a: A, io: std.Io, paths: *const instances.Paths, instance: config.Instance, parser: ?MetadataParser, options: Options) !WorldList {
-    try transaction_gate.lock(io);
-    defer transaction_gate.unlock(io);
+    try validateInstance(instance);
+    const scope = try enterScope(options, .{ .source = instance.id });
+    defer scope.deinit();
     const dir = saves(a, io, paths, instance, false) catch |err| switch (err) {
         error.FileNotFound => return .{ .allocator = a, .items = try a.alloc(World, 0) },
         else => return err,
@@ -299,19 +380,18 @@ pub fn restore(a: A, io: std.Io, paths: *const instances.Paths, ref: BackupRef, 
 }
 
 fn transact(a: A, io: std.Io, paths: *const instances.Paths, operation: Operation, source_ref: WorldRef, target_ref: ?WorldRef, restore_id: ?BackupRef, options: Options) !Outcome {
-    try transaction_gate.lock(io);
-    defer transaction_gate.unlock(io);
-    try options.hooks.check(io);
     try validateInstance(source_ref.instance);
     if (!validFolder(source_ref.folder)) return error.UnsafeWorldName;
-    try options.guard.check(source_ref.instance);
     if ((operation == .delete or operation == .rename_display_name) and !options.confirmed_destructive) return error.ConfirmationRequired;
     if (target_ref) |target| {
         try validateInstance(target.instance);
         if (!validFolder(target.folder)) return error.UnsafeWorldName;
-        try options.guard.check(target.instance);
         if (std.ascii.eqlIgnoreCase(source_ref.instance.name, target.instance.name) and std.mem.eql(u8, source_ref.folder, target.folder) and operation != .restore and operation != .rename_display_name) return error.SameWorld;
     }
+    const ids: ScopeIds = .{ .source = source_ref.instance.id, .target = if (target_ref) |target| target.instance.id else null };
+    const scope = try enterScope(options, ids);
+    defer scope.deinit();
+    try options.hooks.check(io);
     const source_saves = try saves(a, io, paths, source_ref.instance, false);
     defer source_saves.close(io);
     const target_saves = if (target_ref) |target| try saves(a, io, paths, target.instance, true) else source_saves;
@@ -412,8 +492,8 @@ fn transact(a: A, io: std.Io, paths: *const instances.Paths, operation: Operatio
         outcome.state = .uncertain;
         outcome.cause = error.DirectoryDurabilityUnavailable;
     }
-    try options.guard.check(source_ref.instance);
-    if (target_ref) |t| try options.guard.check(t.instance);
+    try scope.held.recheck();
+    try checkStaticGuard(options.guard, ids);
     try options.hooks.check(io);
     // No cancellation points after publication. Preallocated outcome needs no fallible allocation.
     const old_protection = io.swapCancelProtection(.blocked);

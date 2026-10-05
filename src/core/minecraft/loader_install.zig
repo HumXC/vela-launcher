@@ -10,6 +10,7 @@ const metadata_loader = @import("metadata_loader.zig");
 const plan_module = @import("install_plan.zig");
 const http = @import("../http_transport.zig");
 const instances = @import("../instances.zig");
+const namespace = @import("../instance_namespace.zig");
 const tree = @import("../worlds_tree.zig");
 const A = std.mem.Allocator;
 const max_file = 512 * 1024 * 1024;
@@ -38,6 +39,10 @@ pub const Options = struct {
     environment: m.rules.Environment,
     java: ?[]const u8 = null,
     lease: Lease,
+    /// Borrowed reservations are validated and never released by this operation.
+    namespace_token: ?namespace.Token = null,
+    /// Worker admission may wait for the short namespace stamp gate.
+    worker_checks: bool = false,
     http_options: http.Options = .{},
     /// Optional metadata/artifact fixture transport; production uses shared HTTP.
     transport: ?loaders.Transport = null,
@@ -61,6 +66,8 @@ pub const MetadataOptions = struct {
     environment: m.rules.Environment,
     vanilla: metadata_loader.Options,
     fetcher: metadata_loader.Fetcher = .{},
+    namespace_token: ?namespace.Token = null,
+    worker_checks: bool = false,
     http_options: http.Options = .{},
     transport: ?loaders.Transport = null,
 };
@@ -140,9 +147,20 @@ pub const PreparedMetadata = struct {
     }
 };
 
+fn reserveNamespace(io: std.Io, borrowed: ?namespace.Token, worker: bool) !namespace.Token {
+    if (borrowed) |token| {
+        if (worker) try token.recheckWaiting() else try token.recheck();
+        return token;
+    }
+    return if (worker) namespace.acquireWaiting(io) else namespace.acquire(io);
+}
+
 /// No JVM, game installation, or final publication. Only private temporary ZIP
 /// extraction is permitted; the returned owner retains bytes, not scratch paths.
 pub fn prepareMetadata(a: A, io: std.Io, options: MetadataOptions, control: loaders.Control) !PreparedMetadata {
+    const token = try reserveNamespace(io, options.namespace_token, options.worker_checks);
+    // Runs after metadata stage removal, all closes and cancellation restoration.
+    defer if (options.namespace_token == null) token.release();
     try control.check();
     if (options.generation == 0) return error.InvalidPreparationGeneration;
     try c.id(options.instance_id);
@@ -398,6 +416,8 @@ pub fn installPrepared(a: A, io: std.Io, options: Options, prepared: *const Prep
 }
 
 fn installCore(a: A, io: std.Io, options: Options, supplied: ?*const PreparedMetadata, control: loaders.Control) !Installed {
+    const token = try reserveNamespace(io, options.namespace_token, options.worker_checks);
+    defer if (options.namespace_token == null) token.release();
     try control.check();
     if (supplied) |prepared| try prepared.validate(a, io, options);
     try c.id(options.instance_id);
@@ -443,6 +463,7 @@ fn installCore(a: A, io: std.Io, options: Options, supplied: ?*const PreparedMet
     var client = try http.Client.init(a, io, options.http_options);
     defer client.deinit();
     var ctx: Context = .{ .a = a, .g = g, .io = io, .client = &client, .options = options, .base_plan = base_plan, .base_directory = base_directory, .minecraft = minecraft, .versions = versions, .stage = stage, .stage_name = stage_name, .final_directory = final_directory, .control = control, .recovery_required = &recovery_required };
+    ctx.options.namespace_token = token;
     var acquired: ?PreparedMetadata = null;
     defer if (acquired) |*prepared| prepared.deinit();
     if (supplied == null) acquired = try acquireMetadata(a, io, .{
@@ -657,6 +678,7 @@ const Context = struct {
         const version_dir = try files.directory(ctx.io, ctx.versions, false);
         defer version_dir.close(ctx.io);
         try ctx.control.check();
+        if (ctx.options.worker_checks) try ctx.options.namespace_token.?.recheckWaiting() else try ctx.options.namespace_token.?.recheck();
         try ctx.options.lease.recheck(ctx.options.lease.context, ctx.options.instance_id);
         // No cancellable operation or fallible allocation follows this boundary.
         const protection = ctx.io.swapCancelProtection(.blocked);
@@ -849,6 +871,17 @@ const MetadataFixture = struct {
     loader_calls: usize = 0,
     lease_calls: usize = 0,
     cancel: ?*std.atomic.Value(bool) = null,
+    probe_namespace: bool = false,
+    gate_available_probes: usize = 0,
+
+    fn probeNamespace(self: *MetadataFixture, io: std.Io) !void {
+        if (!self.probe_namespace) return;
+        try std.testing.expectError(error.InstanceNamespaceBusy, namespace.acquire(io));
+        const worlds = @import("../worlds.zig");
+        try std.testing.expect(worlds.transaction_gate.tryLock());
+        worlds.transaction_gate.unlock(io);
+        self.gate_available_probes += 1;
+    }
 
     fn options(self: *MetadataFixture, root: []const u8) MetadataOptions {
         var checksum: m.Sha1 = undefined;
@@ -868,12 +901,14 @@ const MetadataFixture = struct {
     }
     fn vanilla(raw: ?*anyopaque, a: A, _: std.Io, request: metadata_loader.Request) ![]u8 {
         const self: *MetadataFixture = @ptrCast(@alignCast(raw.?));
+        try self.probeNamespace(std.testing.io);
         self.vanilla_calls += 1;
         try std.testing.expect(request.sha1 != null);
         return a.dupe(u8, metadata_fixture_vanilla);
     }
     fn get(raw: ?*anyopaque, a: A, url: []const u8, _: usize, _: loaders.Control) !loaders.Response {
         const self: *MetadataFixture = @ptrCast(@alignCast(raw.?));
+        try self.probeNamespace(std.testing.io);
         self.loader_calls += 1;
         const body = if (std.mem.endsWith(u8, url, ".sha1")) blk: {
             const checksum = if (self.bad_checksum) @as(m.Sha1, .{0} ** 20) else loaders.recipes.digest(self.installer.?);
@@ -1161,4 +1196,83 @@ test "metadata preparation rejects unsafe and mismatched roots before any fetch"
     try std.testing.expectEqual(@as(usize, 0), fixture.vanilla_calls);
     try std.testing.expectEqual(@as(usize, 0), fixture.loader_calls);
     try std.testing.expectEqual(@as(usize, 0), fixture.lease_calls);
+}
+
+test "metadata namespace blocker prevents earliest directory and fetch side effects" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var fixture: MetadataFixture = .{};
+    const options = fixture.options(root);
+    const token = try namespace.acquire(io);
+    defer token.release();
+    try std.testing.expectError(error.InstanceNamespaceBusy, prepareMetadata(a, io, options, metadata_fixture_control));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft", .{ .follow_symlinks = false }));
+    try std.testing.expectEqual(@as(usize, 0), fixture.vanilla_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.loader_calls);
+    try token.recheck();
+}
+
+test "metadata direct and borrowed namespace lifetimes leave the gate available" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var fixture: MetadataFixture = .{ .probe_namespace = true };
+    var options = fixture.options(root);
+    var direct = try prepareMetadata(a, io, options, metadata_fixture_control);
+    defer direct.deinit();
+    try std.testing.expect(fixture.gate_available_probes > 0);
+    const token = try namespace.acquire(io);
+    defer token.release();
+    options.namespace_token = token;
+    var borrowed = try prepareMetadata(a, io, options, metadata_fixture_control);
+    defer borrowed.deinit();
+    try token.recheck();
+    try std.testing.expectError(error.InstanceNamespaceBusy, namespace.acquire(io));
+    token.release();
+    const current = try namespace.acquire(io);
+    defer current.release();
+    const vanilla_calls = fixture.vanilla_calls;
+    const loader_calls = fixture.loader_calls;
+    try std.testing.expectError(error.InstanceNamespaceLeaseLost, prepareMetadata(a, io, options, metadata_fixture_control));
+    try std.testing.expectEqual(vanilla_calls, fixture.vanilla_calls);
+    try std.testing.expectEqual(loader_calls, fixture.loader_calls);
+    try current.recheck();
+}
+
+test "worker loader and metadata admission reject active namespace and stale borrowers before side effects" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var fixture: MetadataFixture = .{};
+    var metadata_options = fixture.options(root);
+    metadata_options.worker_checks = true;
+    var options: Options = .{ .root = root, .instance_id = "pack-fixture", .instance_name = "Pack", .selection = metadata_options.selection, .environment = metadata_options.environment, .lease = undefined, .worker_checks = true };
+    const old = try namespace.acquire(io);
+    defer old.release();
+    try std.testing.expectError(error.InstanceNamespaceBusy, prepareMetadata(a, io, metadata_options, metadata_fixture_control));
+    try std.testing.expectError(error.InstanceNamespaceBusy, install(a, io, options, metadata_fixture_control));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft", .{ .follow_symlinks = false }));
+    try std.testing.expectEqual(@as(usize, 0), fixture.vanilla_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.loader_calls);
+    old.release();
+    const current = try namespace.acquire(io);
+    defer current.release();
+    metadata_options.namespace_token = old;
+    options.namespace_token = old;
+    try std.testing.expectError(error.InstanceNamespaceLeaseLost, prepareMetadata(a, io, metadata_options, metadata_fixture_control));
+    try std.testing.expectError(error.InstanceNamespaceLeaseLost, install(a, io, options, metadata_fixture_control));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft", .{ .follow_symlinks = false }));
+    try std.testing.expectEqual(@as(usize, 0), fixture.vanilla_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.loader_calls);
+    try current.recheck();
 }

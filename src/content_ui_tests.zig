@@ -107,6 +107,7 @@ fn versionFixture(allocator: std.mem.Allocator, provider: config.SourceKind, pro
 test "content manager manual hash validation commit backups conflict keep and removal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Display Name");
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     var paths = try instances.Paths.init(a, io, root);
@@ -125,6 +126,8 @@ test "content manager manual hash validation commit backups conflict keep and re
     try std.testing.expect(service.snapshot().failure == null);
     const missing = service.snapshot().proposal.?;
     try std.testing.expectEqual(@as(usize, 1), missing.missing_manual);
+    const missing_status = manualStatus(missing, "mods/sample.jar").?;
+    try std.testing.expect(!missing_status.verified and missing_status.source_absolute_path == null);
     try std.testing.expect(!missing.ready);
     try std.testing.expectError(error.IncompleteContent, service.commit());
     try tmp.dir.writeFile(io, .{ .sub_path = "supplied.jar", .data = "wrong" });
@@ -135,10 +138,14 @@ test "content manager manual hash validation commit backups conflict keep and re
     try drain(&service);
     try std.testing.expectEqual(error.SizeMismatch, service.snapshot().failure.?);
     try std.testing.expect(service.snapshot().proposal.? == missing);
+    try std.testing.expect(!manualStatus(service.snapshot().proposal.?, "mods/sample.jar").?.verified);
     try tmp.dir.writeFile(io, .{ .sub_path = "supplied.jar", .data = "payload" });
     try service.resolve(&.{}, &.{}, &.{mapping}, &.{});
     try drain(&service);
     try std.testing.expect(service.snapshot().proposal.?.ready);
+    const checked_status = manualStatus(service.snapshot().proposal.?, "mods/sample.jar").?;
+    try std.testing.expect(checked_status.verified);
+    try std.testing.expectEqualStrings(supplied, checked_status.source_absolute_path.?);
     const acquired = leases.acquired;
     try service.commit();
     try std.testing.expect(leases.held and registry.hasActive());
@@ -148,6 +155,9 @@ test "content manager manual hash validation commit backups conflict keep and re
     try std.testing.expect(service.snapshot().failure == null);
     try std.testing.expect(service.snapshot().report.?.committed);
     try std.testing.expectEqual(@as(usize, 1), service.snapshot().installed.len);
+    // Full transaction history retains committed backups without requiring recovery.
+    try std.testing.expectEqual(@as(usize, 1), service.snapshot().transactions.len);
+    try std.testing.expect(!service.snapshot().recovery_required);
     const actual = try tmp.dir.readFileAlloc(io, ".minecraft/versions/Display Name/mods/sample.jar", a, .limited(1024));
     defer a.free(actual);
     try std.testing.expectEqualStrings("payload", actual);
@@ -292,6 +302,7 @@ fn readyManual(service: *manager.Manager, version: providers.Version, supplied: 
 test "content manager crash pin survives selection cancel failed repair and restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Display Name");
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     var paths = try instances.Paths.init(a, io, root);
@@ -375,6 +386,61 @@ test "content UI owned entrypoints" {
 test "content draw semantic declarations" {
     const callbacks = .{ &view.draw, &view.drawModal, &view.finish };
     std.mem.doNotOptimizeAway(&callbacks);
+}
+
+fn manualStatus(proposal: *const manager.Proposal, path: []const u8) ?manager.ManualSourceStatus {
+    for (proposal.manual_source_status) |status| if (std.mem.eql(u8, status.path, path)) return status;
+    return null;
+}
+
+test "content manual presentation uses provenance checked target path and live inclusion" {
+    var file: manifest.InstallFile = .{ .record = .{ .path = "mods/a.jar", .provider = .curseforge, .project_id = "12", .version_id = "34", .hashes = .{} }, .download = .{ .manual_required = .{ .official_page = "https://www.curseforge.com/minecraft/mc-mods/example/files/34", .reason = .missing_url } } };
+    const status: manager.ManualSourceStatus = .{ .path = file.record.path, .source_absolute_path = "/tmp/a.jar", .verified = true };
+    const Presentation = view.ManualSourcePresentation;
+    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, null, "/tmp/a.jar", false));
+    try std.testing.expectEqual(Presentation.external_verified, view.manualSourcePresentation(file, true, status, "  /tmp/a.jar\t", false));
+    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, status, "/tmp/other.jar", false));
+    // Even edit-and-revert must wait for another verification pass.
+    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, status, "/tmp/a.jar", true));
+    var other_status = status;
+    other_status.path = "mods/other.jar";
+    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, other_status, "/tmp/a.jar", false));
+    other_status = status;
+    other_status.verified = false;
+    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, other_status, "/tmp/a.jar", false));
+    other_status = status;
+    other_status.source_absolute_path = null;
+    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, other_status, "/tmp/a.jar", false));
+    try std.testing.expectEqualStrings(file.download.manual_required.official_page, view.manualOfficialPage(file, .external_required).?);
+    try std.testing.expect(view.manualOfficialPage(file, .external_verified) == null);
+    for ([_]providers.ManualReason{ .missing_url, .distribution_disabled }) |reason| {
+        file.download.manual_required.reason = reason;
+        file.download.manual_required.official_page = "";
+        try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, null, "", false));
+        try std.testing.expect(view.manualOfficialPage(file, .external_required) == null);
+    }
+    file.record.role = .override;
+    // Role or an empty page alone is not proof that a file came from an archive.
+    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, status, "", false));
+    file.record.identity_provenance = .pack_override;
+    try std.testing.expectEqual(Presentation.archive_verified, view.manualSourcePresentation(file, true, status, "/tmp/a.jar", false));
+    try std.testing.expectEqual(Presentation.archive_unverified, view.manualSourcePresentation(file, true, null, "/tmp/a.jar", false));
+    try std.testing.expectEqual(Presentation.archive_unverified, view.manualSourcePresentation(file, true, status, "/tmp/a.jar", true));
+    try std.testing.expect(view.manualOfficialPage(file, .archive_unverified) == null);
+    file.required = false;
+    file.selected = false;
+    const choices = [_]manager.OptionalChoice{.{ .path = file.record.path, .include = true }};
+    try std.testing.expect(view.manualFileIncluded(file, &choices));
+    try std.testing.expectEqual(Presentation.archive_verified, view.manualSourcePresentation(file, view.manualFileIncluded(file, &choices), status, "/tmp/a.jar", false));
+    file.selected = true;
+    const excluded = [_]manager.OptionalChoice{.{ .path = file.record.path, .include = false }};
+    try std.testing.expectEqual(Presentation.hidden, view.manualSourcePresentation(file, view.manualFileIncluded(file, &excluded), status, "/tmp/a.jar", false));
+    file.selected = null;
+    try std.testing.expect(!view.manualFileIncluded(file, &.{}));
+    file.required = true;
+    try std.testing.expect(view.manualFileIncluded(file, &excluded));
+    file.download = .{ .remote = "https://example.com/a.jar" };
+    try std.testing.expectEqual(Presentation.hidden, view.manualSourcePresentation(file, true, status, "/tmp/a.jar", false));
 }
 
 const ZipEntry = struct { path: []const u8, bytes: []const u8 };
@@ -506,6 +572,13 @@ test "content manager real archive game receipt dependencies asset tamper and co
     _ = try expectProposal(&service);
     try std.testing.expect(!service.snapshot().proposal.?.ready);
     try std.testing.expectEqual(error.MissingGamePrerequisite, service.snapshot().proposal.?.blocker.?);
+    const staged = service.snapshot().proposal.?;
+    const staged_status = manualStatus(staged, "config/pack.cfg").?;
+    try std.testing.expectEqual(@as(usize, 0), staged.missing_manual);
+    try std.testing.expect(staged_status.verified);
+    try std.testing.expectEqual(manifest.IdentityProvenance.pack_override, staged.files[0].record.identity_provenance);
+    try std.testing.expectEqual(view.ManualSourcePresentation.archive_verified, view.manualSourcePresentation(staged.files[0], true, staged_status, staged.manual_files[0].source_absolute_path, false));
+    try std.testing.expectEqualStrings(staged.manual_files[0].source_absolute_path, staged_status.source_absolute_path.?);
     try tmp.dir.createDirPath(io, ".minecraft/libraries/fixture/runtime/1");
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/libraries/fixture/runtime/1/runtime-1.jar", .data = library });
     try service.resolve(&.{}, &.{}, &.{}, &.{});
@@ -1170,6 +1243,10 @@ test "content CF explicit authorization gates before fake vault and HTTP" {
     try std.testing.expectEqual(@as(usize, 0), proposal.pack.?.unresolved.len);
     try std.testing.expectEqual(@as(usize, 1), proposal.missing_manual);
     try std.testing.expect(!proposal.ready);
+    try std.testing.expect(manualStatus(proposal, "config/pack.cfg").?.verified);
+    const remote_manual_status = manualStatus(proposal, "resourcepacks/example.jar").?;
+    try std.testing.expect(!remote_manual_status.verified and remote_manual_status.source_absolute_path == null);
+    try std.testing.expectEqual(view.ManualSourcePresentation.external_required, view.manualSourcePresentation(proposal.files[1], true, remote_manual_status, "", false));
     try std.testing.expectEqual(@as(usize, 1), vault.gets);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try std.testing.expectEqualStrings("12", proposal.files[1].record.project_id);
@@ -1237,11 +1314,16 @@ test "content CF partial retry preserves stage overrides manual optional and con
     try std.testing.expectEqualStrings(stage, service.snapshot().proposal.?.stage_path.?);
     try std.testing.expectEqual(@as(usize, 0), service.snapshot().proposal.?.pack.?.unresolved.len);
     try std.testing.expectEqual(@as(usize, 0), service.snapshot().proposal.?.missing_manual);
+    const retried_status = manualStatus(service.snapshot().proposal.?, "resourcepacks/example.jar").?;
+    try std.testing.expect(retried_status.verified);
+    try std.testing.expectEqualStrings(manual, retried_status.source_absolute_path.?);
+    try std.testing.expect(manualStatus(service.snapshot().proposal.?, "config/pack.cfg").?.verified);
     try std.testing.expect(!service.snapshot().proposal.?.ready);
     try service.resolve(&.{}, decisions, &.{}, &.{.{ .path = "resourcepacks/extra.jar", .include = false }});
     try drain(&service);
     try std.testing.expect(service.snapshot().failure == null);
     try std.testing.expect(service.snapshot().proposal.?.ready);
+    try std.testing.expect(manualStatus(service.snapshot().proposal.?, "resourcepacks/extra.jar") == null);
     try std.testing.expectEqualStrings(stage, service.snapshot().proposal.?.stage_path.?);
     try service.commit();
     try drain(&service);
@@ -2010,7 +2092,7 @@ test "owned mod state UI request is local for standalone and pack children with 
         var counters: ToggleNoRemote = .{};
         var registry = tasks.Registry.init(a);
         defer registry.deinit();
-        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .allow_manifest_v2 = true, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters }, .vanilla_preparation = .{ .context = &counters, .prepare = ToggleNoRemote.prepare } });
+        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback, .allow_manifest_v2 = true, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters }, .vanilla_preparation = .{ .context = &counters, .prepare = ToggleNoRemote.prepare } });
         defer service.deinit();
         try service.select(selected);
         try drainToggle(&service, &coordinator);
@@ -2117,7 +2199,7 @@ test "disabled official standalone choice survives an owned version update and f
     var counters: ToggleNoRemote = .{};
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .allow_manifest_v2 = true, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback, .allow_manifest_v2 = true, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
     defer service.deinit();
     try service.select(selected);
     try drainToggle(&service, &coordinator);
@@ -2161,7 +2243,7 @@ test "failed mod rename recovery keeps real launch and mutation reservations unt
     var crash: CrashFixture = .{};
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .allow_manifest_v2 = true, .fixture_fault = .{ .context = &crash, .boundary = CrashFixture.boundary }, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback, .allow_manifest_v2 = true, .fixture_fault = .{ .context = &crash, .boundary = CrashFixture.boundary }, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
     defer service.deinit();
     try service.select(selected);
     try drainToggle(&service, &coordinator);

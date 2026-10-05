@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const content_fs = @import("content_fs.zig");
+const namespace = @import("instance_namespace.zig");
 const config = @import("config.zig");
 const instances = @import("instances.zig");
 const tree = @import("worlds_tree.zig");
@@ -33,9 +34,13 @@ pub const TrustedVanilla = struct {
 };
 pub const Options = struct {
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// Static running IDs add a veto; dynamic callbacks are unsupported.
     guard: worlds.Guard = .{},
     limits: tree.Limits = .{},
     trusted_vanilla: ?TrustedVanilla = null,
+    lease: ?LeaseCheck = null,
+    namespace_token: ?namespace.Token = null,
+    worker_checks: bool = false,
 };
 /// Adapter for a caller-owned stable-ID mutation lease; never releases that lease.
 /// Recheck runs outside the shared gate and may acquire it internally.
@@ -53,14 +58,18 @@ pub const Result = struct {
     /// Official metadata pin and actual local client hash/size, not full readiness.
     local_client_verified: bool = false,
     publication_proof: ?PublicationProof = null,
+    /// Direct inspection transfers ownership while its returned proof keeps files open.
+    owned_ns: ?namespace.Token = null,
 
     /// Release held evidence after publication while preserving owned instance strings.
     pub fn releasePublicationProof(self: *Result) void {
         if (self.publication_proof) |proof| proof.close();
         self.publication_proof = null;
+        if (self.owned_ns) |token| token.release();
+        self.owned_ns = null;
     }
 
-    /// Caller holds the transaction gate and mutation lease. No content rehash.
+    /// Caller holds the stable-ID lease and namespace reservation. No content rehash.
     pub fn recheckPublication(self: *const Result, root: []const u8) !void {
         if (!self.local_client_verified) return;
         const proof = self.publication_proof orelse return error.InvalidCompletedPublication;
@@ -68,8 +77,11 @@ pub const Result = struct {
     }
 
     pub fn deinit(self: *Result) void {
+        const token = self.owned_ns;
+        self.owned_ns = null;
         self.releasePublicationProof();
         self.arena.deinit();
+        if (token) |held| held.release();
         self.* = undefined;
     }
 };
@@ -77,9 +89,31 @@ pub const Result = struct {
 fn check(io: std.Io, instance: config.Instance, options: Options) !void {
     try io.checkCancel();
     try safe.canceled(options.cancel);
-    for (options.guard.running_ids) |id| if (std.mem.eql(u8, id, instance.id)) return error.InstanceRunning;
-    if (options.guard.is_running) |f| if (f(options.guard.context, instance.id)) return error.InstanceRunning;
+    {
+        try worlds.transaction_gate.lock(io);
+        defer worlds.transaction_gate.unlock(io);
+        for (options.guard.running_ids) |id| if (std.mem.eql(u8, id, instance.id)) return error.InstanceRunning;
+    }
     try safe.canceled(options.cancel);
+}
+fn requireScope(options: Options) !LeaseCheck {
+    const lease = options.lease orelse return error.MissingStableScope;
+    if (options.guard.is_running != null) return error.UnsupportedInstanceGuard;
+    return lease;
+}
+fn recheckNamespace(token: namespace.Token, options: Options) !void {
+    if (options.worker_checks) {
+        try token.recheckWaiting();
+    } else {
+        try token.recheck();
+    }
+}
+fn reserveNamespace(io: std.Io, options: Options) !namespace.Token {
+    if (options.namespace_token) |token| {
+        try recheckNamespace(token, options);
+        return token;
+    }
+    return if (options.worker_checks) namespace.acquireWaiting(io) else namespace.acquire(io);
 }
 fn canceled(context: ?*anyopaque) bool {
     const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(context.?));
@@ -498,33 +532,31 @@ pub fn inspectInstalled(a: A, io: std.Io, root: []const u8, instance: config.Ins
     return inspectExisting(a, io, root, instance, options, true);
 }
 /// Parent holds the stable-ID lease across this call and publication of its result.
-/// Lease callbacks run outside the gate; only guard/cancel checks run under it.
+/// Lease callbacks and all filesystem work run outside the gate.
 pub fn inspectInstalledLeased(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options, lease: LeaseCheck) !Result {
-    try validate(instance, options);
-    try lease.recheck(lease.context, instance.id);
-    {
-        try worlds.transaction_gate.lock(io);
-        defer worlds.transaction_gate.unlock(io);
-        try check(io, instance, options);
-    }
-    var result = try inspectExistingBody(a, io, root, instance, options, true);
-    errdefer result.deinit();
-    try lease.recheck(lease.context, instance.id);
-    {
-        try worlds.transaction_gate.lock(io);
-        defer worlds.transaction_gate.unlock(io);
-        try check(io, instance, options);
-    }
-    return result;
+    var scoped = options;
+    scoped.lease = lease;
+    return inspectExisting(a, io, root, instance, scoped, true);
 }
 fn inspectExisting(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options, verify_client: bool) !Result {
+    const lease = try requireScope(options);
     try validate(instance, options);
-    try worlds.transaction_gate.lock(io);
-    defer worlds.transaction_gate.unlock(io);
+    try lease.recheck(lease.context, instance.id);
+    const token = try reserveNamespace(io, options);
+    // Release last unless a returned live proof takes ownership of this token.
+    var release_token = options.namespace_token == null;
+    defer if (release_token) token.release();
+    try recheckNamespace(token, options);
     try check(io, instance, options);
     var result = try inspectExistingBody(a, io, root, instance, options, verify_client);
     errdefer result.deinit();
+    try lease.recheck(lease.context, instance.id);
+    try recheckNamespace(token, options);
     try check(io, instance, options);
+    if (release_token and result.publication_proof != null) {
+        result.owned_ns = token;
+        release_token = false;
+    }
     return result;
 }
 const HeldFile = struct {
@@ -736,6 +768,7 @@ fn verifyManifest(a: A, io: std.Io, dir: Dir, expected: []const u8, options: Opt
 }
 
 pub fn rename(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_name: []const u8, options: Options) !Result {
+    _ = try requireScope(options);
     if (!config.validId(new_name)) return error.UnsafeInstance;
     try safe.component(new_name);
     if (std.ascii.eqlIgnoreCase(instance.name, new_name)) return error.SameInstanceName;
@@ -745,7 +778,12 @@ pub fn remove(a: A, io: std.Io, root: []const u8, instance: config.Instance, opt
     return transact(a, io, root, instance, null, .deleted, options);
 }
 fn transact(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_name: ?[]const u8, operation: Operation, options: Options) !Result {
+    const lease = try requireScope(options);
     try validate(instance, options);
+    try lease.recheck(lease.context, instance.id);
+    const token = try reserveNamespace(io, options);
+    defer if (options.namespace_token == null) token.release();
+    try recheckNamespace(token, options);
     var result: Result = .{ .arena = .init(a), .operation = operation, .instance = undefined };
     errdefer result.deinit();
     var scratch: std.heap.ArenaAllocator = .init(a);
@@ -757,9 +795,6 @@ fn transact(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_n
     if (new_name) |name| result.instance.name = try output.dupe(u8, name);
     const handles = try Root.open(io, root);
     defer handles.close(io);
-    try worlds.transaction_gate.lock(io);
-    var locked = true;
-    defer if (locked) worlds.transaction_gate.unlock(io);
     try check(io, instance, options);
     if (new_name) |name| try collision(io, handles.versions, name);
     const source = try tree.child(io, handles.versions, instance.name, false);
@@ -768,8 +803,6 @@ fn transact(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_n
     const identity = try inspect(ar, io, root, handles, instance, options);
     if (identity.ambiguous_flattened) return error.CanonicalVersionProtected;
     try canonicalProtection(ar, io, handles.versions, instance, identity.minecraft_version, options);
-    worlds.transaction_gate.unlock(io);
-    locked = false;
 
     try auditTree(io, source, options, false);
     const vela = try tree.child(io, handles.root, ".vela", true);
@@ -830,8 +863,8 @@ fn transact(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_n
     const manifest_json = try writeManifest(ar, io, recovery, .{ .transaction_id = transaction_id, .operation = operation, .instance_id = instance.id, .old_name = instance.name, .new_name = new_name, .instance = instance, .snapshot_bytes = snapshot.bytes, .entries = snapshot.entries }, options);
     try tree.syncDir(io, vela);
 
-    try worlds.transaction_gate.lock(io);
-    locked = true;
+    try lease.recheck(lease.context, instance.id);
+    try recheckNamespace(token, options);
     try check(io, instance, options);
     try handles.verify(io, root);
     try sameInode(try directoryStat(io, vela), try handles.root.statFile(io, ".vela", .{ .follow_symlinks = false }));
@@ -849,6 +882,8 @@ fn transact(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_n
         try verified(ar, io, staged, expected, options);
     }
     try verifyManifest(ar, io, recovery, manifest_json, options);
+    try lease.recheck(lease.context, instance.id);
+    try recheckNamespace(token, options);
     try check(io, instance, options);
     // No cancellation after the first namespace mutation: report committed success.
     const protection = io.swapCancelProtection(.blocked);
@@ -1010,6 +1045,48 @@ fn updateExpected(entry: *tree.Entry, bytes: []const u8, total: *u64) void {
     std.crypto.hash.sha2.Sha256.hash(bytes, &entry.sha256, .{});
 }
 
+const TestCall = enum { import_existing, inspect_installed, rename_instance, remove_instance };
+const TestCheckChain = struct {
+    mutation: *@import("instance_leases.zig").Mutation,
+    injected: ?LeaseCheck,
+    fn recheck(context: ?*anyopaque, id: []const u8) anyerror!void {
+        const self: *TestCheckChain = @ptrCast(@alignCast(context.?));
+        try self.mutation.recheck(id);
+        if (self.injected) |injected| try injected.recheck(injected.context, id);
+    }
+};
+fn testScopedCall(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_name: ?[]const u8, options: Options, call: TestCall) !Result {
+    const leases = @import("instance_leases.zig");
+    var coordinator = leases.Coordinator.init(io);
+    const mutation = coordinator.mutation(0);
+    try mutation.acquire(instance.id);
+    defer {
+        mutation.release(instance.id);
+        coordinator.tick();
+    }
+    var scoped = options;
+    var chain: TestCheckChain = .{ .mutation = mutation, .injected = options.lease };
+    scoped.lease = .{ .context = &chain, .recheck = TestCheckChain.recheck };
+    return switch (call) {
+        .import_existing => importExisting(a, io, root, instance, scoped),
+        .inspect_installed => inspectInstalled(a, io, root, instance, scoped),
+        .rename_instance => rename(a, io, root, instance, new_name.?, scoped),
+        .remove_instance => remove(a, io, root, instance, scoped),
+    };
+}
+fn testImportExisting(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
+    return testScopedCall(a, io, root, instance, null, options, .import_existing);
+}
+fn testInspectInstalled(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
+    return testScopedCall(a, io, root, instance, null, options, .inspect_installed);
+}
+fn testRename(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_name: []const u8, options: Options) !Result {
+    return testScopedCall(a, io, root, instance, new_name, options, .rename_instance);
+}
+fn testRemove(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
+    return testScopedCall(a, io, root, instance, null, options, .remove_instance);
+}
+
 const fixture_instance: config.Instance = .{ .id = "stable-id", .name = "Play", .minecraft_version = "placeholder", .java_path = "/fixture/java", .origin = .{ .kind = .modrinth, .project_id = "project", .version_id = "release" } };
 const fixture_base = "{\"id\":\"1.21\",\"mainClass\":\"net.minecraft.client.main.Main\",\"downloads\":{\"client\":{\"url\":\"https://example.invalid/client\",\"size\":4}},\"arguments\":{\"game\":[],\"jvm\":[]}}";
 const fixture_alias = "{\"id\":\"Play\",\"inheritsFrom\":\"1.21\"}";
@@ -1055,7 +1132,7 @@ test "instance transaction import derives identity without claiming installation
     try fixture(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    var imported = try importExisting(a, io, root, fixture_instance, .{});
+    var imported = try testImportExisting(a, io, root, fixture_instance, .{});
     defer imported.deinit();
     try std.testing.expectEqual(.imported, imported.operation);
     try std.testing.expectEqualStrings("1.21", imported.instance.minecraft_version);
@@ -1076,7 +1153,7 @@ test "instance transaction rename preserves metadata payload shared data and rec
     try fixture(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    var result = try rename(a, io, root, fixture_instance, "New Play", .{});
+    var result = try testRename(a, io, root, fixture_instance, "New Play", .{});
     defer result.deinit();
     try std.testing.expectEqual(.renamed, result.operation);
     try std.testing.expectEqualStrings("New Play", result.instance.name);
@@ -1106,7 +1183,7 @@ test "instance transaction rename preserves metadata payload shared data and rec
     try std.testing.expectEqualStrings("Play", manifest.value.old_name);
     try std.testing.expectEqualStrings("New Play", manifest.value.new_name.?);
     try std.testing.expectEqual(.renamed, manifest.value.operation);
-    var renamed_import = try importExisting(a, io, root, result.instance, .{});
+    var renamed_import = try testImportExisting(a, io, root, result.instance, .{});
     defer renamed_import.deinit();
     try std.testing.expectEqualStrings("1.21", renamed_import.instance.minecraft_version);
 }
@@ -1120,7 +1197,7 @@ test "instance transaction deletion moves exact tree without unlinking data" {
     try fixture(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    var result = try remove(a, io, root, fixture_instance, .{});
+    var result = try testRemove(a, io, root, fixture_instance, .{});
     defer result.deinit();
     try std.testing.expectEqual(.deleted, result.operation);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/Play", .{}));
@@ -1142,14 +1219,14 @@ test "instance transaction preflight rejects collision cancellation running guar
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     try tmp.dir.createDirPath(io, ".minecraft/versions/TAKEN");
-    try std.testing.expectError(error.NameCollision, rename(a, io, root, fixture_instance, "taken", .{}));
-    try std.testing.expectError(error.SameInstanceName, rename(a, io, root, fixture_instance, "PLAY", .{}));
-    try std.testing.expectError(error.UnsafeInstance, rename(a, io, root, fixture_instance, "../outside", .{}));
+    try std.testing.expectError(error.NameCollision, testRename(a, io, root, fixture_instance, "taken", .{}));
+    try std.testing.expectError(error.SameInstanceName, testRename(a, io, root, fixture_instance, "PLAY", .{}));
+    try std.testing.expectError(error.UnsafeInstance, testRename(a, io, root, fixture_instance, "../outside", .{}));
     var cancel = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.Canceled, remove(a, io, root, fixture_instance, .{ .cancel = &cancel }));
-    try std.testing.expectError(error.Canceled, importExisting(a, io, root, fixture_instance, .{ .cancel = &cancel }));
-    try std.testing.expectError(error.InstanceRunning, remove(a, io, root, fixture_instance, .{ .guard = .{ .running_ids = &.{"stable-id"} } }));
-    try std.testing.expectError(error.ResourceLimit, importExisting(a, io, root, fixture_instance, .{ .limits = .{ .max_files = 1 } }));
+    try std.testing.expectError(error.Canceled, testRemove(a, io, root, fixture_instance, .{ .cancel = &cancel }));
+    try std.testing.expectError(error.Canceled, testImportExisting(a, io, root, fixture_instance, .{ .cancel = &cancel }));
+    try std.testing.expectError(error.InstanceRunning, testRemove(a, io, root, fixture_instance, .{ .guard = .{ .running_ids = &.{"stable-id"} } }));
+    try std.testing.expectError(error.ResourceLimit, testImportExisting(a, io, root, fixture_instance, .{ .limits = .{ .max_files = 1 } }));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     try expectBytes(io, tmp.dir, ".minecraft/versions/Play/Play.json", fixture_alias);
 }
@@ -1163,12 +1240,12 @@ test "instance transaction rejects symlinks hardlinks and linked root components
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     try tmp.dir.symLink(io, "../1.21/1.21.json", ".minecraft/versions/Play/link", .{});
-    try std.testing.expectError(error.UnsafeFileType, importExisting(a, io, root, fixture_instance, .{}));
-    try std.testing.expectError(error.UnsafeFileType, remove(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.UnsafeFileType, testImportExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.UnsafeFileType, testRemove(a, io, root, fixture_instance, .{}));
     try tmp.dir.deleteFile(io, ".minecraft/versions/Play/link");
     try tmp.dir.hardLink(".minecraft/assets/shared", tmp.dir, ".minecraft/versions/Play/alias", io, .{});
-    try std.testing.expectError(error.HardLinkAlias, importExisting(a, io, root, fixture_instance, .{}));
-    try std.testing.expectError(error.HardLinkAlias, rename(a, io, root, fixture_instance, "New", .{}));
+    try std.testing.expectError(error.HardLinkAlias, testImportExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.HardLinkAlias, testRename(a, io, root, fixture_instance, "New", .{}));
     try tmp.dir.symLink(io, ".minecraft", "linked", .{ .is_directory = true });
     const linked = try std.fs.path.join(a, &.{ root, "linked" });
     defer a.free(linked);
@@ -1189,10 +1266,10 @@ test "instance transaction protects canonical versions and referenced aliases" {
     defer a.free(root);
     var canonical = fixture_instance;
     canonical.name = "1.21";
-    try std.testing.expectError(error.CanonicalVersionProtected, remove(a, io, root, canonical, .{}));
+    try std.testing.expectError(error.CanonicalVersionProtected, testRemove(a, io, root, canonical, .{}));
     try tmp.dir.createDirPath(io, ".minecraft/versions/Sibling");
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Sibling/Sibling.json", .data = "{\"id\":\"Sibling\",\"inheritsFrom\":\"Play\"}" });
-    try std.testing.expectError(error.CanonicalVersionProtected, rename(a, io, root, fixture_instance, "New", .{}));
+    try std.testing.expectError(error.CanonicalVersionProtected, testRename(a, io, root, fixture_instance, "New", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
 }
 
@@ -1205,13 +1282,13 @@ test "instance transaction import detects Fabric and rejects unknown loader" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/Play.json", .data = "{\"id\":\"Play\",\"inheritsFrom\":\"1.21\",\"mainClass\":\"net.fabricmc.loader.impl.launch.knot.KnotClient\",\"libraries\":[{\"name\":\"net.fabricmc:fabric-loader:0.16.10\"}]}" });
-    var result = try importExisting(a, io, root, fixture_instance, .{});
+    var result = try testImportExisting(a, io, root, fixture_instance, .{});
     defer result.deinit();
     try std.testing.expectEqual(.fabric, result.instance.loader);
     try std.testing.expectEqualStrings("0.16.10", result.instance.loader_version.?);
     try std.testing.expectEqualStrings("1.21", result.instance.minecraft_version);
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/Play.json", .data = "{\"id\":\"Play\",\"inheritsFrom\":\"1.21\",\"mainClass\":\"unknown.CustomLoader\"}" });
-    try std.testing.expectError(error.UnknownLoaderIdentity, importExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.UnknownLoaderIdentity, testImportExisting(a, io, root, fixture_instance, .{}));
 }
 
 const CommitFixture = struct {
@@ -1221,10 +1298,10 @@ const CommitFixture = struct {
     action: enum { change_source, collide, cancel },
     cancel: ?*std.atomic.Value(bool) = null,
     failure: ?anyerror = null,
-    fn guard(context: ?*anyopaque, _: []const u8) bool {
+    fn recheck(context: ?*anyopaque, _: []const u8) anyerror!void {
         const self: *CommitFixture = @ptrCast(@alignCast(context.?));
         self.calls += 1;
-        if (self.calls != self.at) return false;
+        if (self.calls != self.at) return;
         switch (self.action) {
             .change_source => self.dir.writeFile(std.testing.io, .{ .sub_path = ".minecraft/versions/Play/config/options.txt", .data = "changed" }) catch |err| {
                 self.failure = err;
@@ -1234,7 +1311,6 @@ const CommitFixture = struct {
             },
             .cancel => self.cancel.?.store(true, .release),
         }
-        return false;
     }
 };
 test "instance transaction detects changed source during backup before commit" {
@@ -1247,7 +1323,7 @@ test "instance transaction detects changed source during backup before commit" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     var mutation: CommitFixture = .{ .dir = tmp.dir, .at = 2, .action = .change_source };
-    try std.testing.expectError(error.IntegrityMismatch, rename(a, io, root, fixture_instance, "New", .{ .guard = .{ .context = &mutation, .is_running = CommitFixture.guard } }));
+    try std.testing.expectError(error.IntegrityMismatch, testRename(a, io, root, fixture_instance, "New", .{ .lease = .{ .context = &mutation, .recheck = CommitFixture.recheck } }));
     try std.testing.expect(mutation.failure == null);
     try expectBytes(io, tmp.dir, ".minecraft/versions/Play/config/options.txt", "changed");
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/New", .{}));
@@ -1262,7 +1338,7 @@ test "instance transaction exclusive publish rolls original back on late collisi
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     var mutation: CommitFixture = .{ .dir = tmp.dir, .at = 3, .action = .collide };
-    try std.testing.expectError(error.PathAlreadyExists, rename(a, io, root, fixture_instance, "New", .{ .guard = .{ .context = &mutation, .is_running = CommitFixture.guard } }));
+    try std.testing.expectError(error.PathAlreadyExists, testRename(a, io, root, fixture_instance, "New", .{ .lease = .{ .context = &mutation, .recheck = CommitFixture.recheck } }));
     try std.testing.expect(mutation.failure == null);
     try expectBytes(io, tmp.dir, ".minecraft/versions/Play/Play.json", fixture_alias);
     try tmp.dir.access(io, ".minecraft/versions/New", .{});
@@ -1279,7 +1355,7 @@ test "instance transaction final cancellation preserves original tree" {
     defer a.free(root);
     var cancel = std.atomic.Value(bool).init(false);
     var mutation: CommitFixture = .{ .dir = tmp.dir, .at = 3, .action = .cancel, .cancel = &cancel };
-    try std.testing.expectError(error.Canceled, remove(a, io, root, fixture_instance, .{ .cancel = &cancel, .guard = .{ .context = &mutation, .is_running = CommitFixture.guard } }));
+    try std.testing.expectError(error.Canceled, testRemove(a, io, root, fixture_instance, .{ .cancel = &cancel, .lease = .{ .context = &mutation, .recheck = CommitFixture.recheck } }));
     try expectBytes(io, tmp.dir, ".minecraft/versions/Play/saves/World/level.dat", "world");
 }
 fn allocationFixture(a: A, operation: Operation) !void {
@@ -1291,9 +1367,9 @@ fn allocationFixture(a: A, operation: Operation) !void {
     const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     var result = (switch (operation) {
-        .imported => importExisting(a, io, root, fixture_instance, .{}),
-        .renamed => rename(a, io, root, fixture_instance, "New", .{}),
-        .deleted => remove(a, io, root, fixture_instance, .{}),
+        .imported => testImportExisting(a, io, root, fixture_instance, .{}),
+        .renamed => testRename(a, io, root, fixture_instance, "New", .{}),
+        .deleted => testRemove(a, io, root, fixture_instance, .{}),
     }) catch |err| {
         try expectBytes(io, tmp.dir, ".minecraft/versions/Play/Play.json", fixture_alias);
         return err;
@@ -1332,11 +1408,11 @@ test "instance transaction uncertain syscall outcomes and failed rollback requir
         rename_fault = fault;
         defer rename_fault = null;
         if (fault == .first_before) {
-            try std.testing.expectError(error.OperationUnsupported, rename(a, io, root, fixture_instance, "New", .{}));
+            try std.testing.expectError(error.OperationUnsupported, testRename(a, io, root, fixture_instance, "New", .{}));
             try expectBytes(real_io, tmp.dir, ".minecraft/versions/Play/Play.json", fixture_alias);
             continue;
         }
-        try std.testing.expectError(error.RecoveryRequired, rename(a, io, root, fixture_instance, "New", .{}));
+        try std.testing.expectError(error.RecoveryRequired, testRename(a, io, root, fixture_instance, "New", .{}));
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(real_io, ".minecraft/versions/Play", .{}));
         const vela = try tmp.dir.openDir(real_io, ".vela", .{ .iterate = true });
         defer vela.close(real_io);
@@ -1416,15 +1492,15 @@ fn expectFlattenedRename(kind: config.Loader) !void {
     defer a.free(root);
     const original = try tmp.dir.readFileAlloc(io, ".minecraft/versions/Play/Play.json", a, .limited(1024 * 1024));
     defer a.free(original);
-    var imported = try importExisting(a, io, root, fixture_instance, .{});
+    var imported = try testImportExisting(a, io, root, fixture_instance, .{});
     defer imported.deinit();
     try std.testing.expectEqualStrings("1.21", imported.instance.minecraft_version);
     try std.testing.expectEqualStrings("stable-id", imported.instance.id);
     try std.testing.expectEqual(kind, imported.instance.loader);
-    var installed = try inspectInstalled(a, io, root, fixture_instance, .{});
+    var installed = try testInspectInstalled(a, io, root, fixture_instance, .{});
     defer installed.deinit();
     try std.testing.expectEqualStrings("1.21", installed.instance.minecraft_version);
-    var renamed = try rename(a, io, root, imported.instance, "New", .{});
+    var renamed = try testRename(a, io, root, imported.instance, "New", .{});
     defer renamed.deinit();
     try std.testing.expectEqualStrings("New", renamed.instance.name);
     try std.testing.expectEqualStrings("1.21", renamed.instance.minecraft_version);
@@ -1456,19 +1532,19 @@ fn expectFlattenedRename(kind: config.Loader) !void {
     try std.testing.expectEqualStrings("New", receipt.value.object.get("instance_name").?.string);
     try std.testing.expectEqualStrings("previous-id", receipt.value.object.get("instance_id").?.string);
     try std.testing.expectEqualStrings("preserve-me", receipt.value.object.get("audit_extra").?.string);
-    var reimported = try importExisting(a, io, root, renamed.instance, .{});
+    var reimported = try testImportExisting(a, io, root, renamed.instance, .{});
     defer reimported.deinit();
     try std.testing.expectEqualStrings("1.21", reimported.instance.minecraft_version);
     try std.testing.expectEqual(kind, reimported.instance.loader);
     if (kind == .forge) try std.testing.expectEqualStrings("47.3.0", reimported.instance.loader_version.?);
-    var ready = try inspectInstalled(a, io, root, renamed.instance, .{});
+    var ready = try testInspectInstalled(a, io, root, renamed.instance, .{});
     defer ready.deinit();
     const minecraft = try std.fs.path.join(a, &.{ root, ".minecraft" });
     defer a.free(minecraft);
     var loaded = try loader.load(a, io, .{ .root = minecraft, .version_id = "New" }, .{});
     defer loaded.deinit();
     try std.testing.expectEqualStrings("New", loaded.version.value.jar orelse loaded.version.value.id);
-    var deleted = try remove(a, io, root, renamed.instance, .{});
+    var deleted = try testRemove(a, io, root, renamed.instance, .{});
     defer deleted.deinit();
     const removed = try tree.openAbsolute(io, deleted.recovery_directory.?);
     defer removed.close(io);
@@ -1541,8 +1617,8 @@ test "instance transaction rejects missing malformed mismatched and unbound mana
             .hardlinked => error.HardLinkAlias,
             else => error.InvalidInstallReceipt,
         };
-        try std.testing.expectError(expected, importExisting(a, io, root, fixture_instance, .{}));
-        try std.testing.expectError(expected, inspectInstalled(a, io, root, fixture_instance, .{}));
+        try std.testing.expectError(expected, testImportExisting(a, io, root, fixture_instance, .{}));
+        try std.testing.expectError(expected, testInspectInstalled(a, io, root, fixture_instance, .{}));
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     }
 }
@@ -1574,9 +1650,9 @@ test "instance transaction installed managed client validation rejects corrupt a
             .linked => error.UnsafeFileType,
             .hardlinked => error.HardLinkAlias,
         };
-        try std.testing.expectError(expected, inspectInstalled(a, io, root, fixture_instance, .{}));
+        try std.testing.expectError(expected, testInspectInstalled(a, io, root, fixture_instance, .{}));
         if (case == .hash or case == .size or case == .missing) {
-            var metadata_only = try importExisting(a, io, root, fixture_instance, .{});
+            var metadata_only = try testImportExisting(a, io, root, fixture_instance, .{});
             metadata_only.deinit();
         }
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
@@ -1590,22 +1666,22 @@ test "instance transaction installed inherited client validation uses resolved c
     try fixture(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    try std.testing.expectError(error.MissingClientHash, inspectInstalled(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.MissingClientHash, testInspectInstalled(a, io, root, fixture_instance, .{}));
     var hash: [20]u8 = undefined;
     std.crypto.hash.Sha1.hash("base", &hash, .{});
     const doc = try std.json.Stringify.valueAlloc(a, .{ .id = "1.21", .mainClass = "net.minecraft.client.main.Main", .downloads = .{ .client = .{ .url = "https://example.invalid/base", .sha1 = &std.fmt.bytesToHex(&hash, .lower), .size = 4 } } }, .{});
     defer a.free(doc);
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/1.21/1.21.json", .data = doc });
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/1.21/1.21.jar", .data = "base" });
-    var proof = try inspectInstalled(a, io, root, fixture_instance, .{});
+    var proof = try testInspectInstalled(a, io, root, fixture_instance, .{});
     defer proof.deinit();
     try std.testing.expectEqualStrings("1.21", proof.instance.minecraft_version);
     try std.testing.expectEqual(config.Loader.vanilla, proof.instance.loader);
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/1.21/1.21.jar", .data = "evil" });
-    try std.testing.expectError(error.ClientHashMismatch, inspectInstalled(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.ClientHashMismatch, testInspectInstalled(a, io, root, fixture_instance, .{}));
     try tmp.dir.deleteFile(io, ".minecraft/versions/1.21/1.21.jar");
     try tmp.dir.symLink(io, "../../assets/shared", ".minecraft/versions/1.21/1.21.jar", .{});
-    try std.testing.expectError(error.UnsafeFileType, inspectInstalled(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.UnsafeFileType, testInspectInstalled(a, io, root, fixture_instance, .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
 }
 fn managedAllocationFixture(a: A, rename_it: bool) !void {
@@ -1618,7 +1694,7 @@ fn managedAllocationFixture(a: A, rename_it: bool) !void {
     defer std.testing.allocator.free(root);
     const original = try tmp.dir.readFileAlloc(io, ".minecraft/versions/Play/Play.json", std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(original);
-    var result = (if (rename_it) rename(a, io, root, fixture_instance, "New", .{}) else inspectInstalled(a, io, root, fixture_instance, .{})) catch |err| {
+    var result = (if (rename_it) testRename(a, io, root, fixture_instance, "New", .{}) else testInspectInstalled(a, io, root, fixture_instance, .{})) catch |err| {
         try expectBytes(io, tmp.dir, ".minecraft/versions/Play/Play.json", original);
         try expectBytes(io, tmp.dir, ".minecraft/versions/Play/Play.jar", fixture_private_jar);
         return err;
@@ -1641,11 +1717,11 @@ test "instance transaction inherited base identity is independent of explicit ca
     defer a.free(document);
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/JarSource/JarSource.json", .data = document });
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/JarSource/JarSource.jar", .data = "real" });
-    var proof = try inspectInstalled(a, io, root, fixture_instance, .{});
+    var proof = try testInspectInstalled(a, io, root, fixture_instance, .{});
     defer proof.deinit();
     try std.testing.expectEqualStrings("1.21", proof.instance.minecraft_version);
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/JarSource/JarSource.jar", .data = "evil" });
-    try std.testing.expectError(error.ClientHashMismatch, inspectInstalled(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.ClientHashMismatch, testInspectInstalled(a, io, root, fixture_instance, .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
 }
 test "instance transaction managed loader receipt cannot contradict descriptor version or metadata binding" {
@@ -1666,8 +1742,8 @@ test "instance transaction managed loader receipt cannot contradict descriptor v
         const changed = try std.json.Stringify.valueAlloc(a, receipt.value, .{});
         defer a.free(changed);
         try tmp.dir.writeFile(io, .{ .sub_path = path, .data = changed });
-        try std.testing.expectError(error.InstallReceiptMismatch, importExisting(a, io, root, fixture_instance, .{}));
-        try std.testing.expectError(error.InstallReceiptMismatch, inspectInstalled(a, io, root, fixture_instance, .{}));
+        try std.testing.expectError(error.InstallReceiptMismatch, testImportExisting(a, io, root, fixture_instance, .{}));
+        try std.testing.expectError(error.InstallReceiptMismatch, testInspectInstalled(a, io, root, fixture_instance, .{}));
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     }
 }
@@ -1680,7 +1756,6 @@ const LeaseProbe = struct {
     checks: usize = 0,
     reads: usize = 0,
     fail_at: usize = 0,
-    expect_read_locked: bool = false,
     read_gate_mismatch: bool = false,
     recheck_gate_mismatch: bool = false,
     wrong_id: bool = false,
@@ -1701,7 +1776,7 @@ fn probeLeaseRead(userdata: ?*anyopaque, file: std.Io.File, data: []const []u8, 
     probe.reads += 1;
     const available = worlds.transaction_gate.tryLock();
     if (available) worlds.transaction_gate.unlock(std.testing.io);
-    if (available == probe.expect_read_locked) probe.read_gate_mismatch = true;
+    if (!available) probe.read_gate_mismatch = true;
     return std.testing.io.vtable.fileReadPositional(userdata, file, data, offset);
 }
 
@@ -1740,11 +1815,10 @@ test "instance transaction leased installed inspection reads outside gate and re
     try std.testing.expect(probe.reads > 3);
     try std.testing.expect(!probe.read_gate_mismatch and !probe.recheck_gate_mismatch and !probe.wrong_id);
     try std.testing.expectEqualStrings("1.21", result.instance.minecraft_version);
-    probe = .{ .expect_read_locked = true };
-    var guarded = try inspectInstalled(a, io, root, fixture_instance, .{});
-    defer guarded.deinit();
-    try std.testing.expect(probe.reads > 3);
-    try std.testing.expect(!probe.read_gate_mismatch);
+    probe = .{};
+    try std.testing.expectError(error.MissingStableScope, inspectInstalled(a, io, root, fixture_instance, .{}));
+    try std.testing.expectEqual(@as(usize, 0), probe.reads);
+    try std.testing.expectEqual(@as(usize, 0), probe.checks);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(real_io, ".vela", .{}));
 }
 
@@ -1801,7 +1875,7 @@ test "instance transaction leased installed inspection interoperates with real C
         coordinator.tick();
     }
     const callback: LeaseCheck = .{ .context = mutation, .recheck = leases.Mutation.recheckCallback };
-    var result = try inspectInstalledLeased(a, io, root, fixture_instance, .{ .guard = coordinator.guard(mutation) }, callback);
+    var result = try inspectInstalledLeased(a, io, root, fixture_instance, .{}, callback);
     defer result.deinit();
     try std.testing.expectEqualStrings("1.21", result.instance.minecraft_version);
     try std.testing.expectEqual(config.Loader.fabric, result.instance.loader);
@@ -1810,7 +1884,7 @@ test "instance transaction leased installed inspection interoperates with real C
     try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(fixture_instance.id));
     mutation.release(fixture_instance.id);
     coordinator.tick();
-    try std.testing.expectError(error.LeaseNotHeld, inspectInstalledLeased(a, io, root, fixture_instance, .{ .guard = coordinator.guard(mutation) }, callback));
+    try std.testing.expectError(error.LeaseNotHeld, inspectInstalledLeased(a, io, root, fixture_instance, .{}, callback));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
 }
 
@@ -1852,11 +1926,11 @@ test "instance transaction accepts producer 4096 artifact receipt and preserves 
     const old_bytes = try tmp.dir.readFileAlloc(io, old_path, a, .limited(receipt_limit));
     defer a.free(old_bytes);
     try std.testing.expect(old_bytes.len > 64 * 1024 and old_bytes.len < receipt_limit);
-    var imported = try importExisting(a, io, root, fixture_instance, .{});
+    var imported = try testImportExisting(a, io, root, fixture_instance, .{});
     defer imported.deinit();
-    var moved = try rename(a, io, root, imported.instance, "New", .{});
+    var moved = try testRename(a, io, root, imported.instance, "New", .{});
     defer moved.deinit();
-    var proof = try inspectInstalled(a, io, root, moved.instance, .{});
+    var proof = try testInspectInstalled(a, io, root, moved.instance, .{});
     defer proof.deinit();
     const changed = try tmp.dir.readFileAlloc(io, ".minecraft/versions/New/.vela-loader.json", a, .limited(receipt_limit));
     defer a.free(changed);
@@ -1883,17 +1957,17 @@ test "instance transaction receipt preflight bounds bytes depth tokens strings a
     defer a.free(root);
     const path = ".minecraft/versions/Play/.vela-loader.json";
     try artifactReceiptFixture(a, io, tmp.dir, 4097);
-    try std.testing.expectError(error.ResourceLimit, importExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.ResourceLimit, testImportExisting(a, io, root, fixture_instance, .{}));
     const too_deep = "{\"unknown\":[[[[[[[[0]]]]]]]]}";
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = too_deep });
-    try std.testing.expectError(error.ResourceLimit, importExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.ResourceLimit, testImportExisting(a, io, root, fixture_instance, .{}));
     const many = try a.alloc(u8, 2 * 65536 + 10);
     defer a.free(many);
     @memcpy(many[0..6], "{\"x\":[");
     for (0..65536) |index| @memcpy(many[6 + index * 2 ..][0..2], "0,");
     @memcpy(many[6 + 2 * 65536 ..], "0]} ");
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = many });
-    try std.testing.expectError(error.ResourceLimit, importExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.ResourceLimit, testImportExisting(a, io, root, fixture_instance, .{}));
     try artifactReceiptFixture(a, io, tmp.dir, 0);
     const original = try tmp.dir.readFileAlloc(io, path, a, .limited(receipt_limit));
     defer a.free(original);
@@ -1906,19 +1980,19 @@ test "instance transaction receipt preflight bounds bytes depth tokens strings a
         defer a.free(changed);
         try tmp.dir.writeFile(io, .{ .sub_path = path, .data = changed });
         if (length == 4096) {
-            var result = try importExisting(a, io, root, fixture_instance, .{});
+            var result = try testImportExisting(a, io, root, fixture_instance, .{});
             result.deinit();
-        } else try std.testing.expectError(error.ResourceLimit, importExisting(a, io, root, fixture_instance, .{}));
+        } else try std.testing.expectError(error.ResourceLimit, testImportExisting(a, io, root, fixture_instance, .{}));
     }
     const padded = try a.alloc(u8, receipt_limit + 1);
     defer a.free(padded);
     @memset(padded, ' ');
     @memcpy(padded[0..original.len], original);
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = padded[0..receipt_limit] });
-    var accepted = try importExisting(a, io, root, fixture_instance, .{});
+    var accepted = try testImportExisting(a, io, root, fixture_instance, .{});
     accepted.deinit();
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = padded });
-    try std.testing.expectError(error.MetadataTooLarge, importExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.MetadataTooLarge, testImportExisting(a, io, root, fixture_instance, .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
 }
 
@@ -1952,7 +2026,7 @@ test "instance transaction receipt artifacts reject aliases nonflat shapes unsaf
         const changed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
         defer a.free(changed);
         try tmp.dir.writeFile(io, .{ .sub_path = path, .data = changed });
-        if (mode < 2) try std.testing.expectError(error.DuplicateArtifactPath, importExisting(a, io, root, fixture_instance, .{})) else try std.testing.expectError(error.InvalidInstallReceipt, importExisting(a, io, root, fixture_instance, .{}));
+        if (mode < 2) try std.testing.expectError(error.DuplicateArtifactPath, testImportExisting(a, io, root, fixture_instance, .{})) else try std.testing.expectError(error.InvalidInstallReceipt, testImportExisting(a, io, root, fixture_instance, .{}));
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     }
 }
@@ -1964,7 +2038,7 @@ fn artifactAllocationFixture(a: A) !void {
     try artifactReceiptFixture(std.testing.allocator, io, tmp.dir, 2);
     const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
-    var result = try importExisting(a, io, root, fixture_instance, .{});
+    var result = try testImportExisting(a, io, root, fixture_instance, .{});
     defer result.deinit();
 }
 
@@ -2004,48 +2078,50 @@ test "canonical import requires independent official metadata pin and actual cli
     try canonicalFixture(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    try std.testing.expectError(error.MissingInstallReceipt, importExisting(a, io, root, canonical_instance, .{}));
+    try std.testing.expectError(error.MissingInstallReceipt, testImportExisting(a, io, root, canonical_instance, .{}));
     var prepared = try canonicalPreparation(a, io, root, null);
     defer prepared.deinit();
     try std.testing.expectEqual(@as(u64, 25), prepared.runtime_major);
     const options: Options = .{ .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment } };
-    var imported = try importExisting(a, io, root, canonical_instance, options);
+    var imported = try testImportExisting(a, io, root, canonical_instance, options);
     defer imported.deinit();
     try std.testing.expect(imported.local_client_verified);
     try imported.recheckPublication(root);
     try std.testing.expect(imported.instance.origin == null);
     try std.testing.expectEqualStrings("26.3", imported.instance.minecraft_version);
-    var installed = try inspectInstalled(a, io, root, imported.instance, options);
+    imported.releasePublicationProof();
+    var installed = try testInspectInstalled(a, io, root, imported.instance, options);
     defer installed.deinit();
     try std.testing.expect(installed.local_client_verified);
     try expectBytes(io, tmp.dir, ".minecraft/versions/26.3/mods/keep.jar", "mod");
     try expectBytes(io, tmp.dir, ".minecraft/versions/26.3/saves/world/level.dat", "world");
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/26.3/.vela-instance.json", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
-    try std.testing.expectError(error.CanonicalVersionProtected, rename(a, io, root, imported.instance, "New", options));
-    try std.testing.expectError(error.CanonicalVersionProtected, remove(a, io, root, imported.instance, options));
+    installed.releasePublicationProof();
+    try std.testing.expectError(error.CanonicalVersionProtected, testRename(a, io, root, imported.instance, "New", options));
+    try std.testing.expectError(error.CanonicalVersionProtected, testRemove(a, io, root, imported.instance, options));
     var wrong = options;
     wrong.trusted_vanilla.?.generation += 1;
-    try std.testing.expectError(error.PreparedMetadataGenerationMismatch, importExisting(a, io, root, canonical_instance, wrong));
+    try std.testing.expectError(error.PreparedMetadataGenerationMismatch, testImportExisting(a, io, root, canonical_instance, wrong));
     wrong = options;
     wrong.trusted_vanilla.?.environment.os_version = "changed";
-    try std.testing.expectError(error.PreparedMetadataMismatch, importExisting(a, io, root, canonical_instance, wrong));
+    try std.testing.expectError(error.PreparedMetadataMismatch, testImportExisting(a, io, root, canonical_instance, wrong));
     var changed_id = canonical_instance;
     changed_id.id = "other-id";
-    try std.testing.expectError(error.PreparedMetadataMismatch, importExisting(a, io, root, changed_id, options));
+    try std.testing.expectError(error.PreparedMetadataMismatch, testImportExisting(a, io, root, changed_id, options));
     var other = std.testing.tmpDir(.{ .iterate = true });
     defer other.cleanup();
     try canonicalFixture(io, other.dir);
     const other_root = try other.dir.realPathFileAlloc(io, ".", a);
     defer a.free(other_root);
-    try std.testing.expectError(error.PreparedMetadataMismatch, importExisting(a, io, other_root, canonical_instance, options));
+    try std.testing.expectError(error.PreparedMetadataMismatch, testImportExisting(a, io, other_root, canonical_instance, options));
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.jar", .data = "evil" });
-    try std.testing.expectError(error.ClientHashMismatch, importExisting(a, io, root, canonical_instance, options));
+    try std.testing.expectError(error.ClientHashMismatch, testImportExisting(a, io, root, canonical_instance, options));
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.jar", .data = "large" });
-    try std.testing.expectError(error.ClientSizeMismatch, importExisting(a, io, root, canonical_instance, options));
+    try std.testing.expectError(error.ClientSizeMismatch, testImportExisting(a, io, root, canonical_instance, options));
     try tmp.dir.deleteFile(io, ".minecraft/versions/26.3/26.3.jar");
     try tmp.dir.symLink(io, "mods/keep.jar", ".minecraft/versions/26.3/26.3.jar", .{});
-    try std.testing.expectError(error.UnsafeFileType, importExisting(a, io, root, canonical_instance, options));
+    try std.testing.expectError(error.UnsafeFileType, testImportExisting(a, io, root, canonical_instance, options));
     try tmp.dir.deleteFile(io, ".minecraft/versions/26.3/26.3.jar");
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.jar", .data = "base" });
     const bytes = try canonicalFixtureBytes(a);
@@ -2056,10 +2132,10 @@ test "canonical import requires independent official metadata pin and actual cli
     altered[major + 1] = '4';
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.json", .data = altered });
     try std.testing.expectError(error.ChecksumMismatch, canonicalPreparation(a, io, root, null));
-    try std.testing.expectError(error.PreparedMetadataChanged, importExisting(a, io, root, canonical_instance, options));
+    try std.testing.expectError(error.PreparedMetadataChanged, testImportExisting(a, io, root, canonical_instance, options));
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.json", .data = bytes });
     @constCast(prepared.sources)[0].bytes = altered;
-    try std.testing.expectError(error.PreparedMetadataChanged, importExisting(a, io, root, canonical_instance, options));
+    try std.testing.expectError(error.PreparedMetadataChanged, testImportExisting(a, io, root, canonical_instance, options));
 }
 fn canonicalAllocationFixture(a: A) !void {
     const io = std.testing.io;
@@ -2070,7 +2146,7 @@ fn canonicalAllocationFixture(a: A) !void {
     defer std.testing.allocator.free(root);
     var prepared = try canonicalPreparation(a, io, root, null);
     defer prepared.deinit();
-    var result = try importExisting(a, io, root, canonical_instance, .{ .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment } });
+    var result = try testImportExisting(a, io, root, canonical_instance, .{ .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment } });
     defer result.deinit();
     try std.testing.expect(result.local_client_verified);
     try expectBytes(io, tmp.dir, ".minecraft/versions/26.3/26.3.jar", "base");
@@ -2090,10 +2166,425 @@ test "canonical proof allocation failures and cancellation release ownership wit
     var prepared = try canonicalPreparation(a, io, root, &cancel);
     defer prepared.deinit();
     cancel.store(true, .release);
-    try std.testing.expectError(error.Canceled, importExisting(a, io, root, canonical_instance, .{ .cancel = &cancel, .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment } }));
+    try std.testing.expectError(error.Canceled, testImportExisting(a, io, root, canonical_instance, .{ .cancel = &cancel, .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment } }));
     try expectBytes(io, tmp.dir, ".minecraft/versions/26.3/26.3.jar", "base");
 }
 
 test "instance transaction artifact receipt allocation failures release typed and alias scratch" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, artifactAllocationFixture, .{});
+}
+
+const ScopeIoKind = enum { directory_open, directory_stat, file_open, file_stat, read, iterate, create, write, close, rename, sync };
+const ScopeIoProbe = struct {
+    const Leases = @import("instance_leases.zig");
+    counts: [std.meta.fields(ScopeIoKind).len]usize = @splat(0),
+    coordinator: ?*Leases.Coordinator = null,
+    mutation: ?*Leases.Mutation = null,
+    competing: ?*Leases.Mutation = null,
+    id: []const u8 = fixture_instance.id,
+    io: ?std.Io = null,
+    guard_dir: ?Dir = null,
+    checks: usize = 0,
+    hook_calls: usize = 0,
+    unrelated_launches: usize = 0,
+    namespace_blocks: [3]usize = @splat(0),
+    gate_unavailable: bool = false,
+    admission_failed: bool = false,
+    hook_failed: bool = false,
+
+    fn count(self: *const ScopeIoProbe, kind: ScopeIoKind) usize {
+        return self.counts[@intFromEnum(kind)];
+    }
+    fn total(self: *const ScopeIoProbe) usize {
+        var n: usize = 0;
+        for (self.counts) |value| n += value;
+        return n;
+    }
+    fn observe(self: *ScopeIoProbe, kind: ScopeIoKind) void {
+        self.counts[@intFromEnum(kind)] += 1;
+        if (!worlds.transaction_gate.tryLock()) {
+            self.gate_unavailable = true;
+            return;
+        }
+        worlds.transaction_gate.unlock(std.testing.io);
+        const coordinator = self.coordinator orelse return;
+        self.mutation.?.recheck(self.id) catch {
+            self.admission_failed = true;
+        };
+        if (self.competing.?.acquire(self.id)) |_| {
+            self.admission_failed = true;
+            self.competing.?.release(self.id);
+            coordinator.tick();
+        } else |err| {
+            if (err != error.InstanceBusy) self.admission_failed = true;
+        }
+        if (coordinator.reserveLaunch(self.id)) |_| {
+            self.admission_failed = true;
+            coordinator.releaseLaunch();
+            coordinator.tick();
+        } else |err| {
+            if (err != error.InstanceBusy) self.admission_failed = true;
+        }
+        if (coordinator.reserveLaunch("unrelated-launch")) |_| {
+            self.unrelated_launches += 1;
+            coordinator.releaseLaunch();
+            coordinator.tick();
+        } else |_| {
+            self.admission_failed = true;
+        }
+        // All three publisher classes use the real process-wide admission API.
+        for (0..self.namespace_blocks.len) |publisher| {
+            if (namespace.acquire(std.testing.io)) |token| {
+                self.admission_failed = true;
+                token.release();
+            } else |err| {
+                if (err == error.InstanceNamespaceBusy) self.namespace_blocks[publisher] += 1 else self.admission_failed = true;
+            }
+        }
+    }
+    fn recheck(context: ?*anyopaque, id: []const u8) anyerror!void {
+        const self: *ScopeIoProbe = @ptrCast(@alignCast(context.?));
+        self.checks += 1;
+        if (!worlds.transaction_gate.tryLock()) return error.CallbackUnderGate;
+        worlds.transaction_gate.unlock(std.testing.io);
+        try self.mutation.?.recheck(id);
+        // The initial lease check precedes namespace admission.
+        if (self.checks > 1 and self.guard_dir != null) {
+            self.hook_calls += 1;
+            _ = directoryStat(self.io.?, self.guard_dir.?) catch {
+                self.hook_failed = true;
+                return;
+            };
+        }
+    }
+};
+var scope_io_probe: ?*ScopeIoProbe = null;
+fn scopeOpenDir(context: ?*anyopaque, dir: Dir, path: []const u8, options: Dir.OpenOptions) Dir.OpenError!Dir {
+    scope_io_probe.?.observe(.directory_open);
+    return std.testing.io.vtable.dirOpenDir(context, dir, path, options);
+}
+fn scopeStatFile(context: ?*anyopaque, dir: Dir, path: []const u8, options: Dir.StatFileOptions) Dir.StatFileError!Stat {
+    scope_io_probe.?.observe(.directory_stat);
+    return std.testing.io.vtable.dirStatFile(context, dir, path, options);
+}
+fn scopeOpenFile(context: ?*anyopaque, dir: Dir, path: []const u8, options: Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+    scope_io_probe.?.observe(.file_open);
+    return std.testing.io.vtable.dirOpenFile(context, dir, path, options);
+}
+fn scopeFileStat(context: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!Stat {
+    scope_io_probe.?.observe(.file_stat);
+    return std.testing.io.vtable.fileStat(context, file);
+}
+fn scopeRead(context: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+    scope_io_probe.?.observe(.read);
+    return std.testing.io.vtable.fileReadPositional(context, file, data, offset);
+}
+fn scopeIterate(context: ?*anyopaque, reader: *Dir.Reader, entries: []Dir.Entry) Dir.Reader.Error!usize {
+    scope_io_probe.?.observe(.iterate);
+    return std.testing.io.vtable.dirRead(context, reader, entries);
+}
+fn scopeCreateDir(context: ?*anyopaque, dir: Dir, path: []const u8, permissions: Dir.Permissions) Dir.CreateDirError!void {
+    scope_io_probe.?.observe(.create);
+    return std.testing.io.vtable.dirCreateDir(context, dir, path, permissions);
+}
+fn scopeCreateFile(context: ?*anyopaque, dir: Dir, path: []const u8, options: Dir.CreateFileOptions) std.Io.File.OpenError!std.Io.File {
+    scope_io_probe.?.observe(.create);
+    return std.testing.io.vtable.dirCreateFile(context, dir, path, options);
+}
+fn scopeWrite(context: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+    scope_io_probe.?.observe(.write);
+    return std.testing.io.vtable.fileWritePositional(context, file, header, data, splat, offset);
+}
+fn scopeCloseDirs(context: ?*anyopaque, dirs: []const Dir) void {
+    scope_io_probe.?.observe(.close);
+    std.testing.io.vtable.dirClose(context, dirs);
+}
+fn scopeCloseFiles(context: ?*anyopaque, files: []const std.Io.File) void {
+    scope_io_probe.?.observe(.close);
+    std.testing.io.vtable.fileClose(context, files);
+}
+fn scopeRename(context: ?*anyopaque, old_dir: Dir, old_path: []const u8, new_dir: Dir, new_path: []const u8) Dir.RenamePreserveError!void {
+    scope_io_probe.?.observe(.rename);
+    return std.testing.io.vtable.dirRenamePreserve(context, old_dir, old_path, new_dir, new_path);
+}
+fn scopeSync(context: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+    scope_io_probe.?.observe(.sync);
+    return std.testing.io.vtable.fileSync(context, file);
+}
+fn scopeIoVtable() std.Io.VTable {
+    var vtable = std.testing.io.vtable.*;
+    vtable.dirOpenDir = scopeOpenDir;
+    vtable.dirStatFile = scopeStatFile;
+    vtable.dirOpenFile = scopeOpenFile;
+    vtable.fileStat = scopeFileStat;
+    vtable.fileReadPositional = scopeRead;
+    vtable.dirRead = scopeIterate;
+    vtable.dirCreateDir = scopeCreateDir;
+    vtable.dirCreateFile = scopeCreateFile;
+    vtable.fileWritePositional = scopeWrite;
+    vtable.dirClose = scopeCloseDirs;
+    vtable.fileClose = scopeCloseFiles;
+    vtable.dirRenamePreserve = scopeRename;
+    vtable.fileSync = scopeSync;
+    return vtable;
+}
+
+test "cold instance transaction APIs require stable scope before any filesystem or namespace admission" {
+    const a = std.testing.allocator;
+    var probe: ScopeIoProbe = .{};
+    scope_io_probe = &probe;
+    defer scope_io_probe = null;
+    const vtable = scopeIoVtable();
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const token = try namespace.acquire(io);
+    defer token.release();
+    // Missing scope takes precedence even with a held namespace and unavailable gate.
+    try std.testing.expect(worlds.transaction_gate.tryLock());
+    defer worlds.transaction_gate.unlock(io);
+    for ([_]Options{ .{}, .{ .namespace_token = token } }) |options| {
+        try std.testing.expectError(error.MissingStableScope, inspectInstalled(a, io, "/no-scope-io", fixture_instance, options));
+        try std.testing.expectError(error.MissingStableScope, importExisting(a, io, "/no-scope-io", fixture_instance, options));
+        try std.testing.expectError(error.MissingStableScope, rename(a, io, "/no-scope-io", fixture_instance, "New", options));
+        try std.testing.expectError(error.MissingStableScope, remove(a, io, "/no-scope-io", fixture_instance, options));
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.total());
+}
+
+test "cold instance transaction APIs reject dynamic guards before lease namespace and filesystem work" {
+    const leases = @import("instance_leases.zig");
+    const GuardCounter = struct {
+        fn called(context: ?*anyopaque, _: []const u8) bool {
+            const calls: *usize = @ptrCast(@alignCast(context.?));
+            calls.* += 1;
+            return false;
+        }
+    };
+    const NamespaceState = enum { free, busy, lost };
+    const a = std.testing.allocator;
+    const real_io = std.testing.io;
+    for ([_]bool{ false, true }) |gate_busy| {
+        for ([_]NamespaceState{ .free, .busy, .lost }) |state| {
+            var coordinator = leases.Coordinator.init(real_io);
+            const mutation = coordinator.mutation(0);
+            try mutation.acquire(fixture_instance.id);
+            defer {
+                mutation.release(fixture_instance.id);
+                coordinator.tick();
+            }
+            var held: ?namespace.Token = null;
+            var borrowed: ?namespace.Token = null;
+            switch (state) {
+                .free => {},
+                .busy => held = try namespace.acquire(real_io),
+                .lost => {
+                    const stale = try namespace.acquire(real_io);
+                    stale.release();
+                    try std.testing.expectError(error.InstanceNamespaceLeaseLost, stale.recheck());
+                    borrowed = stale;
+                },
+            }
+            defer if (held) |token| token.release();
+            var probe: ScopeIoProbe = .{ .mutation = mutation };
+            scope_io_probe = &probe;
+            defer scope_io_probe = null;
+            const vtable = scopeIoVtable();
+            const io: std.Io = .{ .userdata = real_io.userdata, .vtable = &vtable };
+            var guard_calls: usize = 0;
+            const lease: LeaseCheck = .{ .context = &probe, .recheck = ScopeIoProbe.recheck };
+            const options: Options = .{
+                .lease = lease,
+                .namespace_token = borrowed,
+                .guard = .{ .context = &guard_calls, .is_running = GuardCounter.called },
+            };
+            if (gate_busy) try std.testing.expect(worlds.transaction_gate.tryLock());
+            defer if (gate_busy) worlds.transaction_gate.unlock(real_io);
+            try std.testing.expectError(error.UnsupportedInstanceGuard, inspectInstalled(a, io, "/no-guard-io", fixture_instance, options));
+            try std.testing.expectError(error.UnsupportedInstanceGuard, importExisting(a, io, "/no-guard-io", fixture_instance, options));
+            try std.testing.expectError(error.UnsupportedInstanceGuard, rename(a, io, "/no-guard-io", fixture_instance, "New", options));
+            try std.testing.expectError(error.UnsupportedInstanceGuard, remove(a, io, "/no-guard-io", fixture_instance, options));
+            try std.testing.expectError(error.UnsupportedInstanceGuard, inspectInstalledLeased(a, io, "/no-guard-io", fixture_instance, options, lease));
+            var unscoped = options;
+            unscoped.lease = null;
+            try std.testing.expectError(error.MissingStableScope, importExisting(a, io, "/no-guard-io", fixture_instance, unscoped));
+            try std.testing.expectEqual(@as(usize, 0), guard_calls);
+            try std.testing.expectEqual(@as(usize, 0), probe.checks);
+            try std.testing.expectEqual(@as(usize, 0), probe.total());
+        }
+    }
+}
+
+test "instance transaction actual filesystem and hook IO retain Coordinator lease and namespace outside gate" {
+    const leases = @import("instance_leases.zig");
+    const a = std.testing.allocator;
+    const real_io = std.testing.io;
+    for ([_]TestCall{ .import_existing, .inspect_installed, .rename_instance, .remove_instance }) |call| {
+        for ([_]bool{ false, true }) |borrowed| {
+            var tmp = std.testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            defer fixtureWritable(real_io, tmp.dir);
+            try flattenedFixture(real_io, tmp.dir, .fabric);
+            const root = try tmp.dir.realPathFileAlloc(real_io, ".", a);
+            defer a.free(root);
+            var coordinator = leases.Coordinator.init(real_io);
+            const mutation = coordinator.mutation(0);
+            const competing = coordinator.mutation(1);
+            try mutation.acquire(fixture_instance.id);
+            defer {
+                mutation.release(fixture_instance.id);
+                coordinator.tick();
+            }
+            const token: ?namespace.Token = if (borrowed) try namespace.acquire(real_io) else null;
+            defer if (token) |held| held.release();
+            var probe: ScopeIoProbe = .{ .coordinator = &coordinator, .mutation = mutation, .competing = competing, .guard_dir = tmp.dir };
+            scope_io_probe = &probe;
+            defer scope_io_probe = null;
+            const vtable = scopeIoVtable();
+            const io: std.Io = .{ .userdata = real_io.userdata, .vtable = &vtable };
+            probe.io = io;
+            const options: Options = .{
+                .lease = .{ .context = &probe, .recheck = ScopeIoProbe.recheck },
+                .namespace_token = token,
+            };
+            var result = try switch (call) {
+                .import_existing => importExisting(a, io, root, fixture_instance, options),
+                .inspect_installed => inspectInstalledLeased(a, io, root, fixture_instance, options, options.lease.?),
+                .rename_instance => rename(a, io, root, fixture_instance, "New", options),
+                .remove_instance => remove(a, io, root, fixture_instance, options),
+            };
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, if (call == .import_existing or call == .inspect_installed) 2 else 3), probe.checks);
+            try std.testing.expectEqual(probe.checks - 1, probe.hook_calls);
+            try std.testing.expect(!probe.gate_unavailable and !probe.admission_failed and !probe.hook_failed);
+            for ([_]ScopeIoKind{ .directory_open, .directory_stat, .file_open, .file_stat, .read, .iterate, .close }) |kind| {
+                try std.testing.expect(probe.count(kind) > 0);
+            }
+            if (call == .rename_instance or call == .remove_instance) {
+                for ([_]ScopeIoKind{ .create, .write, .rename, .sync }) |kind| try std.testing.expect(probe.count(kind) > 0);
+            }
+            try std.testing.expect(probe.unrelated_launches > 0);
+            for (probe.namespace_blocks) |count| try std.testing.expect(count > 0);
+            try mutation.recheck(fixture_instance.id);
+            if (token) |held| {
+                try held.recheck();
+                try std.testing.expectError(error.InstanceNamespaceBusy, namespace.acquire(real_io));
+            } else {
+                const available = try namespace.acquire(real_io);
+                available.release();
+            }
+        }
+    }
+}
+
+test "cold instance transaction APIs reject busy namespace and lost borrowed stamps before actual IO" {
+    const leases = @import("instance_leases.zig");
+    const a = std.testing.allocator;
+    var coordinator = leases.Coordinator.init(std.testing.io);
+    const mutation = coordinator.mutation(0);
+    try mutation.acquire(fixture_instance.id);
+    defer {
+        mutation.release(fixture_instance.id);
+        coordinator.tick();
+    }
+    const held = try namespace.acquire(std.testing.io);
+    defer held.release();
+    var probe: ScopeIoProbe = .{ .mutation = mutation };
+    scope_io_probe = &probe;
+    defer scope_io_probe = null;
+    const vtable = scopeIoVtable();
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const lease: LeaseCheck = .{ .context = &probe, .recheck = ScopeIoProbe.recheck };
+    const lost: namespace.Token = .{ .io = io, .generation = 0 };
+    for ([_]Options{ .{ .lease = lease }, .{ .lease = lease, .namespace_token = lost } }, 0..) |options, index| {
+        const expected = if (index == 0) error.InstanceNamespaceBusy else error.InstanceNamespaceLeaseLost;
+        try std.testing.expectError(expected, inspectInstalled(a, io, "/no-namespace-io", fixture_instance, options));
+        try std.testing.expectError(expected, importExisting(a, io, "/no-namespace-io", fixture_instance, options));
+        try std.testing.expectError(expected, rename(a, io, "/no-namespace-io", fixture_instance, "New", options));
+        try std.testing.expectError(expected, remove(a, io, "/no-namespace-io", fixture_instance, options));
+        try std.testing.expectEqual(@as(usize, 0), probe.total());
+        try held.recheck();
+    }
+    try std.testing.expectEqual(@as(usize, 8), probe.checks);
+}
+
+test "canonical inspection retains owning namespace through publication recheck and all returned proof closes" {
+    const leases = @import("instance_leases.zig");
+    const a = std.testing.allocator;
+    const real_io = std.testing.io;
+    for ([_]bool{ false, true }) |installed| {
+        for ([_]bool{ false, true }) |borrowed| {
+            for ([_]bool{ false, true }) |full_cleanup| {
+                var tmp = std.testing.tmpDir(.{ .iterate = true });
+                defer tmp.cleanup();
+                try canonicalFixture(real_io, tmp.dir);
+                const root = try tmp.dir.realPathFileAlloc(real_io, ".", a);
+                defer a.free(root);
+                var prepared = try canonicalPreparation(a, real_io, root, null);
+                defer prepared.deinit();
+                var coordinator = leases.Coordinator.init(real_io);
+                const mutation = coordinator.mutation(0);
+                const competing = coordinator.mutation(1);
+                try mutation.acquire(canonical_instance.id);
+                defer {
+                    mutation.release(canonical_instance.id);
+                    coordinator.tick();
+                }
+                const token: ?namespace.Token = if (borrowed) try namespace.acquire(real_io) else null;
+                defer if (token) |held| held.release();
+                var probe: ScopeIoProbe = .{
+                    .coordinator = &coordinator,
+                    .mutation = mutation,
+                    .competing = competing,
+                    .id = canonical_instance.id,
+                    .guard_dir = tmp.dir,
+                };
+                scope_io_probe = &probe;
+                defer scope_io_probe = null;
+                const vtable = scopeIoVtable();
+                const io: std.Io = .{ .userdata = real_io.userdata, .vtable = &vtable };
+                probe.io = io;
+                const options: Options = .{
+                    .lease = .{ .context = &probe, .recheck = ScopeIoProbe.recheck },
+                    .namespace_token = token,
+                    // The existing cleanup variants exercise both namespace modes.
+                    .worker_checks = full_cleanup,
+                    .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment },
+                };
+                var result = try if (installed)
+                    inspectInstalledLeased(a, io, root, canonical_instance, options, options.lease.?)
+                else
+                    importExisting(a, io, root, canonical_instance, options);
+                var result_live = true;
+                defer if (result_live) result.deinit();
+                try std.testing.expect(result.publication_proof != null);
+                try std.testing.expectEqual(!borrowed, result.owned_ns != null);
+                try std.testing.expectEqual(@as(usize, 2), probe.checks);
+                try std.testing.expectEqual(probe.checks - 1, probe.hook_calls);
+                try std.testing.expectError(error.InstanceNamespaceBusy, namespace.acquire(real_io));
+                const stats_before = probe.count(.file_stat) + probe.count(.directory_stat);
+                try result.recheckPublication(root);
+                try std.testing.expect(probe.count(.file_stat) + probe.count(.directory_stat) > stats_before);
+                const closes_before = probe.count(.close);
+                if (full_cleanup) {
+                    result.deinit();
+                    result_live = false;
+                } else {
+                    result.releasePublicationProof();
+                    try std.testing.expect(result.publication_proof == null and result.owned_ns == null);
+                }
+                try std.testing.expect(probe.count(.close) > closes_before);
+                try std.testing.expect(!probe.gate_unavailable and !probe.admission_failed and !probe.hook_failed);
+                try std.testing.expect(probe.unrelated_launches > 0);
+                for (probe.namespace_blocks) |count| try std.testing.expect(count > 0);
+                try std.testing.expectEqual(@as(usize, 2), probe.checks);
+                try mutation.recheck(canonical_instance.id);
+                if (token) |held| {
+                    try held.recheck();
+                    try std.testing.expectError(error.InstanceNamespaceBusy, namespace.acquire(real_io));
+                } else {
+                    const available = try namespace.acquire(real_io);
+                    available.release();
+                }
+            }
+        }
+    }
 }

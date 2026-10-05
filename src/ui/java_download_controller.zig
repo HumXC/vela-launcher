@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const curl = @import("curl");
 const backend = @import("../core/java_download.zig");
+const owned_storage = @import("java_owned_storage.zig");
 const archive = @import("../core/java_archive.zig");
 const downloader = @import("../core/downloader.zig");
 const tasks = @import("../core/tasks.zig");
@@ -25,9 +26,22 @@ pub const Snapshot = struct {
     registration_failure: ?anyerror,
     failure: ?anyerror,
 };
+/// Paths are borrowed until the next beginOwnedDelete/deinit; confirmation is caller-owned.
+pub const OwnedDeleteSnapshot = struct {
+    phase: Phase,
+    java_path: ?[]const u8,
+    failure: ?anyerror,
+    registry_failure: ?anyerror,
+    files_deleted: bool,
+};
 pub const Probe = struct {
     context: ?*anyopaque = null,
     run: *const fn (?*anyopaque, Allocator, Io, []const u8, ?*const std.atomic.Value(bool)) anyerror!java.Runtime = probeJava,
+};
+/// UI-thread admission; context must outlive the controller.
+pub const OwnedDeleteAdmission = struct {
+    context: ?*anyopaque = null,
+    check: *const fn (?*anyopaque) anyerror!void,
 };
 pub const Options = struct {
     root: []const u8,
@@ -37,6 +51,7 @@ pub const Options = struct {
     transport: ?backend.Transport = null,
     extractor: ?backend.Extractor = null,
     probe: Probe = .{},
+    owned_delete_admission: ?OwnedDeleteAdmission = null,
 };
 
 fn validateDownloadConnections(connections: u16) !void {
@@ -151,6 +166,34 @@ const Job = struct {
     }
 };
 
+const DeleteJob = struct {
+    arena: std.heap.ArenaAllocator = .init(worker_allocator),
+    io: Io,
+    root: []const u8 = "",
+    java_path: []const u8 = "",
+    thread: ?std.Thread = null,
+    cancel: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+    registry_failure: ?anyerror = null,
+    deleted: bool = false,
+
+    fn run(self: *DeleteJob) void {
+        owned_storage.delete(self.arena.allocator(), self.io, self.root, self.java_path, &self.cancel) catch |err| {
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
+        self.deleted = true;
+        self.done.store(true, .release);
+    }
+    fn destroy(self: *DeleteJob) void {
+        std.debug.assert(self.thread == null);
+        self.arena.deinit();
+        worker_allocator.destroy(self);
+    }
+};
+
 /// Do not move an active controller. External registries outlive this owner.
 /// All borrowed snapshot paths remain valid through draw, until tick/start/deinit.
 pub const Controller = struct {
@@ -164,10 +207,14 @@ pub const Controller = struct {
     fixture_transport: ?backend.Transport,
     fixture_extractor: ?backend.Extractor,
     probe: Probe,
+    owned_delete_admission: ?OwnedDeleteAdmission = null,
     active: ?*Job = null,
     published: ?*Job = null,
     phase: Phase = .idle,
     failure: ?anyerror = null,
+    active_delete: ?*DeleteJob = null,
+    published_delete: ?*DeleteJob = null,
+    delete_phase: Phase = .idle,
 
     pub fn init(a: Allocator, io: Io, root: []const u8) !Controller {
         return initWithOptions(a, io, .{ .root = root });
@@ -197,9 +244,17 @@ pub const Controller = struct {
             .fixture_transport = options.transport,
             .fixture_extractor = options.extractor,
             .probe = options.probe,
+            .owned_delete_admission = options.owned_delete_admission,
         };
     }
     pub fn deinit(self: *Controller) void {
+        if (self.active_delete) |job| {
+            job.cancel.store(true, .release);
+            if (job.thread) |thread| thread.join();
+            job.thread = null;
+            job.destroy();
+        }
+        if (self.published_delete) |job| job.destroy();
         if (self.active) |job| {
             self.cancel();
             job.probe_cancel.store(true, .release);
@@ -226,8 +281,78 @@ pub const Controller = struct {
         try validateDownloadConnections(connections);
         self.download_connections = connections;
     }
+    /// Deletion stays owned through cancellation and worker completion until JOIN/tick.
+    pub fn isDeleting(self: *const Controller) bool {
+        return self.active_delete != null;
+    }
+    pub fn isBusy(self: *const Controller) bool {
+        return self.active != null or self.isDeleting();
+    }
+    /// Check only on an explicit action; success permits asking for file-delete confirmation.
+    pub fn checkOwnedStorage(self: *const Controller, java_path: []const u8) !void {
+        try owned_storage.check(self.allocator, self.io, self.root, java_path);
+    }
+    /// The caller must obtain explicit confirmation before starting this worker.
+    /// Ownership is rechecked in the worker; registry publication happens only in tick.
+    pub fn beginOwnedDelete(self: *Controller, java_path: []const u8) !void {
+        if (self.isBusy()) return error.Busy;
+        if (self.owned_delete_admission) |admission| try admission.check(admission.context);
+        try self.checkOwnedStorage(java_path);
+        const job = try worker_allocator.create(DeleteJob);
+        job.* = .{ .io = self.io };
+        errdefer job.destroy();
+        const a = job.arena.allocator();
+        job.root = try a.dupe(u8, self.root);
+        job.java_path = try a.dupe(u8, java_path);
+        job.thread = try std.Thread.spawn(.{}, DeleteJob.run, .{job});
+        if (self.published_delete) |old| old.destroy();
+        self.published_delete = null;
+        self.active_delete = job;
+        self.delete_phase = .running;
+    }
+    pub fn ownedDeleteSnapshot(self: *const Controller) OwnedDeleteSnapshot {
+        const job = self.published_delete;
+        return .{
+            .phase = self.delete_phase,
+            .java_path = if (self.active_delete) |active| active.java_path else if (job) |result| result.java_path else null,
+            .failure = if (job) |result| result.failure else null,
+            .registry_failure = if (job) |result| result.registry_failure else null,
+            .files_deleted = if (job) |result| result.deleted else false,
+        };
+    }
+    fn tickOwnedDelete(self: *Controller, manager: *java.Manager) void {
+        const job = self.active_delete orelse return;
+        if (!job.done.load(.acquire)) return;
+        if (job.thread) |thread| thread.join();
+        job.thread = null;
+        // Partial/canceled/failed deletion never forgets a registered Java.
+        if (job.deleted) {
+            manager.forget(job.java_path) catch |err| {
+                if (err != error.JavaNotRegistered) {
+                    job.registry_failure = err;
+                    job.failure = err;
+                }
+            };
+            // An old download snapshot must not advertise a removed install.
+            if (self.published) |download| {
+                if (download.installed) |installed| {
+                    if (std.mem.eql(u8, installed.java_path, job.java_path)) {
+                        download.destroy();
+                        self.published = null;
+                        self.phase = .idle;
+                        self.failure = null;
+                    }
+                }
+            }
+        }
+        if (self.published_delete) |old| old.destroy();
+        self.published_delete = job;
+        self.active_delete = null;
+        const canceled = if (job.failure) |failure| failure == error.Canceled else false;
+        self.delete_phase = if (job.deleted and job.failure == null) .complete else if (canceled) .canceled else .failed;
+    }
     pub fn start(self: *Controller, request: Request) !void {
-        if (self.active != null) return error.Busy;
+        if (self.isBusy()) return error.Busy;
         if (!backend.supported(request.vendor, request.major)) return error.UnsupportedRelease;
         if (self.service.max_active != self.download_connections) {
             const replacement = try downloader.Service.init(worker_allocator, self.io, self.download_connections);
@@ -267,10 +392,17 @@ pub const Controller = struct {
         self.failure = null;
     }
     pub fn cancel(self: *Controller) void {
+        if (self.active_delete) |job| job.cancel.store(true, .release);
         if (self.active) |job| _ = self.registry.cancel(job.task.?.id);
     }
     /// Join download and probe work; tick retains committed JDKs and registration results.
     pub fn cancelAndJoin(self: *Controller, manager: *java.Manager) void {
+        if (self.active_delete) |job| {
+            job.cancel.store(true, .release);
+            if (job.thread) |thread| thread.join();
+            job.thread = null;
+            self.tickOwnedDelete(manager);
+        }
         const job = self.active orelse return;
         self.cancel();
         job.probe_cancel.store(true, .release);
@@ -279,6 +411,7 @@ pub const Controller = struct {
         self.tick(manager);
     }
     pub fn tick(self: *Controller, manager: *java.Manager) void {
+        self.tickOwnedDelete(manager);
         const job = self.active orelse return;
         if (!job.done.load(.acquire)) return;
         if (job.thread) |thread| thread.join();
@@ -743,4 +876,238 @@ test "download cancelAndJoin consumes late success and registration failures thr
             try std.testing.expectEqual(@as(usize, 1), reloaded.entries().len);
         }
     }
+}
+
+test "owned delete validates receipts and paths, preserves links, joins before publication, and never falsely completes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = enum { success, interior_links, cancel_before_worker, partial_retry, registry_failure, malformed_receipt, java_symlink, java_hardlink };
+    for ([_]Case{ .success, .interior_links, .cancel_before_worker, .partial_retry, .registry_failure, .malformed_receipt, .java_symlink, .java_hardlink }) |case| {
+        if (builtin.os.tag == .windows and (case == .interior_links or case == .java_symlink)) continue;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try fixtureRoot(&tmp);
+        defer a.free(root);
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var manager = try java.Manager.init(a, io, root);
+        defer manager.deinit();
+        var fixture: Fixture = .{};
+        var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+        defer controller.deinit();
+        try controller.start(.{ .vendor = .microsoft, .major = 21 });
+        try awaitController(&controller, &manager);
+        const path = try a.dupe(u8, controller.snapshot().installed.?.java_path);
+        defer a.free(path);
+        const directory_path = try a.dupe(u8, controller.snapshot().installed.?.directory);
+        defer a.free(directory_path);
+        try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+        try std.testing.expect(!controller.isDeleting() and !controller.isBusy());
+        try controller.checkOwnedStorage(path);
+
+        const sibling = try std.fmt.allocPrint(a, "{s}-sibling/runtime/bin/java", .{controller.root});
+        defer a.free(sibling);
+        try std.testing.expectError(error.NotOwnedJava, controller.beginOwnedDelete(sibling));
+        const traversal = try std.fs.path.join(a, &.{ controller.root, "runtime", "..", "bin", "java" });
+        defer a.free(traversal);
+        try std.testing.expectError(error.UnsafeOwnedPath, controller.beginOwnedDelete(traversal));
+        const mismatched_java = try std.fmt.allocPrint(a, "{s}.other", .{path});
+        defer a.free(mismatched_java);
+        try std.testing.expectError(error.NotOwnedJava, controller.beginOwnedDelete(mismatched_java));
+        try std.testing.expectEqual(Phase.idle, controller.ownedDeleteSnapshot().phase);
+
+        const directory = try Io.Dir.cwd().openDir(io, directory_path, .{});
+        defer directory.close(io);
+        if (case == .malformed_receipt) {
+            const receipt = try directory.createFile(io, ".vela-runtime.json", .{});
+            try receipt.writeStreamingAll(io, "{}");
+            receipt.close(io);
+            if (controller.beginOwnedDelete(path)) |_| return error.MalformedReceiptAccepted else |_| {}
+            try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+            try std.testing.expectEqual(Phase.idle, controller.ownedDeleteSnapshot().phase);
+            const java_file = try Io.Dir.cwd().openFile(io, path, .{});
+            java_file.close(io);
+            continue;
+        }
+        if (case == .java_hardlink) {
+            try Io.Dir.cwd().hardLink(path, tmp.dir, "external-hardlink", io, .{});
+            try std.testing.expectError(error.UnsafeOwnedLink, controller.beginOwnedDelete(path));
+            try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+            continue;
+        }
+        const outside = try std.fs.path.join(a, &.{ root, "outside-java" });
+        defer a.free(outside);
+        if (case == .interior_links or case == .java_symlink) {
+            const external = try tmp.dir.createFile(io, "outside-java", .{});
+            try external.writeStreamingAll(io, "must survive owned deletion");
+            external.close(io);
+            if (case == .java_symlink) {
+                try Io.Dir.cwd().deleteFile(io, path);
+                try Io.Dir.cwd().symLink(io, outside, path, .{});
+                try std.testing.expectError(error.UnsafeOwnedLink, controller.beginOwnedDelete(path));
+                try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+                continue;
+            }
+            try directory.symLink(io, outside, "outside-file-link", .{});
+            // A link to the launcher directory must never be recursively followed.
+            try directory.symLink(io, root, "outside-directory-link", .{ .is_directory = true });
+        }
+        if (case == .registry_failure) {
+            try tmp.dir.deleteFile(io, ".vela/java.json");
+            try tmp.dir.createDir(io, ".vela/java.json", .default_dir);
+        }
+        if (case == .partial_retry) {
+            // Model cancellation after a leaf unlink: ownership proof remains in place.
+            try Io.Dir.cwd().deleteFile(io, path);
+            try startCanceledOwnedDelete(&controller, path);
+            try awaitFlag(&controller.active_delete.?.done);
+            try std.testing.expect(controller.isDeleting() and controller.isBusy());
+            controller.cancelAndJoin(&manager);
+            try std.testing.expect(!controller.isDeleting() and !controller.isBusy());
+            try std.testing.expectEqual(Phase.canceled, controller.ownedDeleteSnapshot().phase);
+            try std.testing.expect(!controller.ownedDeleteSnapshot().files_deleted);
+            try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+            const proof = try directory.statFile(io, ".vela-runtime.json", .{ .follow_symlinks = false });
+            try std.testing.expectEqual(Io.File.Kind.file, proof.kind);
+            try controller.checkOwnedStorage(path);
+        }
+        if (case == .cancel_before_worker) {
+            try startCanceledOwnedDelete(&controller, path);
+        } else {
+            try controller.beginOwnedDelete(path);
+        }
+        try std.testing.expectError(error.Busy, controller.start(.{ .vendor = .microsoft, .major = 21 }));
+        try std.testing.expectError(error.Busy, controller.beginOwnedDelete(path));
+        try std.testing.expect(controller.isDeleting() and controller.isBusy());
+        const job = controller.active_delete.?;
+        try awaitFlag(&job.done);
+        try std.testing.expect(controller.isDeleting() and controller.isBusy());
+        // A finished worker still cannot publish state until its owner joins it.
+        try std.testing.expectEqual(Phase.running, controller.ownedDeleteSnapshot().phase);
+        try std.testing.expect(!controller.ownedDeleteSnapshot().files_deleted);
+        try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+        if (case == .cancel_before_worker) controller.tick(&manager) else controller.cancelAndJoin(&manager);
+        try std.testing.expect(controller.active_delete == null and job.thread == null);
+        try std.testing.expect(!controller.isDeleting() and !controller.isBusy());
+        const result = controller.ownedDeleteSnapshot();
+        if (case == .cancel_before_worker) {
+            try std.testing.expectEqual(Phase.canceled, result.phase);
+            try std.testing.expect(!result.files_deleted);
+            try std.testing.expectEqual(error.Canceled, result.failure.?);
+            try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+            try controller.checkOwnedStorage(path);
+        } else {
+            try std.testing.expect(result.files_deleted);
+            try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, directory_path, .{ .follow_symlinks = false }));
+            if (case == .registry_failure) {
+                try std.testing.expectEqual(Phase.failed, result.phase);
+                try std.testing.expect(result.registry_failure != null and result.failure != null);
+                try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+            } else {
+                try std.testing.expectEqual(Phase.complete, result.phase);
+                try std.testing.expect(result.failure == null and result.registry_failure == null);
+                try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
+                var reloaded = try java.Manager.init(a, io, root);
+                defer reloaded.deinit();
+                try std.testing.expectEqual(@as(usize, 0), reloaded.entries().len);
+            }
+            if (case == .interior_links) {
+                const external = try tmp.dir.openFile(io, "outside-java", .{});
+                defer external.close(io);
+                var bytes: [64]u8 = undefined;
+                const n = try external.readPositionalAll(io, &bytes, 0);
+                try std.testing.expectEqualStrings("must survive owned deletion", bytes[0..n]);
+                try std.testing.expectEqual(Io.File.Kind.directory, (try tmp.dir.stat(io)).kind);
+            }
+        }
+        controller.tick(&manager);
+        try std.testing.expectEqual(result.phase, controller.ownedDeleteSnapshot().phase);
+    }
+}
+
+fn startCanceledOwnedDelete(controller: *Controller, path: []const u8) !void {
+    // An already-canceled real worker makes cancellation tests independent of scheduling.
+    const job = try worker_allocator.create(DeleteJob);
+    job.* = .{ .io = controller.io };
+    errdefer job.destroy();
+    job.root = try job.arena.allocator().dupe(u8, controller.root);
+    job.java_path = try job.arena.allocator().dupe(u8, path);
+    controller.active_delete = job;
+    controller.delete_phase = .running;
+    errdefer {
+        controller.active_delete = null;
+        controller.delete_phase = .idle;
+    }
+    try std.testing.expect(controller.isDeleting() and controller.isBusy());
+    controller.cancel();
+    try std.testing.expect(job.cancel.load(.acquire));
+    try std.testing.expect(controller.isDeleting() and controller.isBusy());
+    job.thread = try std.Thread.spawn(.{}, DeleteJob.run, .{job});
+}
+
+test "owned delete admission rejects before ownership allocation tasks or filesystem changes and permits retry" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Admission = struct {
+        blocked: bool = true,
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.blocked) return error.JavaDeletionBlocked;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try fixtureRoot(&tmp);
+    defer a.free(root);
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var manager = try java.Manager.init(a, io, root);
+    defer manager.deinit();
+    var fixture: Fixture = .{};
+    var admission: Admission = .{};
+    var controller = try Controller.initWithOptions(a, io, .{
+        .root = root,
+        .task_registry = &registry,
+        .transport = fixture.transport(),
+        .extractor = fixture.extractor(),
+        .probe = fixture.probe(),
+        .owned_delete_admission = .{ .context = &admission, .check = Admission.check },
+    });
+    defer controller.deinit();
+    // The admission applies only to owned deletion; downloads remain available.
+    try controller.start(.{ .vendor = .microsoft, .major = 21 });
+    try awaitController(&controller, &manager);
+    const downloaded = controller.published.?;
+    const path = try a.dupe(u8, controller.snapshot().installed.?.java_path);
+    defer a.free(path);
+    const task_count = registry.tasks().len;
+    try std.testing.expectEqual(@as(usize, 0), admission.checks);
+    try std.testing.expectError(error.JavaDeletionBlocked, controller.beginOwnedDelete(path));
+    // Invalid paths still return admission failure, before filesystem ownership checks.
+    try std.testing.expectError(error.JavaDeletionBlocked, controller.beginOwnedDelete("invalid-owned-path"));
+    try std.testing.expectEqual(@as(usize, 2), admission.checks);
+    try std.testing.expect(!controller.isBusy() and !controller.isDeleting());
+    try std.testing.expect(controller.active_delete == null and controller.published_delete == null);
+    try std.testing.expectEqual(Phase.idle, controller.ownedDeleteSnapshot().phase);
+    try std.testing.expect(controller.published.? == downloaded);
+    try std.testing.expectEqual(Phase.complete, controller.snapshot().phase);
+    try std.testing.expect(controller.snapshot().registered);
+    try std.testing.expectEqual(task_count, registry.tasks().len);
+    try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    file.close(io);
+    try controller.checkOwnedStorage(path);
+    admission.blocked = false;
+    try controller.beginOwnedDelete(path);
+    try std.testing.expectEqual(@as(usize, 3), admission.checks);
+    // Own busy wins without consulting the application admission again.
+    try std.testing.expectError(error.Busy, controller.beginOwnedDelete(path));
+    try std.testing.expectEqual(@as(usize, 3), admission.checks);
+    try awaitFlag(&controller.active_delete.?.done);
+    controller.tick(&manager);
+    try std.testing.expect(!controller.isBusy() and !controller.isDeleting());
+    try std.testing.expect(controller.ownedDeleteSnapshot().files_deleted);
+    try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
 }

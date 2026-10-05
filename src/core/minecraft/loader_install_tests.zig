@@ -5,6 +5,8 @@ const loaders = @import("loaders.zig");
 const files = @import("loaders_files.zig");
 const m = @import("metadata/root.zig");
 const plan_module = @import("install_plan.zig");
+const namespace = @import("../instance_namespace.zig");
+const worlds = @import("../worlds.zig");
 const A = std.mem.Allocator;
 const io = std.testing.io;
 const base_id = "1.20.1";
@@ -66,6 +68,9 @@ const Fixture = struct {
     sidecar_requests: usize = 0,
     artifact_requests: usize = 0,
     cancel: std.atomic.Value(bool) = .init(false),
+    namespace_token: ?namespace.Token = null,
+    probe_namespace: bool = false,
+    gate_available_probes: usize = 0,
 
     fn init(private_base: bool) !Fixture {
         var tmp = std.testing.tmpDir(.{});
@@ -101,14 +106,23 @@ const Fixture = struct {
     fn self(raw: ?*anyopaque) *Fixture {
         return @ptrCast(@alignCast(raw.?));
     }
+    fn probeNamespace(f: *Fixture) !void {
+        if (!f.probe_namespace) return;
+        try std.testing.expectError(error.InstanceNamespaceBusy, namespace.acquire(io));
+        try std.testing.expect(worlds.transaction_gate.tryLock());
+        worlds.transaction_gate.unlock(io);
+        f.gate_available_probes += 1;
+    }
     fn acquire(raw: ?*anyopaque, id: []const u8) !void {
         const f = self(raw);
+        try f.probeNamespace();
         try std.testing.expectEqualStrings("fixture-instance", id);
         try std.testing.expectEqual(@as(usize, 0), f.acquired);
         f.acquired += 1;
     }
     fn recheck(raw: ?*anyopaque, id: []const u8) !void {
         const f = self(raw);
+        try f.probeNamespace();
         try std.testing.expectEqualStrings("fixture-instance", id);
         try std.testing.expectEqual(@as(usize, 1), f.acquired);
         try std.testing.expectEqual(@as(usize, 0), f.released);
@@ -117,6 +131,7 @@ const Fixture = struct {
         if (f.mode == .running) return error.InstanceRunning;
     }
     fn release(raw: ?*anyopaque, _: []const u8) void {
+        self(raw).probeNamespace() catch unreachable;
         self(raw).released += 1;
     }
     fn profile(f: *Fixture) []const u8 {
@@ -131,6 +146,7 @@ const Fixture = struct {
     }
     fn get(raw: ?*anyopaque, a: A, url: []const u8, max: usize, request_control: loaders.Control) !loaders.Response {
         const f = self(raw);
+        try f.probeNamespace();
         try request_control.check();
         f.requests += 1;
         const body: []const u8 = if (std.mem.eql(u8, url, catalog_url)) catalog_json else if (std.mem.eql(u8, url, profile_url)) f.profile() else if (std.mem.eql(u8, url, artifact_url ++ ".sha1") or std.mem.eql(u8, url, alias_artifact_url ++ ".sha1")) blk: {
@@ -167,6 +183,7 @@ const Fixture = struct {
             .base_plan = base_plan,
             .base_directory = if (f.private_base) f.base_directory else null,
             .environment = .{ .os_name = "linux", .arch = "x86_64" },
+            .namespace_token = f.namespace_token,
             .lease = .{ .context = f, .acquire = acquire, .recheck = recheck, .release = release },
             .transport = .{ .context = f, .get = get },
         }, f.control());
@@ -561,4 +578,54 @@ test "production successful publication reports native directory durability supp
     defer result.deinit();
     try std.testing.expectEqual(!@import("../worlds_tree.zig").directory_sync_supported, result.durability_uncertain);
     try f.expectPublished(result);
+}
+
+test "namespace blocker rejects direct loader before versions creation or callbacks" {
+    var f = try Fixture.init(true);
+    defer f.deinit();
+    const token = try namespace.acquire(io);
+    defer token.release();
+    try std.testing.expectError(error.InstanceNamespaceBusy, f.run(std.testing.allocator));
+    try f.expectAbsent(try std.fmt.allocPrint(f.arena.allocator(), "{s}/versions", .{f.minecraft}));
+    try std.testing.expectEqual(@as(usize, 0), f.acquired);
+    try std.testing.expectEqual(@as(usize, 0), f.requests);
+    try token.recheck();
+}
+
+test "borrowed loader namespace survives publication and stale stamps fail before IO" {
+    var f = try Fixture.init(true);
+    defer f.deinit();
+    const token = try namespace.acquire(io);
+    defer token.release();
+    f.namespace_token = token;
+    f.probe_namespace = true;
+    var result = try f.run(std.testing.allocator);
+    defer result.deinit();
+    try f.expectPublished(result);
+    try std.testing.expect(f.gate_available_probes > 0);
+    try token.recheck();
+    try std.testing.expectError(error.InstanceNamespaceBusy, namespace.acquire(io));
+    token.release();
+    const current = try namespace.acquire(io);
+    defer current.release();
+    var stale = try Fixture.init(true);
+    defer stale.deinit();
+    stale.namespace_token = token;
+    try std.testing.expectError(error.InstanceNamespaceLeaseLost, stale.run(std.testing.allocator));
+    try stale.expectAbsent(try std.fmt.allocPrint(stale.arena.allocator(), "{s}/versions", .{stale.minecraft}));
+    try std.testing.expectEqual(@as(usize, 0), stale.acquired);
+    try std.testing.expectEqual(@as(usize, 0), stale.requests);
+    try current.recheck();
+}
+
+test "direct loader reservation survives rollback callbacks then releases" {
+    var f = try Fixture.init(true);
+    defer f.deinit();
+    f.probe_namespace = true;
+    f.mode = .malformed;
+    try std.testing.expectError(error.MissingField, f.run(std.testing.allocator));
+    try f.expectRollback();
+    try std.testing.expect(f.gate_available_probes > 0);
+    const next = try namespace.acquire(io);
+    defer next.release();
 }

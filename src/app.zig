@@ -33,14 +33,12 @@ const pack_import_view = @import("ui/pack_import_view.zig");
 const cf_credentials_controller = @import("ui/curseforge_credentials_controller.zig");
 const worlds_manager = @import("ui/worlds_manager.zig");
 const worlds_view = @import("ui/worlds_view.zig");
+// The normal root has no acceptance capability and retains its production services.
+const acceptance_enabled = @hasDecl(@import("root"), "vela_lifecycle_acceptance");
+const acceptance = if (acceptance_enabled) @import("root").vela_lifecycle_acceptance else struct {};
 
 pub const dvui_app: dvui.App = .{
-    .config = .{ .options = .{
-        .size = .{ .w = 1000, .h = 640 },
-        .min_size = .{ .w = 640, .h = 400 },
-        .title = "Vela Launcher",
-        .window_init_options = .{ .keybinds_zoom = true },
-    } },
+    .config = .{ .startFn = start },
     .initFn = init,
     .deinitFn = deinit,
     .frameFn = frame,
@@ -48,6 +46,21 @@ pub const dvui_app: dvui.App = .{
 pub const main = dvui.App.main;
 pub const panic = dvui.App.panic;
 pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
+
+var native_backend_configuration_error: ?anyerror = null;
+
+fn start() dvui.App.StartOptions {
+    native_backend_configuration_error = null;
+    window_control.configureNativeBackend() catch |err| {
+        native_backend_configuration_error = err;
+    };
+    return .{
+        .size = .{ .w = 1000, .h = 640 },
+        .min_size = .{ .w = 640, .h = 400 },
+        .title = "Vela Launcher",
+        .window_init_options = .{ .keybinds_zoom = true },
+    };
+}
 
 var model: state.Model = .{};
 var library: game_library.Controller = undefined;
@@ -106,12 +119,15 @@ fn instanceFingerprint(document: *const config.Document) u64 {
 }
 
 pub fn init(win: *dvui.Window) !void {
+    if (native_backend_configuration_error) |err| return err;
     win.backend.impl.log_events = false;
     model = .{ .versions = &.{}, .selected_version = 0 };
     policy = .{};
     logs_ui = .{};
     observed_attempt = 0;
     const main_init = dvui.App.main_init orelse return error.MissingAppInit;
+    if (acceptance_enabled) try acceptance.validate(main_init.gpa, main_init.io, main_init.environ_map);
+    errdefer if (acceptance_enabled) acceptance.destroy();
     leases = instance_leases.Coordinator.init(main_init.io);
     _ = leases.mutation(0);
     const base = if (main_init.environ_map.get("VELA_DATA_DIR")) |override|
@@ -123,6 +139,7 @@ pub fn init(win: *dvui.Window) !void {
     errdefer paths.deinit();
     configuration = try config.Store.init(main_init.gpa, main_init.io, paths.root);
     errdefer configuration.deinit();
+    if (acceptance_enabled) try acceptance.validateProfile(configuration.snapshot());
     if (@import("builtin").os.tag == .windows) try configuration.prepareStorage();
     observed_instances = instanceFingerprint(configuration.snapshot());
     settings_ui = try settings_view.Ui.init(main_init.gpa, configuration.snapshot().settings);
@@ -131,13 +148,15 @@ pub fn init(win: *dvui.Window) !void {
     errdefer tasks.deinit();
     cf_credentials = null;
     cf_credentials_failure = null;
-    if (cf_credentials_controller.Controller.init(main_init.gpa, main_init.io, paths.root, .{ .registry = &tasks })) |controller| {
-        cf_credentials = controller;
-    } else |err| {
-        cf_credentials_failure = err;
+    if (!acceptance_enabled) {
+        if (cf_credentials_controller.Controller.init(main_init.gpa, main_init.io, paths.root, .{ .registry = &tasks })) |controller| {
+            cf_credentials = controller;
+        } else |err| {
+            cf_credentials_failure = err;
+        }
     }
     errdefer if (cf_credentials) |*controller| controller.deinit();
-    servers = server_manager.Manager.init(main_init.gpa, main_init.io);
+    servers = if (acceptance_enabled) server_manager.Manager.initWithQuery(main_init.gpa, main_init.io, acceptance.denyServer) else server_manager.Manager.init(main_init.gpa, main_init.io);
     errdefer servers.deinit();
     servers_ui = servers_view.Ui.init(main_init.gpa);
     errdefer servers_ui.deinit();
@@ -151,14 +170,18 @@ pub fn init(win: *dvui.Window) !void {
         .task_registry = &tasks,
         .cache_root = paths.cache,
     };
-    if (main_init.environ_map.get("VELA_MANIFEST_URL")) |url| library_options.manifest_url = url;
+    if (acceptance_enabled) {
+        library_options.manifest_url = "invalid://no-http";
+    } else if (main_init.environ_map.get("VELA_MANIFEST_URL")) |url| library_options.manifest_url = url;
     library = try game_library.Controller.initWithOptions(main_init.gpa, main_init.io, library_options);
     errdefer library.deinit();
     java = try java_manager.Manager.init(main_init.gpa, main_init.io, paths.root);
     errdefer java.deinit();
     java_ui = java_view.Ui.init(main_init.gpa);
     errdefer java_ui.deinit();
-    java_download = try java_download_controller.Controller.initWithOptions(main_init.gpa, main_init.io, .{ .root = paths.root, .task_registry = &tasks });
+    var java_options: java_download_controller.Options = if (acceptance_enabled) acceptance.javaOptions(paths.root, &tasks) else .{ .root = paths.root, .task_registry = &tasks };
+    java_options.owned_delete_admission = .{ .check = checkOwnedJavaDeletion };
+    java_download = try java_download_controller.Controller.initWithOptions(main_init.gpa, main_init.io, java_options);
     errdefer java_download.deinit();
     java_download_ui = java_download_view.Ui.init(main_init.gpa);
     errdefer java_download_ui.deinit();
@@ -167,11 +190,11 @@ pub fn init(win: *dvui.Window) !void {
         .launch_guard = .{ .context = null, .acquire = reserveLaunch, .release = releaseLaunch },
     });
     errdefer launcher.deinit();
-    world_manager = try worlds_manager.Manager.init(main_init.gpa, main_init.io, &paths, &tasks, leases.guard(null));
+    world_manager = if (acceptance_enabled) try worlds_manager.Manager.initOptions(main_init.gpa, main_init.io, &paths, &tasks, .{ .scope = leases.worldScope(3), .worker = acceptance.worldWorker }) else try worlds_manager.Manager.init(main_init.gpa, main_init.io, &paths, &tasks, leases.worldScope(3));
     errdefer world_manager.deinit();
     worlds_ui = try worlds_view.Ui.init(main_init.gpa);
     errdefer worlds_ui.deinit();
-    accounts = try accounts_manager.Manager.init(main_init.gpa, main_init.io, paths.root);
+    accounts = if (acceptance_enabled) try accounts_manager.Manager.initWithOptions(main_init.gpa, main_init.io, acceptance.accountOptions(paths.root)) else try accounts_manager.Manager.init(main_init.gpa, main_init.io, paths.root);
     errdefer accounts.deinit();
     accounts_ui = try accounts_view.Ui.init(main_init.gpa);
     errdefer accounts_ui.deinit();
@@ -179,17 +202,21 @@ pub fn init(win: *dvui.Window) !void {
     const instance_mutation = leases.mutation(2);
     instance_manager = try instances_manager.Manager.init(main_init.gpa, main_init.io, &paths, &tasks, leases.guard(instance_mutation), .{ .context = instance_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback });
     errdefer instance_manager.deinit();
+    instance_manager.setWorkerRecheck(instance_leases.Mutation.workerRecheckCallback);
+    instance_manager.setCreationAdmission(.{ .check = checkJavaForCreation });
     instance_manager.setInstaller(instances_manager.productionInstaller());
     instance_manager.setLoaderCatalogue(instances_manager.productionLoaderCatalogue());
     instances_ui = instances_view.Ui.init(main_init.gpa);
     errdefer instances_ui.deinit();
     const content_mutation = leases.mutation(1);
-    content = try content_manager.Manager.initOptions(main_init.gpa, main_init.io, &paths, &tasks, .{
+    const content_options: content_manager.Options = .{
         .lease = .{ .context = content_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback },
+        .worker_recheck = instance_leases.Mutation.workerRecheckCallback,
         .transport_options = .{ .allow_curseforge = true },
         .allow_manifest_v2 = true,
         .allow_curseforge_remote = true,
-    });
+    };
+    content = try content_manager.Manager.initOptions(main_init.gpa, main_init.io, &paths, &tasks, if (acceptance_enabled) acceptance.contentOptions(content_options) else content_options);
     errdefer content.deinit();
     content_ui = try content_view.Ui.init(main_init.gpa);
     errdefer content_ui.deinit();
@@ -203,12 +230,17 @@ pub fn init(win: *dvui.Window) !void {
     theme.install(win);
     library_initialized = true;
     // A start failure is retained in the controller snapshot for the game view.
-    library.loadCatalogue() catch {};
+    if (acceptance_enabled) {
+        library.refreshInstalled() catch |err| {
+            model.library_error = err;
+        };
+    } else library.loadCatalogue() catch {};
 }
 
 pub fn deinit(win: *dvui.Window) void {
     _ = win;
     if (library_initialized) {
+        if (acceptance_enabled) acceptance.beforeDestroy();
         pack_import.deinit(packServices());
         pack_import_ui.deinit();
         window.deinit();
@@ -218,6 +250,7 @@ pub fn deinit(win: *dvui.Window) void {
         instances_ui.deinit();
         instance_manager.deinit();
         world_manager.deinit();
+        if (acceptance_enabled) acceptance.worldJoined();
         worlds_ui.deinit();
         java_download.deinit();
         java_download_ui.deinit();
@@ -225,6 +258,7 @@ pub fn deinit(win: *dvui.Window) void {
         servers_ui.deinit();
         accounts_ui.deinit();
         accounts.deinit();
+        if (acceptance_enabled) acceptance.accountsJoined();
         if (cf_credentials) |*controller| controller.deinit();
         cf_credentials = null;
         settings_ui.deinit();
@@ -235,11 +269,14 @@ pub fn deinit(win: *dvui.Window) void {
         configuration.deinit();
         paths.deinit();
         library_initialized = false;
+        if (acceptance_enabled) acceptance.destroy();
     }
 }
 
 pub fn frame() !dvui.App.Result {
+    try window.checkNativeDisplay();
     dvui.currentWindow().backend.impl.log_events = false;
+    if (acceptance_enabled) try acceptance.beforeFrame(&launcher, &world_manager, &configuration, &paths);
     library.tick();
     if (!pack_import.ownsJavaDiscovery()) java.tick();
     launcher.tick();
@@ -281,11 +318,14 @@ pub fn frame() !dvui.App.Result {
         if (settings.curseforge_credential_ref) |reference| cf_policy.credential_ref = reference[0..32].*;
         try content.setCurseForgePolicy(cf_policy);
     }
-    if (try synchronizeGameLifecycle()) return .close;
+    if (try synchronizeGameLifecycle()) {
+        try window.checkNativeDisplay();
+        return .close;
+    }
     launcher.setLaunchAllowed(policy.canLaunch());
     if (pack_import_ui.takeReviewRequest()) {
         model.panel = .content;
-        content_ui.review_requested = true;
+        content_ui.requestReview(content.snapshot());
     }
     try view.draw(&model, &library, &java, &java_ui, &launcher, .{
         .pack_import = &pack_import,
@@ -312,26 +352,67 @@ pub fn frame() !dvui.App.Result {
     });
     const phase = library.snapshot().phase;
     const launch_phase = launcher.snapshot().phase;
-    if (try synchronizeGameLifecycle()) return .close;
+    if (try synchronizeGameLifecycle()) {
+        try window.checkNativeDisplay();
+        return .close;
+    }
     const active = activeBackgroundCount();
     if (window.takeCloseRequested()) {
-        if (try applyWindowActions(policy.closeRequested(active))) return .close;
+        if (try applyWindowActions(policy.closeRequested(active))) {
+            try window.checkNativeDisplay();
+            return .close;
+        }
     }
+    var shutdown_layout: shutdown_view.Layout = .{};
     if (policy.shutdown == .prompt) {
-        if (shutdown_view.draw(active)) |choice| {
-            if (try applyWindowActions(policy.chooseClose(choice, active))) return .close;
+        if (shutdown_view.drawWithLayout(active, &shutdown_layout)) |choice| {
+            if (acceptance_enabled) acceptance.observeChoice(choice);
+            if (try applyWindowActions(policy.chooseClose(choice, active))) {
+                try window.checkNativeDisplay();
+                return .close;
+            }
         }
     }
     if (policy.shutdown == .canceling and active == 0) {
-        if (try applyWindowActions(policy.backgroundJoined())) return .close;
+        if (try applyWindowActions(policy.backgroundJoined())) {
+            try window.checkNativeDisplay();
+            return .close;
+        }
     }
-    if (try applyWindowActions(policy.backgroundChanged(active))) return .close;
+    if (try applyWindowActions(policy.backgroundChanged(active))) {
+        try window.checkNativeDisplay();
+        return .close;
+    }
     dvui.currentWindow().backend.impl.log_events = false;
-    if (phase == .loading or phase == .installing or java.isSearching() or java_download.snapshot().phase == .running or servers.isBusy() or world_manager.snapshot().worker_active or accounts.snapshot().busy or instance_manager.isBusy() or content.isBusy() or cfCredentialsBusy() or view.packWorkflowPinned(&pack_import) or pack_import_ui.isBusy() or launch_phase == .preparing or launch_phase == .running or policy.shutdown != .none) dvui.refresh(null, @src(), null);
+    if (phase == .loading or phase == .installing or java.isSearching() or java_download.isBusy() or servers.isBusy() or world_manager.snapshot().worker_active or accounts.snapshot().busy or instance_manager.isBusy() or content.isBusy() or cfCredentialsBusy() or view.packWorkflowPinned(&pack_import) or pack_import_ui.isBusy() or launch_phase == .preparing or launch_phase == .running or policy.shutdown != .none) dvui.refresh(null, @src(), null);
+    if (acceptance_enabled and !tasks.hasActive()) tasks.pruneFinished(0);
+    if (acceptance_enabled) try acceptance.afterFrame(.{
+        .startup_idle = model.panel == .home and active == 0 and tasks.tasks().len == 0 and phase == .complete and !java.isSearching() and !java_download.isBusy() and !servers.isBusy() and !world_manager.snapshot().worker_active and world_manager.snapshot().instance != null and world_manager.snapshot().failure == null and !accounts.snapshot().busy and !instance_manager.isBusy() and !content.isBusy() and content.selected != null and content.snapshot().failure == null and !cfCredentialsBusy() and !view.packWorkflowPinned(&pack_import) and !pack_import_ui.isBusy(),
+        .game = launcher.snapshot(),
+        .world = world_manager.snapshot(),
+        .accounts = accounts.snapshot(),
+        .task_count = tasks.tasks().len,
+        .active_background = active,
+        .policy = &policy,
+        .window = &window,
+        .panel = @tagName(model.panel),
+        .shutdown_layout = shutdown_layout,
+    });
+    try window.checkNativeDisplay();
     return .ok;
 }
 
+fn checkJavaForCreation(_: ?*anyopaque) !void {
+    if (java_download.isDeleting()) return error.JavaDeleteBusy;
+}
+
+fn checkOwnedJavaDeletion(_: ?*anyopaque) !void {
+    const phase = launcher.snapshot().phase;
+    if (phase == .preparing or phase == .running or instance_manager.isBusy() or view.packWorkflowPinned(&pack_import)) return error.JavaInUse;
+}
+
 fn reserveLaunch(_: ?*anyopaque, instance_name: []const u8) !void {
+    try checkJavaForCreation(null);
     leases.tick();
     const instance = instance_paths.findByName(configuration.snapshot(), instance_name) orelse return error.InstanceNotConfigured;
     try leases.reserveLaunch(instance.id);
@@ -377,6 +458,8 @@ fn activeBackgroundCount() usize {
     }
     if (library.snapshot().phase == .loading) count += 1;
     if (java.isSearching()) count += 1;
+    // Owned deletion has no registry task and remains owned until tick joins it.
+    if (java_download.isDeleting()) count += 1;
     if (servers.isBusy()) count += 1;
     if (world_manager.snapshot().worker_active and world_manager.snapshot().loading) count += 1;
     if (accounts.snapshot().busy) count += 1;
@@ -386,6 +469,7 @@ fn activeBackgroundCount() usize {
 }
 
 fn applyWindowActions(actions: lifecycle.Actions) !bool {
+    if (acceptance_enabled) acceptance.observeActions(actions);
     if (actions.hide) window.hide() catch |err| {
         std.log.warn("Cannot hide launcher window: {s}", .{@errorName(err)});
     };

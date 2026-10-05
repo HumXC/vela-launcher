@@ -3,6 +3,7 @@ const dvui = @import("dvui");
 const builtin = @import("builtin");
 const config = @import("../core/config.zig");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const credentials = @import("../core/credentials.zig");
 const credential_controller = @import("curseforge_credentials_controller.zig");
 const masked_key = @import("curseforge_key_editor.zig");
@@ -36,6 +37,7 @@ pub const Ui = struct {
     key_editor: masked_key.Editor = .{},
     key_pending: ?KeyRequest = null,
     key_failure: ?anyerror = null,
+    key_discard_queued: bool = false,
     confirm_remove: bool = false,
 
     pub fn init(a: std.mem.Allocator, initial_settings: config.Settings) !Ui {
@@ -62,6 +64,11 @@ pub const Ui = struct {
         self.key_pending = null;
         self.key_failure = null;
         self.confirm_remove = false;
+        self.key_discard_queued = false;
+    }
+
+    fn finishKeyDiscard(self: *Ui) void {
+        if (self.key_discard_queued) self.clearKey();
     }
 
     pub fn requestKey(self: *Ui, command: KeyCommand, snapshot: credential_controller.Snapshot, content_busy: bool, store_uncertain: bool) !void {
@@ -173,10 +180,10 @@ fn keyIcon(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8,
     dvui.icon(@src(), name, asset, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0), .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .role = .none }));
     button.drawFocus();
     const clicked = enabled and button.clicked();
-    const hovered = button.hovered();
-    const rect = button.data().rectScale().r;
+    const control_id = button.data().id;
+    const rect = button.data().borderRectScale().r;
     button.deinit();
-    if (hovered) dvui.tooltip(src, .{ .active_rect = rect }, "{s}", .{name}, .{ .id_extra = 1 });
+    components.tooltip(src, control_id, rect, name);
     return clicked;
 }
 
@@ -189,13 +196,17 @@ fn keyStatus(src: std.builtin.SourceLocation, value: []const u8, warning: bool) 
 fn drawCredentials(ui: *Ui, snapshot: credential_controller.Snapshot, settings: config.Settings, content_busy: bool, store_uncertain: bool) void {
     const configured = settings.curseforge_credential_ref != null;
     if (!configured) ui.confirm_remove = false;
+    const editor = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
+    defer editor.deinit();
     fieldLabel(@src(), "CurseForge API 密钥");
+    const action = components.formActions(@src(), .{ .save_label = "保存密钥", .save_enabled = ui.key_pending == null and keyAllowed(.save_key, snapshot, content_busy, store_uncertain) and ui.key_editor.readyForSave() });
+    if (action == .cancel) ui.key_discard_queued = true;
     keyStatus(@src(), if (configured) "已配置" else "未配置", false);
     const height = (dvui.Options{}).fontGet().sizeM(0, 1).h;
     const result = ui.key_editor.draw(@src(), .{ .expand = .horizontal, .min_size_content = .{ .h = height }, .max_size_content = .height(height), .padding = R.all(8), .margin = .{ .h = 8 }, .corners = .all(4) });
     if (result.edited) ui.key_failure = null;
-    if (result.cancel) ui.clearKey();
-    if (result.submit) ui.requestKey(.save_key, snapshot, content_busy, store_uncertain) catch |err| {
+    if (result.cancel) ui.key_discard_queued = true;
+    if (!ui.key_discard_queued and (action == .save or result.submit)) ui.requestKey(.save_key, snapshot, content_busy, store_uncertain) catch |err| {
         ui.key_failure = err;
     };
     switch (result.status) {
@@ -206,11 +217,7 @@ fn drawCredentials(ui: *Ui, snapshot: credential_controller.Snapshot, settings: 
     {
         const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 8 } });
         defer actions.deinit();
-        const save_allowed = ui.key_pending == null and keyAllowed(.save_key, snapshot, content_busy, store_uncertain);
         const remove_allowed = configured and ui.key_pending == null and keyAllowed(.remove_key, snapshot, content_busy, store_uncertain);
-        if (keyIcon(@src(), "保存 API 密钥", dvui.entypo.save, save_allowed and ui.key_editor.readyForSave())) ui.requestKey(.save_key, snapshot, content_busy, store_uncertain) catch |err| {
-            ui.key_failure = err;
-        };
         if (keyIcon(@src(), "移除 API 密钥", dvui.entypo.trash, remove_allowed)) {
             ui.clearKey();
             ui.confirm_remove = true;
@@ -269,11 +276,10 @@ fn drawPage(ui: *Ui, controller: ?*credential_controller.Controller, settings: c
     const page = dvui.box(@src(), .{}, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
     defer page.deinit();
     dvui.labelNoFmt(@src(), "设置", .{}, .{ .font = dvui.themeGet().font_title, .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 16 } });
-    {
-        const footer = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_y = 1, .min_size_content = .{ .h = 36 }, .padding = .{ .y = 8 }, .margin = R.all(0) });
-        defer footer.deinit();
-        if (dvui.buttonLabelAndIcon(@src(), .{ .label = "保存", .tvg_bytes = dvui.entypo.save, .icon_first = true, .icon_label = "保存" }, .{ .style = .highlight, .min_size_content = .{ .h = 20 }, .padding = R.all(8), .margin = .{ .w = 8 }, .corners = .all(4) })) ui.pending = .save;
-        if (dvui.button(@src(), "取消", .{}, .{ .min_size_content = .{ .h = 20 }, .padding = R.all(8), .margin = R.all(0), .corners = .all(4) })) ui.pending = .cancel;
+    switch (components.formActions(@src(), .{})) {
+        .save => ui.pending = .save,
+        .cancel => ui.pending = .cancel,
+        .none => {},
     }
     {
         const scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false, .border = R.all(0), .padding = R.all(0), .margin = R.all(0) });
@@ -326,6 +332,7 @@ fn drawPage(ui: *Ui, controller: ?*credential_controller.Controller, settings: c
 /// Store.update is deliberately outside draw: it invalidates borrowed snapshots.
 /// Failure keeps the working copy for retry; Cancel atomically reloads the latest settings.
 pub fn finish(ui: *Ui, store: *config.Store) void {
+    ui.finishKeyDiscard();
     if (ui.pending == .cancel) {
         finishSettings(ui, store, false);
         return;
@@ -337,6 +344,7 @@ pub fn finish(ui: *Ui, store: *config.Store) void {
 }
 
 pub fn finishWithCredentials(ui: *Ui, store: *config.Store, controller: *credential_controller.Controller, content_busy: bool) void {
+    ui.finishKeyDiscard();
     const policy_locked = controller.lease() or content_busy;
     if (ui.pending == .cancel) {
         finishSettings(ui, store, policy_locked);
@@ -381,6 +389,7 @@ pub fn finishWithCredentials(ui: *Ui, store: *config.Store, controller: *credent
 }
 
 pub fn finishUnavailable(ui: *Ui, store: *config.Store) void {
+    ui.finishKeyDiscard();
     ui.clearKey();
     finishSettings(ui, store, true);
 }
@@ -879,6 +888,22 @@ test "settings Cancel clears key command and replaces unpinned draft at the same
     ui.key_editor.reset();
     try std.testing.expectEqual(address, ui.key_editor.address.?);
     try std.testing.expect(store.snapshot().settings.curseforge_credential_ref == null);
+}
+
+test "key form Cancel defers wiping and preserves unrelated settings draft" {
+    var ui = try Ui.init(std.testing.allocator, .{});
+    defer ui.deinit();
+    setNumber(&ui.memory_buffer, "8192");
+    setTestKey(&ui, "fixture-key");
+    try ui.requestKey(.save_key, keyTestSnapshot(), false, false);
+    setTestKey(&ui, "uncommitted-key");
+    ui.key_failure = error.InvalidKey;
+    ui.key_discard_queued = true;
+    try std.testing.expect(ui.key_pending != null and ui.key_editor.readyForSave());
+    ui.finishKeyDiscard();
+    try expectKeyCleared(&ui);
+    try std.testing.expect(ui.key_pending == null and ui.key_failure == null and !ui.key_discard_queued);
+    try std.testing.expectEqual(@as(u32, 8192), (try ui.settings()).default_memory_mb);
 }
 
 test "settings leased policy save preserves latest CF bits and reference while updating unrelated fields" {

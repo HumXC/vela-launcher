@@ -22,9 +22,16 @@ const A = std.mem.Allocator;
 const Io = std.Io;
 pub const Kind = enum { mod, resourcepack, shader, modpack };
 pub const OptionalChoice = struct { path: []const u8, include: bool };
+/// Verification of a supplied source at proposal construction time, not a live filesystem claim.
+pub const ManualSourceStatus = struct {
+    path: []const u8,
+    source_absolute_path: ?[]const u8 = null,
+    verified: bool = false,
+};
 pub const Proposal = struct {
     files: []const manifest.InstallFile = &.{},
     manual_files: []const install.ManualFile = &.{},
+    manual_source_status: []const ManualSourceStatus = &.{},
     pack: ?manifest.PackPlan = null,
     plan: manifest.UpdatePlan,
     desired: ?manifest.Manifest = null,
@@ -66,6 +73,8 @@ pub const CurseForgePolicy = struct {
 };
 pub const Options = struct {
     lease: install.Lease,
+    /// Optional waiting worker checker uses the same lease context, frozen per job.
+    worker_recheck: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
     transport_options: transport.Adapter.Options = .{},
     fixture_fault: ?install.Fault = null,
     curseforge: CurseForgePolicy = .{},
@@ -236,13 +245,17 @@ const Job = struct {
             if (!optionalEqual(self.stage(), retained)) self.discardReserved(self);
         }
         if (self.inspection) |*inspection| {
-            if (self.held) inspection.cleanup(self.io) catch {};
+            if (self.held) {
+                nestedAcquire(self, self.instance.id) catch return;
+                inspection.cleanup(self.io) catch {};
+            }
         }
     }
     fn nestedAcquire(context: ?*anyopaque, id: []const u8) anyerror!void {
         const self: *Job = @ptrCast(@alignCast(context.?));
         if (!self.held or !std.mem.eql(u8, id, self.instance.id)) return error.LeaseNotHeld;
-        try self.options.lease.recheck(self.options.lease.context, id);
+        const recheck = self.options.worker_recheck orelse self.options.lease.recheck;
+        try recheck(self.options.lease.context, id);
     }
     fn nestedRelease(_: ?*anyopaque, _: []const u8) void {}
     fn nestedLease(self: *Job) install.Lease {
@@ -927,7 +940,7 @@ fn gameReady(job: *Job) !bool {
         std.mem.eql(u8, job.instance.name, job.instance.minecraft_version);
     var prepared: ?metadata_loader.PreparedVanilla = null;
     defer if (prepared) |*owned| owned.deinit();
-    var proof = instance_tx.inspectInstalledLeased(a, job.io, job.paths.root, job.instance, .{ .cancel = job.cancelToken() }, .{ .context = job, .recheck = Job.nestedAcquire }) catch |err| retry: {
+    var proof = instance_tx.inspectInstalledLeased(a, job.io, job.paths.root, job.instance, .{ .cancel = job.cancelToken(), .worker_checks = true }, .{ .context = job, .recheck = Job.nestedAcquire }) catch |err| retry: {
         if (err != error.MissingInstallReceipt or !canonical_vanilla) return err;
         try job.check();
         const task = job.task orelse return error.InvalidPreparationGeneration;
@@ -937,6 +950,7 @@ fn gameReady(job: *Job) !bool {
         try job.check();
         break :retry try instance_tx.inspectInstalledLeased(a, job.io, job.paths.root, job.instance, .{
             .cancel = job.cancelToken(),
+            .worker_checks = true,
             .trusted_vanilla = .{ .prepared = &prepared.?, .generation = task.id, .environment = target.environment },
         }, .{ .context = job, .recheck = Job.nestedAcquire });
     };
@@ -1379,7 +1393,7 @@ fn makeProposal(job: *Job, input_files: []const manifest.InstallFile, input_pack
     const choice_blocker: ?anyerror = normalized.blocker orelse @as(?anyerror, if (disabledRequiredDependency(job.result.candidates, desired)) error.DisabledRequiredDependency else null);
     const active_dependencies_ready = dependencies_ready and choice_blocker == null;
     const observed = try observe(job, a, previous, desired);
-    var plan = try manifest.buildUpdatePlan(a, previous, desired, observed, decisions, .{ .instance_id = job.instance.id, .running = false });
+    var plan = try manifest.buildUpdatePlan(a, previous, desired, observed, decisions, .{ .instance_id = job.instance.id, .instance_name = job.instance.name, .running = false });
     defer plan.deinit();
     if (choice_blocker != null) {
         plan.value.ready = false;
@@ -1387,13 +1401,25 @@ fn makeProposal(job: *Job, input_files: []const manifest.InstallFile, input_pack
     }
     var missing: usize = 0;
     var undecided: usize = 0;
+    var manual_source_status: std.ArrayList(ManualSourceStatus) = .empty;
     for (files) |file| {
         if (file.selected == false) continue;
         if (!file.required and file.selected == null) {
             undecided += 1;
             continue;
         }
-        if (file.download == .manual_required and !(try verifyManual(job, file, manual))) missing += 1;
+        if (file.download == .manual_required) {
+            const verified = try verifyManual(job, file, manual);
+            if (!verified) missing += 1;
+            const source_path: ?[]const u8 = for (manual) |mapping| {
+                if (std.mem.eql(u8, mapping.path, file.record.path)) break mapping.source_absolute_path;
+            } else null;
+            try manual_source_status.append(a, .{
+                .path = try a.dupe(u8, file.record.path),
+                .source_absolute_path = if (source_path) |path| try a.dupe(u8, path) else null,
+                .verified = verified,
+            });
+        }
     }
     for (manual, 0..) |mapping, index| {
         var found = false;
@@ -1415,6 +1441,7 @@ fn makeProposal(job: *Job, input_files: []const manifest.InstallFile, input_pack
     job.result.proposal = .{
         .files = try clone([]const manifest.InstallFile, a, files),
         .manual_files = try clone([]const install.ManualFile, a, manual),
+        .manual_source_status = try manual_source_status.toOwnedSlice(a),
         .pack = try clone(?manifest.PackPlan, a, pack),
         .plan = try clone(manifest.UpdatePlan, a, plan.value),
         .desired = try clone(manifest.Manifest, a, desired),
@@ -1802,7 +1829,7 @@ fn resolveProposal(job: *Job, adapter: *transport.Adapter, request: @FieldType(R
         if (request.manual_files.len != 0 or request.choices.len != 0 or request.optional.len != 0) return error.InvalidChoice;
         const desired = request.proposal.desired orelse request.proposal.plan.next_manifest;
         const observed = try observe(job, a, previous, desired);
-        var plan = try manifest.buildUpdatePlan(a, previous, desired, observed, request.decisions, .{ .instance_id = job.instance.id, .running = false });
+        var plan = try manifest.buildUpdatePlan(a, previous, desired, observed, request.decisions, .{ .instance_id = job.instance.id, .instance_name = job.instance.name, .running = false });
         defer plan.deinit();
         job.result.proposal = .{ .plan = try clone(manifest.UpdatePlan, a, plan.value), .desired = try clone(manifest.Manifest, a, desired), .ready = plan.value.ready, .dependencies_ready = true };
         return;
@@ -1954,7 +1981,7 @@ fn prepareState(job: *Job, path: []const u8, enabled: bool) !void {
     const a = job.result.arena.allocator();
     const previous = try readManifest(job, a);
     const observed = try observe(job, a, previous, previous);
-    var plan = try manifest.buildEnabledPlan(a, previous, path, enabled, observed, .{ .instance_id = job.instance.id, .running = false });
+    var plan = try manifest.buildEnabledPlan(a, previous, path, enabled, observed, .{ .instance_id = job.instance.id, .instance_name = job.instance.name, .running = false });
     defer plan.deinit();
     job.result.proposal = .{ .plan = try clone(manifest.UpdatePlan, a, plan.value), .desired = try clone(manifest.Manifest, a, plan.value.next_manifest), .ready = plan.value.ready, .dependencies_ready = true };
 }
@@ -1978,7 +2005,7 @@ fn prepareRemoval(job: *Job, adapter: *transport.Adapter, path: []const u8) !voi
     }
     const desired: manifest.Manifest = .{ .instance_id = previous.instance_id, .pack_version = previous.pack_version, .files = try records.toOwnedSlice(a) };
     const observed = try observe(job, a, previous, desired);
-    var plan = try manifest.buildUpdatePlan(a, previous, desired, observed, &.{}, .{ .instance_id = job.instance.id, .running = false });
+    var plan = try manifest.buildUpdatePlan(a, previous, desired, observed, &.{}, .{ .instance_id = job.instance.id, .instance_name = job.instance.name, .running = false });
     defer plan.deinit();
     job.result.proposal = .{ .plan = try clone(manifest.UpdatePlan, a, plan.value), .desired = try clone(manifest.Manifest, a, desired), .ready = plan.value.ready, .dependencies_ready = true };
 }

@@ -69,9 +69,9 @@ fn less(_: void, x: Backup, y: Backup) bool {
     return std.mem.lessThan(u8, x.id, y.id);
 }
 pub fn list(a: A, io: std.Io, paths: *const instances.Paths, instance: config.Instance, options: w.Options) !BackupList {
-    try w.transaction_gate.lock(io);
-    defer w.transaction_gate.unlock(io);
     if (!config.validId(instance.id) or !config.validId(instance.name)) return error.UnsafeInstance;
+    const scope = try w.enterScope(options, .{ .source = instance.id });
+    defer scope.deinit();
     const directory = try std.fs.path.join(a, &.{ paths.root, ".minecraft", "versions", instance.name, "saves", ".vela-worlds" });
     defer a.free(directory);
     const repo = tree.openAbsolute(io, directory) catch |err| switch (err) {

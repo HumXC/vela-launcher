@@ -2,6 +2,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const tasks = @import("../core/tasks.zig");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const R = dvui.Rect;
 const recent_limit = 3;
 
@@ -60,17 +61,18 @@ fn rowHeight(options: Options) f32 {
     return 2 * body.lineHeight() + body.withSize(14).textHeight() + 24;
 }
 
-fn cancelButton(bounds: R, tag: []const u8) bool {
+fn actionButton(bounds: R, tag: []const u8, label: []const u8) bool {
     var button: dvui.ButtonWidget = undefined;
-    button.init(@src(), .{}, .{ .tag = tag, .rect = bounds, .label = .{ .text = "取消任务" }, .min_size_content = .{ .w = 20, .h = 20 }, .max_size_content = .{ .w = 20, .h = 20 }, .padding = R.all(8), .margin = R.all(0), .border = R.all(0), .corners = .all(4) });
+    button.init(@src(), .{}, .{ .tag = tag, .rect = bounds, .label = .{ .text = label }, .min_size_content = .{ .w = 20, .h = 20 }, .max_size_content = .{ .w = 20, .h = 20 }, .padding = R.all(8), .margin = R.all(0), .border = R.all(0), .corners = .all(4) });
     button.processEvents();
     button.drawBackground();
-    dvui.icon(@src(), "取消任务", dvui.entypo.cross, .{}, button.style().override(.{ .min_size_content = .{ .w = 20, .h = 20 }, .max_size_content = .{ .w = 20, .h = 20 }, .padding = R.all(0), .margin = R.all(0), .role = .none, .gravity_x = 0.5, .gravity_y = 0.5 }));
+    dvui.icon(@src(), label, dvui.entypo.cross, .{}, button.style().override(.{ .min_size_content = .{ .w = 20, .h = 20 }, .max_size_content = .{ .w = 20, .h = 20 }, .padding = R.all(0), .margin = R.all(0), .role = .none, .gravity_x = 0.5, .gravity_y = 0.5 }));
     button.drawFocus();
     const clicked = button.clicked();
     const rect = button.data().borderRectScale().r;
+    const control_id = button.data().id;
     button.deinit();
-    dvui.tooltip(@src(), .{ .active_rect = rect }, "取消任务", .{}, .{});
+    components.tooltip(@src(), control_id, rect, label);
     return clicked;
 }
 
@@ -108,7 +110,12 @@ fn drawRow(task: *tasks.Task, options: Options) !bool {
         stateName(task.state);
     dvui.labelNoFmt(@src(), status, .{}, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-status", .{task.id}), .rect = .{ .x = 0, .y = 8 + title_height, .w = details_width, .h = small.textHeight() }, .font = small, .color_text = .{ .color = if (task.state == .failed) dvui.Color.fromHex("F0A6A1") else theme.muted }, .padding = R.all(0), .margin = R.all(0) });
     dvui.progress(@src(), .{ .percent = if (task.state == .succeeded) 1 else fraction(progress), .color = if (task.state == .failed) dvui.Color.fromHex("F0A6A1") else null }, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-progress", .{task.id}), .rect = .{ .x = 0, .y = height - 12, .w = details_width, .h = 4 }, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .corners = .all(2) });
-    return if (task.state == .queued or task.state == .running) cancelButton(.{ .x = @max(0, width - 36), .y = (height - 36) / 2, .w = 36, .h = 36 }, try std.fmt.allocPrint(arena, "task-{d}-cancel", .{task.id})) else false;
+    const bounds: R = .{ .x = @max(0, width - 36), .y = (height - 36) / 2, .w = 36, .h = 36 };
+    if (task.state == .queued or task.state == .running)
+        return actionButton(bounds, try std.fmt.allocPrint(arena, "task-{d}-cancel", .{task.id}), "取消任务");
+    if (!active(task.state))
+        return actionButton(bounds, try std.fmt.allocPrint(arena, "task-{d}-dismiss", .{task.id}), "移除通知");
+    return false;
 }
 
 const Counts = struct { active: usize = 0, recent: usize = 0 };
@@ -140,11 +147,12 @@ pub fn draw(registry: *tasks.Registry) !void {
 }
 
 /// The viewport budget never limits task history or active entries.
-/// Cancels run after this section's child widgets close; pruning belongs to the owner.
+/// Cancellation and dismissal run after every section widget closes; IDs outlive row borrows.
 pub fn drawWithOptions(registry: *tasks.Registry, options: Options) !void {
     const entries = registry.tasks();
     const count = counts(entries);
-    var cancellations: std.ArrayList(u64) = .empty;
+    const Action = union(enum) { cancel: u64, dismiss: u64 };
+    var actions: std.ArrayList(Action) = .empty;
     const arena = dvui.currentWindow().arena();
     {
         const section = dvui.box(@src(), .{}, .{ .tag = "task-section", .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = if (options.compact) 8 else 16 } });
@@ -176,7 +184,10 @@ pub fn drawWithOptions(registry: *tasks.Registry, options: Options) !void {
                         recent += 1;
                     }
                     if (row_index >= first and row_index < end) {
-                        if (try drawRow(entry, options)) try cancellations.append(arena, entry.id);
+                        if (try drawRow(entry, options)) {
+                            const action: Action = if (active(entry.state)) .{ .cancel = entry.id } else .{ .dismiss = entry.id };
+                            try actions.append(arena, action);
+                        }
                     }
                     row_index += 1;
                 }
@@ -184,7 +195,10 @@ pub fn drawWithOptions(registry: *tasks.Registry, options: Options) !void {
             if (end < total) _ = dvui.spacer(@src(), .{ .min_size_content = .{ .h = @as(f32, @floatFromInt(total - end)) * height } });
         }
     }
-    for (cancellations.items) |id| _ = registry.cancel(id);
+    for (actions.items) |action| switch (action) {
+        .cancel => |id| _ = registry.cancel(id),
+        .dismiss => |id| _ = registry.dismiss(id),
+    };
 }
 
 test "task rows distinguish every outcome and cap only finished history" {

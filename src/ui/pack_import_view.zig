@@ -11,6 +11,7 @@ const metadata = @import("../core/minecraft/metadata/root.zig");
 const pack_controller = @import("pack_import_controller.zig");
 const instances_view = @import("instances_view.zig");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const A = std.mem.Allocator;
 const Io = std.Io;
 const R = dvui.Rect;
@@ -48,7 +49,7 @@ fn drainOwned(_: ?*anyopaque, action: OwnedAction, store: *config.Store, control
         .reconcile => {
             if (!controller.ownsInstancesPublication()) return error.NoOwnedPublicationUncertainty;
             if (services.store != store or !equal(store.root, services.instances.root) or
-                !equal(store.root, services.content.paths.root) or !equal(store.root, services.java_download.root)) return error.ConfigurationChanged;
+                !equal(store.root, services.content.paths.root) or !equal(services.content.paths.jdks, services.java_download.root)) return error.ConfigurationChanged;
             try store.reconcile();
             try controller.acknowledgeReconciled(services);
         },
@@ -486,7 +487,7 @@ pub const Ui = struct {
             if (!matchesPack(row, inspection.pack)) return error.PackPrerequisitesMismatch;
             target = .{ .new_instance = row };
         }
-        if (services.java.isSearching() or services.java_download.snapshot().phase == .running or services.instances.isBusy() or services.content.isBusy()) return error.Busy;
+        if (services.java.isSearching() or services.java_download.isBusy() or services.instances.isBusy() or services.content.isBusy()) return error.Busy;
         if (services.instances.snapshot().phase == .awaiting_publication) return error.InstancePublicationPending;
         if (services.content.snapshot().recovery_required) return error.RecoveryRequired;
         if (!services.content.options.allow_manifest_v2) return error.ManifestV2CapabilityRequired;
@@ -547,47 +548,38 @@ fn hostEnvironment() !metadata.rules.Environment {
     };
 }
 fn line(src: std.builtin.SourceLocation, value: []const u8, color: dvui.Color) void {
-    const layout = dvui.textLayout(src, .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = 8 }, .color_text = .{ .color = color } });
-    layout.addText(value, .{});
-    layout.deinit();
+    components.text(src, value, color);
 }
 fn fmt(comptime format: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), format, args) catch "";
 }
 fn commandButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8, enabled: bool) bool {
-    return targetButton(src, name, asset, enabled, 0);
+    return targetButton(src, name, asset, enabled, name);
 }
-fn targetButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8, enabled: bool, id_extra: usize) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{ .grayed = !enabled }, .{ .id_extra = id_extra, .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .h = 20 }, .padding = R.all(8), .margin = .{ .h = 6 }, .corners = .all(4), .label = .{ .text = name }, .tab_index = if (enabled) 0 else null });
-    defer button.deinit();
-    if (enabled) button.processEvents();
-    button.drawBackground();
-    const row = dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0) });
-    dvui.icon(src, name, asset, .{}, .{ .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .padding = R.all(0), .margin = .{ .w = 8 } });
-    const label = dvui.textLayout(src, .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0) });
-    label.addText(name, .{});
-    label.deinit();
-    row.deinit();
-    button.drawFocus();
-    dvui.tooltip(src, .{ .active_rect = button.data().borderRectScale().r }, "{s}", .{name}, .{});
-    return enabled and button.clicked();
+fn targetButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8, enabled: bool, key: []const u8) bool {
+    return components.sidebarItem(src, key, name, .{ .icon = asset, .enabled = enabled });
 }
 fn entry(src: std.builtin.SourceLocation, name: []const u8, buffer: []u8, numeric: bool) void {
-    dvui.labelNoFmt(src, name, .{}, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = 8, .h = 4 } });
-    const input = dvui.textEntry(src, .{ .text = .{ .buffer = buffer } }, .{ .label = .{ .text = name }, .expand = .horizontal, .padding = R.all(8), .corners = .all(4) });
+    const group = dvui.box(src, .{}, .{ .expand = .horizontal, .background = false, .padding = R.all(0), .margin = .{ .y = 8, .h = 4 } });
+    defer group.deinit();
+    components.text(@src(), name, theme.muted);
+    const input = dvui.textEntry(@src(), .{ .text = .{ .buffer = buffer } }, .{ .label = .{ .text = name }, .expand = .horizontal, .padding = R.all(8), .corners = .all(4) });
     if (numeric) input.filterIn("0123456789");
     input.deinit();
 }
-pub fn drawModal(ui: *Ui, store: *config.Store, controller: *pack_controller.Controller, blocked: bool) !void {
+pub fn drawInline(ui: *Ui, store: *config.Store, controller: *pack_controller.Controller, blocked: bool) !void {
     if (!ui.modal_open) return;
     const snapshot = controller.snapshot();
-    const rect = dvui.windowRect();
-    var visible = true;
-    const modal = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &visible, .resize = .none, .window_avoid = .none }, .{ .rect = .{ .x = rect.x + @max(12, (rect.w - 620) / 2), .y = rect.y + 12, .w = @max(0, @min(620, rect.w - 24)), .h = @max(0, @min(680, rect.h - 24)) }, .padding = R.all(16), .corners = .all(8), .label = .{ .text = "Import modpack" } });
-    defer modal.deinit();
-    modal.dragAreaSet(dvui.windowHeader("Import modpack", "", &visible));
-    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .border = R.all(0) });
+    dvui.labelNoFmt(@src(), "Import modpack", .{}, .{
+        .expand = .horizontal,
+        .max_size_content = .width(0),
+        .font = dvui.themeGet().font_body.withSize(22),
+        .color_text = .{ .color = dvui.themeGet().text },
+        .background = false,
+        .padding = R.all(0),
+        .margin = .{ .h = 16 },
+    });
+    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .background = false, .padding = R.all(0), .border = R.all(0) });
     defer scroll.deinit();
     if (ui.failure) |err| line(@src(), @errorName(err), dvui.Color.fromHex("F0A6A1"));
     if (ui.cleanup_failure) |err| {
@@ -619,7 +611,7 @@ pub fn drawModal(ui: *Ui, store: *config.Store, controller: *pack_controller.Con
             const enabled = !blocked and ui.pending == null;
             if (commandButton(@src(), "New instance", dvui.entypo.plus, enabled)) ui.queue(.choose_new);
             for (store.snapshot().instances) |instance| if (matchesPack(instance, inspection.pack)) {
-                if (targetButton(@src(), instance.name, if (ui.existing) |chosen| if (sameRow(chosen.value, instance)) dvui.entypo.check else dvui.entypo.box else dvui.entypo.box, enabled, @as(usize, @truncate(std.hash.Wyhash.hash(0, instance.id))))) ui.queueExisting(instance) catch |err| {
+                if (targetButton(@src(), instance.name, if (ui.existing) |chosen| if (sameRow(chosen.value, instance)) dvui.entypo.check else dvui.entypo.box else dvui.entypo.box, enabled, instance.id)) ui.queueExisting(instance) catch |err| {
                     ui.failure = err;
                 };
             };
@@ -644,9 +636,6 @@ pub fn drawModal(ui: *Ui, store: *config.Store, controller: *pack_controller.Con
     }
     const close_enabled = (!ui.pinned or ui.stopping) and ui.pending == null;
     if (commandButton(@src(), "Close", dvui.entypo.cross, close_enabled)) ui.queueOwned(.close, controller) catch |err| {
-        ui.failure = err;
-    };
-    if (!visible and close_enabled) ui.queueOwned(.close, controller) catch |err| {
         ui.failure = err;
     };
 }

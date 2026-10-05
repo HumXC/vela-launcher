@@ -52,6 +52,8 @@ pub const Msg = union(enum) {
 pub const Model = struct {
     labels: @import("labels.zig").Labels = .{},
     panel: Panel = .home,
+    sidebar_width: f32 = 276,
+    instance_leave: ?Msg = null,
     players: []const Player = &preview_players,
     versions: []const Version = &preview_versions,
     selected_player: u32 = 1,
@@ -126,8 +128,7 @@ pub fn transition(model: *Model, msg: Msg) void {
             model.launch_notice = false;
         },
         .open_library => {
-            model.panel = .library;
-            model.getting_game = true;
+            model.panel = .instances;
             model.launch_notice = false;
         },
         .open_java => {
@@ -138,7 +139,7 @@ pub fn transition(model: *Model, msg: Msg) void {
             if (model.panel == .java) model.panel = .more;
         },
         .library_back => {
-            if (model.panel == .library) model.panel = .more;
+            if (model.panel == .library or model.panel == .instances) model.panel = .more;
         },
         .open_servers => {
             model.panel = .servers;
@@ -169,26 +170,19 @@ pub fn transition(model: *Model, msg: Msg) void {
         .select_category => |category| {
             if (model.panel == .more) model.category = category;
         },
-        .get_game => {
-            if (model.panel == .library) model.getting_game = true;
-        },
-        .inspect_game => |name| {
-            if (model.panel == .library and model.library_game.set(name)) model.getting_game = false;
+        .get_game, .inspect_game => {
+            model.panel = .instances;
+            model.launch_notice = false;
         },
         .use_game => |name| {
-            if ((model.panel == .library or model.panel == .versions) and model.active_game.set(name)) {
+            if (model.panel == .versions and model.active_game.set(name)) {
                 model.panel = .home;
                 model.launch_notice = false;
             }
         },
-        .choose_download => |name| {
-            if (model.panel == .library and model.getting_game) _ = model.download_game.set(name);
-        },
-        .filter_versions => |filter| {
-            if (model.panel == .library) {
-                model.version_filter = filter;
-                model.download_game.len = 0;
-            }
+        .choose_download, .filter_versions => {
+            model.panel = .instances;
+            model.launch_notice = false;
         },
         .back => {
             model.panel = .home;
@@ -272,44 +266,32 @@ test "launch feedback clears in more and returning retains selections" {
     try std.testing.expectEqual(@as(u32, 1), model.selected_version);
 }
 
-test "more categories and library footer preserve navigation and selection" {
+test "legacy directory aliases route to instance management without a second catalogue" {
     var model: Model = .{};
-    transition(&model, .open_more);
-    transition(&model, .{ .select_category = .settings });
-    transition(&model, .open_library);
-    try std.testing.expect(model.panel == .library);
-    transition(&model, .{ .inspect_game = "1.21.1" });
-    try std.testing.expect(!model.getting_game);
-    transition(&model, .library_back);
-    try std.testing.expect(model.panel == .more and model.category == .settings);
-    transition(&model, .back);
-    try std.testing.expect(model.isHome());
-    try std.testing.expectEqualStrings("1.21.1", model.library_game.get());
-    try std.testing.expectEqual(@as(u32, 1), model.selected_player);
-    transition(&model, .open_versions);
-    transition(&model, .open_library);
-    try std.testing.expect(model.panel == .library and model.getting_game);
+    _ = model.active_game.set("1.21.1");
+    for ([_]Msg{ .open_library, .get_game, .{ .inspect_game = "1.21.1" }, .{ .choose_download = "1.20.1" }, .{ .filter_versions = .snapshot } }) |message| {
+        transition(&model, message);
+        try std.testing.expectEqual(Panel.instances, model.panel);
+        try std.testing.expectEqualStrings("1.21.1", model.active_game.get());
+        transition(&model, .library_back);
+        try std.testing.expectEqual(Panel.more, model.panel);
+    }
 }
 
-test "get game selection is owned and invalid paths do not replace it" {
-    var model: Model = .{};
-    transition(&model, .{ .choose_download = "ignored" });
-    try std.testing.expectEqual(@as(usize, 0), model.download_game.len);
-    transition(&model, .open_library);
-    var name = [_]u8{ '1', '.', '2', '1' };
-    transition(&model, .{ .choose_download = &name });
+test "game name owns validated path component" {
+    var value: GameName = .{};
+    var name = "1.21".*;
+    try std.testing.expect(value.set(&name));
     name[0] = '9';
-    try std.testing.expectEqualStrings("1.21", model.download_game.get());
-    transition(&model, .{ .choose_download = "../escape" });
-    try std.testing.expectEqualStrings("1.21", model.download_game.get());
-    transition(&model, .{ .filter_versions = .snapshot });
-    try std.testing.expect(model.version_filter == .snapshot and model.download_game.len == 0);
+    try std.testing.expectEqualStrings("1.21", value.get());
+    try std.testing.expect(!value.set("../escape"));
+    try std.testing.expectEqualStrings("1.21", value.get());
 }
 
 test "using a real installed version updates home without borrowing catalogue memory" {
     var model: Model = .{ .versions = &.{}, .selected_version = 0 };
     try std.testing.expect(model.startDisabled());
-    transition(&model, .open_library);
+    transition(&model, .open_versions);
     transition(&model, .{ .use_game = "1.21.1" });
     try std.testing.expect(model.isHome() and !model.startDisabled());
     try std.testing.expectEqualStrings("1.21.1", model.versionName());

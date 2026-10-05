@@ -7,6 +7,7 @@ const manifest = @import("../core/content_manifest.zig");
 const install = @import("../core/content_install.zig");
 const content = @import("content_manager.zig");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const A = std.mem.Allocator;
 const R = dvui.Rect;
 const warning = dvui.Color.fromHex("E5BA78");
@@ -40,6 +41,29 @@ fn selected(doc: *const config.Document) ?config.Instance {
     for (doc.instances) |instance| if (sameId(instance.id, id)) return instance;
     return null;
 }
+pub const ManualSourcePresentation = enum { hidden, archive_verified, archive_unverified, external_verified, external_required };
+
+pub fn manualFileIncluded(file: manifest.InstallFile, optional: []const content.OptionalChoice) bool {
+    if (file.required) return file.selected != false;
+    for (optional) |choice| if (sameId(choice.path, file.record.path)) return choice.include;
+    return file.selected == true;
+}
+
+pub fn manualSourcePresentation(file: manifest.InstallFile, included: bool, status: ?content.ManualSourceStatus, current_source_path: []const u8, source_dirty: bool) ManualSourcePresentation {
+    if (!included or file.download != .manual_required) return .hidden;
+    const checked = if (status) |known| known.verified and sameId(known.path, file.record.path) and
+        known.source_absolute_path != null and !source_dirty and
+        sameId(known.source_absolute_path, std.mem.trim(u8, current_source_path, " \t\r\n")) else false;
+    if (file.record.identity_provenance == .pack_override) return if (checked) .archive_verified else .archive_unverified;
+    return if (checked) .external_verified else .external_required;
+}
+
+pub fn manualOfficialPage(file: manifest.InstallFile, presentation: ManualSourcePresentation) ?[]const u8 {
+    if (presentation != .external_required or file.download != .manual_required) return null;
+    const page = file.download.manual_required.official_page;
+    return if (page.len == 0) null else page;
+}
+
 const Request = struct {
     arena: std.heap.ArenaAllocator,
     source: config.Instance,
@@ -60,7 +84,7 @@ const Request = struct {
     connections: u16 = 8,
     identity: ?manifest.PackIdentity = null,
 };
-const ManualDraft = struct { path: []const u8, absolute: [4096]u8 = @splat(0) };
+const ManualDraft = struct { path: []const u8, absolute: [4096]u8 = @splat(0), source_dirty: bool = false };
 const Draft = struct {
     arena: std.heap.ArenaAllocator,
     source: config.Instance,
@@ -82,6 +106,7 @@ const Draft = struct {
         var proposal = snapshot.proposal.?.*;
         proposal.files = try clone([]const manifest.InstallFile, aa, proposal.files);
         proposal.manual_files = try clone([]const install.ManualFile, aa, proposal.manual_files);
+        proposal.manual_source_status = try clone([]const content.ManualSourceStatus, aa, proposal.manual_source_status);
         proposal.pack = try clone(?manifest.PackPlan, aa, proposal.pack);
         proposal.plan = try clone(manifest.UpdatePlan, aa, proposal.plan);
         proposal.stage_path = try clone(?[]const u8, aa, proposal.stage_path);
@@ -134,6 +159,18 @@ const Draft = struct {
 
 // Native dialogs are blocking and not thread-safe. Serialize this view's picker
 // off the render thread; publish only an owned path and an atomic done flag.
+pub const PickerKind = enum { archive, manual };
+pub const PickerRunner = struct {
+    context: ?*anyopaque = null,
+    /// Return null for cancellation, or a sentinel path owned by the supplied allocator.
+    pick: ?*const fn (?*anyopaque, A, PickerKind) anyerror!?[:0]const u8 = null,
+};
+pub const Options = struct { picker_runner: PickerRunner = .{} };
+
+fn pickerAvailable(ui: *const Ui) bool {
+    return dvui.useTinyFileDialogs or ui.options.picker_runner.pick != null;
+}
+
 const Picker = struct {
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
@@ -142,8 +179,13 @@ const Picker = struct {
     manual_index: ?usize,
     instance_id: []const u8,
     draft_epoch: u64,
+    runner: PickerRunner = .{},
     fn run(self: *Picker) void {
-        self.result = dvui.native_dialogs.Native.open(std.heap.page_allocator, .{ .title = if (self.manual_index == null) "Import modpack" else "Select verified source file", .filters = if (self.manual_index == null) &.{ "*.mrpack", "*.zip" } else null }) catch |err| blk: {
+        const kind: PickerKind = if (self.manual_index == null) .archive else .manual;
+        self.result = (if (self.runner.pick) |pick|
+            pick(self.runner.context, std.heap.page_allocator, kind)
+        else
+            dvui.native_dialogs.Native.open(std.heap.page_allocator, .{ .title = if (kind == .archive) "Import modpack" else "Select verified source file", .filters = if (kind == .archive) &.{ "*.mrpack", "*.zip" } else null })) catch |err| blk: {
             self.failure = err;
             break :blk null;
         };
@@ -159,6 +201,7 @@ const Picker = struct {
 
 pub const Ui = struct {
     allocator: A,
+    options: Options = .{},
     failure: ?anyerror = null,
     kind: content.Kind = .mod,
     page: Page = .browse,
@@ -174,6 +217,7 @@ pub const Ui = struct {
     pending_select: ?[]u8 = null,
     select_queued: bool = false,
     cancel_queued: bool = false,
+    discard_queued: bool = false,
     draft: ?Draft = null,
     review_requested: bool = false,
     review_refresh: bool = false,
@@ -186,7 +230,15 @@ pub const Ui = struct {
     draft_epoch: u64 = 0,
 
     pub fn init(a: A) !Ui {
-        return .{ .allocator = a };
+        return initOptions(a, .{});
+    }
+    pub fn initOptions(a: A, options: Options) !Ui {
+        return .{ .allocator = a, .options = options };
+    }
+    /// Bind a new external review request to the current manager policy first.
+    pub fn requestReview(self: *Ui, snapshot: content.Snapshot) void {
+        syncPolicy(self, snapshot);
+        self.review_requested = true;
     }
     pub fn deinit(self: *Ui) void {
         self.clearPending();
@@ -238,6 +290,7 @@ pub const Ui = struct {
             };
             for (next.manual) |*item| for (old.manual) |known| if (sameId(item.path, known.path)) {
                 item.absolute = known.absolute;
+                item.source_dirty = known.source_dirty;
                 break;
             };
             next.dirty = old.dirty;
@@ -250,6 +303,15 @@ pub const Ui = struct {
         self.review_refresh = false;
         if (self.draft) |*draft| draft.arena.deinit();
         self.draft = null;
+    }
+    fn finishDiscard(self: *Ui) void {
+        if (!self.discard_queued) return;
+        self.discard_queued = false;
+        self.closeDraft();
+        self.clearPending();
+        self.review_requested = false;
+        self.picker_queued = false;
+        self.failure = null;
     }
     fn queueSelect(self: *Ui, id: ?[]const u8) !void {
         const owned = if (id) |value| try self.allocator.dupe(u8, value) else null;
@@ -315,21 +377,8 @@ fn validateAbsolute(path: []const u8) !void {
 fn fmt(comptime pattern: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), pattern, args) catch "";
 }
-fn line(src: std.builtin.SourceLocation, value: []const u8, color: dvui.Color) void {
-    const layout = dvui.textLayout(src, .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = 4 }, .color_text = .{ .color = color } });
-    layout.addText(value, .{});
-    layout.deinit();
-}
 fn button(src: std.builtin.SourceLocation, label: []const u8, enabled: bool) bool {
-    var widget: dvui.ButtonWidget = undefined;
-    widget.init(src, .{}, .{ .label = .{ .text = label }, .padding = R.all(6), .corners = .all(4), .color_text = .{ .color = if (enabled) theme.accent else theme.muted } });
-    if (enabled) widget.processEvents();
-    widget.drawBackground();
-    dvui.labelNoFmt(src, label, .{}, widget.style().override(.{ .padding = R.all(0), .margin = R.all(0) }));
-    widget.drawFocus();
-    const clicked = enabled and widget.clicked();
-    widget.deinit();
-    return clicked;
+    return components.action(src, label, enabled);
 }
 fn icon(src: std.builtin.SourceLocation, label: []const u8, asset: []const u8, enabled: bool) bool {
     var widget: dvui.ButtonWidget = undefined;
@@ -339,10 +388,10 @@ fn icon(src: std.builtin.SourceLocation, label: []const u8, asset: []const u8, e
     dvui.icon(src, label, asset, .{}, widget.style().override(.{ .padding = R.all(0), .margin = R.all(0), .role = .none }));
     widget.drawFocus();
     const clicked = enabled and widget.clicked();
-    const hovered = widget.hovered();
-    const rect = widget.data().rectScale().r;
+    const control_id = widget.data().id;
+    const rect = widget.data().borderRectScale().r;
     widget.deinit();
-    if (hovered) dvui.tooltip(src, .{ .active_rect = rect }, "{s}", .{label}, .{ .id_extra = 1 });
+    components.tooltip(src, control_id, rect, label);
     return clicked;
 }
 fn input(src: std.builtin.SourceLocation, label: []const u8, buffer: []u8) bool {
@@ -354,8 +403,7 @@ fn row(src: std.builtin.SourceLocation, index: usize) *dvui.BoxWidget {
     return dvui.box(src, .{}, .{ .id_extra = index, .expand = .horizontal, .padding = .{ .y = 6, .h = 6 }, .border = .{ .h = 1 }, .margin = R.all(0) });
 }
 
-pub fn draw(ui: *Ui, doc: *const config.Document, manager: *content.Manager) !void {
-    const snapshot = manager.snapshot();
+fn syncPolicy(ui: *Ui, snapshot: content.Snapshot) void {
     if (ui.policy_generation != snapshot.policy_generation or ui.provider != snapshot.provider) {
         ui.clearPending();
         ui.closeDraft();
@@ -365,51 +413,99 @@ pub fn draw(ui: *Ui, doc: *const config.Document, manager: *content.Manager) !vo
         ui.policy_generation = snapshot.policy_generation;
         ui.provider = snapshot.provider;
     }
+}
+
+fn canOperate(ui: *const Ui, doc: *const config.Document, snapshot: content.Snapshot) bool {
+    const source = snapshot.instance orelse return false;
+    const desired = selected(doc) orelse return false;
+    return sameInstance(desired, source) and !snapshot.recovery_required and !snapshot.busy and !ui.select_queued and ui.pending == null and ui.draft == null and !ui.review_requested;
+}
+
+// The caller owns the Version Directory card header and footer.
+// Like draw(), this only queues commands; finish() owns manager mutation.
+pub fn drawSidebar(ui: *Ui, doc: *const config.Document, manager: *content.Manager) !void {
+    const snapshot = manager.snapshot();
+    syncPolicy(ui, snapshot);
+    const root = dvui.box(@src(), .{}, .{ .expand = .both, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0) });
+    defer root.deinit();
+    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0) });
+    defer scroll.deinit();
+    components.section(@src(), "内容实例");
+    if (snapshot.recovery_required) {
+        components.text(@src(), "存在未完成事务，请先恢复；实例已锁定", danger);
+        ui.page = .recovery;
+    }
+    if (components.sidebarItem(@src(), "no-instance", "不选择实例", .{ .enabled = !snapshot.recovery_required and doc.selected_instance != null, .selected = doc.selected_instance == null })) try ui.queueSelect(null);
+    for (doc.instances) |instance| {
+        const active = sameId(doc.selected_instance, instance.id);
+        if (components.sidebarItem(@src(), instance.id, instance.name, .{ .enabled = !snapshot.recovery_required, .selected = active, .subtitle = fmt("Minecraft {s} · {s}", .{ instance.minecraft_version, @tagName(instance.loader) }) }) and !active) try ui.queueSelect(instance.id);
+    }
+    if (doc.instances.len == 0) components.emptyState(@src(), "暂无版本实例");
+    const enabled = canOperate(ui, doc, snapshot);
+    components.section(@src(), "内容管理");
+    const page_labels = [_][]const u8{ "浏览与安装", "已管理内容", "事务恢复" };
+    for (page_labels, 0..) |label, i| {
+        if (components.sidebarItem(@src(), @tagName(@as(Page, @enumFromInt(i))), label, .{ .enabled = !snapshot.recovery_required or i == @intFromEnum(Page.recovery), .selected = @intFromEnum(ui.page) == i })) ui.page = @enumFromInt(i);
+    }
+    components.text(@src(), fmt("已管理 {d} 项 · 事务记录 {d}", .{ snapshot.installed.len, snapshot.transactions.len }), theme.muted);
+    if (snapshot.instance == null) {
+        components.emptyState(@src(), "选择实例后管理 Mod、资源包与整合包");
+        return;
+    }
+    const source = snapshot.instance.?;
+    if (components.sidebarItem(@src(), "refresh-content", "刷新已安装内容", .{ .enabled = enabled })) ui.enqueue(source, .refresh, "");
+    if (components.sidebarItem(@src(), "cancel-content", "取消内容任务", .{ .enabled = snapshot.busy and !snapshot.recovery_required })) ui.cancel_queued = true;
+    if (ui.page != .browse or snapshot.recovery_required) return;
+    components.section(@src(), "内容分类");
+    const kinds = [_]content.Kind{ .mod, .resourcepack, .shader, .modpack };
+    const kind_labels = [_][]const u8{ "Mod", "资源包", "光影", "整合包" };
+    for (kinds, kind_labels) |kind, label| {
+        if (components.sidebarItem(@src(), @tagName(kind), label, .{ .enabled = enabled, .selected = ui.kind == kind })) {
+            ui.kind = kind;
+            ui.offset = 0;
+            ui.enqueue(source, .search, text(&ui.query));
+        }
+    }
+    var provider_choice: ?usize = if (snapshot.provider == .curseforge) 1 else 0;
+    const names: []const []const u8 = if (snapshot.curseforge_available) &.{ "Modrinth", "CurseForge" } else &.{"Modrinth"};
+    if (dvui.dropdown(@src(), names, .{ .choice_nullable = &provider_choice }, .{ .null_selectable = false }, .{ .label = .{ .text = "内容来源" }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(6), .corners = .all(4) }) and enabled) {
+        ui.enqueue(source, .provider, if (provider_choice == 1) "curseforge" else "modrinth");
+    }
+    _ = input(@src(), "搜索 Mod 或整合包", &ui.query);
+    if (components.sidebarItem(@src(), "search-content", "搜索", .{ .enabled = enabled })) {
+        ui.offset = 0;
+        ui.enqueue(source, .search, text(&ui.query));
+    }
+}
+
+pub fn draw(ui: *Ui, doc: *const config.Document, manager: *content.Manager) !void {
+    const snapshot = manager.snapshot();
+    syncPolicy(ui, snapshot);
     const root = dvui.box(@src(), .{}, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
     defer root.deinit();
-    const labels = try dvui.currentWindow().arena().alloc([]const u8, doc.instances.len + 1);
-    labels[0] = "Select instance";
-    var choice: ?usize = 0;
-    for (doc.instances, 0..) |instance, i| {
-        labels[i + 1] = instance.name;
-        if (sameId(doc.selected_instance, instance.id)) choice = i + 1;
-    }
     if (snapshot.recovery_required) {
-        line(@src(), "Recovery required; content instance is locked", danger);
+        components.text(@src(), "存在未完成事务，请先恢复", danger);
         ui.page = .recovery;
-    } else if (dvui.dropdown(@src(), labels, .{ .choice_nullable = &choice }, .{ .null_selectable = false }, .{ .label = .{ .text = "Content instance" }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(6), .corners = .all(4) })) {
-        const i = choice orelse 0;
-        try ui.queueSelect(if (i == 0) null else doc.instances[i - 1].id);
     }
     const failure: ?anyerror = if (ui.failure) |err| err else snapshot.failure;
-    if (failure) |err| line(@src(), fmt("Content operation failed: {s}", .{@errorName(err)}), danger);
+    if (failure) |err| components.text(@src(), fmt("Content operation failed: {s}", .{@errorName(err)}), danger);
     if (snapshot.report) |report| {
-        line(@src(), if (report.recovered) "Transaction recovered" else if (report.complete and report.committed and report.fully_applied) "Installation complete" else if (report.committed) "Transaction committed; installation incomplete" else "Transaction not committed", if (report.recovered or (report.complete and report.committed and report.fully_applied)) theme.accent else warning);
-        line(@src(), fmt("Applied: {d}   Kept local: {d}   Backup: {s}", .{ report.applied_files, report.kept_local, report.backup_directory }), theme.muted);
+        components.text(@src(), if (report.recovered) "Transaction recovered" else if (report.complete and report.committed and report.fully_applied) "Installation complete" else if (report.committed) "Transaction committed; installation incomplete" else "Transaction not committed", if (report.recovered or (report.complete and report.committed and report.fully_applied)) theme.accent else warning);
+        components.text(@src(), fmt("Applied: {d}   Kept local: {d}   Backup: {s}", .{ report.applied_files, report.kept_local, report.backup_directory }), theme.muted);
     }
     const source = snapshot.instance orelse {
-        line(@src(), "No content instance selected", theme.muted);
+        components.text(@src(), "No content instance selected", theme.muted);
         return;
     };
     const desired = selected(doc);
     const current = if (desired) |value| sameInstance(value, source) else false;
-    const enabled = current and !snapshot.recovery_required and !snapshot.busy and !ui.select_queued and ui.pending == null and ui.draft == null and !ui.review_requested;
-    line(@src(), fmt("{s}   Minecraft {s}   {s}", .{ source.name, source.minecraft_version, @tagName(source.loader) }), theme.muted);
-    if (!current) line(@src(), "Instance selection changed", warning);
+    const enabled = canOperate(ui, doc, snapshot);
+    components.text(@src(), fmt("{s}   Minecraft {s}   {s}", .{ source.name, source.minecraft_version, @tagName(source.loader) }), theme.muted);
+    if (!current) components.text(@src(), "Instance selection changed", warning);
     if (snapshot.busy) {
         if (snapshot.progress) |progress| {
-            if (progress.total) |total| line(@src(), fmt("{s}: {d} / {d}", .{ @tagName(progress.stage), progress.completed, total }), theme.muted) else line(@src(), fmt("{s}: {d}", .{ @tagName(progress.stage), progress.completed }), theme.muted);
-        } else line(@src(), "Content task running", theme.muted);
-    }
-    {
-        const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0) });
-        defer actions.deinit();
-        const page_labels = [_][]const u8{ "Browse", "Managed", "Recovery" };
-        for (page_labels, 0..) |label, i| if (dvui.button(@src(), label, .{}, .{ .id_extra = i, .color_text = .{ .color = if (@intFromEnum(ui.page) == i) theme.accent else theme.muted }, .corners = .all(4) })) {
-            ui.page = @enumFromInt(i);
-        };
-        if (icon(@src(), "Refresh content", dvui.entypo.cw, enabled)) ui.enqueue(source, .refresh, "");
-        if (icon(@src(), "Cancel content task", dvui.entypo.cross, snapshot.busy and !snapshot.recovery_required)) ui.cancel_queued = true;
+            if (progress.total) |total| components.text(@src(), fmt("{s}: {d} / {d}", .{ @tagName(progress.stage), progress.completed, total }), theme.muted) else components.text(@src(), fmt("{s}: {d}", .{ @tagName(progress.stage), progress.completed }), theme.muted);
+        } else components.text(@src(), "Content task running", theme.muted);
     }
     if (current and !snapshot.recovery_required) try ui.refreshReview(snapshot);
     if (ui.review_requested and ui.draft == null and snapshot.proposal != null and current and !snapshot.busy and !snapshot.recovery_required) {
@@ -421,10 +517,10 @@ pub fn draw(ui: *Ui, doc: *const config.Document, manager: *content.Manager) !vo
     switch (if (snapshot.recovery_required) Page.recovery else ui.page) {
         .browse => try drawBrowse(ui, source, snapshot, enabled),
         .managed => {
-            if (snapshot.installed.len == 0) line(@src(), "No managed content", theme.muted);
+            if (snapshot.installed.len == 0) components.text(@src(), "暂无已管理内容", theme.muted);
             if (snapshot.pack_membership) |membership| {
-                line(@src(), fmt("{s}  {s}  {s}", .{ @tagName(membership.identity.provider), membership.identity.project_id, membership.identity.version_id }), theme.accent);
-                if (icon(@src(), "Review modpack updates", dvui.entypo.cw, enabled and (membership.identity.provider == .modrinth or snapshot.curseforge_available))) {
+                components.text(@src(), fmt("{s}  {s}  {s}", .{ @tagName(membership.identity.provider), membership.identity.project_id, membership.identity.version_id }), theme.accent);
+                if (icon(@src(), "检查整合包更新", dvui.entypo.cw, enabled and (membership.identity.provider == .modrinth or snapshot.curseforge_available))) {
                     ui.kind = .modpack;
                     ui.rememberUpdate(source, membership.identity, null) catch |err| {
                         ui.failure = err;
@@ -438,25 +534,25 @@ pub fn draw(ui: *Ui, doc: *const config.Document, manager: *content.Manager) !vo
             for (snapshot.installed, 0..) |file, i| {
                 const item = row(@src(), i);
                 defer item.deinit();
-                line(@src(), file.path, theme.accent);
+                components.text(@src(), file.path, theme.accent);
                 if (manifest.toggleable(file)) {
-                    line(@src(), if (file.enabled) "Enabled" else "Disabled (.jar.disabled)", if (file.enabled) theme.accent else warning);
-                    if (button(@src(), if (file.enabled) "Review disabling mod" else "Review enabling mod", enabled)) {
+                    components.text(@src(), if (file.enabled) "已启用" else "已禁用（.jar.disabled）", if (file.enabled) theme.accent else warning);
+                    if (button(@src(), if (file.enabled) "预览禁用 Mod" else "预览启用 Mod", enabled)) {
                         ui.queueEnabled(source, file.path, !file.enabled) catch |err| {
                             ui.failure = err;
                         };
                     }
                 }
-                line(@src(), fmt("{s}   {s}   {s}", .{ @tagName(file.provider), file.project_id, file.version_id }), theme.muted);
-                line(@src(), @tagName(file.identity_provenance), theme.muted);
+                components.text(@src(), fmt("{s}   {s}   {s}", .{ @tagName(file.provider), file.project_id, file.version_id }), theme.muted);
+                components.text(@src(), @tagName(file.identity_provenance), theme.muted);
                 var legacy_approved = std.mem.eql(u8, text(&ui.legacy_path), file.path);
-                if (file.identity_provenance == .legacy_unknown and dvui.checkbox(@src(), &legacy_approved, "Approve this legacy file for replacement", .{})) {
+                if (file.identity_provenance == .legacy_unknown and dvui.checkbox(@src(), &legacy_approved, "允许替换此旧版文件", .{})) {
                     setText(&ui.legacy_path, if (legacy_approved) file.path else "") catch |err| {
                         ui.failure = err;
                     };
                 }
                 const updateable = file.identity_provenance == .official_file or (file.identity_provenance == .legacy_unknown and legacy_approved);
-                if (icon(@src(), "Review file updates", dvui.entypo.cw, enabled and updateable and (file.provider == .modrinth or snapshot.curseforge_available))) {
+                if (icon(@src(), "检查文件更新", dvui.entypo.cw, enabled and updateable and (file.provider == .modrinth or snapshot.curseforge_available))) {
                     ui.kind = if (std.mem.startsWith(u8, file.path, "resourcepacks/")) .resourcepack else if (std.mem.startsWith(u8, file.path, "shaderpacks/")) .shader else .mod;
                     const identity: manifest.PackIdentity = .{ .provider = file.provider, .project_id = file.project_id, .version_id = file.version_id };
                     const approval: ?manifest.LegacyApproval = if (file.identity_provenance == .legacy_unknown) .{ .path = file.path, .expected_hashes = file.hashes, .expected_size = file.size } else null;
@@ -468,52 +564,28 @@ pub fn draw(ui: *Ui, doc: *const config.Document, manager: *content.Manager) !vo
                         ui.failure = err;
                     };
                 }
-                if (button(@src(), "Review removal", enabled and file.identity_provenance != .pack_archive and file.identity_provenance != .pack_override)) ui.enqueue(source, .remove, file.path);
+                if (button(@src(), "预览移除", enabled and file.identity_provenance != .pack_archive and file.identity_provenance != .pack_override)) ui.enqueue(source, .remove, file.path);
             }
         },
         .recovery => {
-            if (snapshot.transactions.len == 0) line(@src(), "No pending transactions", theme.muted);
+            if (snapshot.transactions.len == 0) components.text(@src(), "没有事务记录", theme.muted);
             for (snapshot.transactions, 0..) |id, i| {
                 const item = row(@src(), i);
                 defer item.deinit();
-                line(@src(), id, warning);
-                if (button(@src(), "Recover transaction", if (snapshot.recovery_required) !snapshot.busy and ui.pending == null else enabled)) ui.enqueue(source, .recover, id);
+                components.text(@src(), id, warning);
+                if (button(@src(), "恢复事务", if (snapshot.recovery_required) !snapshot.busy and ui.pending == null else enabled)) ui.enqueue(source, .recover, id);
             }
         },
     }
 }
 fn drawBrowse(ui: *Ui, source: config.Instance, snapshot: content.Snapshot, enabled: bool) !void {
-    line(@src(), fmt("{s}: {s}", .{ if (snapshot.provider == .curseforge) "CurseForge" else "Modrinth", @tagName(ui.kind) }), theme.accent);
-    var provider_choice: ?usize = if (snapshot.provider == .curseforge) 1 else 0;
-    const names: []const []const u8 = if (snapshot.curseforge_available) &.{ "Modrinth", "CurseForge" } else &.{"Modrinth"};
-    if (dvui.dropdown(@src(), names, .{ .choice_nullable = &provider_choice }, .{ .null_selectable = false }, .{ .label = .{ .text = "Provider" }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(6), .corners = .all(4) }) and enabled) {
-        ui.enqueue(source, .provider, if (provider_choice == 1) "curseforge" else "modrinth");
-    }
-    {
-        const tabs = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0) });
-        defer tabs.deinit();
-        const kinds = [_]content.Kind{ .mod, .resourcepack, .shader, .modpack };
-        const labels = [_][]const u8{ "Mods", "Resource packs", "Shaders", "Modpacks" };
-        if (dvui.windowRect().w < 520) {
-            var kind_choice: ?usize = @intFromEnum(ui.kind);
-            if (dvui.dropdown(@src(), &labels, .{ .choice_nullable = &kind_choice }, .{ .null_selectable = false }, .{ .label = .{ .text = "Content type" }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(6), .corners = .all(4) }) and enabled) {
-                ui.kind = kinds[kind_choice orelse 0];
-                ui.offset = 0;
-                ui.enqueue(source, .search, text(&ui.query));
-            }
-        } else {
-            for (kinds, labels) |kind, label| if (button(@src(), label, enabled)) {
-                ui.kind = kind;
-                ui.offset = 0;
-                ui.enqueue(source, .search, text(&ui.query));
-            };
-        }
-    }
-    _ = input(@src(), "Search", &ui.query);
-    if (button(@src(), "Search", enabled)) {
-        ui.offset = 0;
-        ui.enqueue(source, .search, text(&ui.query));
-    }
+    const kind_label = switch (ui.kind) {
+        .mod => "Mod",
+        .resourcepack => "资源包",
+        .shader => "光影",
+        .modpack => "整合包",
+    };
+    components.text(@src(), fmt("{s} · {s}", .{ if (snapshot.provider == .curseforge) "CurseForge" else "Modrinth", kind_label }), theme.accent);
     {
         const pages = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0) });
         defer pages.deinit();
@@ -530,8 +602,8 @@ fn drawBrowse(ui: *Ui, source: config.Instance, snapshot: content.Snapshot, enab
     for (snapshot.catalog, 0..) |project, i| {
         const item = row(@src(), i);
         defer item.deinit();
-        line(@src(), project.name, theme.accent);
-        line(@src(), project.summary, theme.muted);
+        components.text(@src(), project.name, theme.accent);
+        components.text(@src(), project.summary, theme.muted);
         if (button(@src(), "Versions", enabled and (project.provider == .modrinth or snapshot.curseforge_available))) ui.queue(source, .versions, "", project, null) catch |err| {
             ui.failure = err;
         };
@@ -539,25 +611,25 @@ fn drawBrowse(ui: *Ui, source: config.Instance, snapshot: content.Snapshot, enab
     for (snapshot.versions, 0..) |version, i| {
         const item = row(@src(), i + snapshot.catalog.len);
         defer item.deinit();
-        line(@src(), fmt("{s}   {s}", .{ version.name, version.id }), theme.accent);
-        line(@src(), fmt("Files: {d}   Dependencies: {d}", .{ version.files.len, version.dependencies.len }), theme.muted);
+        components.text(@src(), fmt("{s}   {s}", .{ version.name, version.id }), theme.accent);
+        components.text(@src(), fmt("Files: {d}   Dependencies: {d}", .{ version.files.len, version.dependencies.len }), theme.muted);
         const updating = if (ui.update_selection) |selection| selection.project.?.provider == version.provider and std.mem.eql(u8, selection.project.?.id, version.project_id) else false;
         if (button(@src(), if (updating) "Review update" else "Prepare version", enabled)) ui.queue(source, if (updating) .update else .prepare, "", null, version) catch |err| {
             ui.failure = err;
         };
     }
-    line(@src(), "Archive import", theme.accent);
+    components.text(@src(), "Archive import", theme.accent);
     _ = input(@src(), "Absolute .mrpack or CurseForge .zip path", &ui.archive);
     var archive_source: ?usize = if (ui.archive_provider == .modrinth) 0 else 1;
     if (dvui.dropdown(@src(), &.{ "Modrinth archive", "CurseForge archive" }, .{ .choice_nullable = &archive_source }, .{ .null_selectable = false }, .{ .label = .{ .text = "Archive source" }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(6), .corners = .all(4) })) ui.archive_provider = if ((archive_source orelse 0) == 0) .modrinth else .curseforge;
     _ = input(@src(), "Official project ID", &ui.archive_project);
     _ = input(@src(), "Official version or file ID", &ui.archive_version);
-    if (icon(@src(), "Choose archive", dvui.entypo.folder, enabled and dvui.useTinyFileDialogs and ui.picker == null)) {
+    if (icon(@src(), "Choose archive", dvui.entypo.folder, enabled and pickerAvailable(ui) and ui.picker == null)) {
         ui.picker_queued = true;
         ui.picker_manual = null;
     }
     if (button(@src(), "Import archive", enabled)) ui.enqueue(source, .import_pack, text(&ui.archive));
-    line(@src(), "Download connections", theme.muted);
+    components.text(@src(), "Download connections", theme.muted);
     _ = input(@src(), "Download connections (1-64)", &ui.connections);
     if (button(@src(), "Apply connections", enabled)) ui.enqueue(source, .connections, text(&ui.connections));
 }
@@ -568,6 +640,19 @@ fn matchesDependency(candidate: providers.Version, parent: providers.Version, de
     if (dep.version_id) |id| if (!sameId(candidate.id, id)) return false;
     if (dep.project_id == null and dep.version_id == null) return false;
     return providers.compatible(candidate, .{ .minecraft_version = source.minecraft_version, .loader = source.loader });
+}
+fn requiredChoicesReady(draft: *const Draft, a: A) !bool {
+    const active = try activeCandidates(draft, a);
+    defer a.free(active);
+    for (draft.candidates, 0..) |version, vi| {
+        if (!active[vi]) continue;
+        for (version.dependencies, 0..) |dep, di| {
+            if (dep.kind != .required) continue;
+            const ci = draft.choiceIndex(.{ .provider = version.provider, .id = version.id }, di) orelse return false;
+            if (!draft.choices.items[ci].include or draft.choices.items[ci].version_id == null) return false;
+        }
+    }
+    return true;
 }
 fn activeCandidates(draft: *const Draft, a: A) ![]bool {
     const active = try a.alloc(bool, draft.candidates.len);
@@ -604,7 +689,7 @@ fn drawDependencies(draft: *Draft) !bool {
             if (dep.kind != .required and dep.kind != .optional) continue;
             const item = row(@src(), vi * providers.max_items + di);
             defer item.deinit();
-            line(@src(), fmt("{s}: {s} ({s})", .{ version.name, dep.project_id orelse dep.version_id orelse dep.file_name orelse "Unknown dependency", @tagName(dep.kind) }), theme.muted);
+            components.text(@src(), fmt("{s}: {s} ({s})", .{ version.name, dep.project_id orelse dep.version_id orelse dep.file_name orelse "Unknown dependency", @tagName(dep.kind) }), theme.muted);
             const from: providers.VersionKey = .{ .provider = version.provider, .id = version.id };
             const ci = draft.choiceIndex(from, di);
             var include = if (ci) |index| draft.choices.items[index].include else dep.kind == .required;
@@ -627,16 +712,18 @@ fn drawDependencies(draft: *Draft) !bool {
             if (dvui.dropdown(@src(), labels.items, .{ .choice_nullable = &selection }, .{ .null_selectable = false }, .{ .label = .{ .text = "Dependency version" }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(6), .corners = .all(4) })) {
                 try draft.putChoice(.{ .from = from, .dependency_index = di, .include = true, .version_id = ids.items[selection orelse 0] });
             }
-            if (ids.items.len == 1) line(@src(), "No compatible candidate metadata available", warning);
+            if (ids.items.len == 1) components.text(@src(), "No compatible candidate metadata available", warning);
         }
     }
-    for (draft.issues) |issue| {
+    for (draft.issues, 0..) |issue, i| {
+        const item = row(@src(), i);
+        defer item.deinit();
         if (issue.from_index >= draft.candidates.len) {
-            line(@src(), "Invalid dependency candidate index", danger);
+            components.text(@src(), "Invalid dependency candidate index", danger);
             continue;
         }
         const version = draft.candidates[issue.from_index];
-        line(@src(), fmt("{s}: {s} (dependency {d})", .{ version.name, @tagName(issue.kind), issue.dependency_index }), warning);
+        components.text(@src(), fmt("{s}: {s} (dependency {d})", .{ version.name, @tagName(issue.kind), issue.dependency_index }), warning);
     }
     return required_ready;
 }
@@ -656,51 +743,66 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *content.Manager
         const modal = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &draft.open, .resize = .none, .window_avoid = .none }, .{ .rect = .{ .x = window.x + (window.w - width) / 2, .y = window.y + (window.h - height) / 2, .w = width, .h = height }, .padding = R.all(12), .corners = .all(8), .label = .{ .text = "Content review" } });
         defer modal.deinit();
         modal.dragAreaSet(dvui.windowHeader("Content review", "", &draft.open));
+        const form_action = components.formActions(@src(), .{ .save_label = if (draft.proposal.root != null or draft.proposal.pack != null) "安装" else "确认", .save_enabled = enabled and draft.confirmed and !draft.dirty and draft.proposal.ready and try requiredChoicesReady(draft, ui.allocator) });
+        if (form_action == .cancel) draft.open = false;
         const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0) });
         defer scroll.deinit();
-        line(@src(), fmt("{s}   {s}", .{ draft.source.name, draft.source.minecraft_version }), theme.accent);
-        if (!current) line(@src(), "Instance selection changed; review is locked", warning);
-        if (ui.failure) |err| line(@src(), @errorName(err), danger);
+        components.text(@src(), fmt("{s}   {s}", .{ draft.source.name, draft.source.minecraft_version }), theme.accent);
+        if (!current) components.text(@src(), "Instance selection changed; review is locked", warning);
+        if (ui.failure) |err| components.text(@src(), @errorName(err), danger);
         const required_choices_ready = try drawDependencies(draft);
         if (draft.proposal.pack) |pack| {
-            line(@src(), fmt("{s}   {s}", .{ pack.name, pack.version }), theme.accent);
+            components.text(@src(), fmt("{s}   {s}", .{ pack.name, pack.version }), theme.accent);
             for (pack.unresolved, 0..) |ref, i| {
                 const item = row(@src(), i);
                 defer item.deinit();
-                line(@src(), fmt("Missing CurseForge metadata: project {s}, file {s}", .{ ref.project_id, ref.file_id }), warning);
-                if (!manager.canResolvePackReferences()) line(@src(), "CurseForge transport disabled", warning);
+                components.text(@src(), fmt("Missing CurseForge metadata: project {s}, file {s}", .{ ref.project_id, ref.file_id }), warning);
+                if (!manager.canResolvePackReferences()) components.text(@src(), "CurseForge transport disabled", warning);
             }
             if (pack.unresolved.len != 0 and icon(@src(), "Resolve CurseForge file metadata", dvui.entypo.cw, enabled and manager.canResolvePackReferences())) ui.enqueue(draft.source, .resolve_pack_references, "");
-            if (!draft.proposal.prerequisites.loader_ready) line(@src(), "Required Minecraft loader is not ready", warning);
-            if (!draft.proposal.prerequisites.overrides_processed) line(@src(), "Archive overrides not processed", warning);
+            if (!draft.proposal.prerequisites.loader_ready) components.text(@src(), "Required Minecraft loader is not ready", warning);
+            if (!draft.proposal.prerequisites.overrides_processed) components.text(@src(), "Archive overrides not processed", warning);
         }
         for (draft.optional.items, 0..) |*optional, i| if (dvui.checkbox(@src(), &optional.include, optional.path, .{ .id_extra = i })) {
             draft.dirty = true;
             draft.confirmed = false;
         };
         for (draft.manual, 0..) |*manual, i| {
+            const file = for (draft.proposal.files) |candidate| {
+                if (sameId(candidate.record.path, manual.path)) break candidate;
+            } else continue;
+            const status: ?content.ManualSourceStatus = for (draft.proposal.manual_source_status) |known| {
+                if (sameId(known.path, manual.path)) break known;
+            } else null;
+            const presentation = manualSourcePresentation(file, manualFileIncluded(file, draft.optional.items), status, text(&manual.absolute), manual.source_dirty);
+            if (presentation == .hidden) continue;
             const item = row(@src(), i);
             defer item.deinit();
-            line(@src(), manual.path, theme.accent);
-            for (draft.proposal.files) |file| if (sameId(file.record.path, manual.path) and file.download == .manual_required) {
-                const required = file.download.manual_required;
-                line(@src(), @tagName(required.reason), warning);
-                dvui.link(@src(), .{ .label = "Official download page", .url = required.official_page }, .{});
-                break;
-            };
-            if (input(@src(), "Absolute local file path", &manual.absolute)) {
-                draft.dirty = true;
-                draft.confirmed = false;
-            }
-            if (icon(@src(), "Choose local file", dvui.entypo.folder, enabled and dvui.useTinyFileDialogs and ui.picker == null)) {
-                ui.picker_queued = true;
-                ui.picker_manual = i;
+            components.text(@src(), manual.path, theme.accent);
+            switch (presentation) {
+                .archive_verified => components.text(@src(), "Included archive file · source verified", theme.muted),
+                .archive_unverified => components.text(@src(), "Included archive file · source needs verification", warning),
+                .external_verified => components.text(@src(), "Local source verified", theme.muted),
+                .external_required => {
+                    components.text(@src(), @tagName(file.download.manual_required.reason), warning);
+                    if (manualOfficialPage(file, presentation)) |page| dvui.link(@src(), .{ .label = "Official download page", .url = page }, .{});
+                    if (input(@src(), "Absolute local file path", &manual.absolute)) {
+                        manual.source_dirty = true;
+                        draft.dirty = true;
+                        draft.confirmed = false;
+                    }
+                    if (icon(@src(), "Choose local file", dvui.entypo.folder, enabled and pickerAvailable(ui) and ui.picker == null)) {
+                        ui.picker_queued = true;
+                        ui.picker_manual = i;
+                    }
+                },
+                .hidden => unreachable,
             }
         }
         for (draft.proposal.plan.conflicts, 0..) |conflict, i| {
             const item = row(@src(), i);
             defer item.deinit();
-            line(@src(), fmt("{s}   {s}", .{ conflict.path, @tagName(conflict.reason) }), warning);
+            components.text(@src(), fmt("{s}   {s}", .{ conflict.path, @tagName(conflict.reason) }), warning);
             var choice: ?usize = 0;
             for (draft.decisions.items) |decision| if (sameId(decision.path, conflict.path)) {
                 choice = if (decision.choice == .keep_local) 1 else 2;
@@ -710,25 +812,28 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *content.Manager
                 if ((choice orelse 0) > 0) try draft.putDecision(conflict.path, if (choice.? == 1) .keep_local else .replace);
             }
         }
-        for (draft.proposal.plan.actions, 0..) |action, i| line(@src(), fmt("{d}. {s}   {s}", .{ i + 1, @tagName(action.kind), action.path }), theme.muted);
+        for (draft.proposal.plan.actions, 0..) |action, i| {
+            const item = row(@src(), i);
+            defer item.deinit();
+            components.text(@src(), fmt("{d}. {s}   {s}", .{ i + 1, @tagName(action.kind), action.path }), theme.muted);
+        }
         for (draft.proposal.plan.actions) |action| if (action.kind == .toggle) {
-            line(@src(), "Local override: changing an installed mod's state can break dependencies or startup. No other mods will change state automatically.", warning);
+            components.text(@src(), "Local override: changing an installed mod's state can break dependencies or startup. No other mods will change state automatically.", warning);
             break;
         };
         if (draft.proposal.blocker) |err| {
-            line(@src(), @errorName(err), warning);
-            if (err == error.DisabledIdentityUnresolved) line(@src(), "A disabled pack file could not be matched. Close this review, enable the old file, retry the pack update, then disable the new file you choose.", warning);
-            if (err == error.DisabledRequiredDependency) line(@src(), "A required dependency is disabled. Close this review, enable that dependency explicitly, then retry.", warning);
+            components.text(@src(), @errorName(err), warning);
+            if (err == error.DisabledIdentityUnresolved) components.text(@src(), "A disabled pack file could not be matched. Close this review, enable the old file, retry the pack update, then disable the new file you choose.", warning);
+            if (err == error.DisabledRequiredDependency) components.text(@src(), "A required dependency is disabled. Close this review, enable that dependency explicitly, then retry.", warning);
         }
-        line(@src(), fmt("Dependencies ready: {s}   Missing manual files: {d}", .{ if (draft.proposal.dependencies_ready) "yes" else "no", draft.proposal.missing_manual }), if (draft.proposal.ready) theme.accent else warning);
-        if (!draft.proposal.plan.fully_applied) line(@src(), "Kept-local overrides leave the requested installation incomplete", warning);
+        components.text(@src(), fmt("Dependencies ready: {s}   Missing manual files: {d}", .{ if (draft.proposal.dependencies_ready) "yes" else "no", draft.proposal.missing_manual }), if (draft.proposal.ready) theme.accent else warning);
+        if (!draft.proposal.plan.fully_applied) components.text(@src(), "Kept-local overrides leave the requested installation incomplete", warning);
         if (button(@src(), "Recompute review", enabled)) ui.enqueue(draft.source, .resolve, "");
         _ = dvui.checkbox(@src(), &draft.confirmed, "Confirm reviewed file changes", .{});
-        if (!required_choices_ready) line(@src(), "Required dependency version choices are incomplete", warning);
-        if (button(@src(), "Commit transaction", enabled and draft.confirmed and !draft.dirty and draft.proposal.ready and required_choices_ready)) ui.enqueue(draft.source, .commit, "");
-        if (button(@src(), "Close", true)) draft.open = false;
+        if (!required_choices_ready) components.text(@src(), "Required dependency version choices are incomplete", warning);
+        if (form_action == .save and draft.open and enabled and draft.confirmed and !draft.dirty and draft.proposal.ready and required_choices_ready) ui.enqueue(draft.source, .commit, "");
     }
-    if (!draft.open) ui.closeDraft();
+    if (!draft.open) ui.discard_queued = true;
 }
 
 fn collectPicker(ui: *Ui, doc: *const config.Document) void {
@@ -757,6 +862,7 @@ fn collectPicker(ui: *Ui, doc: *const config.Document) void {
                 ui.failure = err;
                 return;
             };
+            draft.manual[i].source_dirty = true;
             draft.dirty = true;
             draft.confirmed = false;
         }
@@ -765,7 +871,7 @@ fn collectPicker(ui: *Ui, doc: *const config.Document) void {
     };
 }
 fn startPicker(ui: *Ui, doc: *const config.Document) !void {
-    if (!dvui.useTinyFileDialogs) return error.NativeFileDialogUnavailable;
+    if (!pickerAvailable(ui)) return error.NativeFileDialogUnavailable;
     if (ui.picker != null) return error.Busy;
     const instance = selected(doc) orelse return error.InstanceNotFound;
     const a = std.heap.page_allocator;
@@ -773,7 +879,7 @@ fn startPicker(ui: *Ui, doc: *const config.Document) !void {
     errdefer a.destroy(picker);
     const id = try a.dupe(u8, instance.id);
     errdefer a.free(id);
-    picker.* = .{ .manual_index = ui.picker_manual, .instance_id = id, .draft_epoch = ui.draft_epoch };
+    picker.* = .{ .manual_index = ui.picker_manual, .instance_id = id, .draft_epoch = ui.draft_epoch, .runner = ui.options.picker_runner };
     picker.thread = try std.Thread.spawn(.{}, Picker.run, .{picker});
     ui.picker = picker;
 }
@@ -813,6 +919,7 @@ fn apply(request: *const Request, manager: *content.Manager) !void {
 /// Call AFTER all root and modal widgets close. Never retain borrowed snapshots.
 pub fn finish(ui: *Ui, store: *config.Store, manager: *content.Manager) void {
     defer ui.clearPending();
+    ui.finishDiscard();
     const pinned = manager.snapshot();
     if (pinned.recovery_required) {
         ui.cancel_queued = false;
@@ -958,20 +1065,48 @@ test "content review owns manual paths choices and blockers" {
     const a = std.testing.allocator;
     var path = [_]u8{ 'm', 'o', 'd', 's', '/', 'a', '.', 'j', 'a', 'r' };
     const file: manifest.InstallFile = .{ .record = .{ .path = &path, .provider = .modrinth, .project_id = "project", .version_id = "version", .hashes = .{} }, .download = .{ .manual_required = .{ .official_page = "https://modrinth.com/mod/project", .reason = .missing_url } } };
-    const proposal: content.Proposal = .{ .files = &.{file}, .plan = .{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = "stable", .pack_version = "version" }, .ready = false, .fully_applied = false }, .blocker = error.LoaderPrerequisiteUnsupported };
+    var source_path = "/tmp/source.jar".*;
+    const proposal: content.Proposal = .{ .files = &.{file}, .plan = .{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = "stable", .pack_version = "version" }, .ready = false, .fully_applied = false }, .blocker = error.LoaderPrerequisiteUnsupported, .manual_source_status = &.{.{ .path = &path, .source_absolute_path = &source_path, .verified = true }}, .manual_files = &.{.{ .path = &path, .source_absolute_path = &source_path }} };
     const snapshot: content.Snapshot = .{ .instance = .{ .id = "stable", .name = "Instance", .minecraft_version = "1.21" }, .proposal = &proposal };
     var ui = try Ui.init(a);
     defer ui.deinit();
     ui.draft = try Draft.init(a, snapshot);
     path[5] = 'z';
+    source_path[5] = 'X';
     try std.testing.expectEqualStrings("mods/a.jar", ui.draft.?.manual[0].path);
+    const owned_status = ui.draft.?.proposal.manual_source_status[0];
+    try std.testing.expectEqualStrings("mods/a.jar", owned_status.path);
+    try std.testing.expectEqualStrings("/tmp/source.jar", owned_status.source_absolute_path.?);
+    try std.testing.expect(owned_status.verified);
     try std.testing.expectEqual(error.LoaderPrerequisiteUnsupported, ui.draft.?.proposal.blocker.?);
     try setText(&ui.draft.?.manual[0].absolute, "/tmp/source.jar");
     try ui.draft.?.putChoice(.{ .from = .{ .provider = .modrinth, .id = "root" }, .dependency_index = 0, .include = true, .version_id = "dependency" });
+    // Unrelated review dirtiness does not invalidate this checked source.
+    try std.testing.expectEqual(ManualSourcePresentation.external_verified, manualSourcePresentation(ui.draft.?.proposal.files[0], true, owned_status, text(&ui.draft.?.manual[0].absolute), ui.draft.?.manual[0].source_dirty));
     try ui.queue(ui.draft.?.source, .resolve, "", null, null);
     ui.closeDraft();
     try std.testing.expectEqualStrings("/tmp/source.jar", ui.pending.?.manual[0].source_absolute_path);
     try std.testing.expectEqualStrings("dependency", ui.pending.?.choices[0].version_id.?);
+}
+
+test "content draft discard is deferred and drops commit without worker cancellation" {
+    const a = std.testing.allocator;
+    const proposal: content.Proposal = .{ .files = &.{}, .plan = .{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = "stable", .pack_version = "version" }, .ready = true, .fully_applied = true } };
+    const snapshot: content.Snapshot = .{ .instance = .{ .id = "stable", .name = "Instance", .minecraft_version = "1.21" }, .proposal = &proposal };
+    var ui = try Ui.init(a);
+    defer ui.deinit();
+    ui.draft = try Draft.init(a, snapshot);
+    try ui.queue(ui.draft.?.source, .commit, "", null, null);
+    ui.discard_queued = true;
+    ui.failure = error.InvalidChoice;
+    ui.review_requested = true;
+    ui.picker_queued = true;
+    const epoch = ui.draft_epoch;
+    try std.testing.expect(ui.draft != null and ui.pending != null);
+    ui.finishDiscard();
+    try std.testing.expect(ui.draft == null and ui.pending == null and ui.failure == null);
+    try std.testing.expect(!ui.discard_queued and !ui.cancel_queued and !ui.review_requested and !ui.picker_queued);
+    try std.testing.expectEqual(epoch +% 1, ui.draft_epoch);
 }
 
 test "content archive requests require explicit owned source identity" {
@@ -996,7 +1131,7 @@ test "content metadata review refresh preserves live paths choices optional and 
     added.record.version_id = "43";
     added.required = true;
     added.selected = true;
-    const proposal: content.Proposal = .{ .files = &.{old_file}, .plan = .{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = "stable", .pack_version = "v1" }, .ready = false, .fully_applied = false } };
+    const proposal: content.Proposal = .{ .files = &.{old_file}, .plan = .{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = "stable", .pack_version = "v1" }, .ready = false, .fully_applied = false }, .manual_source_status = &.{.{ .path = old_file.record.path, .source_absolute_path = "/tmp/original.jar", .verified = true }}, .manual_files = &.{.{ .path = old_file.record.path, .source_absolute_path = "/tmp/original.jar" }} };
     var updated = proposal;
     updated.files = &.{ old_file, added };
     const snapshot: content.Snapshot = .{ .instance = .{ .id = "stable", .name = "Instance", .minecraft_version = "1.20.1" }, .proposal = &proposal };
@@ -1006,6 +1141,9 @@ test "content metadata review refresh preserves live paths choices optional and 
     ui.review_refresh = true;
     ui.draft.?.optional.items[0].include = true;
     try setText(&ui.draft.?.manual[0].absolute, "/tmp/changed-while-busy.jar");
+    ui.draft.?.manual[0].source_dirty = true;
+    // Returning to the checked spelling still requires re-verification.
+    try setText(&ui.draft.?.manual[0].absolute, "/tmp/original.jar");
     try ui.draft.?.putChoice(.{ .from = .{ .provider = .curseforge, .id = "34" }, .dependency_index = 0, .include = true, .version_id = "43" });
     try ui.draft.?.putDecision("mods/a.jar", .keep_local);
     var next = snapshot;
@@ -1017,7 +1155,10 @@ test "content metadata review refresh preserves live paths choices optional and 
     try ui.refreshReview(next);
     try std.testing.expect(!ui.review_refresh and ui.draft.?.dirty and !ui.draft.?.confirmed);
     try std.testing.expectEqual(@as(usize, 2), ui.draft.?.manual.len);
-    try std.testing.expectEqualStrings("/tmp/changed-while-busy.jar", text(&ui.draft.?.manual[0].absolute));
+    try std.testing.expectEqualStrings("/tmp/original.jar", text(&ui.draft.?.manual[0].absolute));
+    try std.testing.expect(ui.draft.?.manual[0].source_dirty);
+    try std.testing.expect(!ui.draft.?.manual[1].source_dirty);
+    try std.testing.expectEqual(ManualSourcePresentation.external_required, manualSourcePresentation(ui.draft.?.proposal.files[0], true, ui.draft.?.proposal.manual_source_status[0], text(&ui.draft.?.manual[0].absolute), ui.draft.?.manual[0].source_dirty));
     try std.testing.expectEqualStrings("", text(&ui.draft.?.manual[1].absolute));
     try std.testing.expect(ui.draft.?.optional.items[0].include);
     try std.testing.expectEqualStrings("43", ui.draft.?.choices.items[0].version_id.?);
@@ -1025,7 +1166,7 @@ test "content metadata review refresh preserves live paths choices optional and 
     try ui.queue(ui.draft.?.source, .resolve_pack_references, "", null, null);
     ui.closeDraft();
     try std.testing.expectEqual(Action.resolve_pack_references, ui.pending.?.action);
-    try std.testing.expectEqualStrings("/tmp/changed-while-busy.jar", ui.pending.?.manual[0].source_absolute_path);
+    try std.testing.expectEqualStrings("/tmp/original.jar", ui.pending.?.manual[0].source_absolute_path);
     try std.testing.expect(ui.pending.?.optional[0].include);
     try std.testing.expectEqual(manifest.ConflictChoice.keep_local, ui.pending.?.decisions[0].choice);
 }
@@ -1116,4 +1257,138 @@ test "content update selection owns legacy proof and preserves old exact tuple" 
     try std.testing.expectEqualStrings("mods/legacy.jar", request.legacy_approvals[0].path);
     try std.testing.expectEqualStrings("a" ** 40, request.legacy_approvals[0].expected_hashes.sha1.?);
     try std.testing.expectEqual(@as(?u64, 3), request.legacy_approvals[0].expected_size);
+}
+
+test "content external review binds current policy and later changes clear stale intent" {
+    const a = std.testing.allocator;
+    var ui = try Ui.init(a);
+    defer ui.deinit();
+    const source: config.Instance = .{ .id = "stable", .name = "Instance", .minecraft_version = "1.21" };
+    const proposal: content.Proposal = .{ .files = &.{}, .plan = .{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = "stable", .pack_version = "version" }, .ready = true, .fully_applied = true } };
+    const snapshot: content.Snapshot = .{ .instance = source, .proposal = &proposal, .policy_generation = 4 };
+    try ui.queue(source, .connections, "8", null, null);
+    for ([_]bool{ false, true }) |change_provider| {
+        ui.requestReview(snapshot);
+        try std.testing.expect(ui.review_requested);
+        try std.testing.expectEqual(snapshot.policy_generation, ui.policy_generation);
+        try std.testing.expectEqual(snapshot.provider, ui.provider);
+        try std.testing.expect(ui.pending == null);
+        syncPolicy(&ui, snapshot);
+        try std.testing.expect(ui.review_requested);
+        ui.draft = try Draft.init(a, snapshot);
+        try ui.queue(source, .connections, "8", null, null);
+        try ui.rememberUpdate(source, .{ .provider = .modrinth, .project_id = "project", .version_id = "version" }, null);
+        var changed = snapshot;
+        if (change_provider) changed.provider = .curseforge else changed.policy_generation += 1;
+        syncPolicy(&ui, changed);
+        try std.testing.expect(!ui.review_requested and ui.draft == null and ui.pending == null and ui.update_selection == null);
+        try std.testing.expectEqual(changed.policy_generation, ui.policy_generation);
+        try std.testing.expectEqual(changed.provider, ui.provider);
+        // Returning to the old policy never revives an invalidated review.
+        syncPolicy(&ui, snapshot);
+        try std.testing.expect(!ui.review_requested and ui.draft == null and ui.pending == null);
+    }
+}
+
+test "content picker callback owns completion and rejects stale manual targets" {
+    const Fake = struct {
+        path: ?[]const u8 = "/tmp/picked.jar",
+        failure: ?anyerror = null,
+        kind: ?PickerKind = null,
+        fn pick(raw: ?*anyopaque, a: A, kind: PickerKind) anyerror!?[:0]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.kind = kind;
+            if (self.failure) |failure| return failure;
+            return if (self.path) |path| try a.dupeZ(u8, path) else null;
+        }
+        fn complete(ui: *Ui, index: ?usize, id: []const u8, epoch: u64) !void {
+            const a = std.heap.page_allocator;
+            const picker = try a.create(Picker);
+            errdefer a.destroy(picker);
+            picker.* = .{ .manual_index = index, .instance_id = try a.dupe(u8, id), .draft_epoch = epoch, .runner = ui.options.picker_runner };
+            ui.picker = picker;
+            Picker.run(picker);
+        }
+    };
+    const a = std.testing.allocator;
+    const file: manifest.InstallFile = .{ .record = .{ .path = "mods/a.jar", .provider = .curseforge, .project_id = "12", .version_id = "34", .hashes = .{} }, .download = .{ .manual_required = .{ .official_page = "", .reason = .distribution_disabled } } };
+    const source: config.Instance = .{ .id = "stable", .name = "Instance", .minecraft_version = "1.21" };
+    const proposal: content.Proposal = .{ .files = &.{file}, .plan = .{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = source.id, .pack_version = "v1" }, .ready = true, .fully_applied = true }, .manual_source_status = &.{.{ .path = file.record.path, .source_absolute_path = "/tmp/checked.jar", .verified = true }}, .manual_files = &.{.{ .path = file.record.path, .source_absolute_path = "/tmp/checked.jar" }} };
+    const snapshot: content.Snapshot = .{ .instance = source, .proposal = &proposal };
+    const doc: config.Document = .{ .instances = &.{source}, .selected_instance = source.id };
+    var fake: Fake = .{};
+    var ui = try Ui.initOptions(a, .{ .picker_runner = .{ .context = &fake, .pick = Fake.pick } });
+    defer ui.deinit();
+    try std.testing.expect(pickerAvailable(&ui));
+    try Fake.complete(&ui, null, source.id, ui.draft_epoch);
+    try std.testing.expect(ui.picker.?.done.load(.acquire));
+    collectPicker(&ui, &doc);
+    try std.testing.expectEqual(PickerKind.archive, fake.kind.?);
+    try std.testing.expectEqualStrings("/tmp/picked.jar", text(&ui.archive));
+    try std.testing.expect(ui.picker == null);
+    ui.draft = try Draft.init(a, snapshot);
+    ui.draft.?.confirmed = true;
+    try Fake.complete(&ui, 0, source.id, ui.draft_epoch);
+    collectPicker(&ui, &doc);
+    try std.testing.expectEqual(PickerKind.manual, fake.kind.?);
+    try std.testing.expect(ui.picker == null and ui.draft.?.manual[0].source_dirty and ui.draft.?.dirty and !ui.draft.?.confirmed);
+    try std.testing.expectEqualStrings("/tmp/picked.jar", text(&ui.draft.?.manual[0].absolute));
+    // A callback result never asserts verification, even if its bytes spell the old path.
+    try setText(&ui.draft.?.manual[0].absolute, "/tmp/checked.jar");
+    try std.testing.expectEqual(ManualSourcePresentation.external_required, manualSourcePresentation(file, true, proposal.manual_source_status[0], text(&ui.draft.?.manual[0].absolute), ui.draft.?.manual[0].source_dirty));
+    ui.closeDraft();
+    ui.draft = try Draft.init(a, snapshot);
+    for (0..4) |scenario| {
+        ui.failure = null;
+        try Fake.complete(&ui, if (scenario == 1) 1 else 0, if (scenario == 2) "other" else source.id, if (scenario == 0) ui.draft_epoch + 1 else ui.draft_epoch);
+        if (scenario == 3) ui.draft.?.source.id = "other";
+        collectPicker(&ui, &doc);
+        try std.testing.expectEqual(error.SelectionChanged, ui.failure.?);
+        try std.testing.expect(ui.picker == null and !ui.draft.?.manual[0].source_dirty);
+        try std.testing.expectEqualStrings("/tmp/checked.jar", text(&ui.draft.?.manual[0].absolute));
+        ui.draft.?.source.id = source.id;
+    }
+    ui.failure = null;
+    fake.path = null;
+    try Fake.complete(&ui, 0, source.id, ui.draft_epoch);
+    collectPicker(&ui, &doc);
+    try std.testing.expect(ui.picker == null and ui.failure == null and !ui.draft.?.manual[0].source_dirty);
+    fake.failure = error.PickerFixtureFailure;
+    try Fake.complete(&ui, 0, source.id, ui.draft_epoch);
+    collectPicker(&ui, &doc);
+    try std.testing.expectEqual(error.PickerFixtureFailure, ui.failure.?);
+    try std.testing.expect(ui.picker == null);
+    fake.failure = null;
+    // A pending chooser must not follow its numeric index into a refreshed row.
+    ui.closeDraft();
+    var later = file;
+    later.record.path = "mods/later.jar";
+    var third = file;
+    third.record.path = "mods/third.jar";
+    var before_refresh = proposal;
+    before_refresh.files = &.{ file, later, third };
+    var old_snapshot = snapshot;
+    old_snapshot.proposal = &before_refresh;
+    ui.draft = try Draft.init(a, old_snapshot);
+    fake.path = "/tmp/late-refresh.jar";
+    try Fake.complete(&ui, 1, source.id, ui.draft_epoch);
+    var after_refresh = before_refresh;
+    after_refresh.files = &.{ third, file, later };
+    var refreshed_snapshot = snapshot;
+    refreshed_snapshot.proposal = &after_refresh;
+    ui.review_refresh = true;
+    try ui.refreshReview(refreshed_snapshot);
+    try std.testing.expectEqualStrings(file.record.path, ui.draft.?.manual[1].path);
+    collectPicker(&ui, &doc);
+    try std.testing.expectEqual(error.SelectionChanged, ui.failure.?);
+    try std.testing.expect(ui.picker == null);
+    for (ui.draft.?.manual) |manual| {
+        try std.testing.expect(!manual.source_dirty);
+        try std.testing.expect(!std.mem.eql(u8, "/tmp/late-refresh.jar", text(&manual.absolute)));
+    }
+    fake.path = "/tmp/late.jar";
+    try Fake.complete(&ui, 0, source.id, ui.draft_epoch);
+    ui.closeDraft();
+    collectPicker(&ui, &doc);
+    try std.testing.expect(ui.picker == null and ui.draft == null);
 }

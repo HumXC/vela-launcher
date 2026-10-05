@@ -90,7 +90,7 @@ pub const Registry = struct {
         self.* = undefined;
     }
 
-    /// Copies title. Entry pointers survive list growth until prune or deinit.
+    /// Copies title. Entry pointers survive growth until terminal dismissal/prune or deinit.
     pub fn create(self: *Registry, kind: Kind, title: []const u8) !*Task {
         if (self.next_id == 0) return error.IdExhausted;
         const task = try self.allocator.create(Task);
@@ -141,8 +141,8 @@ pub const Registry = struct {
         }
     }
 
-    /// Borrowed list slice, invalidated by create/prune/deinit; task pointers
-    /// themselves remain stable. Access this slice only on the main thread.
+    /// Borrowed list slice, invalidated by create/dismiss/prune/deinit. Surviving
+    /// task pointers remain stable. Access this slice only on the main thread.
     pub fn tasks(self: *const Registry) []const *Task {
         return self.entries.items;
     }
@@ -150,6 +150,20 @@ pub const Registry = struct {
     pub fn hasActive(self: *const Registry) bool {
         for (self.entries.items) |task| {
             if (!terminal(task.state)) return true;
+        }
+        return false;
+    }
+
+    /// Dismiss one terminal notification after UI borrows end. Like pruneFinished,
+    /// this requires finish's worker-join contract; active entries are never freed.
+    /// Returns false for an active task or an unknown ID, preserving survivor order.
+    pub fn dismiss(self: *Registry, id: u64) bool {
+        for (self.entries.items, 0..) |task, index| {
+            if (task.id != id) continue;
+            if (!terminal(task.state)) return false;
+            _ = self.entries.orderedRemove(index);
+            self.destroy(task);
+            return true;
         }
         return false;
     }
@@ -425,4 +439,80 @@ test "id exhaustion never wraps or reuses an id" {
     registry.finish(last, .succeeded);
     registry.pruneFinished(0);
     try std.testing.expectError(error.IdExhausted, registry.create(.save_copy, "No reuse"));
+}
+
+test "dismiss removes only terminal IDs and preserves unrelated entries and order" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    const queued = try registry.create(.java_scan, "Queued");
+    const succeeded = try registry.create(.game_install, "Succeeded");
+    const running = try registry.create(.java_download, "Running");
+    const canceled = try registry.create(.save_copy, "Canceled");
+    const failed = try registry.create(.save_backup, "Failed");
+    const canceling = try registry.create(.java_download, "Canceling");
+    const tail = try registry.create(.java_scan, "Tail");
+    try registry.start(succeeded);
+    registry.finish(succeeded, .succeeded);
+    try registry.start(running);
+    try registry.start(canceled);
+    registry.finish(canceled, .canceled);
+    registry.finish(failed, .{ .failed = error.FixtureFailure });
+    try registry.start(canceling);
+    try std.testing.expect(registry.cancel(canceling.id));
+    const succeeded_id = succeeded.id;
+    const canceled_id = canceled.id;
+    const failed_id = failed.id;
+    const next_id = registry.next_id;
+
+    try std.testing.expect(!registry.dismiss(0));
+    try std.testing.expect(!registry.dismiss(std.math.maxInt(u64)));
+    for ([_]*Task{ queued, running, canceling, tail }) |task|
+        try std.testing.expect(!registry.dismiss(task.id));
+    try std.testing.expectEqual(@as(usize, 7), registry.tasks().len);
+    try std.testing.expect(registry.dismiss(succeeded_id));
+    try std.testing.expect(registry.dismiss(canceled_id));
+    try std.testing.expect(registry.dismiss(failed_id));
+    try std.testing.expect(!registry.dismiss(succeeded_id));
+    try std.testing.expectEqual(@as(usize, 4), registry.tasks().len);
+    for ([_]*Task{ queued, running, canceling, tail }, registry.tasks()) |expected, actual|
+        try std.testing.expectEqual(expected, actual);
+    try std.testing.expectEqual(next_id, registry.next_id);
+    try std.testing.expectEqualStrings("Running", running.title);
+    running.report(.downloading, 4, 10);
+    try std.testing.expectEqual(@as(u64, 4), running.progress().completed);
+    try std.testing.expectEqual(State.canceling, canceling.state);
+    const later = try registry.create(.java_scan, "Later");
+    try std.testing.expectEqual(next_id, later.id);
+}
+
+test "dismiss retains a worker-owned task until join and terminal acknowledgement" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    const task = try registry.create(.java_download, "Worker-owned");
+    const id = task.id;
+    try registry.start(task);
+    const Worker = struct {
+        fn run(owned: *Task) void {
+            while (!owned.canceled()) std.atomic.spinLoopHint();
+            owned.report(.downloading, 7, 10);
+        }
+    };
+    const worker = try std.Thread.spawn(.{}, Worker.run, .{task});
+    var joined = false;
+    defer if (!joined) {
+        _ = registry.cancel(id);
+        worker.join();
+    };
+    try std.testing.expect(!registry.dismiss(id));
+    try std.testing.expect(registry.cancel(id));
+    try std.testing.expectEqual(State.canceling, task.state);
+    try std.testing.expect(!registry.dismiss(id));
+    worker.join();
+    joined = true;
+    // Joining alone does not publish a terminal state or free the notification.
+    try std.testing.expect(!registry.dismiss(id));
+    try std.testing.expectEqual(@as(u64, 7), task.progress().completed);
+    registry.finish(task, .canceled);
+    try std.testing.expect(registry.dismiss(id));
+    try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
 }

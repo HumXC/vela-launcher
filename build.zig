@@ -63,6 +63,18 @@ pub fn build(b: *std.Build) void {
     });
     if (target.result.os.tag == .windows) gui_fixture.subsystem = .windows;
     b.step("build-gui-fixture", "Build isolated GUI acceptance fixture").dependOn(&b.addInstallArtifact(gui_fixture, .{}).step);
+    // Acceptance clones the production module; this root is never default-installed.
+    const lifecycle_exe = b.addExecutable(.{
+        .name = "vela-lifecycle-acceptance",
+        .root_module = cloneAppModule(b, app_mod, b.path("src/lifecycle_acceptance.zig")),
+    });
+    const lifecycle_child = b.addExecutable(.{
+        .name = "vela-lifecycle-child",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/lifecycle_acceptance_child.zig"), .target = target, .optimize = optimize }),
+    });
+    const lifecycle_step = b.step("build-lifecycle-acceptance", "Build SAME-App lifecycle root and controlled Java helper only");
+    lifecycle_step.dependOn(&b.addInstallArtifact(lifecycle_exe, .{}).step);
+    lifecycle_step.dependOn(&b.addInstallArtifact(lifecycle_child, .{}).step);
     const compile_step = b.step("compile-app", "Compile App");
     compile_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     b.getInstallStep().dependOn(compile_step);
@@ -222,7 +234,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/mc_cli.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "curl", .module = curl_dep.module("curl") }},
+        .imports = &.{
+            .{ .name = "curl", .module = curl_dep.module("curl") },
+            .{ .name = "nbt", .module = nbt_module },
+            .{ .name = "nbt_compression", .module = nbt_compression },
+        },
     }) });
     b.step("mc-cli", "Build headless Minecraft installer and launcher").dependOn(&b.addInstallArtifact(mc, .{}).step);
     const mc_run = b.addRunArtifact(mc);
