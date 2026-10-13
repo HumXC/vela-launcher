@@ -131,7 +131,7 @@ fn buildPlan(allocator: std.mem.Allocator, version: m.version.Version, assets: m
         const hex = std.fmt.bytesToHex(asset.hash, .lower);
         const url = try std.fmt.allocPrint(a, "https://resources.download.minecraft.net/{s}/{s}", .{ hex[0..2], &hex });
         const source = try context.add(.asset, &.{ "assets", "objects", hex[0..2], &hex }, .{ .url = url, .sha1 = asset.hash, .size = asset.size, .path = null });
-        if ((assets.virtual orelse false) or (assets.map_to_resources orelse false)) try relative(asset.name);
+        if ((assets.virtual orelse false) or (assets.map_to_resources orelse false)) try context.relativeTarget(asset.name);
         if (assets.virtual orelse false) try context.materialize(source, try std.fs.path.join(a, &.{ directories.root, "assets", "virtual", index.id, asset.name }), asset.hash, asset.size);
         if (assets.map_to_resources orelse false) try context.materialize(source, try std.fs.path.join(a, &.{ game_directory, "resources", asset.name }), asset.hash, asset.size);
     }
@@ -234,15 +234,32 @@ const Context = struct {
     aliases: std.StringHashMapUnmanaged(usize) = .empty,
     materializations: std.ArrayList(AssetMaterialization) = .empty,
     fn pathKey(self: *Context, path: []const u8) ![]const u8 {
-        const key = try self.a.dupe(u8, path);
-        if (self.windows) for (key) |*c| {
-            c.* = std.ascii.toLower(c.*);
-        };
-        return key;
+        if (!self.windows) return self.a.dupe(u8, path);
+        const view = std.unicode.Utf8View.init(path) catch return error.UnsafePath;
+        var codepoints = view.iterator();
+        var key: std.ArrayList(u8) = .empty;
+        // Full destinations include caller-owned Unicode ancestors. Match
+        // Windows ordinal upcasing; supplementary scalars compare unchanged.
+        while (codepoints.nextCodepoint()) |cp| {
+            const upper: u21 = if (cp <= 0xffff) std.os.windows.toUpperWtf16(@intCast(cp)) else cp;
+            var encoded: [4]u8 = undefined;
+            const len = try std.unicode.utf8Encode(if (upper == 92) '/' else upper, &encoded);
+            try key.appendSlice(self.a, encoded[0..len]);
+        }
+        return key.toOwnedSlice(self.a);
+    }
+    fn relativeTarget(self: *Context, path: []const u8) !void {
+        try relative(path);
+        if (!self.windows) return;
+        // Restrict metadata children, not caller-owned ancestor directories.
+        var codepoints = std.unicode.Utf8View.initUnchecked(path).iterator();
+        while (codepoints.nextCodepoint()) |cp| {
+            if (cp > 0xff and !(cp >= 0x3400 and cp <= 0x4dbf) and !(cp >= 0x4e00 and cp <= 0x9fff)) return error.UnsupportedWindowsPathCase;
+        }
     }
     fn add(self: *Context, kind: Kind, pieces: []const []const u8, download: m.version.Download) ![]const u8 {
-        for (pieces) |piece| try relative(piece);
-        if (download.path) |path| try relative(path);
+        for (pieces) |piece| try self.relativeTarget(piece);
+        if (download.path) |path| try self.relativeTarget(path);
         if (download.url.len == 0) {
             if (!self.installed or kind != .library) return error.MissingDownloadUrl;
             if (download.sha1 == null or (download.size orelse 0) == 0) return error.UnverifiableLocalLibrary;
@@ -400,6 +417,106 @@ test "same path dedup merges checksums but conflicts fail including windows case
     _ = try ctx.add(.library, &.{"libraries/other.jar"}, d);
     try std.testing.expectEqual(@as(usize, 2), ctx.files.items.len);
 }
+test "Windows Unicode download keys reject hash and ancestor collisions" {
+    const download: m.version.Download = .{ .url = "https://example/a", .path = null, .sha1 = @as([20]u8, @splat(1)), .size = 1 };
+    var different = download;
+    different.sha1 = @as([20]u8, @splat(2));
+    for ([_]bool{ false, true }) |reverse| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var ctx: Context = .{ .a = arena.allocator(), .root = "中文目录", .windows = true };
+        const first = if (reverse) "libraries/ä.jar" else "libraries/Ä.jar";
+        const second = if (reverse) "libraries/Ä.jar" else "libraries/ä.jar";
+        const original = try ctx.add(.library, &.{first}, download);
+        try std.testing.expectEqualStrings(original, try ctx.add(.library, &.{second}, download));
+        try std.testing.expectEqual(@as(usize, 1), ctx.files.items.len);
+        try std.testing.expectError(error.PathConflict, ctx.add(.library, &.{second}, different));
+
+        var ancestors: Context = .{ .a = arena.allocator(), .root = "中文目录", .windows = true };
+        _ = try ancestors.add(.library, &.{if (reverse) "libraries/ä/child.jar" else "libraries/Ä"}, download);
+        try std.testing.expectError(error.PathConflict, ancestors.add(.library, &.{if (reverse) "libraries/Ä" else "libraries/ä/child.jar"}, download));
+    }
+}
+
+test "Windows Unicode materializations conflict with files and ancestor aliases" {
+    const hash: m.Sha1 = @splat(1);
+    const other_hash: m.Sha1 = @splat(2);
+    const download: m.version.Download = .{ .url = "https://example/a", .path = null, .sha1 = hash, .size = 1 };
+    for ([_]bool{ false, true }) |reverse| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var ctx: Context = .{ .a = a, .root = "中文目录", .windows = true };
+        const upper = try std.fs.path.join(a, &.{ ctx.root, "resources", "Ä.ogg" });
+        const lower = try std.fs.path.join(a, &.{ ctx.root, "resources", "ä.ogg" });
+        if (reverse) {
+            try ctx.materialize("object", lower, hash, 1);
+            try std.testing.expectError(error.PathConflict, ctx.add(.asset, &.{"resources/Ä.ogg"}, download));
+        } else {
+            _ = try ctx.add(.asset, &.{"resources/Ä.ogg"}, download);
+            try std.testing.expectError(error.PathConflict, ctx.materialize("object", lower, hash, 1));
+        }
+        var aliases: Context = .{ .a = a, .root = ctx.root, .windows = true };
+        try aliases.materialize("object", upper, hash, 1);
+        try aliases.materialize("object", lower, hash, 1);
+        try std.testing.expectEqual(@as(usize, 1), aliases.materializations.items.len);
+        try std.testing.expectEqualStrings(upper, aliases.materializations.items[0].destination);
+        try std.testing.expectError(error.PathConflict, aliases.materialize("other-object", lower, other_hash, 1));
+        const parent = try std.fs.path.join(a, &.{ ctx.root, "resources", "Ä" });
+        const child = try std.fs.path.join(a, &.{ ctx.root, "resources", "ä", "child.ogg" });
+        try aliases.materialize("object", if (reverse) child else parent, hash, 1);
+        try std.testing.expectError(error.PathConflict, aliases.materialize("object", if (reverse) parent else child, hash, 1));
+    }
+}
+
+test "Windows Unicode metadata targets fail closed without restricting caller roots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var windows: Context = .{ .a = arena.allocator(), .root = "中文目录", .windows = true };
+    var linux: Context = .{ .a = arena.allocator(), .root = "中文目录", .windows = false };
+    // Only metadata-controlled child names have the bounded policy.
+    for ([_][]const u8{ "ſ.ogg", "Σ.ogg", "σ.ogg", "ɐ.ogg", "Ɐ.ogg", "😀.ogg" }) |path| {
+        try std.testing.expectError(error.UnsupportedWindowsPathCase, windows.relativeTarget(path));
+        try std.testing.expectEqualStrings(path, try linux.pathKey(path));
+    }
+    try std.testing.expectEqualStrings("中文目录/Ä.OGG", try windows.pathKey("中文目录/ä.ogg"));
+    try std.testing.expectEqualStrings("中文目录/A.OGG", try windows.pathKey("中文目录\\a.ogg"));
+    try std.testing.expectError(error.UnsafePath, windows.pathKey("bad\xff"));
+}
+
+test "Windows Unicode ancestors survive full virtual and resources planning" {
+    const a = std.testing.allocator;
+    var version = try m.version.parseSlice(a, fixture);
+    defer version.deinit();
+    const windows: m.rules.Environment = .{ .os_name = "windows", .arch = "x86_64" };
+    const assets: m.asset_index.AssetIndex = .{
+        .objects = &.{.{ .name = "sound/foo.ogg", .hash = @splat(1), .size = 5 }},
+        .virtual = true,
+        .map_to_resources = true,
+    };
+    for ([_][]const u8{ "C:/Users/Νίκος/.minecraft", "C:/Users/Иван/.minecraft", "C:/Users/😀/.minecraft" }) |ancestor| {
+        for ([_]bool{ false, true }) |external| {
+            const directories: Directories = .{
+                .root = if (external) "C:/launcher" else ancestor,
+                .game_directory = ancestor,
+            };
+            for ([_]bool{ false, true }) |installed| {
+                var plan = try buildPlan(a, version.value, assets, windows, directories, installed);
+                defer plan.deinit();
+                const expected = try std.fs.path.join(a, &.{ ancestor, "resources", "sound/foo.ogg" });
+                defer a.free(expected);
+                try std.testing.expectEqualStrings(expected, plan.value.asset_materializations[1].destination);
+            }
+        }
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var ctx: Context = .{ .a = arena.allocator(), .root = "C:/Users/Νίκος/.minecraft", .windows = true };
+    _ = try ctx.add(.library, &.{ "resources", "Ä.ogg" }, .{ .url = "https://example/asset", .sha1 = @splat(1), .size = 5, .path = null });
+    // Compare complete roots too: these are the same Windows ordinal prefix.
+    try std.testing.expectError(error.PathConflict, ctx.materialize("object", "c:/users/νίκος/.MINECRAFT/resources/ä.ogg", @splat(2), 5));
+}
+
 fn allocationCase(a: std.mem.Allocator) !void {
     var version = try m.version.parseSlice(a, fixture);
     defer version.deinit();
@@ -504,6 +621,48 @@ test "legacy Maven URLs and asset aliases share object storage" {
     try std.testing.expectError(error.PathConflict, build(a, version.value, windows.value, .{ .os_name = "windows", .arch = "x86_64" }, dirs));
     assets.value.objects = &.{.{ .name = "../escape", .hash = @as([20]u8, @splat(0)), .size = 0 }};
     try std.testing.expectError(error.UnsafePath, build(a, version.value, assets.value, env, dirs));
+}
+test "Windows Unicode asset aliases fail before virtual or resources materialization" {
+    const a = std.testing.allocator;
+    var version = try m.version.parseSlice(a, legacy_fixture);
+    defer version.deinit();
+    for ([_]bool{ false, true }) |virtual| {
+        for ([_]bool{ false, true }) |reverse| {
+            const names: [2][]const u8 = if (reverse) .{ "ä.ogg", "Ä.ogg" } else .{ "Ä.ogg", "ä.ogg" };
+            const objects = [_]m.asset_index.Asset{
+                .{ .name = names[0], .hash = @splat(1), .size = 5 },
+                .{ .name = names[1], .hash = @splat(2), .size = 5 },
+            };
+            const assets: m.asset_index.AssetIndex = .{ .objects = &objects, .virtual = virtual, .map_to_resources = !virtual };
+            const directories: Directories = .{ .root = "中文目录", .instance_name = "中文实例", .game_directory = "中文目录/versions/中文实例" };
+            const windows: m.rules.Environment = .{ .os_name = "windows", .arch = "x86_64" };
+            try std.testing.expectError(error.PathConflict, build(a, version.value, assets, windows, directories));
+            try std.testing.expectError(error.PathConflict, buildInstalled(a, version.value, assets, windows, directories));
+            var linux = try build(a, version.value, assets, env, directories);
+            defer linux.deinit();
+            try std.testing.expectEqual(@as(usize, 2), linux.value.asset_materializations.len);
+        }
+    }
+    version.value.id = "中文版本";
+    version.value.asset_index.?.id = "资源索引";
+    const chinese_assets: m.asset_index.AssetIndex = .{
+        .objects = &.{.{ .name = "声音/中文.ogg", .hash = @splat(1), .size = 5 }},
+        .virtual = true,
+        .map_to_resources = true,
+    };
+    var chinese = try buildInstalled(a, version.value, chinese_assets, .{ .os_name = "windows", .arch = "x86_64" }, .{
+        .root = "中文目录",
+        .instance_name = "中文实例",
+        .game_directory = "中文目录/versions/中文实例",
+    });
+    defer chinese.deinit();
+    const expected_client = try std.fs.path.join(a, &.{ "中文目录", "versions", "中文版本", "中文版本.jar" });
+    defer a.free(expected_client);
+    try std.testing.expectEqualStrings(expected_client, chinese.value.client_path);
+    try std.testing.expectEqual(@as(usize, 2), chinese.value.asset_materializations.len);
+    const expected_resource = try std.fs.path.join(a, &.{ "中文目录/versions/中文实例", "resources", "声音/中文.ogg" });
+    defer a.free(expected_resource);
+    try std.testing.expectEqualStrings(expected_resource, chinese.value.asset_materializations[1].destination);
 }
 
 test "OS-only native variants select a matching CPU without hiding missing architectures" {

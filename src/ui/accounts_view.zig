@@ -47,6 +47,7 @@ pub const Ui = struct {
     remember: bool = false,
     remember_probe: bool = false,
     failure: ?anyerror = null,
+    open_url: *const fn ([]const u8) bool = nativeOpenUrl,
 
     pub fn init(a: Allocator) !Ui {
         return .{ .allocator = a };
@@ -130,6 +131,8 @@ fn errorText(failure: anyerror) []const u8 {
         error.InvalidAccountName => "用户名须为 3–16 位字母、数字或下划线",
         error.DuplicateUuid => "此账户已存在，请直接选择已有账户",
         error.AccountNotFound => "账户不存在，请重新选择",
+        error.Unconfigured => "请在设置中配置 Microsoft 客户端 ID，然后重试登录",
+        error.OpenVerificationFailed => "无法打开浏览器，请手动访问下方验证网址并输入验证码",
         else => fmt("操作失败：{s}", .{@errorName(failure)}),
     };
 }
@@ -201,14 +204,16 @@ pub fn draw(ui: *Ui, store: *config.Store, manager: *Manager, avatars: ?*avatar_
         const delay_ms = cache.retryDelayMilliseconds();
         if (delay_ms != std.math.maxInt(u32)) dvui.timer(dvui.parentGet().data().id.update("account-avatar-poll"), @intCast(@min(@as(u64, delay_ms) * 1000, std.math.maxInt(i32))));
     }
-    drawDialogs(ui, doc, controls_busy);
+    const now_ms: u64 = @intCast(@max(0, std.Io.Clock.awake.now(manager.io).toMilliseconds()));
+    drawDialogs(ui, doc, snapshot, now_ms);
 }
 
 /// Presentation only: queues user intent; callers decide whether to execute it.
-pub fn drawDialogs(ui: *Ui, doc: *const config.Document, busy: bool) void {
+pub fn drawDialogs(ui: *Ui, doc: *const config.Document, snapshot: accounts_manager.Snapshot, now_ms: u64) void {
+    const busy = snapshot.busy or snapshot.publication_pending;
     if (ui.editor_open) drawEditor(ui, doc, busy);
     if (ui.confirmation != null) drawConfirmation(ui, doc, busy);
-    if (ui.login_open) drawLogin(ui);
+    if (ui.login_open) drawLogin(ui, snapshot, now_ms);
 }
 
 fn drawEditor(ui: *Ui, doc: *const config.Document, busy: bool) void {
@@ -221,7 +226,7 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, busy: bool) void {
         (if (ui.failure != null) theme.style.dialogs.error_height else @as(f32, 0));
     const window = components.modal(@src(), if (adding) "添加账户" else if (microsoft) "编辑微软账户" else "编辑离线账户", height);
     defer window.deinit();
-    const name = std.mem.sliceTo(&ui.draft.name, 0);
+    var save_clicked = false;
     {
         const actions = components.modalActions(@src(), 3);
         defer actions.deinit();
@@ -232,7 +237,7 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, busy: bool) void {
         if (microsoft) {
             if (actions.action(@src(), 2, "退出登录", .{ .enabled = enabled, .tag = "account-sign-out" })) ui.queue(.ask_sign_out, ui.draft.id, null);
         } else {
-            if (actions.action(@src(), if (adding) 1 else 2, if (adding) "离线登录" else "保存", .{ .enabled = !busy and (adding or current), .primary = !adding, .tag = "account-offline-login" })) ui.queue(.save, ui.draft.id, name);
+            save_clicked = actions.action(@src(), if (adding) 1 else 2, if (adding) "离线登录" else "保存", .{ .enabled = !busy and (adding or current), .primary = !adding, .tag = "account-offline-login" });
         }
         if (adding) {
             if (actions.action(@src(), 2, "微软登录", .{ .enabled = !busy, .primary = true, .tag = "account-microsoft-login" })) ui.queue(.start, null, null);
@@ -263,6 +268,8 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, busy: bool) void {
         }
         if (!current) components.text(@src(), "所选账户已更改，请关闭后重新编辑", danger);
     } else components.text(@src(), "账户不存在，请关闭后重新选择", danger);
+    // Footer layout runs first; copy only after the field handles this frame’s events.
+    if (save_clicked) ui.queue(.save, ui.draft.id, std.mem.sliceTo(&ui.draft.name, 0));
     if (ui.failure) |err| {
         _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
         components.text(@src(), errorText(err), danger);
@@ -288,7 +295,7 @@ fn drawConfirmation(ui: *Ui, doc: *const config.Document, busy: bool) void {
     } else components.text(@src(), "账户不存在", danger);
     if (ui.failure) |err| components.text(@src(), errorText(err), danger);
 }
-fn drawLogin(ui: *Ui) void {
+fn drawLogin(ui: *Ui, snapshot: accounts_manager.Snapshot, now_ms: u64) void {
     const window = components.modal(@src(), if (ui.verification_open) "微软登录 · 等待授权" else "微软登录 · 验证码", if (ui.verification_open) theme.style.dialogs.device_wait_height else theme.style.dialogs.device_code_height);
     defer window.deinit();
     switch (components.modalFormActions(@src(), .{ .cancel_label = "返回", .save_label = "关闭" })) {
@@ -302,20 +309,44 @@ fn drawLogin(ui: *Ui) void {
     _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
     const information = components.modalSection(@src(), .{ .min_height = if (ui.verification_open) 248 else 200, .gap_after = 0, .tag = "account-device-information" });
     defer information.deinit();
-    components.text(@src(), "验证码", theme.muted);
-    _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
-    dvui.labelNoFmt(@src(), "ABCD-EFGH", .{}, .{ .font = theme.fontSized(24), .min_size_content = .{ .w = 184, .h = 36 }, .padding = .{ .x = 12, .y = 10, .w = 12, .h = 10 }, .border = R.all(0), .margin = .{ .h = 18 }, .background = true, .color_fill = .{ .color = theme.background } });
-    {
-        const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0), .background = false });
-        defer actions.deinit();
-        if (components.button(@src(), "复制验证码", .{ .placement = .footer, .tag = "account-copy-code" })) ui.queue(.copy_code, null, "ABCD-EFGH");
-        _ = dvui.spacer(@src(), .{ .min_size_content = .width(theme.style.dialogs.action_gap) });
-        if (components.button(@src(), if (ui.verification_open) "重新打开验证页" else "打开验证页", .{ .primary = true, .placement = .footer, .min_width = if (ui.verification_open) 184 else 144, .tag = "account-open-verification" })) ui.queue(.open_verification, null, null);
-    }
-    if (ui.verification_open) {
+    components.text(@src(), phaseText(snapshot.phase), if (snapshot.phase == .authenticated) theme.accent else theme.muted);
+    if (snapshot.device) |device| {
+        const usable = (snapshot.phase == .device_pending or snapshot.phase == .slow_down) and now_ms < device.expires_at_ms;
         _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
-        components.text(@src(), "等待授权完成", theme.muted);
+        dvui.labelNoFmt(@src(), device.userCode(), .{}, .{ .font = theme.fontSized(24), .min_size_content = .{ .w = 184, .h = 36 }, .padding = .{ .x = 12, .y = 10, .w = 12, .h = 10 }, .border = R.all(0), .margin = .{ .h = 18 }, .background = true, .color_fill = .{ .color = theme.background }, .tag = "account-device-code" });
+        components.hint(@src(), device.verificationUri());
+        components.hint(@src(), fmt("有效期剩余 {d} 秒 · 下次检查 {d} 秒后", .{ ((device.expires_at_ms -| now_ms) + 999) / 1000, ((device.next_poll_ms -| now_ms) + 999) / 1000 }));
+        {
+            const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0), .background = false });
+            defer actions.deinit();
+            if (components.button(@src(), "复制验证码", .{ .enabled = usable, .placement = .footer, .tag = "account-copy-code" })) ui.queue(.copy_code, null, device.userCode());
+            _ = dvui.spacer(@src(), .{ .min_size_content = .width(theme.style.dialogs.action_gap) });
+            if (components.button(@src(), if (ui.verification_open) "重新打开验证页" else "打开验证页", .{ .enabled = usable, .primary = true, .placement = .footer, .min_width = if (ui.verification_open) 184 else 144, .tag = "account-open-verification" })) ui.queue(.open_verification, null, null);
+        }
     }
+    if (snapshot.failure) |err| components.text(@src(), errorText(err), danger);
+    if (ui.failure) |err| components.text(@src(), errorText(err), danger);
+    const unconfigured = if (ui.failure) |err| err == error.Unconfigured else false;
+    if (!snapshot.busy and !snapshot.publication_pending and (snapshot.phase == .failed or snapshot.phase == .expired or snapshot.phase == .cancelled or unconfigured)) {
+        if (components.button(@src(), "重试登录", .{ .primary = true, .tag = "account-login-retry" })) ui.queue(.start, null, null);
+    }
+    if (snapshot.busy or snapshot.phase == .device_pending or snapshot.phase == .slow_down) dvui.timer(dvui.parentGet().data().id.update("account-login-poll"), 250_000);
+}
+
+fn nativeOpenUrl(uri: []const u8) bool {
+    return dvui.openURL(.{ .url = uri });
+}
+
+fn openVerification(ui: *Ui, uri: []const u8) !void {
+    if (!validVerificationUri(uri)) return error.InvalidVerificationUri;
+    if (!ui.open_url(uri)) return error.OpenVerificationFailed;
+    ui.verification_open = true;
+}
+
+fn cancelActiveLogin(manager: *Manager) void {
+    const snapshot = manager.snapshot();
+    // cancel() clears the transient launch token, so success must survive closing.
+    if (snapshot.phase != .authenticated and (snapshot.busy or snapshot.device != null or snapshot.publication_pending)) manager.cancel();
 }
 
 /// Parent must tick manager before root draw, and call this before Window.end.
@@ -371,6 +402,7 @@ fn apply(ui: *Ui, store: *config.Store, manager: *Manager, pending: Pending) !vo
             ui.draft.deinit(ui.allocator);
         },
         .close_editor => {
+            if (ui.login_open) cancelActiveLogin(manager);
             ui.editor_open = false;
             ui.login_open = false;
             ui.verification_open = false;
@@ -401,21 +433,31 @@ fn apply(ui: *Ui, store: *config.Store, manager: *Manager, pending: Pending) !vo
         },
         .close_confirm => ui.closeConfirmation(),
         .start => {
-            // Deliberately UI-only until Microsoft credentials are available.
             ui.editor_open = false;
             ui.login_open = true;
             ui.verification_open = false;
+            try manager.startDeviceRemember(store, pending.remember);
         },
-        .open_verification => ui.verification_open = true,
+        .open_verification => {
+            const snapshot = manager.snapshot();
+            const device = snapshot.device orelse return error.InvalidState;
+            if (snapshot.phase != .device_pending and snapshot.phase != .slow_down) return error.InvalidState;
+            const now_ms: u64 = @intCast(@max(0, std.Io.Clock.awake.now(manager.io).toMilliseconds()));
+            if (now_ms >= device.expires_at_ms) return error.AuthorizationExpired;
+            try openVerification(ui, device.verificationUri());
+        },
         .cancel => manager.cancel(),
         .close_login => {
+            const succeeded = manager.snapshot().phase == .authenticated;
+            cancelActiveLogin(manager);
             ui.login_open = false;
-            ui.editor_open = true;
+            ui.verification_open = false;
+            ui.editor_open = !succeeded;
+            if (succeeded) ui.draft.deinit(ui.allocator);
         },
         .copy_code => dvui.clipboardTextSet(pending.text.?),
         .open_uri => {
-            if (!validVerificationUri(pending.text.?)) return error.InvalidVerificationUri;
-            if (!dvui.openURL(.{ .url = pending.text.? })) return error.OpenVerificationFailed;
+            try openVerification(ui, pending.text.?);
         },
         .probe_remember => {
             ui.remember = false;
@@ -496,43 +538,230 @@ test "accounts view editor and confirmation remain deferred and own metadata" {
     try std.testing.expect(ui.draft.id == null);
 }
 
-test "accounts view mock Microsoft preview is local and preserves the input" {
+const LoginFixture = struct {
+    const auth = @import("../core/auth.zig");
+    const credentials = @import("../core/credentials.zig");
+    requests: usize = 0,
+    service_calls: usize = 0,
+    block_begin: bool = false,
+    entered: std.atomic.Value(bool) = .init(false),
+    saw_cancel: std.atomic.Value(bool) = .init(false),
+
+    fn fixture(self: *LoginFixture) accounts_manager.Fixture {
+        return .{
+            .transport = .{ .ctx = self, .kind = .fixture, .supports_post = true, .request = request },
+            .store = .{ .ctx = self, .vtable = &.{ .put = put, .get = get, .delete = delete } },
+            .entropy = .{ .ctx = self, .fill = entropy },
+            .journal = .{ .ctx = self, .stage = journal, .remove = journal, .references = references },
+        };
+    }
+    fn request(ctx: *anyopaque, a: Allocator, req: auth.Request) auth.TransportError!auth.Response {
+        const self: *LoginFixture = @ptrCast(@alignCast(ctx));
+        self.entered.store(true, .release);
+        if (self.block_begin) {
+            const deadline = clockMs() + 3_000;
+            while (clockMs() < deadline) {
+                if (req.cancel) |cancel| if (cancel.cancelled()) {
+                    self.saw_cancel.store(true, .release);
+                    return error.Cancelled;
+                };
+                std.testing.io.sleep(.fromMilliseconds(1), .awake) catch return error.TransportFailure;
+            }
+            return error.Timeout;
+        }
+        const suffixes = [_][]const u8{ "/devicecode", "/token", "/user/authenticate", "/xsts/authorize", "/login_with_xbox", "/entitlements/mcstore", "/minecraft/profile" };
+        const bodies = [_][]const u8{
+            "{\"device_code\":\"fixture-device-secret\",\"user_code\":\"REAL-1234\",\"verification_uri\":\"https://www.microsoft.com/link\",\"expires_in\":900,\"interval\":1}",
+            "{\"access_token\":\"fixture-msa\",\"refresh_token\":\"fixture-refresh\",\"expires_in\":3600,\"token_type\":\"Bearer\"}",
+            "{\"Token\":\"fixture-xbl\",\"DisplayClaims\":{\"xui\":[{\"uhs\":\"123\"}]}}",
+            "{\"Token\":\"fixture-xsts\",\"DisplayClaims\":{\"xui\":[{\"uhs\":\"123\"}]}}",
+            "{\"access_token\":\"fixture-minecraft\",\"expires_in\":3600}",
+            "{\"items\":[{\"name\":\"game_minecraft\"}]}",
+            "{\"id\":\"00112233445566778899aabbccddeeff\",\"name\":\"FixturePlayer\"}",
+        };
+        const index = self.requests % bodies.len;
+        if (!std.mem.endsWith(u8, req.url, suffixes[index])) return error.TransportFailure;
+        if (index == 0 and std.mem.indexOf(u8, req.body, "client_id=fixture-client") == null) return error.TransportFailure;
+        self.requests += 1;
+        return .{ .status = 200, .body = try a.dupe(u8, bodies[index]) };
+    }
+    fn put(ctx: *anyopaque, _: []const u8, _: []const u8) credentials.Error!void {
+        const self: *LoginFixture = @ptrCast(@alignCast(ctx));
+        self.service_calls += 1;
+        return error.Unavailable;
+    }
+    fn get(ctx: *anyopaque, _: Allocator, _: []const u8) credentials.Error!credentials.Secret {
+        const self: *LoginFixture = @ptrCast(@alignCast(ctx));
+        self.service_calls += 1;
+        return error.Unavailable;
+    }
+    fn delete(ctx: *anyopaque, _: []const u8) credentials.Error!void {
+        const self: *LoginFixture = @ptrCast(@alignCast(ctx));
+        self.service_calls += 1;
+        return error.Unavailable;
+    }
+    fn entropy(ctx: *anyopaque, _: []u8) error{EntropyUnavailable}!void {
+        const self: *LoginFixture = @ptrCast(@alignCast(ctx));
+        self.service_calls += 1;
+        return error.EntropyUnavailable;
+    }
+    fn journal(ctx: *anyopaque, _: credentials.Reference) anyerror!void {
+        const self: *LoginFixture = @ptrCast(@alignCast(ctx));
+        self.service_calls += 1;
+        return error.UnexpectedJournalAccess;
+    }
+    fn references(ctx: *anyopaque) []const credentials.Reference {
+        const self: *LoginFixture = @ptrCast(@alignCast(ctx));
+        self.service_calls += 1;
+        return &.{};
+    }
+    fn clockMs() u64 {
+        return @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).toMilliseconds()));
+    }
+    fn waitPhase(manager: *Manager, store: *config.Store, phase: accounts_manager.Phase) !void {
+        const deadline = clockMs() + 5_000;
+        while (clockMs() < deadline) {
+            manager.tick(store);
+            const snapshot = manager.snapshot();
+            if (!snapshot.busy and snapshot.phase == phase) return;
+            if (!snapshot.busy and snapshot.failure != null) return snapshot.failure.?;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.LoginFixtureTimedOut;
+    }
+};
+
+const BrowserFixture = struct {
+    var calls: usize = 0;
+    var succeeds: bool = false;
+    fn open(uri: []const u8) bool {
+        std.debug.assert(std.mem.eql(u8, uri, "https://www.microsoft.com/link"));
+        calls += 1;
+        return succeeds;
+    }
+};
+
+test "accounts view missing client ID reports actionable real error without services or browser" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path: [std.fs.max_path_bytes]u8 = undefined;
-    const len = try tmp.dir.realPath(std.testing.io, &path);
-    var store = try config.Store.init(std.testing.allocator, std.testing.io, path[0..len]);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var store = try config.Store.init(std.testing.allocator, std.testing.io, root);
     defer store.deinit();
+    var fake: LoginFixture = .{};
+    var manager = try Manager.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .fixture = fake.fixture() });
+    defer manager.deinit();
     var ui = try Ui.init(std.testing.allocator);
     defer ui.deinit();
-    // An undefined manager ensures preview navigation cannot touch real auth.
-    var manager: Manager = undefined;
-    ui.queue(.add, null, null);
-    finish(&ui, &store, &manager);
-    @memcpy(ui.draft.name[0..18], "player@example.com");
+    BrowserFixture.calls = 0;
+    ui.open_url = BrowserFixture.open;
     ui.queue(.start, null, null);
-    try std.testing.expect(!ui.login_open);
     finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.Unconfigured, ui.failure.?);
     try std.testing.expect(ui.login_open and !ui.editor_open);
-    try std.testing.expect(ui.failure == null);
-    try std.testing.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
-    try std.testing.expect(store.snapshot().selected_account == null);
+    try std.testing.expect(manager.snapshot().device == null and !manager.snapshot().busy);
+    try std.testing.expect(std.mem.indexOf(u8, errorText(error.Unconfigured), "客户端 ID") != null);
+    try std.testing.expectEqual(@as(usize, 0), fake.requests);
+    try std.testing.expectEqual(@as(usize, 0), fake.service_calls);
+    try std.testing.expectEqual(@as(usize, 0), BrowserFixture.calls);
+}
+
+test "accounts view production finish begins real fixture login validates browser and preserves success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var store = try config.Store.init(std.testing.allocator, std.testing.io, root);
+    defer store.deinit();
+    try store.update(.{ .settings = .{ .microsoft_client_id = "fixture-client" } });
+    var fake: LoginFixture = .{};
+    var manager = try Manager.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .fixture = fake.fixture() });
+    defer manager.deinit();
+    var ui = try Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    @memcpy(ui.draft.name[0..18], "player@example.com");
+    BrowserFixture.calls = 0;
+    BrowserFixture.succeeds = false;
+    ui.open_url = BrowserFixture.open;
+    ui.queue(.start, null, null);
+    finish(&ui, &store, &manager);
+    try LoginFixture.waitPhase(&manager, &store, .device_pending);
+    try std.testing.expectEqual(@as(usize, 1), fake.requests);
+    const device = manager.snapshot().device.?;
+    try std.testing.expectEqualStrings("REAL-1234", device.userCode());
+    try std.testing.expectEqualStrings("https://www.microsoft.com/link", device.verificationUri());
+    try std.testing.expect(device.expires_at_ms > device.next_poll_ms);
+    try std.testing.expectEqual(@as(usize, 0), BrowserFixture.calls);
+    ui.queue(.open_verification, null, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.OpenVerificationFailed, ui.failure.?);
+    try std.testing.expect(!ui.verification_open);
+    BrowserFixture.succeeds = true;
     ui.queue(.open_verification, null, null);
     finish(&ui, &store, &manager);
     try std.testing.expect(ui.verification_open);
-    try std.testing.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
-    ui.queue(.start, null, null);
+    try std.testing.expectEqual(@as(usize, 2), BrowserFixture.calls);
+    const bad_uri = "https://www.microsoft.com/link?redirect=evil";
+    @memcpy(manager.device.?.uri[0..bad_uri.len], bad_uri);
+    manager.device.?.uri_len = bad_uri.len;
+    ui.queue(.open_verification, null, null);
     finish(&ui, &store, &manager);
-    try std.testing.expect(!ui.verification_open);
+    try std.testing.expectEqual(error.InvalidVerificationUri, ui.failure.?);
+    try std.testing.expectEqual(@as(usize, 2), BrowserFixture.calls);
+    manager.device = device;
     ui.queue(.close_login, null, null);
     finish(&ui, &store, &manager);
-    try std.testing.expect(!ui.login_open and ui.editor_open);
+    try LoginFixture.waitPhase(&manager, &store, .cancelled);
+    try std.testing.expect(ui.editor_open and !ui.login_open and !ui.verification_open);
     try std.testing.expectEqualStrings("player@example.com", std.mem.sliceTo(&ui.draft.name, 0));
+    // Retry must execute a fresh begin, not redisplay the cancelled code.
+    fake.requests = 0;
+    ui.queue(.start, null, null);
+    finish(&ui, &store, &manager);
+    try LoginFixture.waitPhase(&manager, &store, .authenticated);
+    try std.testing.expectEqual(@as(usize, 7), fake.requests);
+    try std.testing.expectEqual(@as(usize, 1), store.snapshot().accounts.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.service_calls);
+    const before = try manager.launchIdentity(LoginFixture.clockMs());
+    try std.testing.expect(before.access_token != null);
     ui.queue(.close_editor, null, null);
     finish(&ui, &store, &manager);
-    try std.testing.expect(!ui.editor_open and !ui.login_open);
-    try std.testing.expectEqualStrings("", std.mem.sliceTo(&ui.draft.name, 0));
+    try std.testing.expectEqual(accounts_manager.Phase.authenticated, manager.snapshot().phase);
+    try std.testing.expect((try manager.launchIdentity(LoginFixture.clockMs())).access_token != null);
+    ui.login_open = true;
+    ui.queue(.close_login, null, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(!ui.login_open and !ui.editor_open);
+    try std.testing.expect((try manager.launchIdentity(LoginFixture.clockMs())).access_token != null);
+}
+
+test "accounts view close editor cancels an active begin before publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var store = try config.Store.init(std.testing.allocator, std.testing.io, root);
+    defer store.deinit();
+    try store.update(.{ .settings = .{ .microsoft_client_id = "fixture-client" } });
+    var fake: LoginFixture = .{ .block_begin = true };
+    var manager = try Manager.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .fixture = fake.fixture() });
+    defer manager.deinit();
+    var ui = try Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    ui.queue(.start, null, null);
+    finish(&ui, &store, &manager);
+    const deadline = LoginFixture.clockMs() + 2_000;
+    while (!fake.entered.load(.acquire)) {
+        if (LoginFixture.clockMs() >= deadline) return error.LoginFixtureTimedOut;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    ui.queue(.close_editor, null, null);
+    finish(&ui, &store, &manager);
+    try LoginFixture.waitPhase(&manager, &store, .cancelled);
+    try std.testing.expect(fake.saw_cancel.load(.acquire));
+    try std.testing.expect(!ui.login_open and !ui.editor_open);
     try std.testing.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
+    try std.testing.expect(manager.session == null and manager.snapshot().device == null);
 }
 
 test "accounts view selected Microsoft editor keeps identity read-only and signout deferred" {

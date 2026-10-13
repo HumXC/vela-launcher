@@ -190,6 +190,23 @@ pub const Context = struct {
         self.event_count += 1;
     }
 
+    // Mock auth metadata exists only in this independent, service-free gallery.
+    fn accountSnapshot(self: *const Context) @import("accounts_manager.zig").Snapshot {
+        var snapshot: @import("accounts_manager.zig").Snapshot = .{ .phase = .idle, .busy = self.variant == .loading or self.variant == .disabled, .failure = null, .device = null, .cleanup_count = 0, .publication_pending = false, .remember_available = false };
+        if (self.scene == .@"account-code" or self.scene == .@"account-wait") {
+            var device: @import("accounts_manager.zig").DeviceSnapshot = .{ .expires_at_ms = 900_000, .next_poll_ms = 5_000 };
+            const code = "ABCD-EFGH";
+            const uri = "https://www.microsoft.com/link";
+            @memcpy(device.code[0..code.len], code);
+            device.code_len = code.len;
+            @memcpy(device.uri[0..uri.len], uri);
+            device.uri_len = uri.len;
+            snapshot.device = device;
+            snapshot.phase = .device_pending;
+        }
+        return snapshot;
+    }
+
     /// Consume intent and free queued payloads. Never call business finish/apply.
     pub fn consumeIntents(self: *Context) void {
         if (self.account_ui.pending) |pending| {
@@ -227,7 +244,7 @@ pub const Context = struct {
         switch (self.scene) {
             .@"account-add", .@"account-offline", .@"account-microsoft", .@"account-delete", .@"account-signout", .@"account-code", .@"account-wait" => {
                 const doc: config.Document = .{ .accounts = &self.account_rows, .selected_account = "mock-account" };
-                accounts.drawDialogs(&self.account_ui, &doc, self.variant == .loading or self.variant == .disabled);
+                accounts.drawDialogs(&self.account_ui, &doc, self.accountSnapshot(), 0);
             },
             .@"instance-delete", .@"instance-unsaved", .@"instance-task" => instances.drawModal(&self.instance_ui, self.variant != .disabled),
             .dialog => self.drawDialog(),
@@ -343,4 +360,20 @@ test "component preview rejects incompatible states and invalid custom data" {
     var context = try Context.init(std.testing.allocator, .@"account-add", .filled, .{ .username = "MockOnly" });
     defer context.deinit();
     try std.testing.expectEqualStrings("MockOnly", std.mem.sliceTo(&context.account_ui.draft.name, 0));
+}
+
+test "component preview device scenes inject mock snapshots and consume browser intent without services" {
+    for ([_]Scene{ .@"account-code", .@"account-wait" }) |scene| {
+        var context = try Context.init(std.testing.allocator, scene, .default, .{});
+        defer context.deinit();
+        const snapshot = context.accountSnapshot();
+        try std.testing.expectEqualStrings("ABCD-EFGH", snapshot.device.?.userCode());
+        try std.testing.expectEqualStrings("https://www.microsoft.com/link", snapshot.device.?.verificationUri());
+        try std.testing.expect(context.account_ui.login_open);
+        try std.testing.expectEqual(scene == .@"account-wait", context.account_ui.verification_open);
+        context.account_ui.pending = .{ .action = .open_verification };
+        context.consumeIntents();
+        try std.testing.expect(context.account_ui.pending == null);
+        try std.testing.expectEqual(@as(u64, 1), context.event_count);
+    }
 }

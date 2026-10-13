@@ -80,7 +80,7 @@ const AccountFrame = struct {
         const modal = dvui.currentWindow().subwindows.get(id) orelse return error.AccountConfirmationMissing;
         // The left form action is Cancel; click its actual captured native button.
         for (capture.widgets.items) |widget| {
-            if (widget.subwindow_id != id or !std.mem.eql(u8, widget.name orelse "", "Button") or !std.mem.eql(u8, widget.src_fn, "formActions")) continue;
+            if (widget.subwindow_id != id or !std.mem.eql(u8, widget.name orelse "", "Button") or !std.mem.eql(u8, widget.src_fn, "modalFormActions")) continue;
             if (widget.rect_border.center().x >= modal.rect_pixels.center().x) continue;
             try inside(modal.rect_pixels, widget.rect_border);
             _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = widget.rect_border.center() });
@@ -180,4 +180,43 @@ test "accounts view native selected Edit precedes Add and Delete stays inside se
             try std.testing.expectEqualStrings(account.id, store.snapshot().selected_account.?);
         }
     }
+}
+
+test "accounts view native same-frame text edit and save captures final field value" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var store = try config.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    var manager = try accounts_manager.Manager.init(a, std.testing.io, root);
+    defer manager.deinit();
+    var ui = try view.Ui.init(a);
+    defer ui.deinit();
+    ui.editor_open = true;
+    @memcpy(ui.draft.name[0..6], "Before");
+    AccountFrame.ui = &ui;
+    AccountFrame.store = &store;
+    AccountFrame.manager = &manager;
+    var window = try dvui.testing.init(.{ .window_size = .{ .w = 1280, .h = 720 } });
+    defer window.deinit();
+    window.backend.size_pixels = .{ .w = 1280, .h = 720 };
+    try dvui.testing.settle(AccountFrame.draw);
+    try AccountFrame.click("account-name");
+    try dvui.testing.pressKey(.a, .lcontrol);
+    try dvui.testing.writeText("AfterEdit");
+    // Both text and the real footer click belong to the very next frame.
+    const save = try dvui.testing.tagGet("account-offline-login");
+    _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = save.rect.center() });
+    try dvui.testing.click(.left);
+    _ = try dvui.testing.step(AccountFrame.draw);
+    try std.testing.expectEqualStrings("AfterEdit", std.mem.sliceTo(&ui.draft.name, 0));
+    try std.testing.expectEqualStrings("AfterEdit", ui.pending.?.text.?);
+    // Queued metadata owns the value, independent of later draft edits.
+    ui.draft.name[0] = 'Z';
+    view.finish(&ui, &store, &manager);
+    try std.testing.expectEqualStrings("AfterEdit", store.snapshot().accounts[0].name);
+    try std.testing.expect(!ui.editor_open);
 }
