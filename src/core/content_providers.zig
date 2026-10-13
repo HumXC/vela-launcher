@@ -986,7 +986,7 @@ test "owned version strings compatibility hashes and CurseForge restriction" {
     try testing.expectEqual(DependencyKind.required, versions.value.versions[0].dependencies[0].kind);
 }
 test "provider parse OOM unwinds all ownership" {
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseParsers, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseParsers, .{});
 }
 test "hash algorithms verify correctly and URLs and malformed responses fail closed" {
     try verifyBytes("abc", .{ .sha1 = "a9993e364706816aba3e25717850c26c9cd0d89d", .sha512 = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f" }, 3);
@@ -1033,7 +1033,7 @@ test "dependency cycles unknown required ambiguity optional and incompatible" {
     var blocked = try planDependencies(testing.allocator, &incompatible, &.{ root, .{ .provider = .modrinth, .id = "b" } }, test_filter, &.{});
     defer blocked.deinit();
     try testing.expectEqual(IssueKind.incompatible, blocked.value.issues[0].kind);
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseDependencies, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseDependencies, .{});
 }
 const FixtureTransport = struct {
     calls: usize = 0,
@@ -1076,7 +1076,7 @@ fn exerciseClient(a: std.mem.Allocator) !void {
 }
 test "bounded injectable transport CF gate response guards and OOM" {
     try exerciseClient(testing.allocator);
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseClient, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseClient, .{});
     var fixture: FixtureTransport = .{ .mode = .rate_limited };
     const client: Client = .{ .allocator = testing.allocator, .transport = .{ .context = &fixture, .get = FixtureTransport.get }, .user_agent = "Vela/fixture" };
     try testing.expectError(error.ProviderDisabled, client.curseForge());
@@ -1235,7 +1235,7 @@ fn exerciseCurseForgeClient(a: std.mem.Allocator) !void {
 }
 test "CurseForge opt-in client URLs owned metadata pagination and OOM are pure" {
     try exerciseCurseForgeClient(testing.allocator);
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseCurseForgeClient, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseCurseForgeClient, .{});
 }
 test "CurseForge all missing opt-in gates short circuit every route before transport" {
     var fixture: CurseForgeFixtureTransport = .{};
@@ -1254,7 +1254,7 @@ test "CurseForge all missing opt-in gates short circuit every route before trans
         try testing.expectError(error.ProviderDisabled, client.versions(cf_fixture_project, test_filter));
         try testing.expectError(error.ProviderDisabled, client.version(cf_fixture_project, "34", null));
     }
-    const long_key = [_]u8{'x'} ** 513;
+    const long_key: [513]u8 = @splat('x');
     for ([_][]const u8{ "bad\r\nheader", "bad key", "\x7f", "\x80", &long_key }) |key| {
         var client = fixture.client(testing.allocator);
         client.options.api_key = key;
@@ -1394,7 +1394,7 @@ fn exerciseAuthorizedCurseForge(a: std.mem.Allocator) !void {
 }
 test "authorized CF metadata owns fresh project proof and cleans every allocation failure" {
     try exerciseAuthorizedCurseForge(testing.allocator);
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseAuthorizedCurseForge, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseAuthorizedCurseForge, .{});
 }
 test "manual CF metadata and raw remote URLs never authorize installation" {
     var fixture: CurseForgeFixtureTransport = .{ .mode = .version };
@@ -1489,7 +1489,7 @@ fn exerciseModpackCandidates(a: std.mem.Allocator) !void {
 
 test "CF modpack candidates own manual and remote results across allocation failures" {
     try exerciseModpackCandidates(testing.allocator);
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseModpackCandidates, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseModpackCandidates, .{});
 }
 
 test "CF modpack candidates preserve tags and Minecraft filtering while ordinary versions stay strict" {

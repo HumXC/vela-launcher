@@ -366,8 +366,8 @@ test "failed replacement preserves existing argv and value at every allocation" 
         defer b.deinit();
         try b.add(heap, "2G");
         failing.fail_index = failing.alloc_index + failure_offset;
-        const big = "4" ** 8192;
-        b.add(heap, big) catch |err| {
+        const big: [8192]u8 = @splat('4');
+        b.add(heap, &big) catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
             try std.testing.expectEqualStrings("2G", b.get(heap.key).?);
             try expectArgv(&b, &.{ "java", "-Xmx2G" });
@@ -403,5 +403,5 @@ test "removal accepts borrowed key and preserves remaining order" {
 }
 
 test "all allocation failure paths clean up" {
-    try std.testing.checkAllAllocationFailures(test_allocator, allocationCase, .{});
+    try @import("test_allocations").checkAllAllocationFailures(test_allocator, allocationCase, .{});
 }

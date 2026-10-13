@@ -90,5 +90,5 @@ fn allocationCase(allocator: std.mem.Allocator) !void {
     defer p.deinit();
 }
 test "owned nested parse cleans all allocation failure paths" {
-    try std.testing.checkAllAllocationFailures(a, allocationCase, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, allocationCase, .{});
 }

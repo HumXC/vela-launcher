@@ -8,6 +8,13 @@ allowed_log_regexes (reviewed full-line allowances). Both scripts
 must be in sources. Root is an existing, empty, owned mktemp directory
 /tmp/vela-gui-current.<suffix>. Only 1280x720 and 640x400 are supported.
 
+Scenes are layout or instance-prepared. The latter uses the ordinary instance
+creation fixture with real prepared ownership, proof and materialization checks.
+--instance-hold installer retains its cancellation/JOIN exercise; this helper's
+forced stop is still not JOIN evidence. Owner/closure profiles contain scene and
+hold, plus java_progress only for the seeded Java layout. Pack archive, provider,
+review and adoption controls are not accepted.
+
 Native close: --allow-native-quit enables the explicit native-quit operation
 with stage=ordinary-deinit. stop uses forced closure, never JOIN evidence.
 Resume requires --resume <prior closure> --previous-job-collected, plus an
@@ -46,12 +53,9 @@ APPROVED_LIBRARY_DIRS = (
     "/nix/store/4hlgp6r4j5p6b2b9sxw01cba0x3fjxd6-systemd-minimal-libs-261.2/lib",
     "/nix/store/rarvfpm927fcbd6b9p0crg09w9r3ywb3-libglvnd-1.7.0/lib",
 )
-INITIAL_PANELS = ("home", "shutdown")
-FIXTURE_SCENES = ("layout", "pack", "pack-prepared")
-PACK_ARCHIVES = ("modrinth", "curseforge")
-PACK_HOLDS = ("none", "inspection", "content", "installer")
-PACK_SCENARIOS = ("default", "cf-restricted", "cf-manual", "update-keep",
-                  "update-replace", "protected-reject")
+INITIAL_PANELS = ("home", "shutdown", "java")
+FIXTURE_SCENES = ("layout", "instance-prepared")
+INSTANCE_HOLDS = ("none", "installer")
 FIXTURE_LIFECYCLE_LIMIT = (
     "Seeded fixture Registry cancellation and dialog rendering only; does not prove "
     "production close/hide/game or per-real-worker JOIN.")
@@ -622,34 +626,29 @@ def tcp_owned(identities):
 
 
 def validate_fixture_profile(profile):
-    base_fields = {"scene", "archive", "hold", "adoption_retry"}
+    base_fields = {"scene", "hold"}
     require(type(profile) is dict and
-            set(profile) in (base_fields, base_fields | {"scenario"}),
+            set(profile) in (base_fields, base_fields | {"java_progress"}),
             "Missing or invalid fixture profile fields")
-    scenario = profile.get("scenario", "default")
-    require(type(scenario) is str and scenario in PACK_SCENARIOS and
-            ("scenario" not in profile or scenario != "default"),
-            "Default fixture profile must retain exactly four fields")
     require(type(profile["scene"]) is str and profile["scene"] in FIXTURE_SCENES and
-            type(profile["archive"]) is str and profile["archive"] in PACK_ARCHIVES and
-            type(profile["hold"]) is str and profile["hold"] in PACK_HOLDS and
-            type(profile["adoption_retry"]) is bool, "Invalid fixture profile values")
-    require(profile["scene"] != "layout" or
-            (profile["archive"] == "modrinth" and profile["hold"] == "none" and
-             profile["adoption_retry"] is False), "Layout requires default fixture profile")
-    require(profile["scene"] != "pack-prepared" or profile["archive"] == "modrinth",
-            "Prepared fixture requires Modrinth archive")
-    require(profile["hold"] != "installer" or profile["scene"] == "pack-prepared",
-            "Installer hold requires prepared fixture")
-    result = {key: profile[key] for key in ("scene", "archive", "hold", "adoption_retry")}
-    if scenario != "default":
-        require(profile["scene"] == "pack" and profile["hold"] == "none" and
-                profile["adoption_retry"] is False,
-                "Deep scenarios require pack scene without holds or adoption retry")
-        expected_archive = "curseforge" if scenario.startswith("cf-") else "modrinth"
-        require(profile["archive"] == expected_archive, "Scenario/archive mismatch")
-        result["scenario"] = scenario
+            type(profile["hold"]) is str and profile["hold"] in INSTANCE_HOLDS,
+            "Invalid fixture profile values")
+    require(profile["hold"] == "none" or profile["scene"] == "instance-prepared",
+            "Installer hold requires ordinary prepared creation")
+    result = {key: profile[key] for key in ("scene", "hold")}
+    if "java_progress" in profile:
+        require(profile["java_progress"] is True and profile["scene"] == "layout" and
+                profile["hold"] == "none", "Invalid seeded Java progress profile")
+        result["java_progress"] = True
     return result
+
+
+def fixture_profile(args):
+    profile = {"scene": args.fixture_scene, "hold": args.instance_hold}
+    if args.java_progress:
+        require(args.initial_panel == "java", "Seeded Java progress requires Java panel")
+        profile["java_progress"] = True
+    return validate_fixture_profile(profile)
 
 
 def validate_frame(frame, tree, freeze, owner=False):
@@ -722,11 +721,7 @@ class Harness:
         self.initial_panel = args.initial_panel
         require(self.initial_panel in INITIAL_PANELS, "Invalid initial fixture panel")
         # Immutable canonical pairs; every evidence frame receives its own dictionary.
-        profile = {"scene": args.fixture_scene, "archive": args.pack_archive,
-                   "hold": args.pack_hold, "adoption_retry": args.pack_adoption_retry}
-        if args.pack_scenario != "default":
-            profile["scenario"] = args.pack_scenario
-        self.fixture_profile = tuple(validate_fixture_profile(profile).items())
+        self.fixture_profile = tuple(fixture_profile(args).items())
         self.tree = Tree(args.root)
         self.children = []
         self.spawn_serial = 0
@@ -802,12 +797,10 @@ class Harness:
             "SDL_RENDER_DRIVER": "opengl", "VELA_DATA_DIR": self.fixture,
             "VELA_FIXTURE_ROOT": self.fixture, "VELA_FIXTURE_PANEL": self.initial_panel,
             "VELA_FIXTURE_SCENE": profile["scene"], "VELA_FIXTURE_VIEWPORT": self.args.viewport,
-            "VELA_FIXTURE_PACK_ARCHIVE": profile["archive"],
-            "VELA_FIXTURE_PACK_HOLD": profile["hold"],
-            "VELA_FIXTURE_PACK_ADOPTION_RETRY": "1" if profile["adoption_retry"] else "0",
+            "VELA_FIXTURE_INSTANCE_HOLD": profile["hold"],
         }
-        if "scenario" in profile:
-            self.env["VELA_FIXTURE_PACK_SCENARIO"] = profile["scenario"]
+        if profile.get("java_progress"):
+            self.env["VELA_FIXTURE_JAVA_PROGRESS"] = "1"
         os.environ.clear()
         os.environ.update(self.env)
         os.mkfifo("commands.fifo", 0o600, dir_fd=t.fds[self.run])
@@ -1401,23 +1394,29 @@ class Harness:
         return absent and not problems
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest")
     parser.add_argument("root")
     parser.add_argument("viewport", choices=("1280x720", "640x400"))
     parser.add_argument("--initial-panel", choices=INITIAL_PANELS, default="home")
     parser.add_argument("--fixture-scene", choices=FIXTURE_SCENES, default="layout")
-    parser.add_argument("--pack-archive", choices=PACK_ARCHIVES, default="modrinth")
-    parser.add_argument("--pack-hold", choices=PACK_HOLDS, default="none")
-    parser.add_argument("--pack-adoption-retry", action="store_true")
-    parser.add_argument("--pack-scenario", choices=PACK_SCENARIOS, default="default")
+    parser.add_argument("--java-progress", action="store_true",
+                        help="Seed real Task details for production Java UI; no network proof")
+    parser.add_argument("--instance-hold", choices=INSTANCE_HOLDS, default="none",
+                        help="Hold an ordinary prepared installer until cancellation/JOIN")
     parser.add_argument("--resume", metavar="PRIOR_CLOSURE")
     parser.add_argument("--previous-job-collected", action="store_true")
     parser.add_argument("--allow-native-quit", action="store_true")
     parser.add_argument("--session-timeout", type=int, default=900)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     require(30 <= args.session_timeout <= 3600, "Session timeout outside finite bounds")
+    fixture_profile(args)
+    return args
+
+
+def main():
+    args = parse_args()
     os.umask(0o077)
     sys.dont_write_bytecode = True
     harness = Harness(args)

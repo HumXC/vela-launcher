@@ -245,8 +245,8 @@ fn oomStream(allocator: std.mem.Allocator) !void {
     defer status.deinit();
 }
 test "all allocation failures free JSON icon and protocol ownership" {
-    try std.testing.checkAllAllocationFailures(a, oomParse, .{});
-    try std.testing.checkAllAllocationFailures(a, oomStream, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, oomParse, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, oomStream, .{});
 }
 
 const Loopback = struct {

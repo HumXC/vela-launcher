@@ -18,6 +18,6 @@ pub const Labels = struct {
     current: []const u8 = "当前",
     versionList: []const u8 = "游戏版本列表",
     noVersions: []const u8 = "暂无版本",
-    home: []const u8 = "主页",
+    home: []const u8 = "返回主页",
     unavailable: []const u8 = "该功能尚未接入",
 };

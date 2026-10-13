@@ -12,9 +12,10 @@ pub const Directories = struct {
 };
 pub const Kind = enum { client, library, native, asset_index, asset, logging };
 pub const File = struct { kind: Kind, url: []const u8, path: []const u8, sha1: ?m.Sha1, size: ?u64 };
-pub const NativeExtraction = struct { archive_path: []const u8, destination: []const u8, exclude: []const []const u8 };
+pub const ClassicFamily = @import("native_arch.zig").ClassicFamily;
+pub const NativeExtraction = struct { archive_path: []const u8, destination: []const u8, exclude: []const []const u8, classic_family: ?ClassicFamily = null };
 pub const NativeSuitability = enum { compatible, inspection_required, incompatible };
-pub const NativeCheck = struct { archive_path: []const u8, classifier: []const u8, suitability: NativeSuitability };
+pub const NativeCheck = struct { archive_path: []const u8, classifier: []const u8, suitability: NativeSuitability, classic_family: ?ClassicFamily = null };
 pub const AssetMaterialization = struct { source_path: []const u8, destination: []const u8, sha1: m.Sha1, size: u64 };
 pub const Plan = struct {
     files: []const File,
@@ -29,6 +30,17 @@ pub const Plan = struct {
 /// Inputs must describe the same version. Paths are lexical: executor must also
 /// prevent symlink escapes and validate archive members when performing IO.
 pub fn build(allocator: std.mem.Allocator, version: m.version.Version, assets: m.asset_index.AssetIndex, environment: m.rules.Environment, directories: Directories) !m.Owned(Plan) {
+    return buildPlan(allocator, version, assets, environment, directories, false);
+}
+
+/// Read-only consumers must verify every planned file before using it. Libraries
+/// without a remote URL remain in the plan and require a SHA-1 and nonzero size.
+/// Download installation continues to use build, which requires remote URLs.
+pub fn buildInstalled(allocator: std.mem.Allocator, version: m.version.Version, assets: m.asset_index.AssetIndex, environment: m.rules.Environment, directories: Directories) !m.Owned(Plan) {
+    return buildPlan(allocator, version, assets, environment, directories, true);
+}
+
+fn buildPlan(allocator: std.mem.Allocator, version: m.version.Version, assets: m.asset_index.AssetIndex, environment: m.rules.Environment, directories: Directories, installed_mode: bool) !m.Owned(Plan) {
     if (version.inherits_from != null) return error.UnresolvedInheritance;
     if (version.jar) |id| try m.version.validateId(id);
     if (directories.root.len == 0 or std.mem.indexOfScalar(u8, directories.root, 0) != null) return error.InvalidDirectories;
@@ -48,7 +60,7 @@ pub fn build(allocator: std.mem.Allocator, version: m.version.Version, assets: m
     const cpu = directories.cpu_arch orelse if (@hasField(m.rules.Environment, "cpu_arch")) environment.cpu_arch else environment.arch;
     const native_destination = if (directories.natives) |path| try a.dupe(u8, path) else try std.fs.path.join(a, &.{ directories.root, "versions", instance, "natives" });
     var native_checks: std.ArrayList(NativeCheck) = .empty;
-    var context: Context = .{ .a = a, .root = directories.root, .windows = std.mem.eql(u8, environment.os_name, "windows") };
+    var context: Context = .{ .a = a, .root = directories.root, .windows = std.mem.eql(u8, environment.os_name, "windows"), .installed = installed_mode };
     var cp: std.ArrayList([]const u8) = .empty;
     var cp_seen: std.StringHashMapUnmanaged(void) = .empty;
     var extractions: std.ArrayList(NativeExtraction) = .empty;
@@ -77,9 +89,15 @@ pub fn build(allocator: std.mem.Allocator, version: m.version.Version, assets: m
             const classifier = if (coordinate) |c| c.classifier else null;
             const modern_native = if (classifier) |c| std.mem.startsWith(u8, c, "natives-") else false;
             const suitability = if (modern_native) nativeSuitability(library.name, classifier.?, environment.os_name, cpu) else NativeSuitability.compatible;
-            if (suitability == .incompatible) return error.IncompatibleNativeArchitecture;
+            if (suitability == .incompatible) {
+                // Mojang lists CPU alternatives as separate artifact libraries with
+                // OS-only rules. Skip an alternative only if this exact Maven
+                // family also provides a native candidate for the selected host.
+                if (modern_native and try hostNativeAlternative(version.libraries.?, coordinate.?, environment, cpu)) continue;
+                return error.IncompatibleNativeArchitecture;
+            }
             const installed = try context.add(if (modern_native) .native else .library, &.{ "libraries", path }, download);
-            if (modern_native) try native_checks.append(a, .{ .archive_path = installed, .classifier = try a.dupe(u8, classifier.?), .suitability = suitability });
+            if (modern_native) try native_checks.append(a, .{ .archive_path = installed, .classifier = try a.dupe(u8, classifier.?), .suitability = suitability, .classic_family = classicFamily(coordinate, classifier.?, environment.os_name) });
             const key = try context.pathKey(installed);
             const result = try cp_seen.getOrPut(a, key);
             if (!result.found_existing) try cp.append(a, installed);
@@ -96,14 +114,15 @@ pub fn build(allocator: std.mem.Allocator, version: m.version.Version, assets: m
             } else try legacyDownload(a, library, coordinate, classifier);
             const path = download.path orelse if (coordinate) |c| try c.path(a, classifier) else return error.MissingLibraryPath;
             const installed = try context.add(.native, &.{ "libraries", path }, download);
-            try native_checks.append(a, .{ .archive_path = installed, .classifier = try a.dupe(u8, classifier), .suitability = suitability });
+            const classic_family = classicFamily(coordinate, classifier, environment.os_name);
+            try native_checks.append(a, .{ .archive_path = installed, .classifier = try a.dupe(u8, classifier), .suitability = suitability, .classic_family = classic_family });
             const excludes = library.extract_exclude orelse &.{};
             const copied = try a.alloc([]const u8, excludes.len);
             for (excludes, copied) |exclude, *out| {
                 if (std.mem.indexOfScalar(u8, exclude, 0) != null) return error.UnsafePath;
                 out.* = try a.dupe(u8, exclude);
             }
-            try extractions.append(a, .{ .archive_path = installed, .destination = native_destination, .exclude = copied });
+            try extractions.append(a, .{ .archive_path = installed, .destination = native_destination, .exclude = copied, .classic_family = classic_family });
             break;
         }
     }
@@ -157,6 +176,35 @@ pub fn nativeSuitability(library_name: []const u8, classifier: []const u8, os_na
     if (generic and std.mem.startsWith(u8, library_name, "org.lwjgl:")) return if (host == .x86_64) .compatible else .incompatible;
     return .inspection_required;
 }
+// A path or a native-looking filename alone never enables a mixed CPU layout.
+fn classicFamily(coordinate: ?m.version.MavenCoordinate, classifier: []const u8, os_name: []const u8) ?ClassicFamily {
+    const c = coordinate orelse return null;
+    if (!std.mem.eql(u8, c.extension, "jar")) return null;
+    if (c.classifier) |declared| if (!std.mem.eql(u8, declared, classifier)) return null;
+    const linux = std.mem.eql(u8, os_name, "linux") and std.mem.eql(u8, classifier, "natives-linux");
+    const windows = std.mem.eql(u8, os_name, "windows") and std.mem.eql(u8, classifier, "natives-windows");
+    if (!linux and !windows) return null;
+    if (std.mem.eql(u8, c.group, "org.lwjgl.lwjgl") and std.mem.eql(u8, c.artifact, "lwjgl-platform") and std.mem.startsWith(u8, c.version, "2.")) return if (linux) .lwjgl2_linux else .lwjgl2_windows;
+    if (std.mem.eql(u8, c.group, "net.java.jinput") and std.mem.eql(u8, c.artifact, "jinput-platform") and std.mem.eql(u8, c.version, "2.0.5")) return if (linux) .jinput_linux else .jinput_windows;
+    return null;
+}
+
+fn hostNativeAlternative(libraries: []const m.version.Library, target: m.version.MavenCoordinate, environment: m.rules.Environment, cpu: []const u8) !bool {
+    for (libraries) |candidate| {
+        if (!try m.rules.allows(candidate.rules, environment)) continue;
+        if (candidate.downloads == null or candidate.downloads.?.artifact == null) continue;
+        if (std.mem.indexOfScalar(u8, candidate.name, ':') == null) continue;
+        const coordinate = try m.version.mavenCoordinate(candidate.name);
+        if (!std.mem.eql(u8, coordinate.group, target.group) or
+            !std.mem.eql(u8, coordinate.artifact, target.artifact) or
+            !std.mem.eql(u8, coordinate.version, target.version) or
+            !std.mem.eql(u8, coordinate.extension, target.extension)) continue;
+        const classifier = coordinate.classifier orelse continue;
+        if (!std.mem.startsWith(u8, classifier, "natives-")) continue;
+        if (nativeSuitability(candidate.name, classifier, environment.os_name, cpu) != .incompatible) return true;
+    }
+    return false;
+}
 fn hostClassifier(a: std.mem.Allocator, base: []const u8, classifiers: []const m.version.DownloadEntry, cpu: []const u8) ![]const u8 {
     if (cpuKind(cpu) != .arm64) return base;
     var generic = base;
@@ -179,6 +227,7 @@ const Context = struct {
     a: std.mem.Allocator,
     root: []const u8,
     windows: bool,
+    installed: bool = false,
     files: std.ArrayList(File) = .empty,
     paths: std.StringHashMapUnmanaged(usize) = .empty,
     directory_paths: std.StringHashMapUnmanaged(void) = .empty,
@@ -194,7 +243,10 @@ const Context = struct {
     fn add(self: *Context, kind: Kind, pieces: []const []const u8, download: m.version.Download) ![]const u8 {
         for (pieces) |piece| try relative(piece);
         if (download.path) |path| try relative(path);
-        if (download.url.len == 0) return error.MissingDownloadUrl;
+        if (download.url.len == 0) {
+            if (!self.installed or kind != .library) return error.MissingDownloadUrl;
+            if (download.sha1 == null or (download.size orelse 0) == 0) return error.UnverifiableLocalLibrary;
+        }
         const parts = try self.a.alloc([]const u8, pieces.len + 1);
         parts[0] = self.root;
         @memcpy(parts[1..], pieces);
@@ -241,15 +293,23 @@ fn component(name: []const u8) !void {
     if (std.mem.indexOfScalar(u8, name, '/') != null) return error.UnsafePath;
 }
 fn relative(path: []const u8) !void {
-    if (path.len == 0 or path[0] == '/' or std.mem.indexOfScalar(u8, path, 92) != null or std.mem.indexOfScalar(u8, path, ':') != null) return error.UnsafePath;
+    if (!std.unicode.utf8ValidateSlice(path) or path.len == 0 or path[0] == '/' or std.mem.indexOfScalar(u8, path, 92) != null or std.mem.indexOfScalar(u8, path, ':') != null) return error.UnsafePath;
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or part[part.len - 1] == '.' or part[part.len - 1] == ' ') return error.UnsafePath;
-        for (part) |c| if (c < 32 or c >= 127 or c == 34 or std.mem.indexOfScalar(u8, "<>|?*", c) != null) return error.UnsafePath;
+        var codepoints = std.unicode.Utf8View.initUnchecked(part).iterator();
+        while (codepoints.nextCodepoint()) |cp| {
+            if (cp < 32 or (cp >= 127 and cp <= 159)) return error.UnsafePath;
+            if (cp < 128 and std.mem.indexOfScalar(u8, "<>\"|?*", @intCast(cp)) != null) return error.UnsafePath;
+        }
         const end = std.mem.indexOfScalar(u8, part, '.') orelse part.len;
-        const base = part[0..end];
-        if (std.ascii.eqlIgnoreCase(base, "con") or std.ascii.eqlIgnoreCase(base, "prn") or std.ascii.eqlIgnoreCase(base, "aux") or std.ascii.eqlIgnoreCase(base, "nul")) return error.UnsafePath;
-        if (base.len == 4 and (std.ascii.eqlIgnoreCase(base[0..3], "com") or std.ascii.eqlIgnoreCase(base[0..3], "lpt")) and base[3] >= '0' and base[3] <= '9') return error.UnsafePath;
+        const base = std.mem.trimEnd(u8, part[0..end], " ");
+        for ([_][]const u8{ "con", "prn", "aux", "nul", "clock$", "conin$", "conout$" }) |reserved|
+            if (std.ascii.eqlIgnoreCase(base, reserved)) return error.UnsafePath;
+        if (base.len >= 4 and (std.ascii.eqlIgnoreCase(base[0..3], "com") or std.ascii.eqlIgnoreCase(base[0..3], "lpt"))) {
+            if (base.len == 4 and base[3] >= '0' and base[3] <= '9') return error.UnsafePath;
+            if (base.len == 5 and base[3] == 0xc2 and (base[4] == 0xb9 or base[4] == 0xb2 or base[4] == 0xb3)) return error.UnsafePath;
+        }
     }
 }
 fn classifierName(a: std.mem.Allocator, template: []const u8, arch: ?NativeArch) ![]const u8 {
@@ -322,12 +382,15 @@ test "portable metadata paths reject traversal windows aliases and controls" {
     try std.testing.expectError(error.UnsafePath, relative(&.{ 'a', 92, 'b' }));
     try std.testing.expectError(error.UnsafePath, relative(&.{ 'a', 0, 'b' }));
     try relative("org/example/lib-1.0.jar");
+    try relative("组织/中文版本/lib.jar");
+    try component("中文实例");
+    for ([_][]const u8{ "a\x1fb", "a\x7fb", "a\xc2\x80b", "a\xc2\x9fb", "\xff", "a:b", "a/../../b", "COM¹", "LPT².dll", "CON .json", "clock$.json", "CONIN$", "CONOUT$" }) |path| try std.testing.expectError(error.UnsafePath, relative(path));
 }
 test "same path dedup merges checksums but conflicts fail including windows case" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var ctx: Context = .{ .a = arena.allocator(), .root = "/game", .windows = true };
-    const d: m.version.Download = .{ .url = "https://example/a", .path = null, .sha1 = .{1} ** 20, .size = 1 };
+    const d: m.version.Download = .{ .url = "https://example/a", .path = null, .sha1 = @as([20]u8, @splat(1)), .size = 1 };
     _ = try ctx.add(.library, &.{"libraries/A.jar"}, d);
     _ = try ctx.add(.library, &.{"libraries/a.jar"}, d);
     try std.testing.expectEqual(@as(usize, 1), ctx.files.items.len);
@@ -346,7 +409,7 @@ fn allocationCase(a: std.mem.Allocator) !void {
     defer plan.deinit();
 }
 test "all planner allocations clean up on failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
 }
 test "modern native artifacts stay on classpath and incomplete libraries fail" {
     const a = std.testing.allocator;
@@ -419,7 +482,7 @@ fn legacyPlanAllocationCase(a: std.mem.Allocator) !void {
 
 test "legacy Maven URLs and asset aliases share object storage" {
     const a = std.testing.allocator;
-    try std.testing.checkAllAllocationFailures(a, legacyPlanAllocationCase, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, legacyPlanAllocationCase, .{});
     var version = try m.version.parseSlice(a, legacy_fixture);
     defer version.deinit();
     var assets = try m.asset_index.parseSlice(a, legacy_assets_fixture);
@@ -439,8 +502,30 @@ test "legacy Maven URLs and asset aliases share object storage" {
     var windows = try m.asset_index.parseSlice(a, "{\"virtual\":true,\"objects\":{\"SOUND\":{\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":5},\"sound\":{\"hash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"size\":5}}}");
     defer windows.deinit();
     try std.testing.expectError(error.PathConflict, build(a, version.value, windows.value, .{ .os_name = "windows", .arch = "x86_64" }, dirs));
-    assets.value.objects = &.{.{ .name = "../escape", .hash = [_]u8{0} ** 20, .size = 0 }};
+    assets.value.objects = &.{.{ .name = "../escape", .hash = @as([20]u8, @splat(0)), .size = 0 }};
     try std.testing.expectError(error.UnsafePath, build(a, version.value, assets.value, env, dirs));
+}
+
+test "OS-only native variants select a matching CPU without hiding missing architectures" {
+    const a = std.testing.allocator;
+    var assets = try m.asset_index.parseSlice(a, "{\"objects\":{}}");
+    defer assets.deinit();
+    const metadata =
+        \\{"id":"modern","downloads":{"client":{"url":"https://example/client"}},"assetIndex":{"id":"modern","url":"https://example/index"},"libraries":[
+        \\{"name":"org.lwjgl:lwjgl:3.3.3:natives-linux","rules":[{"action":"allow","os":{"name":"linux"}}],"downloads":{"artifact":{"url":"https://example/x64","path":"org/lwjgl/x64.jar"}}},
+        \\{"name":"org.lwjgl:lwjgl:3.3.3:natives-linux-arm64","rules":[{"action":"allow","os":{"name":"linux"}}],"downloads":{"artifact":{"url":"https://example/arm","path":"org/lwjgl/arm.jar"}}}]}
+    ;
+    var version = try m.version.parseSlice(a, metadata);
+    defer version.deinit();
+    for ([_][]const u8{ "x86_64", "aarch64" }, [_][]const u8{ "natives-linux", "natives-linux-arm64" }) |cpu, classifier| {
+        var plan = try build(a, version.value, assets.value, .{ .os_name = "linux", .arch = cpu }, .{ .root = "/game", .cpu_arch = cpu });
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(usize, 1), plan.value.native_checks.len);
+        try std.testing.expectEqualStrings(classifier, plan.value.native_checks[0].classifier);
+        try std.testing.expectEqual(@as(usize, 2), plan.value.classpath.len);
+    }
+    version.value.libraries = version.value.libraries.?[1..];
+    try std.testing.expectError(error.IncompatibleNativeArchitecture, build(a, version.value, assets.value, env, .{ .root = "/game", .cpu_arch = "x86_64" }));
 }
 
 test "ARM64 artifact natives and provided classifiers select accurate host archives" {
@@ -483,4 +568,123 @@ test "generic unknown natives require inspection rather than inventing ARM mirro
     try std.testing.expectEqual(NativeSuitability.compatible, nativeSuitability("org.lwjgl:lwjgl:3.3.3", "natives-linux-arm64", "linux", "aarch64"));
     try std.testing.expectEqual(NativeSuitability.inspection_required, nativeSuitability("example:custom:1", "natives-linux", "linux", "aarch64"));
     try std.testing.expectEqual(NativeSuitability.incompatible, nativeSuitability("example:custom:1", "natives-osx-arm64", "linux", "aarch64"));
+}
+
+test "authentic classic metadata binds mixed CPU families across platforms and excludes impersonated coordinates" {
+    const a = std.testing.allocator;
+    var assets = try m.asset_index.parseSlice(a, "{\"objects\":{}}");
+    defer assets.deinit();
+    const fixtures = [_][]const u8{
+        @embedFile("../launch_fixtures/vanilla_1_7_10_version.json"),
+        @embedFile("../launch_fixtures/vanilla_1_12_2_version.json"),
+    };
+    for (fixtures, 0..) |bytes, fixture_index| {
+        var version = try m.version.parseSlice(a, bytes);
+        defer version.deinit();
+        for ([_][]const u8{ "linux", "windows", "osx" }) |os| {
+            var plan = try build(a, version.value, assets.value, .{ .os_name = os, .arch = "x86_64" }, .{ .root = "/classic", .cpu_arch = "x86_64", .native_arch = .bits64 });
+            defer plan.deinit();
+            try std.testing.expect(plan.value.native_checks.len >= 2);
+            try std.testing.expectEqual(plan.value.native_checks.len, plan.value.native_extractions.len);
+            var seen_lwjgl = false;
+            var seen_jinput = false;
+            var classic_count: usize = 0;
+            for (plan.value.native_checks) |check| {
+                const is_lwjgl = std.mem.indexOf(u8, check.archive_path, "/org/lwjgl/lwjgl/lwjgl-platform/") != null;
+                const is_jinput = std.mem.indexOf(u8, check.archive_path, "/net/java/jinput/jinput-platform/2.0.5/") != null;
+                if (!is_lwjgl and !is_jinput) {
+                    try std.testing.expectEqual(@as(?ClassicFamily, null), check.classic_family);
+                    continue;
+                }
+                classic_count += 1;
+                seen_lwjgl = seen_lwjgl or is_lwjgl;
+                seen_jinput = seen_jinput or is_jinput;
+                const expected: ?ClassicFamily = if (std.mem.eql(u8, os, "osx")) null else if (std.mem.eql(u8, os, "linux")) (if (is_lwjgl) .lwjgl2_linux else .jinput_linux) else (if (is_lwjgl) .lwjgl2_windows else .jinput_windows);
+                try std.testing.expectEqual(expected, check.classic_family);
+                for (plan.value.native_extractions) |task| {
+                    if (std.mem.eql(u8, task.archive_path, check.archive_path)) try std.testing.expectEqual(expected, task.classic_family);
+                }
+                if (fixture_index == 1 and is_lwjgl) {
+                    const selected = if (std.mem.eql(u8, os, "osx")) "/2.9.2-nightly-20140822/" else "/2.9.4-nightly-20150209/";
+                    try std.testing.expect(std.mem.indexOf(u8, check.archive_path, selected) != null);
+                }
+            }
+            try std.testing.expect(seen_lwjgl and seen_jinput);
+            try std.testing.expectEqual(@as(usize, 2), classic_count);
+        }
+        const libraries = try a.dupe(m.version.Library, version.value.libraries.?);
+        defer a.free(libraries);
+        for (libraries) |*library| {
+            if (std.mem.eql(u8, library.name, "net.java.jinput:jinput-platform:2.0.5")) library.name = "net.java.jinput.imitator:jinput-platform:2.0.5";
+        }
+        var spoofed = version.value;
+        spoofed.libraries = libraries;
+        var untrusted_family = try build(a, spoofed, assets.value, .{ .os_name = "linux", .arch = "x86_64" }, .{ .root = "/classic", .cpu_arch = "x86_64", .native_arch = .bits64 });
+        defer untrusted_family.deinit();
+        var found_impostor = false;
+        for (untrusted_family.value.native_checks) |check| {
+            if (std.mem.indexOf(u8, check.archive_path, "/net/java/jinput/jinput-platform/2.0.5/") != null) {
+                found_impostor = true;
+                try std.testing.expectEqual(@as(?ClassicFamily, null), check.classic_family);
+            }
+        }
+        try std.testing.expect(found_impostor);
+    }
+}
+
+test "installed planning retains verified local libraries while download planning stays strict" {
+    const a = std.testing.allocator;
+    var version = try m.version.parseSlice(a, fixture);
+    defer version.deinit();
+    var assets = try m.asset_index.parseSlice(a, "{\"objects\":{}}");
+    defer assets.deinit();
+    var libraries = [_]m.version.Library{version.value.libraries.?[0]};
+    libraries[0].natives = &.{};
+    libraries[0].name = "fixture:embedded:1";
+    libraries[0].downloads.?.artifact.?.url = "";
+    libraries[0].downloads.?.artifact.?.sha1 = @as([20]u8, @splat(1));
+    version.value.libraries = &libraries;
+    try std.testing.expectError(error.MissingDownloadUrl, build(a, version.value, assets.value, env, dirs));
+    {
+        var plan = try buildInstalled(a, version.value, assets.value, env, dirs);
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(usize, 4), plan.value.files.len);
+        try std.testing.expectEqualStrings("/game/libraries/org/base.jar", plan.value.classpath[0]);
+        try std.testing.expectEqualStrings("", plan.value.files[2].url);
+        try std.testing.expectEqual(@as(?u64, 20), plan.value.files[2].size);
+        try std.testing.expectEqualSlices(u8, &@as([20]u8, @splat(1)), &plan.value.files[2].sha1.?);
+    }
+    libraries[0].downloads.?.artifact.?.sha1 = null;
+    try std.testing.expectError(error.UnverifiableLocalLibrary, buildInstalled(a, version.value, assets.value, env, dirs));
+    libraries[0].downloads.?.artifact.?.sha1 = @as([20]u8, @splat(1));
+    libraries[0].downloads.?.artifact.?.size = null;
+    try std.testing.expectError(error.UnverifiableLocalLibrary, buildInstalled(a, version.value, assets.value, env, dirs));
+    libraries[0].downloads.?.artifact.?.size = 0;
+    try std.testing.expectError(error.UnverifiableLocalLibrary, buildInstalled(a, version.value, assets.value, env, dirs));
+    libraries[0].downloads.?.artifact.?.size = 20;
+    libraries[0].name = "org.lwjgl:lwjgl:3:natives-linux";
+    try std.testing.expectError(error.MissingDownloadUrl, buildInstalled(a, version.value, assets.value, env, dirs));
+    libraries[0].name = "fixture:embedded:1";
+    libraries[0].downloads.?.artifact.?.path = "../outside.jar";
+    try std.testing.expectError(error.UnsafePath, buildInstalled(a, version.value, assets.value, env, dirs));
+}
+
+test "path contract Unicode version instance asset index and metadata paths" {
+    const a = std.testing.allocator;
+    var version = try m.version.parseSlice(a, fixture);
+    defer version.deinit();
+    version.value.id = "中文版本";
+    version.value.asset_index.?.id = "资源索引";
+    var assets = try m.asset_index.parseSlice(a, "{\"objects\":{}}");
+    defer assets.deinit();
+    var plan = try buildInstalled(a, version.value, assets.value, env, .{ .root = "game", .instance_name = "中文实例", .native_arch = .bits64 });
+    defer plan.deinit();
+    const client = try std.fs.path.join(a, &.{ "game", "versions", "中文版本", "中文版本.jar" });
+    defer a.free(client);
+    const natives = try std.fs.path.join(a, &.{ "game", "versions", "中文实例", "natives" });
+    defer a.free(natives);
+    try std.testing.expectEqualStrings(client, plan.value.client_path);
+    try std.testing.expectEqualStrings(natives, plan.value.native_extractions[0].destination);
+    version.value.id = "bad\xc2\x80id";
+    try std.testing.expectError(error.UnsafePath, buildInstalled(a, version.value, assets.value, env, dirs));
 }

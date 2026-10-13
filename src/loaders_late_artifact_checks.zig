@@ -1,3 +1,3 @@
 test {
-    _ = @import("core/minecraft/loaders_late_artifact_tests.zig");
+    _ = @import("core/loaders/tests/late_artifact.zig");
 }

@@ -4,14 +4,16 @@ const dvui = @import("dvui");
 const config = @import("../core/config.zig");
 const worlds = @import("../core/worlds.zig");
 const worlds_manager = @import("worlds_manager.zig");
+const local_time = @import("local_time.zig");
 const theme = @import("theme.zig");
 const components = @import("components.zig");
+const card_grid = @import("card_grid.zig");
 const A = std.mem.Allocator;
 const R = dvui.Rect;
 const Part = @FieldType(worlds.BackupRef, "part");
 const preview_limit = 4 * 1024 * 1024;
-const warning = dvui.Color.fromHex("E5BA78");
-const danger = dvui.Color.fromHex("F0A6A1");
+const warning = theme.warning;
+const danger = theme.danger;
 
 const Operation = enum { copy, rename_display, rename_folder, restore, delete };
 
@@ -142,6 +144,7 @@ pub const Ui = struct {
     failure: ?anyerror = null,
     draft: ?Draft = null,
     selected_world: ?[]u8 = null,
+    backups_expanded: bool = false,
     pending_select: ?[]u8 = null,
     select_queued: bool = false,
     refresh_queued: bool = false,
@@ -151,10 +154,19 @@ pub const Ui = struct {
     synced_id: ?[]u8 = null,
     synced_name: ?[]u8 = null,
     sync_initialized: bool = false,
+    page_active: bool = false,
+    entry_refresh_pending: bool = false,
     directory_open: ?OwnedDirectoryOpen = null,
 
     pub fn init(a: A) !Ui {
         return .{ .allocator = a };
+    }
+
+    /// Record the visible route every frame, even when service dispatch is gated.
+    pub fn setPageActive(self: *Ui, active: bool) void {
+        if (active and !self.page_active) self.entry_refresh_pending = true;
+        if (!active) self.entry_refresh_pending = false;
+        self.page_active = active;
     }
 
     pub fn deinit(self: *Ui) void {
@@ -218,6 +230,7 @@ pub const Ui = struct {
     }
 
     fn selectWorld(self: *Ui, folder: []const u8) !void {
+        if (sameId(self.selected_world, folder)) return;
         const next = try self.allocator.dupe(u8, folder);
         if (self.selected_world) |old| self.allocator.free(old);
         self.selected_world = next;
@@ -231,7 +244,9 @@ pub const Ui = struct {
     }
 
     fn openBackup(self: *Ui, source: config.Instance, backup: worlds.Backup) !void {
-        var next = try Draft.init(self.allocator, .restore, source, "", backup.source_folder orelse backup.id, backup.source_folder orelse self.selected_world orelse "");
+        if (!backupRestorable(backup)) return error.InvalidManifest;
+        const folder = backup.source_folder.?;
+        var next = try Draft.init(self.allocator, .restore, source, "", folder, folder);
         errdefer next.deinit();
         next.backup_id = try next.arena.allocator().dupe(u8, backup.id);
         next.part = backup.part;
@@ -258,27 +273,6 @@ fn sameId(a: ?[]const u8, b: ?[]const u8) bool {
 fn fmt(comptime format: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), format, args) catch "";
 }
-fn line(src: std.builtin.SourceLocation, value: []const u8, color: dvui.Color) void {
-    const height = @max(@as(f32, 20), (dvui.Options{}).fontGet().textHeight());
-    const text = dvui.textLayout(src, .{}, .{ .expand = .horizontal, .min_size_content = .{ .h = height }, .max_size_content = .width(0), .background = false, .padding = R.all(0), .margin = R.all(0), .color_text = .{ .color = color } });
-    text.addText(value, .{});
-    text.deinit();
-}
-fn iconButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8, enabled: bool) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{}, .{ .label = .{ .text = name }, .min_size_content = .{ .w = 16, .h = 16 }, .max_size_content = .{ .w = 16, .h = 16 }, .padding = R.all(6), .margin = .{ .x = 2 }, .corners = .all(4), .color_text = .{ .color = if (enabled) theme.accent else theme.muted } });
-    if (enabled) button.processEvents();
-    button.drawBackground();
-    dvui.icon(src, name, asset, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0), .min_size_content = .{ .w = 16, .h = 16 }, .max_size_content = .{ .w = 16, .h = 16 }, .role = .none }));
-    button.drawFocus();
-    const clicked = enabled and button.clicked();
-    const control_id = button.data().id;
-    const rect = button.data().borderRectScale().r;
-    button.deinit();
-    components.tooltip(src, control_id, rect, name);
-    return clicked;
-}
-
 const Dimensions = struct { width: u32, height: u32 };
 // Bound encoded and decoded storage before stb is allowed to allocate pixels.
 fn pngDimensions(bytes: []const u8) !Dimensions {
@@ -309,20 +303,18 @@ fn pngDimensions(bytes: []const u8) !Dimensions {
     }
     return error.InvalidPreview;
 }
-fn drawPreview(folder: []const u8, previews: []const worlds_manager.Preview, budget: *usize) void {
-    const slot = dvui.box(@src(), .{}, .{ .min_size_content = .{ .w = 48, .h = 48 }, .max_size_content = .{ .w = 48, .h = 48 }, .padding = R.all(0), .margin = .{ .w = 10 } });
-    defer slot.deinit();
+fn previewSource(folder: []const u8, previews: []const worlds_manager.Preview, budget: *usize) ?dvui.ImageSource {
     for (previews) |preview| {
         if (!std.mem.eql(u8, preview.folder, folder)) continue;
-        const dimensions = pngDimensions(preview.png) catch return;
+        const dimensions = pngDimensions(preview.png) catch return null;
         const required: usize = @as(usize, dimensions.width) * dimensions.height * 4;
-        if (required > budget.*) return;
+        if (required > budget.*) return null;
         budget.* -= required;
-        const decoded = dvui.Color.PMAImage.fromImageFile("world-preview", dvui.currentWindow().arena(), preview.png) catch return;
-        if (decoded.width != dimensions.width or decoded.height != dimensions.height or decoded.pma.len != required / 4) return;
-        _ = dvui.image(@src(), .{ .source = .{ .pixelsPMA = .{ .rgba = decoded.pma, .width = decoded.width, .height = decoded.height, .invalidation = .bytes } }, .shrink = .ratio }, .{ .label = .{ .text = "世界预览" }, .min_size_content = .{ .w = 48, .h = 48 }, .max_size_content = .{ .w = 48, .h = 48 }, .padding = R.all(0), .margin = R.all(0) });
-        return;
+        const decoded = dvui.Color.PMAImage.fromImageFile("world-preview", dvui.currentWindow().arena(), preview.png) catch return null;
+        if (decoded.width != dimensions.width or decoded.height != dimensions.height or decoded.pma.len != required / 4) return null;
+        return .{ .pixelsPMA = .{ .rgba = decoded.pma, .width = decoded.width, .height = decoded.height, .invalidation = .bytes } };
     }
+    return null;
 }
 
 fn sidebarEnabled(ui: *const Ui, snapshot: worlds_manager.Snapshot, enabled: bool) bool {
@@ -337,7 +329,7 @@ fn queueSidebarSelect(ui: *Ui, id: []const u8, snapshot: worlds_manager.Snapshot
 pub fn drawSidebar(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.Manager, enabled: bool) void {
     const snapshot = manager.snapshot();
     const allowed = sidebarEnabled(ui, snapshot, enabled);
-    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .background = false });
+    const scroll = components.scrollBody(@src());
     defer scroll.deinit();
     if (doc.instances.len == 0) components.emptyState(@src(), "尚无实例");
     for (doc.instances) |instance| {
@@ -349,28 +341,29 @@ pub fn drawSidebar(ui: *Ui, doc: *const config.Document, manager: *worlds_manage
 }
 
 fn drawHeader(ui: *Ui, doc: *const config.Document, snapshot: worlds_manager.Snapshot, enabled: bool) void {
-    const header = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 8 } });
+    const header = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = if (dvui.windowRect().h < theme.style.layout.compact_height) theme.spacing.row_gap else theme.spacing.page_title_gap }, .background = false });
     defer header.deinit();
-    components.text(@src(), if (selectedInstance(doc)) |instance| fmt("{s} · 存档", .{instance.name}) else "存档", dvui.themeGet().text);
-    const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0), .margin = R.all(0) });
-    defer actions.deinit();
-    if (iconButton(@src(), "刷新世界与恢复记录", dvui.entypo.cw, enabled and !snapshot.worker_active and snapshot.instance != null and !ui.select_queued and ui.draft == null)) ui.refresh_queued = true;
-    if (iconButton(@src(), "取消当前任务", dvui.entypo.cross, enabled and snapshot.worker_active)) ui.cancel_queued = true;
-}
-fn drawOutcome(outcome: *const worlds.Outcome) void {
-    const color = switch (outcome.state) {
-        .committed => theme.accent,
-        .rolled_back => warning,
-        .uncertain => danger,
-    };
-    components.text(@src(), switch (outcome.state) {
-        .committed => "已提交",
-        .rolled_back => "操作已回滚",
-        .uncertain => "提交状态不确定，请检查保留路径",
-    }, color);
-    if (outcome.cause) |err| components.text(@src(), fmt("原因：{s}", .{@errorName(err)}), color);
-    components.text(@src(), fmt("恢复路径：{s}", .{outcome.recovery_directory}), theme.muted);
-    if (outcome.staging_directory) |path| components.text(@src(), fmt("暂存路径：{s}", .{path}), color);
+    const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0), .background = false });
+    {
+        const heading = dvui.box(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .background = false });
+        components.title(@src(), "存档");
+        if (selectedInstance(doc)) |instance| {
+            const subtitle = fmt("{s} · {d} 个存档", .{ instance.name, snapshot.worlds.len });
+            if (header.data().contentRect().w < theme.style.layout.world_compact_width)
+                components.hint(@src(), subtitle)
+            else
+                components.text(@src(), subtitle, theme.muted);
+        }
+        heading.deinit();
+    }
+    if (components.button(@src(), "刷新", .{ .icon = dvui.entypo.cw, .tag = "world-refresh", .placement = .footer, .enabled = enabled and !snapshot.worker_active and snapshot.instance != null and !ui.select_queued and ui.draft == null })) ui.refresh_queued = true;
+    actions.deinit();
+    if (snapshot.worker_active) {
+        const task = components.toolbar(@src());
+        defer task.deinit();
+        components.text(@src(), if (snapshot.loading) "正在读取存档…" else "正在处理存档…", theme.muted);
+        if (components.iconButton(@src(), "取消当前任务", dvui.entypo.cross, .{ .tag = "world-cancel", .enabled = enabled })) ui.cancel_queued = true;
+    }
 }
 
 /// Draw only borrows Store/Manager snapshots and queues owned intents.
@@ -379,84 +372,219 @@ pub fn draw(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.Manag
     try drawWithEnabled(ui, doc, manager, true);
 }
 
+fn worldMode(world: worlds.World) []const u8 {
+    if (world.metadata.hardcore orelse false) return "极限模式";
+    return switch (world.metadata.game_type orelse -1) {
+        0 => "生存模式",
+        1 => "创造模式",
+        2 => "冒险模式",
+        3 => "旁观模式",
+        else => "游戏模式未知",
+    };
+}
+fn worldStatus(world: worlds.World) ?[]const u8 {
+    return switch (world.access) {
+        .in_use => "正在游玩",
+        .unavailable => "无法确认使用状态",
+        .available => if (world.metadata_status != .valid) "存档信息无法读取" else null,
+    };
+}
+fn failureText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.WorldLocked => "此存档正在游玩，请退出世界后再操作。",
+        error.WorldLockUnsupported => "此文件系统无法安全锁定存档，暂时不能修改。",
+        error.WorldLockChanged => "存档的使用状态已改变，请刷新后重试。",
+        error.InstanceRunning => "实例正在运行，请结束游戏后再修改存档。",
+        error.InstanceBusy, error.Busy => "实例有其他操作进行中，请稍后重试。",
+        error.SelectionChanged => "实例或存档已切换，请重新选择。",
+        else => fmt("操作失败：{s}", .{@errorName(err)}),
+    };
+}
+fn drawWorldActions(ui: *Ui, doc: *const config.Document, source: config.Instance, world: worlds.World, enabled: bool, can_view: bool) void {
+    const section = dvui.box(@src(), .{}, .{ .tag = "world-selected-actions", .expand = .horizontal, .gravity_y = 1, .padding = .{ .y = if (dvui.windowRect().h < theme.style.layout.compact_height) theme.spacing.row_gap else theme.spacing.footer_gap }, .margin = R.all(0), .background = false });
+    defer section.deinit();
+    const compact = section.data().contentRect().w < theme.style.layout.world_compact_width;
+    const action_size = if (section.data().contentRect().w < theme.style.layout.world_compact_actions_width) theme.sizing.compact_icon_button else theme.sizing.control_height;
+    const actions = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0), .background = false });
+    defer actions.deinit();
+    const backup_clicked = if (compact) components.iconButton(@src(), "备份", dvui.entypo.box, .{ .tag = "world-backup", .enabled = enabled, .size = action_size }) else components.button(@src(), "备份", .{ .tag = "world-backup", .enabled = enabled });
+    if (backup_clicked) ui.queueRequest(source, .{ .backup = world.folder }) catch |err| {
+        ui.failure = err;
+    };
+    const copy_clicked = if (compact) components.iconButton(@src(), "复制到实例", dvui.entypo.copy, .{ .tag = "world-copy", .enabled = enabled and doc.instances.len > 1, .size = action_size }) else components.button(@src(), "复制到实例", .{ .tag = "world-copy", .enabled = enabled and doc.instances.len > 1 });
+    if (copy_clicked) ui.openWorld(.copy, source, world) catch |err| {
+        ui.failure = err;
+    };
+    const rename_clicked = if (compact) components.iconButton(@src(), "重命名", dvui.entypo.pencil, .{ .tag = "world-rename", .enabled = enabled and world.metadata_status == .valid, .size = action_size }) else components.button(@src(), "重命名", .{ .tag = "world-rename", .enabled = enabled and world.metadata_status == .valid });
+    if (rename_clicked) ui.openWorld(.rename_display, source, world) catch |err| {
+        ui.failure = err;
+    };
+    const folder_clicked = if (compact) components.iconButton(@src(), "修改文件夹名称", dvui.entypo.folder, .{ .tag = "world-rename-folder", .enabled = enabled, .size = action_size }) else components.button(@src(), "修改文件夹", .{ .tag = "world-rename-folder", .enabled = enabled });
+    if (folder_clicked) ui.openWorld(.rename_folder, source, world) catch |err| {
+        ui.failure = err;
+    };
+    const open_clicked = if (compact) components.iconButton(@src(), "打开存档目录", dvui.entypo.folder, .{ .tag = "world-open", .enabled = can_view, .size = action_size }) else components.button(@src(), "打开目录", .{ .tag = "world-open", .enabled = can_view });
+    if (open_clicked) ui.queueDirectoryOpen(source, world.folder) catch |err| {
+        ui.failure = err;
+    };
+    if (components.button(@src(), "删除", .{ .tag = "world-delete", .destructive = true, .enabled = enabled, .min_width = if (compact) 0 else theme.sizing.button_min_width })) ui.openWorld(.delete, source, world) catch |err| {
+        ui.failure = err;
+    };
+}
 pub fn drawWithEnabled(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.Manager, controls_enabled: bool) !void {
     const snapshot = manager.snapshot();
-    const root = dvui.box(@src(), .{}, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
+    const root = dvui.box(@src(), .{}, .{ .tag = "worlds-page", .expand = .both, .padding = R.all(0), .margin = R.all(0), .background = false });
     defer root.deinit();
     drawHeader(ui, doc, snapshot, controls_enabled);
-    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
-    defer scroll.deinit();
-    if (ui.failure) |err| components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), danger);
-    if (snapshot.failure) |err| components.text(@src(), fmt("任务失败：{s}", .{@errorName(err)}), danger);
-    if (snapshot.outcome) |outcome| drawOutcome(outcome);
-    if (snapshot.worker_active) components.text(@src(), if (snapshot.loading) "正在读取世界与恢复记录…" else "世界任务进行中…", theme.muted);
     const source = snapshot.instance orelse {
-        components.emptyState(@src(), if (doc.instances.len == 0) "尚无实例" else "未选择实例");
+        if (ui.failure) |err| components.text(@src(), failureText(err), danger);
+        if (snapshot.failure) |err| components.text(@src(), failureText(err), danger);
+        components.emptyState(@src(), if (doc.instances.len == 0) "尚无实例" else if (ui.entry_refresh_pending) "正在读取存档…" else "从左侧选择一个实例");
         return;
     };
     const desired = selectedInstance(doc);
     const current = if (desired) |v| sameInstance(v, source) else false;
     const running = manager.isRunning(source.id);
-    if (running) components.text(@src(), "实例正在运行，世界操作已锁定", warning);
     if (!current) {
         components.text(@src(), "正在切换实例…", theme.muted);
         return;
     }
-    const enabled = controls_enabled and current and !running and !snapshot.worker_active and !ui.select_queued and ui.draft == null;
-    var budget: usize = preview_limit;
-    if (snapshot.worlds.len == 0 and !snapshot.loading) components.emptyState(@src(), "此实例暂无世界");
-    for (snapshot.worlds, 0..) |world, index| {
-        const row = dvui.box(@src(), .{}, .{ .id_extra = index, .expand = .horizontal, .min_size_content = .{ .h = 124 }, .padding = .{ .y = 6, .h = 6 }, .margin = R.all(0) });
-        {
-            const details = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
-            drawPreview(world.folder, snapshot.previews, &budget);
-            const text = dvui.box(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0) });
-            line(@src(), world.displayName(), if (sameId(ui.selected_world, world.folder)) theme.accent else dvui.Color.fromHex("EDF1EA"));
-            line(@src(), fmt("文件夹：{s}", .{world.folder}), theme.muted);
-            line(@src(), fmt("版本：{s}", .{world.metadata.version_name orelse "未知"}), theme.muted);
-            if (world.metadata.last_played_ms) |ms| line(@src(), fmt("最后游玩：{s}", .{timestamp(ms)}), theme.muted) else line(@src(), "最后游玩：未知", theme.muted);
-            text.deinit();
-            details.deinit();
+    const can_view = controls_enabled and !ui.select_queued and ui.draft == null;
+    const enabled = can_view and !running and !snapshot.worker_active;
+    var selected_world: ?worlds.World = null;
+    for (snapshot.worlds) |world| {
+        if (sameId(ui.selected_world, world.folder)) {
+            selected_world = world;
+            break;
         }
-        {
-            const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0), .margin = R.all(0) });
-            if (iconButton(@src(), "选择世界", dvui.entypo.check, controls_enabled and ui.draft == null and current and !ui.select_queued)) ui.selectWorld(world.folder) catch |err| {
-                ui.failure = err;
-            };
-            if (iconButton(@src(), "备份世界", dvui.entypo.archive, enabled)) ui.queueRequest(source, .{ .backup = world.folder }) catch |err| {
-                ui.failure = err;
-            };
-            if (iconButton(@src(), "复制到其他实例", dvui.entypo.documents, enabled and doc.instances.len > 1)) ui.openWorld(.copy, source, world) catch |err| {
-                ui.failure = err;
-            };
-            if (iconButton(@src(), "修改世界显示名称", dvui.entypo.pencil, enabled)) ui.openWorld(.rename_display, source, world) catch |err| {
-                ui.failure = err;
-            };
-            if (iconButton(@src(), "修改世界文件夹名", dvui.entypo.folder, enabled)) ui.openWorld(.rename_folder, source, world) catch |err| {
-                ui.failure = err;
-            };
-            if (iconButton(@src(), "打开世界目录", dvui.entypo.folder, controls_enabled and current and !ui.select_queued and ui.draft == null)) ui.queueDirectoryOpen(source, world.folder) catch |err| {
-                ui.failure = err;
-            };
-            if (iconButton(@src(), "删除世界", dvui.entypo.trash, enabled)) ui.openWorld(.delete, source, world) catch |err| {
-                ui.failure = err;
-            };
-            actions.deinit();
-        }
-        row.deinit();
-        _ = dvui.separator(@src(), .{ .id_extra = index, .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
     }
-    components.text(@src(), fmt("恢复记录 · {d}", .{snapshot.backups.len}), theme.accent);
-    for (snapshot.backups, 0..) |backup, index| {
-        const row = dvui.box(@src(), .{}, .{ .id_extra = index, .expand = .horizontal, .min_size_content = .{ .h = 100 }, .padding = .{ .y = 6, .h = 6 }, .margin = R.all(0) });
-        line(@src(), fmt("{s} · {s}", .{ backup.source_folder orelse "来源未知", if (backup.part == .original) "原始数据" else "被替换数据" }), theme.muted);
-        line(@src(), fmt("{s} · {s}", .{ backup.id, timestamp(backup.created_ms) }), theme.muted);
-        if (backup.manifest_error) |err| line(@src(), fmt("清单不可用：{s}", .{@errorName(err)}), danger) else line(@src(), operationText(backup.operation), theme.muted);
-        if (iconButton(@src(), "恢复此份数据", dvui.entypo.ccw, enabled and backup.manifest_error == null)) ui.openBackup(source, backup) catch |err| {
+    // Reserve the action bar before the scrolling content uses the remaining height.
+    if (selected_world) |world| drawWorldActions(ui, doc, source, world, enabled and world.access == .available, can_view);
+    drawBackups(ui, source, snapshot.backups, snapshot.worlds, enabled);
+    const scroll = components.scrollBody(@src());
+    defer scroll.deinit();
+    if (ui.failure) |err| components.text(@src(), failureText(err), danger);
+    if (snapshot.failure) |err| components.text(@src(), failureText(err), danger);
+    if (running) components.text(@src(), "实例正在运行，可以查看存档，修改操作暂不可用", warning);
+    if (snapshot.worlds.len == 0 and !snapshot.loading) components.emptyState(@src(), "此实例还没有存档");
+    var budget: usize = preview_limit;
+    {
+        const text_inset = theme.style.cards.world_preview + 2 * theme.spacing.panel_compact_padding + theme.spacing.card_gap + theme.sizing.selection_diameter + theme.spacing.detail_gap;
+        const minimum_width = @max(theme.style.layout.world_min_width, text_inset + theme.captionFont().textSize("最后游玩：2026-10-07 13:42").w);
+        var grid = card_grid.init(@src(), snapshot.worlds.len, .{ .min_width = minimum_width, .max_columns = 2, .tag = "world-card-grid" });
+        defer grid.deinit();
+        for (snapshot.worlds, 0..) |world, index| {
+            const selected = sameId(ui.selected_world, world.folder);
+            if (selected) selected_world = world;
+            const slot = grid.cell(@src(), index, world.folder);
+            const card_width = grid.cardWidth(index);
+            const date = if (world.metadata.last_played_ms) |ms| timestamp(ms) else "未知";
+            const full_description = if (world.access == .in_use)
+                fmt("文件夹：{s} · {s}", .{ world.folder, worldMode(world) })
+            else
+                fmt("文件夹：{s} · {s}\n最后游玩：{s}", .{ world.folder, worldMode(world), date });
+            const description = if (card_width < minimum_width)
+                if (world.access == .in_use)
+                    fmt("{s}\n{s}", .{ world.folder, worldMode(world) })
+                else
+                    fmt("{s}\n{s}\n{s}", .{ world.folder, worldMode(world), date })
+            else
+                full_description;
+            if (components.selectionCard(@src(), world.folder, world.displayName(), .{
+                .selected = selected,
+                .enabled = can_view,
+                .width = card_width,
+                .stretch = true,
+                .bounded_text = true,
+                .compact = true,
+                .height = theme.style.cards.world_height,
+                .tooltip = full_description,
+                .avatar_text = "存",
+                .avatar_source = previewSource(world.folder, snapshot.previews, &budget),
+                .avatar_size = theme.style.cards.world_preview,
+                .avatar_radius = theme.sizing.control_radius,
+                .avatar_tag = fmt("world-preview-{s}", .{world.folder}),
+                .description = description,
+                .status = worldStatus(world),
+                .status_color = if (world.access == .in_use) theme.accent else warning,
+                .status_gap = theme.spacing.row_gap,
+                .tag = fmt("world-card-{s}", .{world.folder}),
+            })) {
+                ui.selectWorld(world.folder) catch |err| {
+                    ui.failure = err;
+                };
+                selected_world = world;
+            }
+            slot.deinit();
+        }
+    }
+}
+
+fn backupRestorable(backup: worlds.Backup) bool {
+    return backup.manifest_error == null and worlds.validRecoveryId(backup.id) and
+        config.validId(backup.source_instance orelse return false) and
+        worlds.validFolder(backup.source_folder orelse return false);
+}
+
+fn drawBackups(ui: *Ui, source: config.Instance, backups: []const worlds.Backup, live_worlds: []const worlds.World, enabled: bool) void {
+    // The repository belongs to the selected instance; manifest provenance and live
+    // world selection must not hide deleted worlds, old folders or damaged records.
+    const count = backups.len;
+    if (count == 0) return;
+
+    // Reserve the backup dock before the world list expands into the remaining space.
+    const compact_height = dvui.windowRect().h < theme.style.layout.compact_height;
+    const section = components.disclosurePanel(@src(), "world-backups-toggle", fmt("备份 · {d}", .{count}), &ui.backups_expanded, .{ .tag = "world-backups", .gravity_y = 1, .margin = .{ .y = if (compact_height) theme.spacing.detail_gap else theme.spacing.section_gap } });
+    defer section.deinit();
+    const compact = section.data().contentRect().w < theme.style.layout.world_compact_width;
+    if (!ui.backups_expanded) return;
+
+    // At the minimum supported window height, keep both scroll regions usable.
+    const recovery_height: f32 = if (compact_height) theme.style.layout.recovery_compact_height else @min(theme.style.layout.recovery_max_height, dvui.windowRect().h * theme.style.layout.recovery_height_share);
+    const list = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .tag = "world-recovery-list", .expand = .horizontal, .max_size_content = .{ .w = 0, .h = recovery_height }, .padding = R.all(0), .margin = R.all(0), .background = false });
+    defer list.deinit();
+    for (backups) |backup| {
+        const row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(@backingInt(backup.part), backup.id))),
+            .tag = fmt("world-backup-item-{s}-{s}", .{ backup.id, @tagName(backup.part) }),
+            .expand = .horizontal,
+            .padding = .{ .x = theme.spacing.panel_compact_padding - theme.sizing.control_border, .y = theme.spacing.row_gap - theme.sizing.control_border, .w = theme.spacing.panel_compact_padding - theme.sizing.control_border, .h = theme.spacing.row_gap - theme.sizing.control_border },
+            .margin = .{ .h = theme.spacing.row_gap },
+            .border = R.all(theme.sizing.control_border),
+            .color_border = .{ .color = theme.outline },
+            .corners = .all(theme.sizing.card_radius),
+            .background = true,
+            .color_fill = .{ .color = theme.surface },
+        });
+        {
+            const info = dvui.box(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = if (compact) theme.spacing.row_gap else theme.spacing.card_gap }, .background = false });
+            dvui.labelNoFmt(@src(), timestamp(backup.created_ms), .{ .ellipsize = true }, .{ .font = theme.bodyFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = theme.spacing.detail_gap }, .background = false });
+            const caption = if (backup.source_folder) |folder| fmt("{s} · 原文件夹：{s}", .{ operationText(backup.operation), folder }) else fmt("{s} · 记录：{s}", .{ operationText(backup.operation), backup.id });
+            dvui.labelNoFmt(@src(), caption, .{ .ellipsize = true }, .{ .font = theme.captionFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = theme.muted } });
+            if (backup.part == .overwritten) components.hint(@src(), if (compact) "已替换" else "被替换数据");
+            if (!sameId(backup.source_instance, source.id) and backup.source_instance != null) components.hint(@src(), fmt("来源实例：{s}", .{backup.source_instance.?}));
+            if (!backupRestorable(backup)) components.hint(@src(), "备份信息不可用，无法安全恢复");
+            const info_id = info.data().id;
+            const info_rect = info.data().borderRectScale().r;
+            info.deinit();
+            components.tooltip(@src(), info_id, info_rect, fmt("{s}\n{s}", .{ timestamp(backup.created_ms), caption }));
+        }
+        const restore = dvui.box(@src(), .{}, .{ .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .background = false });
+        const restore_tag = fmt("world-restore-{s}-{s}", .{ backup.id, @tagName(backup.part) });
+        const target_available = blk: {
+            const folder = backup.source_folder orelse break :blk true;
+            for (live_worlds) |world| {
+                if (std.mem.eql(u8, world.folder, folder)) break :blk world.access == .available;
+            }
+            break :blk true;
+        };
+        const can_restore = enabled and backupRestorable(backup) and target_available;
+        const restore_clicked = components.button(@src(), "恢复", .{ .tag = restore_tag, .placement = .footer, .min_width = theme.style.sizing.list_action_width, .enabled = can_restore });
+        if (restore_clicked) ui.openBackup(source, backup) catch |err| {
             ui.failure = err;
         };
+        restore.deinit();
         row.deinit();
-        _ = dvui.separator(@src(), .{ .id_extra = index + snapshot.worlds.len, .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
     }
 }
 fn operationText(operation: ?worlds.Operation) []const u8 {
@@ -470,14 +598,8 @@ fn operationText(operation: ?worlds.Operation) []const u8 {
     } else "来源未知";
 }
 fn timestamp(ms: i64) []const u8 {
-    if (ms < 0) return fmt("{d} ms", .{ms});
-    const seconds: u64 = @intCast(@divTrunc(ms, 1000));
-    if (seconds > 253402300799) return fmt("{d} ms", .{ms});
-    const epoch: std.time.epoch.EpochSeconds = .{ .secs = seconds };
-    const day = epoch.getEpochDay().calculateYearDay();
-    const month = day.calculateMonthDay();
-    const time = epoch.getDaySeconds();
-    return fmt("{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC", .{ day.year, @intFromEnum(month.month), month.day_index + 1, time.getHoursIntoDay(), time.getMinutesIntoHour() });
+    const buffer = dvui.currentWindow().arena().alloc(u8, 16) catch return "未知";
+    return local_time.format(buffer, ms) orelse "未知";
 }
 fn title(operation: Operation) []const u8 {
     return switch (operation) {
@@ -508,76 +630,94 @@ fn draftBlocked(draft: *const Draft, doc: *const config.Document, manager: *worl
 pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.Manager) !void {
     if (ui.draft == null) return;
     const draft = &ui.draft.?;
-    const window = dvui.windowRect();
-    const width = @max(0, @min(460, window.w - 24));
-    const height = @max(0, @min(370, window.h - 24));
+    const height: f32 = switch (draft.operation) {
+        .copy => theme.style.dialogs.world_copy_height,
+        .restore => theme.style.dialogs.world_restore_height,
+        .rename_folder => theme.style.dialogs.world_folder_height,
+        .rename_display => theme.style.dialogs.world_rename_height,
+        .delete => theme.style.dialogs.world_delete_height,
+    };
     {
-        const modal = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &draft.open, .resize = .none, .window_avoid = .none }, .{ .rect = .{ .x = window.x + (window.w - width) / 2, .y = window.y + (window.h - height) / 2, .w = width, .h = height }, .min_size_content = .{ .w = @max(0, width - 26), .h = @max(0, height - 26) }, .max_size_content = .{ .w = @max(0, width - 26), .h = @max(0, height - 26) }, .padding = R.all(12), .margin = R.all(0), .border = R.all(1), .corners = .all(8), .label = .{ .text = title(draft.operation) } });
+        const modal = components.modalWithClose(@src(), title(draft.operation), height, &draft.open);
         defer modal.deinit();
-        modal.dragAreaSet(dvui.windowHeader(title(draft.operation), "", &draft.open));
-        const action = components.formActions(@src(), .{ .save_label = switch (draft.operation) {
+        const action = components.modalFormActions(@src(), .{ .save_label = switch (draft.operation) {
             .copy => "复制",
             .restore => "恢复",
             .delete => "确认删除",
             .rename_display, .rename_folder => "保存",
         }, .save_enabled = draftBlocked(draft, doc, manager) == null and draft.confirmed and !ui.select_queued and ui.draft_action == .none });
         if (action == .cancel) draft.open = false;
-        const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
+        const scroll = components.scrollBody(@src());
         defer scroll.deinit();
-        components.text(@src(), fmt("世界：{s}", .{draft.display_name}), theme.accent);
-        components.text(@src(), fmt("源实例：{s}", .{draft.source.name}), theme.muted);
-        if (draft.operation == .restore) {
-            components.text(@src(), fmt("恢复记录：{s} · {s}", .{ draft.backup_id, if (draft.part == .original) "原始数据" else "被替换数据" }), theme.muted);
-        } else components.text(@src(), fmt("文件夹：{s}", .{draft.folder}), theme.muted);
-        if (draft.operation == .copy) {
-            const a = dvui.currentWindow().arena();
-            const labels = try a.alloc([]const u8, doc.instances.len + 1);
-            const ids = try a.alloc(?[]const u8, doc.instances.len + 1);
-            labels[0] = "选择目标实例";
-            ids[0] = null;
-            var count: usize = 1;
-            var selected: usize = 0;
-            for (doc.instances) |instance| {
-                if (std.mem.eql(u8, instance.id, draft.source.id)) continue;
-                labels[count] = instance.name;
-                ids[count] = instance.id;
-                if (sameId(draft.target_id, instance.id)) selected = count;
-                count += 1;
-            }
-            dvui.labelNoFmt(@src(), "目标实例", .{}, .{ .background = false, .padding = R.all(0), .margin = .{ .h = 4 } });
-            var choice: ?usize = selected;
-            if (dvui.dropdown(@src(), labels[0..count], .{ .choice_nullable = &choice }, .{ .placeholder = "选择目标实例", .null_selectable = false }, .{ .label = .{ .text = "目标实例" }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(6), .corners = .all(4) })) {
-                const index = choice orelse 0;
-                if (ids[index]) |id| try draft.setTarget(id) else {
-                    draft.target_id = null;
-                    draft.confirmed = false;
-                    draft.replace_backed_up = false;
+        {
+            const identity = components.modalSection(@src(), .{ .min_height = 128, .tag = "world-dialog-identity" });
+            defer identity.deinit();
+            components.text(@src(), fmt("世界：{s}", .{draft.display_name}), theme.muted);
+            _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.row_gap) });
+            components.text(@src(), fmt("源实例：{s}", .{draft.source.name}), theme.muted);
+            _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.row_gap) });
+            if (draft.operation == .restore) {
+                components.text(@src(), fmt("恢复记录：{s} · {s}", .{ draft.backup_id, if (draft.part == .original) "原始数据" else "被替换数据" }), theme.muted);
+            } else components.text(@src(), fmt("文件夹：{s}", .{draft.folder}), theme.muted);
+        }
+        const confirmation = components.modalSection(@src(), .{ .min_height = switch (draft.operation) {
+            .copy => 284,
+            .restore => 220,
+            .rename_folder => 216,
+            .rename_display, .delete => 176,
+        }, .gap_after = 0, .tag = "world-dialog-confirmation" });
+        defer confirmation.deinit();
+        if (draft.operation != .delete) {
+            // The dialog confirmation section already owns the form inset.
+            if (draft.operation == .copy) {
+                const a = dvui.currentWindow().arena();
+                const labels = try a.alloc([]const u8, doc.instances.len + 1);
+                const ids = try a.alloc(?[]const u8, doc.instances.len + 1);
+                labels[0] = "选择目标实例";
+                ids[0] = null;
+                var count: usize = 1;
+                var selected: usize = 0;
+                for (doc.instances) |instance| {
+                    if (std.mem.eql(u8, instance.id, draft.source.id)) continue;
+                    labels[count] = instance.name;
+                    ids[count] = instance.id;
+                    if (sameId(draft.target_id, instance.id)) selected = count;
+                    count += 1;
+                }
+                components.fieldLabel(@src(), "目标实例");
+                var choice: ?usize = selected;
+                if (components.dropdown(@src(), "目标实例", labels[0..count], .{ .choice_nullable = &choice }, .{ .placeholder = "选择目标实例", .null_selectable = false })) {
+                    const index = choice orelse 0;
+                    if (ids[index]) |id| try draft.setTarget(id) else {
+                        draft.target_id = null;
+                        draft.confirmed = false;
+                        draft.replace_backed_up = false;
+                    }
                 }
             }
-        }
-        if (draft.operation != .delete) {
             const label = if (draft.operation == .rename_display) "新显示名称" else if (draft.operation == .rename_folder) "新文件夹名" else "目标世界文件夹";
-            dvui.labelNoFmt(@src(), label, .{}, .{ .background = false, .padding = R.all(0), .margin = .{ .y = 6, .h = 4 } });
-            const input = dvui.textEntry(@src(), .{ .text = .{ .buffer = &draft.name } }, .{ .label = .{ .text = label }, .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .h = 20 }, .padding = R.all(6), .margin = .{ .h = 4 }, .corners = .all(4) });
-            if (input.text_changed) {
+            if (components.field(@src(), label, &draft.name, .{ .gap_after = 0 })) {
                 draft.confirmed = false;
                 draft.replace_backed_up = false;
                 draft.name_too_long = false;
             }
-            input.deinit();
         }
+        if (draft.operation != .delete) _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
         if (draft.name_too_long) components.text(@src(), "名称过长，请重新输入", danger);
         if (draft.operation == .copy or draft.operation == .restore or draft.operation == .rename_folder) {
-            _ = dvui.checkbox(@src(), &draft.replace_backed_up, "目标存在时，先备份再替换", .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .y = 6, .h = 6 } });
+            _ = components.checkbox(@src(), &draft.replace_backed_up, "目标存在时，先备份再替换", true);
         }
-        if (draft.operation == .delete) components.text(@src(), "世界将从 saves 移除，删除前数据保留在恢复记录中。", warning);
-        _ = dvui.checkbox(@src(), &draft.confirmed, switch (draft.operation) {
+        if (draft.operation == .delete) {
+            components.text(@src(), "世界将从 saves 移除，删除前数据保留在恢复记录中。", warning);
+            _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
+        }
+        _ = components.checkbox(@src(), &draft.confirmed, switch (draft.operation) {
             .delete => "确认删除此世界",
             .rename_display => "确认修改显示名称并保留恢复数据",
             .rename_folder => "确认修改文件夹名并保留恢复数据",
             .copy => "确认复制到所选目标",
             .restore => "确认恢复所选数据",
-        }, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .y = 4, .h = 8 } });
+        }, true);
         const blocked = draftBlocked(draft, doc, manager);
         if (blocked) |err| components.text(@src(), fmt("暂不可执行：{s}", .{@errorName(err)}), warning);
         if (ui.failure) |err| components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), danger);
@@ -591,17 +731,27 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.
     if (!draft.open) ui.draft_action = .cancel;
 }
 
-fn syncSelection(ui: *Ui, store: *config.Store, manager: *worlds_manager.Manager) !void {
+const SelectionSync = enum { unchanged, scanned, deferred };
+
+fn mutationPending(manager: *const worlds_manager.Manager) bool {
+    if (manager.active) |job| if (job.request != null) return true;
+    if (manager.pending) |job| if (job.request != null) return true;
+    return false;
+}
+
+fn syncSelection(ui: *Ui, store: *config.Store, manager: *worlds_manager.Manager) !SelectionSync {
     const desired = selectedInstance(store.snapshot());
     const id: ?[]const u8 = if (desired) |v| v.id else null;
     const name: ?[]const u8 = if (desired) |v| v.name else null;
-    if (ui.sync_initialized and sameId(ui.synced_id, id) and sameId(ui.synced_name, name)) return;
     const snapshot = manager.snapshot();
+    const matches = if (desired) |v| if (snapshot.instance) |current| sameInstance(v, current) else false else snapshot.instance == null;
+    if (matches and ui.sync_initialized and sameId(ui.synced_id, id) and sameId(ui.synced_name, name)) return .unchanged;
+    // select() cancels active jobs; wait until a mutation has published its result.
+    if (!matches and mutationPending(manager)) return .deferred;
     const next_id = if (id) |v| try ui.allocator.dupe(u8, v) else null;
     errdefer if (next_id) |v| ui.allocator.free(v);
     const next_name = if (name) |v| try ui.allocator.dupe(u8, v) else null;
     errdefer if (next_name) |v| ui.allocator.free(v);
-    const matches = if (desired) |v| if (snapshot.instance) |current| sameInstance(v, current) else false else snapshot.instance == null;
     const changed = ui.sync_initialized or !matches;
     if (!matches) try manager.select(desired);
     if (ui.synced_id) |old| ui.allocator.free(old);
@@ -612,8 +762,10 @@ fn syncSelection(ui: *Ui, store: *config.Store, manager: *worlds_manager.Manager
     if (changed) {
         if (ui.selected_world) |old| ui.allocator.free(old);
         ui.selected_world = null;
+        ui.backups_expanded = false;
         ui.closeDraft();
     }
+    return if (!matches and desired != null) .scanned else .unchanged;
 }
 fn applyRequest(owned: *const OwnedRequest, store: *config.Store, manager: *worlds_manager.Manager) !void {
     const selected = selectedInstance(store.snapshot()) orelse return error.SelectionChanged;
@@ -632,6 +784,7 @@ fn applyRequest(owned: *const OwnedRequest, store: *config.Store, manager: *worl
 /// Call only AFTER ALL root widgets and floating windows have been closed.
 /// Every queued request is released even when Store/Manager rejects it; never auto-retry.
 pub fn finish(ui: *Ui, store: *config.Store, manager: *worlds_manager.Manager) void {
+    if (!ui.page_active) return;
     defer ui.releaseRequests();
     const draft_action = ui.draft_action;
     ui.draft_action = .none;
@@ -665,11 +818,24 @@ pub fn finish(ui: *Ui, store: *config.Store, manager: *worlds_manager.Manager) v
             return;
         };
     }
-    syncSelection(ui, store, manager) catch |err| {
+    const sync = syncSelection(ui, store, manager) catch |err| {
         ui.failure = err;
+        ui.entry_refresh_pending = false;
         return;
     };
-    if (refresh) {
+    if (sync == .deferred) return;
+    const has_selected_instance = selectedInstance(store.snapshot()) != null;
+    // A matching pending/active read already fulfills this entry. Never replace
+    // it on another render or reentry; mutations keep the entry pending instead.
+    if (ui.entry_refresh_pending and !mutationPending(manager)) {
+        ui.entry_refresh_pending = false;
+        if (has_selected_instance and sync != .scanned and !manager.snapshot().loading) {
+            manager.refresh() catch |err| {
+                ui.failure = err;
+            };
+        }
+    }
+    if (refresh and has_selected_instance and sync != .scanned and !manager.snapshot().worker_active) {
         manager.refresh() catch |err| {
             ui.failure = err;
         };
@@ -703,6 +869,124 @@ pub fn finish(ui: *Ui, store: *config.Store, manager: *worlds_manager.Manager) v
         };
         ui.failure = null;
     }
+}
+
+test "world backup view real deleted and folder-renamed records restore to safe targets" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Owner/saves/old-folder/region");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Owner/saves/old-folder/region/data", .data = "recovery payload" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var paths = try @import("../core/instances.zig").Paths.init(a, io, root);
+    defer paths.deinit();
+    var registry = @import("../core/tasks.zig").Registry.init(a);
+    defer registry.deinit();
+    var coordinator = @import("../core/instance_leases.zig").Coordinator.init(io);
+    var manager = try worlds_manager.Manager.initOptions(a, io, &paths, &registry, .{ .scope = coordinator.worldScope(3) });
+    defer manager.deinit();
+    const source: config.Instance = .{ .id = "owner", .name = "Owner", .minecraft_version = "1.21" };
+    const doc: config.Document = .{ .instances = &.{source}, .selected_instance = source.id };
+    try manager.select(source);
+    try settleLifecycle(&manager);
+    try std.testing.expect(manager.snapshot().failure == null);
+    try manager.perform(.{ .delete = .{ .folder = "old-folder", .confirmed = true } });
+    try settleLifecycle(&manager);
+    try std.testing.expect(manager.snapshot().failure == null);
+    try std.testing.expect(manager.snapshot().outcome.?.state == .committed);
+    try std.testing.expectEqual(@as(usize, 0), manager.snapshot().worlds.len);
+    try std.testing.expectEqual(@as(usize, 1), manager.snapshot().backups.len);
+    var ui = try Ui.init(a);
+    defer ui.deinit();
+    try ui.openBackup(source, manager.snapshot().backups[0]);
+    try std.testing.expect(ui.selected_world == null);
+    try std.testing.expectError(error.ConfirmationRequired, ui.queueDraft(&doc));
+    ui.draft.?.confirmed = true;
+    try ui.queueDraft(&doc);
+    try std.testing.expect(!ui.requests.items[0].value.restore.confirmed);
+    try coordinator.reserveLaunch(source.id);
+    try std.testing.expectError(error.InstanceRunning, manager.perform(ui.requests.items[0].value));
+    coordinator.releaseLaunch();
+    try manager.perform(ui.requests.items[0].value);
+    ui.releaseRequests();
+    ui.closeDraft();
+    try settleLifecycle(&manager);
+    try std.testing.expect(manager.snapshot().failure == null and manager.snapshot().outcome.?.state == .committed);
+    const restored = try tmp.dir.readFileAlloc(io, ".minecraft/versions/Owner/saves/old-folder/region/data", a, .limited(64));
+    defer a.free(restored);
+    try std.testing.expectEqualStrings("recovery payload", restored);
+    try manager.perform(.{ .rename_folder = .{ .folder = "old-folder", .name = "renamed-folder" } });
+    try settleLifecycle(&manager);
+    try std.testing.expect(manager.snapshot().failure == null and manager.snapshot().outcome.?.state == .committed);
+    try std.testing.expectEqual(@as(usize, 1), manager.snapshot().worlds.len);
+    try std.testing.expectEqualStrings("renamed-folder", manager.snapshot().worlds[0].folder);
+    try ui.selectWorld("renamed-folder");
+    // Both the delete record and folder-rename record retain the old source folder.
+    for (manager.snapshot().backups) |backup| {
+        if (backup.operation != .rename) continue;
+        try ui.openBackup(source, backup);
+        break;
+    }
+    try std.testing.expect(ui.draft != null);
+    try std.testing.expectEqualStrings("old-folder", std.mem.sliceTo(&ui.draft.?.name, 0));
+    @memset(&ui.draft.?.name, 0);
+    @memcpy(ui.draft.?.name[0.."recovered-folder".len], "recovered-folder");
+    ui.draft.?.confirmed = true;
+    try ui.queueDraft(&doc);
+    try manager.perform(ui.requests.items[0].value);
+    ui.releaseRequests();
+    ui.closeDraft();
+    try settleLifecycle(&manager);
+    try std.testing.expect(manager.snapshot().failure == null and manager.snapshot().outcome.?.state == .committed);
+    const recovered = try tmp.dir.readFileAlloc(io, ".minecraft/versions/Owner/saves/recovered-folder/region/data", a, .limited(64));
+    defer a.free(recovered);
+    try std.testing.expectEqualStrings("recovery payload", recovered);
+    try tmp.dir.access(io, ".minecraft/versions/Owner/saves/renamed-folder/region/data", .{});
+}
+
+test "world backup view missing source permits safe target and preserves consent and part" {
+    const a = std.testing.allocator;
+    const source: config.Instance = .{ .id = "owner", .name = "Owner", .minecraft_version = "1.21" };
+    const doc: config.Document = .{ .instances = &.{source}, .selected_instance = source.id };
+    var ui = try Ui.init(a);
+    defer ui.deinit();
+    const backup: worlds.Backup = .{ .id = "0123456789abcdef0123456789abcdef", .part = .overwritten, .directory = "/unused", .source_instance = source.id, .source_folder = "old-folder", .created_ms = 0 };
+    try ui.openBackup(source, backup);
+    try std.testing.expect(ui.selected_world == null);
+    try std.testing.expectEqualStrings("old-folder", std.mem.sliceTo(&ui.draft.?.name, 0));
+    try std.testing.expectError(error.ConfirmationRequired, ui.queueDraft(&doc));
+    const draft = &ui.draft.?;
+    @memset(&draft.name, 0);
+    @memcpy(draft.name[0.."restored-folder".len], "restored-folder");
+    draft.confirmed = true;
+    try ui.queueDraft(&doc);
+    const restore = ui.requests.items[0].value.restore;
+    try std.testing.expectEqualStrings("restored-folder", restore.target_folder);
+    try std.testing.expect(restore.part == .overwritten and !restore.confirmed);
+    ui.releaseRequests();
+    @memset(&draft.name, 0);
+    @memcpy(draft.name[0..3], "../");
+    try std.testing.expectError(error.UnsafeWorldName, ui.queueDraft(&doc));
+    try std.testing.expect(ui.requests.items.len == 0);
+}
+
+test "world backup view rejects malformed and unsafe records before opening draft" {
+    var ui = try Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    const source: config.Instance = .{ .id = "owner", .name = "Owner", .minecraft_version = "1.21" };
+    var backup: worlds.Backup = .{ .id = "0123456789abcdef0123456789abcdef", .part = .original, .directory = "/unused", .created_ms = 0, .manifest_error = error.InvalidManifest };
+    try std.testing.expectError(error.InvalidManifest, ui.openBackup(source, backup));
+    backup.manifest_error = null;
+    try std.testing.expectError(error.InvalidManifest, ui.openBackup(source, backup));
+    backup.source_instance = source.id;
+    backup.source_folder = "../unsafe";
+    try std.testing.expectError(error.InvalidManifest, ui.openBackup(source, backup));
+    backup.source_folder = "old-folder";
+    backup.id = "../unsafe";
+    try std.testing.expectError(error.InvalidManifest, ui.openBackup(source, backup));
+    try std.testing.expect(ui.draft == null and ui.requests.items.len == 0);
 }
 
 test "world view owns deferred selection and request strings" {
@@ -846,7 +1130,7 @@ test "world directory intent allocation failures retain previous intent and rele
             try std.testing.expectEqualStrings("Replacement", ui.directory_open.?.folder);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "world sidebar owns stable queued ID and selected right model rejects stale snapshot" {
@@ -907,4 +1191,224 @@ test "world sidebar respects disabled draft worker and queued intent gates" {
     try queueSidebarSelect(&ui, "second", .{}, true);
     try std.testing.expectEqualStrings("first", ui.pending_select.?);
     try std.testing.expectEqualStrings("Preserved world", ui.selected_world.?);
+}
+
+const LifecycleWorker = struct {
+    scans: std.atomic.Value(usize) = .init(0),
+    mutations: std.atomic.Value(usize) = .init(0),
+    hold: std.atomic.Value(bool) = .init(false),
+    entered: std.atomic.Value(bool) = .init(false),
+    fail_scan: bool = false,
+
+    fn work(a: A, io: std.Io, _: *const @import("../core/instances.zig").Paths, _: config.Instance, request: ?worlds_manager.Request, options: worlds.Options) anyerror!worlds_manager.Result {
+        const self: *LifecycleWorker = @ptrCast(@alignCast(options.guard.context.?));
+        if (request == null) {
+            _ = self.scans.fetchAdd(1, .release);
+        } else {
+            _ = self.mutations.fetchAdd(1, .release);
+        }
+        self.entered.store(true, .release);
+        while (self.hold.load(.acquire)) {
+            try options.hooks.check(io);
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try options.hooks.check(io);
+        if (request == null) {
+            if (self.fail_scan) return error.TestScanFailure;
+            return .{};
+        }
+        const id = try a.dupe(u8, "lifecycle-operation");
+        errdefer a.free(id);
+        return .{ .outcome = .{
+            .allocator = a,
+            .state = .committed,
+            .recovery_id = id,
+            .recovery_directory = try a.dupe(u8, "/tmp/lifecycle-operation"),
+        } };
+    }
+};
+
+fn settleLifecycle(manager: *worlds_manager.Manager) !void {
+    for (0..5000) |_| {
+        manager.tick();
+        if (!manager.snapshot().worker_active) return;
+        try manager.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.TestWorkerTimedOut;
+}
+
+fn waitLifecycleEntered(manager: *worlds_manager.Manager, worker: *LifecycleWorker) !void {
+    for (0..5000) |_| {
+        manager.tick();
+        if (worker.entered.load(.acquire)) return;
+        try manager.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.TestWorkerTimedOut;
+}
+
+const lifecycle_rows = [_]config.Instance{
+    .{ .id = "source-id", .name = "Source", .minecraft_version = "1.21" },
+    .{ .id = "copy-id", .name = "Copied", .minecraft_version = "1.21" },
+};
+
+test "world page scans only on entry selection change and manual refresh" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var store = try config.Store.init(a, io, root);
+    defer store.deinit();
+    try store.update(.{ .instances = &lifecycle_rows, .selected_instance = "source-id" });
+    var paths = try @import("../core/instances.zig").Paths.init(a, io, root);
+    defer paths.deinit();
+    var registry = @import("../core/tasks.zig").Registry.init(a);
+    defer registry.deinit();
+    var coordinator = @import("../core/instance_leases.zig").Coordinator.init(io);
+    var worker: LifecycleWorker = .{};
+    var manager = try worlds_manager.Manager.initOptions(a, io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &worker }, .worker = LifecycleWorker.work });
+    defer manager.deinit();
+    var ui = try Ui.init(a);
+    defer ui.deinit();
+
+    for (0..5) |_| finish(&ui, &store, &manager);
+    try std.testing.expect(manager.selected == null and manager.pending == null);
+    ui.setPageActive(true);
+    finish(&ui, &store, &manager);
+    try settleLifecycle(&manager);
+    try std.testing.expectEqual(@as(usize, 1), worker.scans.load(.acquire));
+    for (0..5) |_| {
+        ui.setPageActive(true);
+        finish(&ui, &store, &manager);
+        manager.tick();
+    }
+    // Store republication replaces all borrowed strings without changing identity.
+    try store.update(store.snapshot().*);
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(@as(usize, 1), worker.scans.load(.acquire));
+    ui.setPageActive(false);
+    finish(&ui, &store, &manager);
+    ui.setPageActive(true);
+    finish(&ui, &store, &manager);
+    try settleLifecycle(&manager);
+    try std.testing.expectEqual(@as(usize, 2), worker.scans.load(.acquire));
+    ui.refresh_queued = true;
+    finish(&ui, &store, &manager);
+    try settleLifecycle(&manager);
+    try std.testing.expectEqual(@as(usize, 3), worker.scans.load(.acquire));
+
+    ui.setPageActive(false);
+    var document = store.snapshot().*;
+    document.selected_instance = "copy-id";
+    try store.update(document);
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqualStrings("source-id", manager.snapshot().instance.?.id);
+    ui.setPageActive(true);
+    finish(&ui, &store, &manager);
+    try settleLifecycle(&manager);
+    try std.testing.expectEqual(@as(usize, 4), worker.scans.load(.acquire));
+    try std.testing.expectEqualStrings("copy-id", manager.snapshot().instance.?.id);
+    var renamed = lifecycle_rows;
+    renamed[1].name = "Renamed copy";
+    try store.update(.{ .instances = &renamed, .selected_instance = "copy-id" });
+    finish(&ui, &store, &manager);
+    try settleLifecycle(&manager);
+    try std.testing.expectEqual(@as(usize, 5), worker.scans.load(.acquire));
+    worker.fail_scan = true;
+    ui.refresh_queued = true;
+    finish(&ui, &store, &manager);
+    try settleLifecycle(&manager);
+    try std.testing.expectEqual(@as(?anyerror, error.TestScanFailure), manager.snapshot().failure);
+    for (0..5) |_| finish(&ui, &store, &manager);
+    try std.testing.expectEqual(@as(usize, 6), worker.scans.load(.acquire));
+    document = store.snapshot().*;
+    document.selected_instance = null;
+    try store.update(document);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(manager.snapshot().instance == null and !manager.snapshot().worker_active);
+    try std.testing.expect(ui.failure == null);
+}
+
+test "world page reentry preserves active scan and mutation completion refresh" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var store = try config.Store.init(a, io, root);
+    defer store.deinit();
+    try store.update(.{ .instances = &lifecycle_rows, .selected_instance = "source-id" });
+    var paths = try @import("../core/instances.zig").Paths.init(a, io, root);
+    defer paths.deinit();
+    var registry = @import("../core/tasks.zig").Registry.init(a);
+    defer registry.deinit();
+    var coordinator = @import("../core/instance_leases.zig").Coordinator.init(io);
+    var worker: LifecycleWorker = .{};
+    var manager = try worlds_manager.Manager.initOptions(a, io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &worker }, .worker = LifecycleWorker.work });
+    defer manager.deinit();
+    defer worker.hold.store(false, .release);
+    var ui = try Ui.init(a);
+    defer ui.deinit();
+
+    worker.hold.store(true, .release);
+    ui.setPageActive(true);
+    finish(&ui, &store, &manager);
+    try waitLifecycleEntered(&manager, &worker);
+    const scan = manager.active.?;
+    for (0..5) |_| {
+        ui.setPageActive(false);
+        ui.setPageActive(true);
+        finish(&ui, &store, &manager);
+        try std.testing.expect(manager.active.? == scan and manager.pending == null);
+        try std.testing.expect(!ui.entry_refresh_pending);
+    }
+    worker.hold.store(false, .release);
+    try settleLifecycle(&manager);
+    try std.testing.expectEqual(@as(usize, 1), worker.scans.load(.acquire));
+
+    worker.entered.store(false, .release);
+    worker.hold.store(true, .release);
+    try manager.perform(.{ .backup = "World" });
+    try waitLifecycleEntered(&manager, &worker);
+    const mutation = manager.active.?;
+    ui.setPageActive(false);
+    ui.setPageActive(true);
+    for (0..5) |_| finish(&ui, &store, &manager);
+    try std.testing.expect(ui.entry_refresh_pending);
+    try std.testing.expect(manager.active.? == mutation and manager.pending == null);
+    worker.hold.store(false, .release);
+    // JOIN queues the manager's normal post-operation read. Let finish consume
+    // the entry while that same read is pending, without replacing it.
+    for (0..5000) |_| {
+        if (mutation.done.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(mutation.done.load(.acquire));
+    manager.tick();
+    finish(&ui, &store, &manager);
+    try settleLifecycle(&manager);
+    try std.testing.expect(!ui.entry_refresh_pending);
+    try std.testing.expectEqual(@as(usize, 1), worker.mutations.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), worker.scans.load(.acquire));
+    try std.testing.expect(manager.operation_failure == null);
+
+    worker.entered.store(false, .release);
+    worker.hold.store(true, .release);
+    try manager.perform(.{ .backup = "World" });
+    try waitLifecycleEntered(&manager, &worker);
+    const second_mutation = manager.active.?;
+    var document = store.snapshot().*;
+    document.selected_instance = "copy-id";
+    try store.update(document);
+    for (0..5) |_| finish(&ui, &store, &manager);
+    try std.testing.expect(manager.active.? == second_mutation and manager.pending == null);
+    try std.testing.expectEqualStrings("source-id", manager.snapshot().instance.?.id);
+    worker.hold.store(false, .release);
+    try settleLifecycle(&manager);
+    finish(&ui, &store, &manager);
+    try settleLifecycle(&manager);
+    try std.testing.expectEqual(@as(usize, 2), worker.mutations.load(.acquire));
+    try std.testing.expectEqualStrings("copy-id", manager.snapshot().instance.?.id);
 }

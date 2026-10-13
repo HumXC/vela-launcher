@@ -113,6 +113,34 @@ test "streamed file SHA1, mismatch preserves destination, redirect body ignored"
     defer a.free(after_blocked);
     try std.testing.expectEqualStrings(body, after_blocked);
 }
+
+test "HTTP byte count distinguishes rounded catalogue size from exact streamed length" {
+    const base = try baseUrl();
+    defer a.free(base);
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    const service = try dl.Service.init(a, io, 1);
+    defer service.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try pathIn(&tmp, "java-archive");
+    defer a.free(path);
+    const u = try url(base, "/slow");
+    defer a.free(u);
+    const rounded_as_exact = try service.submit(.{ .url = u, .output = .{ .file = path }, .expected_size = 262000 });
+    try eq(error.SizeMismatch, (try wait(rounded_as_exact)).failure.?);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, path, .{}));
+    try rounded_as_exact.release();
+    const body: [262144]u8 = @splat('x');
+    var digest: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(&body, &digest, .{});
+    const bounded = try service.submit(.{ .url = u, .output = .{ .file = path }, .max_bytes = 262499, .expected_sha1 = digest });
+    _ = try success(bounded);
+    try bounded.release();
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    try eq(@as(u64, body.len), (try file.stat(io)).size);
+}
 test "JSON parsing, malformed JSON, limits, HTTP errors and explicit proxy" {
     const base = try baseUrl();
     defer a.free(base);
@@ -298,4 +326,23 @@ test "unknown length, timeout, relative file paths and path exclusion" {
     try std.testing.expectEqualStrings("hello minecraft\n", data);
     const wrongsize = try s.submit(.{ .url = bytes, .expected_size = 100 });
     try eq(error.SizeMismatch, (try wait(wrongsize)).failure.?);
+}
+
+test "null and empty proxy disable inherited proxies and explicit proxy ignores NO_PROXY" {
+    const base = try baseUrl();
+    defer a.free(base);
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    const service = try dl.Service.init(a, io, 1);
+    defer service.deinit();
+    const direct_url = try url(base, "/bytes");
+    defer a.free(direct_url);
+    for ([_]?[]const u8{ null, "" }) |proxy| {
+        const task = try service.submit(.{ .url = direct_url, .proxy = proxy });
+        try std.testing.expectEqualStrings("hello minecraft\n", (try success(task)).result.?.bytes);
+        try task.release();
+    }
+    const proxied = try service.submit(.{ .url = "http://downloader-fixture.invalid/bytes", .proxy = base });
+    defer proxied.release() catch unreachable;
+    try std.testing.expectEqualStrings("hello minecraft\n", (try success(proxied)).result.?.bytes);
 }

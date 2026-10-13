@@ -728,7 +728,7 @@ fn allocationFailures(a: Allocator) !void {
 }
 
 test "CF controller allocation failures release secret job registry and stable core" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailures, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationFailures, .{});
 }
 
 fn failAckSpawn(job: *Job) !std.Thread {
@@ -789,12 +789,15 @@ test "CF controller explicit recovery uses authoritative disk not an unrelated s
     try controller.startSet(&fixture.store, &secret, test_policy);
     try settle(&controller, &fixture.store);
     const previous_connections = fixture.store.snapshot().settings.download_connections;
-    var disk_owner = try config.Store.init(std.testing.allocator, std.testing.io, fixture.root);
-    defer disk_owner.deinit();
-    var disk = disk_owner.snapshot().*;
+    // An uncooperative external replacement still needs authoritative recovery.
+    // Cooperating writers cannot open another Store while this owner is alive.
+    try std.testing.expectError(error.LauncherRootInUse, config.Store.init(std.testing.allocator, std.testing.io, fixture.root));
+    var disk = fixture.store.snapshot().*;
     disk.settings.download_connections = 23;
     disk.settings.curseforge_enabled = false;
-    try disk_owner.update(disk);
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, disk, .{});
+    defer std.testing.allocator.free(bytes);
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/config.json", .data = bytes });
     try std.testing.expectEqual(previous_connections, fixture.store.snapshot().settings.download_connections);
     controller.spawn = spawnThread;
     try controller.startRecovery(&fixture.store);

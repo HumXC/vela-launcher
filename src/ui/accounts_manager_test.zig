@@ -286,8 +286,8 @@ test "accounts offline CRUD persists, owns launch selection, and rejects UUID co
     try t.expect(identity.access_token == null);
     try store.update(store.snapshot().*);
     try t.expectEqualStrings("Alex_2", (try manager.launchIdentity(0)).username);
-    var reloaded = try config.Store.init(a, io, root);
-    defer reloaded.deinit();
+    try store.reconcile();
+    const reloaded = &store;
     try t.expectEqual(@as(usize, 2), reloaded.snapshot().accounts.len);
     try t.expectEqualStrings(alex_id, reloaded.snapshot().selected_account.?);
     try manager.removeOffline(&store, alex_id);
@@ -302,6 +302,87 @@ test "accounts offline CRUD persists, owns launch selection, and rejects UUID co
     try t.expectError(error.AccountNotFound, manager.select(&store, "missing"));
     try t.expectError(error.AccountNotFound, manager.removeOffline(&store, "missing"));
     try expectNoPlaintext(&tmp);
+}
+
+test "accounts offline login immediately selects persisted owned launch identity" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try rootPath(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, io, root);
+    defer store.deinit();
+    var manager = try accounts.Manager.init(a, io, root);
+    defer manager.deinit();
+
+    try manager.loginOffline(&store, "Steve");
+    const steve_id = try a.dupe(u8, store.snapshot().selected_account.?);
+    defer a.free(steve_id);
+    try t.expectEqual(@as(usize, 1), store.snapshot().accounts.len);
+    try t.expectEqualStrings(steve_id, store.snapshot().accounts[0].id);
+    try t.expect(manager.canLaunch(0));
+    var owned = try manager.cloneLaunchSession(a, 0);
+    defer owned.deinit();
+    try t.expectEqualStrings(steve_id, owned.id);
+    try t.expectEqualStrings("Steve", owned.username);
+    try t.expectEqualStrings(&(try accounts.offlineUuid("Steve")), owned.uuid);
+    try t.expectEqual(config.AccountKind.offline, owned.kind);
+    try t.expect(owned.token == null);
+
+    try manager.loginOffline(&store, "Alex");
+    const alex_id = try a.dupe(u8, store.snapshot().selected_account.?);
+    defer a.free(alex_id);
+    try t.expect(!std.mem.eql(u8, steve_id, alex_id));
+    try t.expectEqualStrings("Alex", (try manager.launchIdentity(0)).username);
+    try t.expectEqualStrings(&(try accounts.offlineUuid("Alex")), (try manager.launchIdentity(0)).uuid);
+    try t.expectEqualStrings("Steve", owned.username);
+    try t.expectEqualStrings(&(try accounts.offlineUuid("Steve")), owned.uuid);
+
+    // Adding metadata alone must preserve the explicit login selection.
+    try manager.addOffline(&store, "Bob");
+    try t.expectEqualStrings(alex_id, store.snapshot().selected_account.?);
+    try store.reconcile();
+    const reloaded = &store;
+    try t.expectEqual(@as(usize, 3), reloaded.snapshot().accounts.len);
+    try t.expectEqualStrings(alex_id, reloaded.snapshot().selected_account.?);
+    const selected = accounts.findAccount(reloaded.snapshot(), alex_id).?;
+    try t.expectEqualStrings("Alex", selected.name);
+    try t.expectEqualStrings(&(try accounts.offlineUuid("Alex")), selected.uuid);
+    try expectNoPlaintext(&tmp);
+}
+
+test "accounts invalid and duplicate offline login preserve config and selection" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try rootPath(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, io, root);
+    defer store.deinit();
+    var manager = try accounts.Manager.init(a, io, root);
+    defer manager.deinit();
+
+    try t.expectError(error.InvalidAccountName, manager.loginOffline(&store, "ab"));
+    try t.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
+    try t.expect(store.snapshot().selected_account == null);
+    try t.expectError(error.NoAccountSelected, manager.launchIdentity(0));
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, ".vela", .{}));
+
+    try manager.loginOffline(&store, "Steve");
+    const selected_id = try a.dupe(u8, store.snapshot().selected_account.?);
+    defer a.free(selected_id);
+    const before = try tmp.dir.readFileAlloc(io, ".vela/config.json", a, .limited(1024 * 1024));
+    defer a.free(before);
+    for ([_][]const u8{ "", "ab", "abcdefghijklmnopq", "bad name", "user@example.com" }) |name|
+        try t.expectError(error.InvalidAccountName, manager.loginOffline(&store, name));
+    try t.expectError(error.DuplicateUuid, manager.loginOffline(&store, "Steve"));
+    try t.expectEqual(@as(usize, 1), store.snapshot().accounts.len);
+    try t.expectEqualStrings(selected_id, store.snapshot().selected_account.?);
+    const identity = try manager.launchIdentity(0);
+    try t.expectEqualStrings(selected_id, identity.id);
+    try t.expectEqualStrings("Steve", identity.username);
+    try t.expectEqualStrings(&(try accounts.offlineUuid("Steve")), identity.uuid);
+    const after = try tmp.dir.readFileAlloc(io, ".vela/config.json", a, .limited(1024 * 1024));
+    defer a.free(after);
+    try t.expectEqualStrings(before, after);
 }
 
 test "accounts UUID collision includes Microsoft identities and ignores hex case" {
@@ -834,6 +915,49 @@ test "accounts more than 256 offline identities do not block protected cleanup r
     try expectNoPlaintext(&tmp);
 }
 
+test "accounts offline login allocation failures never commit or replace selection and retry succeeds" {
+    // Fail the account list and each owned selection string in turn.
+    for (0..4) |offset| {
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try rootPath(&tmp);
+        defer a.free(root);
+        var store = try config.Store.init(a, io, root);
+        defer store.deinit();
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        var fake: Fake = .{};
+        var manager = try accounts.Manager.initWithOptions(failing.allocator(), io, .{ .root = root, .fixture = fake.fixture() });
+        defer manager.deinit();
+        try manager.loginOffline(&store, "Steve");
+        const selected_id = try a.dupe(u8, store.snapshot().selected_account.?);
+        defer a.free(selected_id);
+        const before = try tmp.dir.readFileAlloc(io, ".vela/config.json", a, .limited(1024 * 1024));
+        defer a.free(before);
+
+        failing.fail_index = failing.alloc_index + offset;
+        failing.resize_fail_index = failing.resize_index;
+        try t.expectError(error.OutOfMemory, manager.loginOffline(&store, "Alex"));
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(@as(usize, 1), store.snapshot().accounts.len);
+        try t.expectEqualStrings(selected_id, store.snapshot().selected_account.?);
+        const identity = try manager.launchIdentity(0);
+        try t.expectEqualStrings(selected_id, identity.id);
+        try t.expectEqualStrings("Steve", identity.username);
+        try t.expectEqualStrings(&(try accounts.offlineUuid("Steve")), identity.uuid);
+        const after = try tmp.dir.readFileAlloc(io, ".vela/config.json", a, .limited(1024 * 1024));
+        defer a.free(after);
+        try t.expectEqualStrings(before, after);
+
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+        try manager.loginOffline(&store, "Alex");
+        try t.expectEqual(@as(usize, 2), store.snapshot().accounts.len);
+        try t.expectEqualStrings("Alex", (try manager.launchIdentity(0)).username);
+        try t.expectEqualStrings(&(try accounts.offlineUuid("Alex")), (try manager.launchIdentity(0)).uuid);
+        try t.expectEqualStrings(store.snapshot().accounts[1].id, store.snapshot().selected_account.?);
+    }
+}
+
 test "accounts selection allocation failure rejects stale offline identity and recovers on next tick" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -953,12 +1077,11 @@ test "accounts uncertain config blocks new work and cleanup recovers latest prot
     try t.expectEqual(@as(usize, 0), fake.reference_calls);
     try t.expectEqual(@as(usize, 0), fake.deletes);
     try tmp.dir.rename(".vela/previous.json", tmp.dir, ".vela/config.json", io);
-    // A separately loaded owner commits newer metadata; recovery must protect it.
-    {
-        var authoritative = try config.Store.init(a, io, root);
-        defer authoritative.deinit();
-        try savedAccount(&authoritative);
-    }
+    // A second writer is excluded; recovery still reloads valid disk evidence.
+    try t.expectError(error.LauncherRootInUse, config.Store.init(a, io, root));
+    const recovered_bytes = try config.serialize(a, .{ .settings = .{ .microsoft_client_id = "fixture-public-client" }, .accounts = &.{.{ .id = "saved-online", .name = "FixturePlayer", .uuid = "00112233445566778899aabbccddeeff", .kind = .microsoft, .credential_ref = &saved_ref }}, .selected_account = "saved-online" });
+    defer a.free(recovered_bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".vela/config.json", .data = recovered_bytes });
     try t.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
     try manager.retryCleanup(&store);
     try settle(&manager, &store);

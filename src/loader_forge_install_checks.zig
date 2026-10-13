@@ -1,3 +1,3 @@
 comptime {
-    _ = @import("core/minecraft/loaders_forge_install_tests.zig");
+    _ = @import("core/loaders/tests/forge_install.zig");
 }

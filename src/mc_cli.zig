@@ -6,6 +6,7 @@ const downloader = @import("core/downloader.zig");
 const install = @import("core/minecraft/install.zig");
 const launch = @import("core/minecraft/launch.zig");
 const metadata = @import("core/minecraft/metadata/root.zig");
+const java_process = @import("core/loaders/java_process.zig");
 
 const usage =
     \\Usage: vela-mc <install|launch> <version> [options]
@@ -138,27 +139,21 @@ fn reportProgress(p: install.Progress) void {
 }
 
 fn checkJava(a: std.mem.Allocator, io: std.Io, java: []const u8, required: u64) !void {
-    const result = try std.process.run(a, io, .{ .argv = &.{ java, "-version" }, .stdout_limit = .limited(64 * 1024), .stderr_limit = .limited(64 * 1024) });
-    defer a.free(result.stdout);
-    defer a.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.JavaVersionCheckFailed,
-        else => return error.JavaVersionCheckFailed,
-    }
-    const major = parseJavaMajor(result.stderr) orelse parseJavaMajor(result.stdout) orelse return error.InvalidJavaVersion;
+    var clock_io = io;
+    const major = try java_process.probe(a, io, java, .{
+        .deadline_ms = javaProbeNow(&clock_io) +| 10 * std.time.ms_per_s,
+        .context = &clock_io,
+        .now_ms = javaProbeNow,
+    });
     if (major < required) {
         std.debug.print("Java {d} required; selected Java {d}\n", .{ required, major });
         return error.JavaTooOld;
     }
 }
 
-fn parseJavaMajor(text: []const u8) ?u32 {
-    const start = (std.mem.indexOf(u8, text, "version \"") orelse return null) + 9;
-    var version = text[start..];
-    if (std.mem.startsWith(u8, version, "1.")) version = version[2..];
-    var len: usize = 0;
-    while (len < version.len and std.ascii.isDigit(version[len])) : (len += 1) {}
-    return std.fmt.parseInt(u32, version[0..len], 10) catch null;
+fn javaProbeNow(context: ?*anyopaque) u64 {
+    const io: *const std.Io = @ptrCast(@alignCast(context.?));
+    return @intCast(@max(0, @divFloor(std.Io.Clock.awake.now(io.*).nanoseconds, std.time.ns_per_ms)));
 }
 
 fn offlineUuid(name: []const u8) [32]u8 {
@@ -170,12 +165,6 @@ fn offlineUuid(name: []const u8) [32]u8 {
     bytes[6] = (bytes[6] & 0x0f) | 0x30;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     return std.fmt.bytesToHex(bytes, .lower);
-}
-
-test "Java version parsing supports modern and legacy formats" {
-    try std.testing.expectEqual(@as(?u32, 21), parseJavaMajor("openjdk version \"21.0.11\""));
-    try std.testing.expectEqual(@as(?u32, 8), parseJavaMajor("java version \"1.8.0_402\""));
-    try std.testing.expectEqual(@as(?u32, null), parseJavaMajor("not java"));
 }
 
 test {

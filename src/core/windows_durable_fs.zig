@@ -18,6 +18,7 @@ pub const Error = error{
     OutOfMemory,
     InvalidRoot,
     InvalidLeaf,
+    LauncherRootInUse,
     FileTooLarge,
     InsecureJournal,
     JournalChanged,
@@ -54,6 +55,8 @@ pub const NativeOps = struct {
     context: *anyopaque,
     open: *const fn (*anyopaque, []const u8, Privacy) Error!void,
     close: *const fn (*anyopaque) void,
+    /// Lifetime root writer, released by close. Absent implementations fail closed.
+    acquire_writer: ?*const fn (*anyopaque) Error!void = null,
     check_cancel: *const fn (*anyopaque) Error!void,
     validate_root: *const fn (*anyopaque) Error!void,
     load: *const fn (*anyopaque, Allocator, []const u8, usize, Privacy) Error!?OwnedBytes,
@@ -107,6 +110,17 @@ pub fn openRootWithOps(a: Allocator, absolute_root: []const u8, privacy: Privacy
     errdefer a.free(normalized);
     try ops.open(ops.context, normalized, privacy);
     return .{ .allocator = a, .normalized = normalized, .privacy = privacy, .ops = ops };
+}
+
+/// Acquire before loading config; retain through reference/vault cleanup.
+/// Journal capabilities do not independently acquire the config writer.
+pub fn acquireWriter(root: *Root) Error!void {
+    if (root.privacy != .ordinary_config) return error.InvalidRoot;
+    try root.ops.check_cancel(root.ops.context);
+    try root.ops.validate_root(root.ops.context);
+    const acquire = root.ops.acquire_writer orelse return error.UnsupportedDurability;
+    try acquire(root.ops.context);
+    try root.ops.validate_root(root.ops.context);
 }
 
 pub fn deinit(root: *Root) void {
@@ -367,6 +381,7 @@ const Windows = struct {
     storage_wide: ?[:0]u16 = null,
     ancestors: std.ArrayList(Guard) = .empty,
     directory: ?Guard = null,
+    writer: ?Handle = null,
     token_buffer: []u64 = &.{},
     user_sid: ?*anyopaque = null,
     file_sd: ?*anyopaque = null,
@@ -376,13 +391,13 @@ const Windows = struct {
         return @ptrCast(@alignCast(ctx));
     }
     fn operations(self: *Windows) NativeOps {
-        return .{ .context = self, .open = open, .close = close, .check_cancel = checkCancel, .validate_root = validateRoot, .load = read, .ensure_directory = ensureDirectory, .random = random, .create_temp = createTemp, .write = write, .flush = flush, .verify_temp = verifyTemp, .move = move, .verify_final = verifyFinal, .close_file = closeFile, .discard_temp = discardTemp };
+        return .{ .context = self, .open = open, .close = close, .acquire_writer = acquireWriterNative, .check_cancel = checkCancel, .validate_root = validateRoot, .load = read, .ensure_directory = ensureDirectory, .random = random, .create_temp = createTemp, .write = write, .flush = flush, .verify_temp = verifyTemp, .move = move, .verify_final = verifyFinal, .close_file = closeFile, .discard_temp = discardTemp };
     }
     fn checkCancel(ctx: *anyopaque) Error!void {
         cast(ctx).io.checkCancel() catch return error.Cancelled;
     }
     fn lastError() u32 {
-        return @intFromEnum(w.GetLastError());
+        return @backingInt(w.GetLastError());
     }
     fn failure() Error {
         return switch (lastError()) {
@@ -399,6 +414,7 @@ const Windows = struct {
         }
     }
     fn cleanup(self: *Windows) void {
+        if (self.writer) |handle| w.CloseHandle(handle);
         if (self.directory) |g| w.CloseHandle(g.handle);
         var i = self.ancestors.items.len;
         while (i != 0) {
@@ -412,6 +428,25 @@ const Windows = struct {
         freeLocal(self.file_sd);
         freeLocal(self.dir_sd);
     }
+    fn acquireWriterNative(ctx: *anyopaque) Error!void {
+        const self = cast(ctx);
+        if (self.writer != null) return;
+        // OPEN_ALWAYS, OPEN_REPARSE_POINT; deny write and delete sharing for the
+        // complete lifetime. Ancestor handles already prevent root substitution.
+        const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\\.vela-writer.lock");
+        const root = self.root_wide.?;
+        const separator: usize = if (root.len != 0 and root[root.len - 1] == '\\') 1 else 0;
+        const wide = try self.allocator.allocSentinel(u16, root.len + suffix.len - separator, 0);
+        defer self.allocator.free(wide);
+        @memcpy(wide[0..root.len], root);
+        @memcpy(wide[root.len..], suffix[separator..]);
+        const handle = CreateFileW(wide, 0xc0000000 | 0x20000, 1, null, 4, 0x200000 | 0x80, null);
+        if (handle == w.INVALID_HANDLE_VALUE) return if (lastError() == 32 or lastError() == 33) error.LauncherRootInUse else failure();
+        errdefer w.CloseHandle(handle);
+        _ = try self.inspect(handle, false);
+        self.writer = handle;
+    }
+
     fn close(ctx: *anyopaque) void {
         const self = cast(ctx);
         const a = self.allocator;
@@ -439,7 +474,7 @@ const Windows = struct {
         // a directory substitution while a later Win32 path-based move is running.
         var end: usize = 7; // internally generated \\?\C:\ prefix
         while (true) {
-            const prefix = try self.allocator.dupeZ(u16, wide[0..end]);
+            const prefix = try self.allocator.dupeSentinel(u16, wide[0..end], 0);
             defer self.allocator.free(prefix);
             const handle = (try self.openDirectory(prefix, 1)) orelse return error.InvalidRoot;
             errdefer w.CloseHandle(handle);
@@ -558,7 +593,7 @@ const Windows = struct {
             if (!Identity.eql(info.identity(), guard.identity)) return error.JournalChanged;
             // Win32 moves resolve paths again. Confirm that each path still
             // names the held object, including after a drive mapping change.
-            const prefix = try self.allocator.dupeZ(u16, self.root_wide.?[0..guard.prefix_len]);
+            const prefix = try self.allocator.dupeSentinel(u16, self.root_wide.?[0..guard.prefix_len], 0);
             defer self.allocator.free(prefix);
             const current = (try self.openDirectory(prefix, 1)) orelse return error.JournalChanged;
             defer w.CloseHandle(current);

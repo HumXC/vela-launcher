@@ -33,6 +33,9 @@ const Job = struct {
 
     fn create(a: Allocator, io: Io, server: config.Server, query: Query, options: servers.Options) !*Job {
         _ = try servers.validateAddress(server.address, server.port);
+        return createOwned(a, io, server, query, options);
+    }
+    fn createOwned(a: Allocator, io: Io, server: config.Server, query: Query, options: servers.Options) !*Job {
         const job = try a.create(Job);
         errdefer a.destroy(job);
         job.* = .{ .allocator = a, .arena = .init(a), .io = io, .server = server, .query = query, .options = options };
@@ -48,6 +51,11 @@ const Job = struct {
         defer self.done.store(true, .release);
         var options = self.options;
         options.cancellation = &self.cancellation;
+        // Invalid picker addresses fail only this card, never its peers or the UI frame.
+        _ = servers.validateAddress(self.server.address, self.server.port) catch |err| {
+            self.failure = err;
+            return;
+        };
         // Worker allocations never touch the UI allocator or config store.
         self.status = self.query(std.heap.page_allocator, self.io, self.server, options) catch |err| {
             self.failure = err;
@@ -70,6 +78,10 @@ pub const Manager = struct {
     active_current: bool = false,
     pending: ?*Job = null,
     published: ?*Job = null,
+    picker: ?*Picker = null,
+    picker_poll_interval_ms: u32 = 10_000,
+    selected_poll_interval_ms: u32 = 10_000,
+    selected_next_poll_ms: i64 = 0,
 
     pub fn init(a: Allocator, io: Io) Manager {
         return .{ .allocator = a, .io = io };
@@ -79,6 +91,11 @@ pub const Manager = struct {
         return .{ .allocator = a, .io = io, .query = query };
     }
     pub fn deinit(self: *Manager) void {
+        if (self.picker) |picker| {
+            picker.deinit(self.allocator);
+            self.allocator.destroy(picker);
+            self.picker = null;
+        }
         self.clear();
         if (self.active) |job| {
             job.cancellation.store(true, .release);
@@ -92,10 +109,26 @@ pub const Manager = struct {
     /// the std.Io backend. Neither this call nor clear waits for that resolver.
     pub fn refreshConfigured(self: *Manager, server: config.Server) !void {
         const next = try Job.create(self.allocator, self.io, server, self.query, self.options);
+        errdefer next.destroy();
+        const current = self.snapshot().server;
+        const same_target = if (current) |value| sameQueryTarget(value, server) else false;
+        if (!same_target and !self.adoptCached(server)) try self.preserveSelection(server);
+        self.replaceJob(next);
+    }
+    fn refreshPicker(self: *Manager, server: config.Server) !void {
+        const next = try Job.createOwned(self.allocator, self.io, server, self.query, self.options);
+        self.replaceJob(next);
+    }
+    fn replaceJob(self: *Manager, next: *Job) void {
         if (self.pending) |job| job.destroy();
-        if (self.published) |job| job.destroy();
-        self.published = null;
+        if (self.published) |job| {
+            if (!sameQueryTarget(job.server, next.server)) {
+                job.destroy();
+                self.published = null;
+            }
+        }
         self.pending = next;
+        self.selected_next_poll_ms = nowMilliseconds(self.io) + self.selected_poll_interval_ms;
         if (self.active) |job| job.cancellation.store(true, .release);
         self.active_current = false;
         self.tick();
@@ -110,6 +143,11 @@ pub const Manager = struct {
         self.active_current = false;
     }
     pub fn cancel(self: *Manager) void {
+        if (self.picker) |picker| picker.leave();
+        self.cancelSelected();
+    }
+    /// Cancel the selected query without discarding unrelated card queries.
+    pub fn cancelSelected(self: *Manager) void {
         if (self.pending) |job| {
             job.failure = error.Canceled;
             job.done.store(true, .release);
@@ -120,6 +158,7 @@ pub const Manager = struct {
         if (self.active) |job| job.cancellation.store(true, .release);
     }
     pub fn tick(self: *Manager) void {
+        if (self.picker) |picker| picker.tick(self.allocator);
         if (self.active) |job| {
             if (!job.done.load(.acquire)) return;
             if (job.future) |*future| future.await(self.io);
@@ -135,6 +174,7 @@ pub const Manager = struct {
             job.future = self.io.concurrent(Job.run, .{job}) catch |err| {
                 job.failure = err;
                 job.done.store(true, .release);
+                if (self.published) |old| old.destroy();
                 self.published = job;
                 return;
             };
@@ -143,21 +183,265 @@ pub const Manager = struct {
         }
     }
     pub fn isBusy(self: *const Manager) bool {
-        return self.active != null or self.pending != null;
+        return self.active != null or self.pending != null or if (self.picker) |picker| picker.isBusy() else false;
+    }
+    /// Select a launch target without restarting an existing query. Picker jobs,
+    /// published status and their polling deadline move together between owners.
+    pub fn selectConfigured(self: *Manager, server: config.Server) !void {
+        const current = self.snapshot().server;
+        if (current) |value| if (sameQueryTarget(value, server)) return;
+        if (self.adoptCached(server)) return;
+        const next = try Job.createOwned(self.allocator, self.io, server, self.query, self.options);
+        errdefer next.destroy();
+        try self.preserveSelection(server);
+        self.replaceJob(next);
+    }
+    fn adoptCached(self: *Manager, server: config.Server) bool {
+        if (self.picker) |picker| {
+            for (picker.entries.items) |entry| {
+                const cached = entry.snapshot().server orelse continue;
+                if (!sameQueryTarget(cached, server)) continue;
+                self.swapQueryState(entry);
+                return true;
+            }
+        }
+        return false;
+    }
+    fn preserveSelection(self: *Manager, server: config.Server) !void {
+        // Keep the old selected card available when selecting a target that has
+        // not been queried yet. Endpoint edits replace only that target's work.
+        const current = self.snapshot().server;
+        if (self.picker) |picker| if (picker.open) {
+            if (current) |value| if (!std.mem.eql(u8, value.id, server.id)) {
+                try picker.entries.ensureUnusedCapacity(self.allocator, 1);
+                const entry = try self.allocator.create(Manager);
+                entry.* = Manager.initWithQuery(self.allocator, self.io, self.query);
+                entry.options = self.options;
+                self.swapQueryState(entry);
+                picker.entries.appendAssumeCapacity(entry);
+            };
+        };
+    }
+    fn swapQueryState(self: *Manager, other: *Manager) void {
+        std.mem.swap(?*Job, &self.active, &other.active);
+        std.mem.swap(bool, &self.active_current, &other.active_current);
+        std.mem.swap(?*Job, &self.pending, &other.pending);
+        std.mem.swap(?*Job, &self.published, &other.published);
+        std.mem.swap(i64, &self.selected_next_poll_ms, &other.selected_next_poll_ms);
+    }
+
+    /// Keep the selected launch target fresh independently of page navigation.
+    pub fn updateSelected(self: *Manager, document: *const config.Document, enabled: bool) !void {
+        if (!enabled) return;
+        const id = document.selected_server orelse {
+            self.clear();
+            return;
+        };
+        for (document.servers) |server| {
+            if (!std.mem.eql(u8, server.id, id)) continue;
+            const now = nowMilliseconds(self.io);
+            const current = self.snapshot();
+            const same_target = if (current.server) |queried| sameQueryTarget(queried, server) else false;
+            if (!same_target) {
+                try self.selectConfigured(server);
+                return;
+            }
+            if (now < self.selected_next_poll_ms) return;
+            // A slow query keeps running; navigation and timers never restart it.
+            if (self.active != null or self.pending != null) {
+                self.selected_next_poll_ms = now + self.selected_poll_interval_ms;
+                return;
+            }
+            try self.refreshPicker(server);
+            return;
+        }
+        self.clear();
+    }
+    pub fn selectedRefreshDelay(self: *const Manager) u32 {
+        if (self.snapshot().server == null) return self.selected_poll_interval_ms;
+        const remaining = @max(0, self.selected_next_poll_ms - nowMilliseconds(self.io));
+        return @intCast(@min(remaining, std.math.maxInt(u32)));
+    }
+
+    /// Unselected card queries share ownership with the selected launch target.
+    pub fn updatePicker(self: *Manager, configured: []const config.Server, visible: bool) !void {
+        if (!visible) {
+            if (self.picker) |picker| picker.leave();
+            return;
+        }
+        if (self.picker == null) {
+            const picker = try self.allocator.create(Picker);
+            picker.* = .{};
+            self.picker = picker;
+        }
+        try self.picker.?.update(self, configured);
+    }
+    pub fn pickerSnapshot(self: *const Manager, id: []const u8) Snapshot {
+        const selected = self.snapshot();
+        if (selected.server) |server| if (std.mem.eql(u8, server.id, id)) return selected;
+        if (self.picker) |picker| for (picker.entries.items) |entry| {
+            const value = entry.snapshot();
+            if (value.server) |server| if (std.mem.eql(u8, server.id, id)) return value;
+        };
+        return .{};
+    }
+    pub fn pickerRefreshDelay(self: *const Manager) u32 {
+        const picker = self.picker orelse return self.picker_poll_interval_ms;
+        const remaining = @max(0, picker.next_poll_ms - nowMilliseconds(self.io));
+        return @intCast(@min(remaining, std.math.maxInt(u32)));
     }
     pub fn snapshot(self: *const Manager) Snapshot {
-        if (self.pending) |job| return .{ .state = .querying, .server = job.server, .worker_active = true };
-        if (self.active_current) {
-            if (self.active) |job| return .{ .state = .querying, .server = job.server, .worker_active = true };
-        }
+        // Published data belongs to this same target; keep it visible while a
+        // refresh runs and replace it only after the worker has finished.
         if (self.published) |job| return .{
             .state = if (job.status != null) .online else if (job.failure != null and job.failure.? == error.Canceled) .canceled else .offline,
             .server = job.server,
             .status = if (job.status) |*status| status else null,
             .failure = job.failure,
-            .worker_active = self.isBusy(),
+            .worker_active = self.active != null or self.pending != null,
         };
-        return .{ .worker_active = self.isBusy() };
+        if (self.pending) |job| return .{ .state = .querying, .server = job.server, .worker_active = true };
+        if (self.active_current) {
+            if (self.active) |job| return .{ .state = .querying, .server = job.server, .worker_active = true };
+        }
+        return .{ .worker_active = self.active != null or self.pending != null };
+    }
+};
+
+fn sameQueryTarget(left: config.Server, right: config.Server) bool {
+    return left.port == right.port and
+        std.mem.eql(u8, left.id, right.id) and
+        std.mem.eql(u8, left.name, right.name) and
+        std.mem.eql(u8, left.address, right.address) and
+        std.mem.eql(u8, left.instance_id, right.instance_id);
+}
+
+fn nowMilliseconds(io: Io) i64 {
+    return @intCast(Io.Clock.awake.now(io).toMilliseconds());
+}
+
+/// Retired queries unwind without blocking navigation or borrowing config arenas.
+const Picker = struct {
+    entries: std.ArrayList(*Manager) = .empty,
+    retired: std.ArrayList(*Manager) = .empty,
+    open: bool = false,
+    fingerprint: u64 = 0,
+    next_poll_ms: i64 = 0,
+
+    fn configurationFingerprint(configured: []const config.Server, selected: ?config.Server) u64 {
+        var hash = std.hash.Wyhash.init(0);
+        for (configured) |server| {
+            if (selected) |value| if (sameQueryTarget(value, server)) continue;
+            for ([_][]const u8{ server.id, server.name, server.address, server.instance_id }) |value| {
+                hash.update(std.mem.asBytes(&value.len));
+                hash.update(value);
+            }
+            hash.update(std.mem.asBytes(&server.port));
+        }
+        return hash.final();
+    }
+    fn destroyEntry(a: Allocator, entry: *Manager) void {
+        entry.deinit();
+        a.destroy(entry);
+    }
+    fn deinit(self: *Picker, a: Allocator) void {
+        for (self.entries.items) |entry| destroyEntry(a, entry);
+        for (self.retired.items) |entry| destroyEntry(a, entry);
+        self.entries.deinit(a);
+        self.retired.deinit(a);
+    }
+    fn update(self: *Picker, owner: *Manager, configured: []const config.Server) !void {
+        const now = nowMilliseconds(owner.io);
+        const selected = owner.snapshot().server;
+        const fingerprint = configurationFingerprint(configured, selected);
+        if (!self.open or fingerprint != self.fingerprint) {
+            var next: std.ArrayList(*Manager) = .empty;
+            errdefer {
+                for (next.items) |entry| if (!containsEntry(self.entries.items, entry)) destroyEntry(owner.allocator, entry);
+                next.deinit(owner.allocator);
+            }
+            // Reuse unchanged owners, including the former selected card. Prepare
+            // new jobs before mutating the live list so failures preserve its work.
+            for (configured) |server| {
+                if (selected) |value| if (sameQueryTarget(value, server)) continue;
+                var reused: ?*Manager = null;
+                for (self.entries.items) |entry| {
+                    const queried = entry.snapshot().server orelse continue;
+                    if (sameQueryTarget(queried, server)) {
+                        reused = entry;
+                        break;
+                    }
+                }
+                if (reused) |entry| {
+                    try next.append(owner.allocator, entry);
+                    continue;
+                }
+                try next.ensureUnusedCapacity(owner.allocator, 1);
+                const entry = try owner.allocator.create(Manager);
+                errdefer owner.allocator.destroy(entry);
+                entry.* = Manager.initWithQuery(owner.allocator, owner.io, owner.query);
+                entry.options = owner.options;
+                entry.selected_poll_interval_ms = owner.picker_poll_interval_ms;
+                entry.selected_next_poll_ms = now + owner.picker_poll_interval_ms;
+                entry.pending = try Job.createOwned(owner.allocator, owner.io, server, owner.query, owner.options);
+                next.appendAssumeCapacity(entry);
+            }
+            try self.retired.ensureUnusedCapacity(owner.allocator, self.entries.items.len);
+            for (self.entries.items) |entry| {
+                if (containsEntry(next.items, entry)) continue;
+                entry.clear();
+                self.retired.appendAssumeCapacity(entry);
+            }
+            self.entries.deinit(owner.allocator);
+            self.entries = next;
+            self.open = true;
+            self.fingerprint = fingerprint;
+            self.schedulePoll(now, owner.picker_poll_interval_ms);
+            self.tick(owner.allocator);
+            return;
+        }
+        if (now < self.next_poll_ms) return;
+        for (self.entries.items) |entry| {
+            if (now < entry.selected_next_poll_ms) continue;
+            if (entry.isBusy()) {
+                entry.selected_next_poll_ms = now + owner.picker_poll_interval_ms;
+                continue;
+            }
+            entry.selected_poll_interval_ms = owner.picker_poll_interval_ms;
+            if (entry.snapshot().server) |server| try entry.refreshPicker(server);
+        }
+        self.schedulePoll(now, owner.picker_poll_interval_ms);
+    }
+    fn containsEntry(entries: []const *Manager, target: *Manager) bool {
+        for (entries) |entry| if (entry == target) return true;
+        return false;
+    }
+    fn schedulePoll(self: *Picker, now: i64, interval_ms: u32) void {
+        self.next_poll_ms = now + interval_ms;
+        for (self.entries.items) |entry| self.next_poll_ms = @min(self.next_poll_ms, entry.selected_next_poll_ms);
+    }
+    fn leave(self: *Picker) void {
+        if (!self.open) return;
+        self.open = false;
+        for (self.entries.items) |entry| entry.clear();
+    }
+    fn tick(self: *Picker, a: Allocator) void {
+        for (self.entries.items) |entry| entry.tick();
+        var index: usize = 0;
+        while (index < self.retired.items.len) {
+            const entry = self.retired.items[index];
+            entry.tick();
+            if (entry.isBusy()) {
+                index += 1;
+            } else {
+                destroyEntry(a, self.retired.swapRemove(index));
+            }
+        }
+    }
+    fn isBusy(self: *const Picker) bool {
+        for (self.entries.items) |entry| if (entry.isBusy()) return true;
+        for (self.retired.items) |entry| if (entry.isBusy()) return true;
+        return false;
     }
 };
 
@@ -239,7 +523,7 @@ fn oomClone(a: Allocator) !void {
     try awaitSettled(&manager);
 }
 test "manager allocation failure sweeps and active shutdown join" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, oomClone, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, oomClone, .{});
     var manager = Manager.initWithQuery(std.testing.allocator, std.testing.io, fixtureQuery);
     try manager.refreshConfigured(fixtureServer("wait"));
     manager.deinit();

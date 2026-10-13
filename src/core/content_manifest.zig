@@ -766,7 +766,7 @@ test "manifest roundtrip owns strings omits null fields rejects unknown fields a
     defer testing.allocator.free(encoded);
     try testing.expect(std.mem.indexOf(u8, encoded, "null") == null);
     try testing.expectError(error.UnknownField, parse(testing.allocator, "{\"schema_version\":1,\"instance_id\":\"instance\",\"pack_version\":\"v1\",\"secret\":\"not-allowed\"}"));
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseManifest, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseManifest, .{});
 }
 fn exercisePacks(a: std.mem.Allocator) !void {
     var mr = try parseMrpack(a, mrpack_fixture, mr_identity, .client);
@@ -792,7 +792,7 @@ test "mrpack environment loaders and CurseForge refs remain explicit" {
     try testing.expectEqual(@as(usize, 1), cf.value.unresolved.len);
     try testing.expectEqualStrings("34", cf.value.unresolved[0].file_id);
     try testing.expectEqual(@as(usize, 0), cf.value.files.len);
-    try testing.checkAllAllocationFailures(testing.allocator, exercisePacks, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exercisePacks, .{});
 }
 fn replacedFixture(a: std.mem.Allocator, input: []const u8, from: []const u8, to: []const u8) ![]u8 {
     const index = std.mem.indexOf(u8, input, from) orelse unreachable;
@@ -865,7 +865,7 @@ fn exerciseUpdate(a: std.mem.Allocator) !void {
 }
 test "update only managed files backup first preserves unmanaged mods and saves OOM" {
     try exerciseUpdate(testing.allocator);
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseUpdate, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseUpdate, .{});
     const old = manifest(&.{managed("mods/a.jar", sha1_a, "v1")}, "v1");
     const new = manifest(&.{managed("mods/a.jar", sha1_b, "v2")}, "v2");
     var plan = try buildUpdatePlan(testing.allocator, old, new, &.{observedFile("mods/a.jar", sha1_a)}, &.{}, guard);
@@ -956,8 +956,8 @@ fn exerciseConflicts(a: std.mem.Allocator) !void {
 test "resolved pack and all conflict clone paths own memory under OOM" {
     try exerciseResolvedPack(testing.allocator);
     try exerciseConflicts(testing.allocator);
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseResolvedPack, .{});
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseConflicts, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseResolvedPack, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseConflicts, .{});
 }
 test "manifest and pack count and string size bounds" {
     const files = try testing.allocator.alloc(ManagedFile, providers.max_items + 1);
@@ -993,7 +993,7 @@ fn exerciseModernReceipt(a: std.mem.Allocator) !void {
 }
 test "strict v2 receipt roundtrip and allocation failures preserve real child identity" {
     try exerciseModernReceipt(testing.allocator);
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseModernReceipt, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseModernReceipt, .{});
     try testing.expectError(error.UnknownField, parse(testing.allocator, "{\"schema_version\":2,\"instance_id\":\"instance\",\"pack_version\":\"v2\",\"authorization\":{}}"));
     try testing.expectError(error.UnknownField, parse(testing.allocator, "{\"schema_version\":1,\"instance_id\":\"instance\",\"pack_version\":\"v1\",\"pack_membership\":null}"));
     var promoted = managed("mods/a.jar", sha1_a, "v1");
@@ -1022,7 +1022,7 @@ fn exerciseLegacyApproval(a: std.mem.Allocator) !void {
 }
 test "strict legacy read literal tuples and exact approval allow explicit reviewed updates" {
     try exerciseLegacyApproval(testing.allocator);
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseLegacyApproval, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseLegacyApproval, .{});
     const old = manifest(&.{managed("mods/old.jar", sha1_a, "v1")}, "v1");
     const identity: PackIdentity = .{ .provider = .modrinth, .project_id = "P1", .version_id = "v1" };
     try testing.expectError(error.StaleLegacyApproval, legacyReplacementPaths(testing.allocator, old, identity, &.{.{ .path = "mods/old.jar", .expected_hashes = .{ .sha1 = sha1_b }, .expected_size = 3 }}));
@@ -1111,7 +1111,7 @@ fn exerciseAuthorizedCFPack(a: std.mem.Allocator) !void {
 }
 test "authorized CF pack preserves transient proof but receipts never authorize later downloads" {
     try exerciseAuthorizedCFPack(testing.allocator);
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseAuthorizedCFPack, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseAuthorizedCFPack, .{});
 }
 
 test "managed mod enabled state has canonical physical paths and reserved counterparts" {

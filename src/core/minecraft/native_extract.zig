@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Task = @import("install_plan.zig").NativeExtraction;
 const architecture = @import("native_arch.zig");
+pub const ClassicFamily = architecture.ClassicFamily;
 
 /// All entries, including exclusions, consume the byte/member budgets.
 /// Extraction shares aggregate budgets across archives at one destination.
@@ -23,19 +24,31 @@ pub fn inspect(a: Allocator, io: Io, archive_path: []const u8, cpu_arch: []const
 }
 
 pub fn inspectWithLimits(a: Allocator, io: Io, archive_path: []const u8, cpu_arch: []const u8, cancel: ?*const std.atomic.Value(bool), limits: Limits) !void {
+    try inspectFamilyWithLimits(a, io, archive_path, cpu_arch, cancel, null, limits);
+}
+
+pub fn inspectWithFamily(a: Allocator, io: Io, archive_path: []const u8, cpu_arch: []const u8, cancel: ?*const std.atomic.Value(bool), family: ?ClassicFamily) !void {
+    try inspectFamilyWithLimits(a, io, archive_path, cpu_arch, cancel, family, .{});
+}
+
+fn inspectFamilyWithLimits(a: Allocator, io: Io, archive_path: []const u8, cpu_arch: []const u8, cancel: ?*const std.atomic.Value(bool), family: ?ClassicFamily, limits: Limits) !void {
     var budget: Budget = .{};
     var paths: Paths = .{ .a = a, .limits = limits };
     defer paths.deinit();
-    try scanArchive(a, io, null, .{ .archive_path = archive_path, .destination = "", .exclude = &.{} }, cpu_arch, cancel, limits, &budget, &paths);
+    try scanArchive(a, io, null, .{ .archive_path = archive_path, .destination = "", .exclude = &.{}, .classic_family = family }, cpu_arch, cancel, limits, &budget, &paths);
 }
 
 /// Borrowed regular file, read positionally from zero; never closed or reopened.
 /// The caller retains containment, source stability, and hash verification duties.
 pub fn inspectFile(a: Allocator, io: Io, file: Io.File, cpu_arch: []const u8, cancel: ?*const std.atomic.Value(bool)) !void {
+    try inspectFileWithFamily(a, io, file, cpu_arch, cancel, null);
+}
+
+pub fn inspectFileWithFamily(a: Allocator, io: Io, file: Io.File, cpu_arch: []const u8, cancel: ?*const std.atomic.Value(bool), family: ?ClassicFamily) !void {
     var budget: Budget = .{};
     var paths: Paths = .{ .a = a };
     defer paths.deinit();
-    try scanFile(a, io, file, null, .{ .archive_path = "", .destination = "", .exclude = &.{} }, cpu_arch, cancel, .{}, &budget, &paths);
+    try scanFile(a, io, file, null, .{ .archive_path = "", .destination = "", .exclude = &.{}, .classic_family = family }, cpu_arch, cancel, .{}, &budget, &paths);
 }
 
 /// Extract with actual payload CPU checks in the same transaction.
@@ -115,19 +128,22 @@ fn checkCancel(cancel: ?*const std.atomic.Value(bool)) !void {
     if (cancel) |flag| if (flag.load(.acquire)) return error.Canceled;
 }
 
-// Open every component separately with no-follow, including existing parents.
+// Let the host path parser own drive/UNC roots; descend using no-follow handles.
 fn openParent(io: Io, path: []const u8) !Io.Dir {
-    var dir = try Io.Dir.cwd().openDir(io, if (std.fs.path.isAbsolute(path)) "/" else ".", .{ .follow_symlinks = false });
+    var parts = std.fs.path.componentIterator(path);
+    var dir = if (parts.root()) |root|
+        try @import("../worlds_tree.zig").openAbsolute(io, root)
+    else
+        try Io.Dir.cwd().openDir(io, ".", .{ .follow_symlinks = false });
     errdefer dir.close(io);
-    var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| {
-        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
-        if (std.mem.eql(u8, part, "..") or std.mem.indexOfAny(u8, part, "\\:\x00") != null) return error.UnsafePath;
-        dir.createDir(io, part, .default_dir) catch |err| switch (err) {
+        if (std.mem.eql(u8, part.name, ".")) continue;
+        try safeName(part.name);
+        dir.createDir(io, part.name, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
-        const next = try dir.openDir(io, part, .{ .follow_symlinks = false });
+        const next = try dir.openDir(io, part.name, .{ .follow_symlinks = false });
         dir.close(io);
         dir = next;
     }
@@ -135,7 +151,7 @@ fn openParent(io: Io, path: []const u8) !Io.Dir {
 }
 
 fn extractDestination(a: Allocator, io: Io, tasks: []const Task, sources: ?[]const Io.File, original_stats: ?[]const Io.File.Stat, destination: []const u8, cpu_arch: ?[]const u8, cancel: ?*const std.atomic.Value(bool)) !void {
-    if (destination.len == 0 or destination[destination.len - 1] == '/') return error.UnsafePath;
+    if (destination.len == 0 or std.fs.path.isSep(destination[destination.len - 1])) return error.UnsafePath;
     const base = std.fs.path.basename(destination);
     try safeName(base);
     var parent = try openParent(io, std.fs.path.dirname(destination) orelse ".");
@@ -192,16 +208,23 @@ fn extractDestination(a: Allocator, io: Io, tasks: []const Task, sources: ?[]con
 }
 
 fn safeName(name: []const u8) !void {
-    if (name.len == 0 or name[0] == '/' or std.mem.indexOfAny(u8, name, "\\:\x00") != null) return error.UnsafePath;
+    if (!std.unicode.utf8ValidateSlice(name) or name.len == 0 or name[0] == '/' or std.mem.indexOfAny(u8, name, "\\:\x00") != null) return error.UnsafePath;
     const trimmed = if (name[name.len - 1] == '/') name[0 .. name.len - 1] else name;
     var parts = std.mem.splitScalar(u8, trimmed, '/');
     while (parts.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.UnsafePath;
         if (part[part.len - 1] == '.' or part[part.len - 1] == ' ') return error.UnsafePath;
-        for (part) |c| if (c < 32 or std.mem.indexOfScalar(u8, "<>\"|?*", c) != null) return error.UnsafePath;
-        const stem = part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len];
-        for ([_][]const u8{ "con", "prn", "aux", "nul" }) |reserved| if (std.ascii.eqlIgnoreCase(stem, reserved)) return error.UnsafePath;
-        if (stem.len == 4 and (std.ascii.eqlIgnoreCase(stem[0..3], "com") or std.ascii.eqlIgnoreCase(stem[0..3], "lpt")) and stem[3] >= '1' and stem[3] <= '9') return error.UnsafePath;
+        var codepoints = std.unicode.Utf8View.initUnchecked(part).iterator();
+        while (codepoints.nextCodepoint()) |cp| {
+            if (cp < 32 or (cp >= 127 and cp <= 159)) return error.UnsafePath;
+            if (cp < 128 and std.mem.indexOfScalar(u8, "<>\"|?*", @intCast(cp)) != null) return error.UnsafePath;
+        }
+        const stem = std.mem.trimEnd(u8, part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len], " ");
+        for ([_][]const u8{ "con", "prn", "aux", "nul", "clock$", "conin$", "conout$" }) |reserved| if (std.ascii.eqlIgnoreCase(stem, reserved)) return error.UnsafePath;
+        if (stem.len >= 4 and (std.ascii.eqlIgnoreCase(stem[0..3], "com") or std.ascii.eqlIgnoreCase(stem[0..3], "lpt"))) {
+            if (stem.len == 4 and stem[3] >= '1' and stem[3] <= '9') return error.UnsafePath;
+            if (stem.len == 5 and stem[3] == 0xc2 and (stem[4] == 0xb9 or stem[4] == 0xb2 or stem[4] == 0xb3)) return error.UnsafePath;
+        }
     }
 }
 
@@ -296,6 +319,7 @@ fn scanFile(a: Allocator, io: Io, file: Io.File, output: ?Io.Dir, task: Task, cp
     const Span = struct { start: u64, end: u64 };
     var spans: std.ArrayList(Span) = .empty;
     defer spans.deinit(a);
+    var classic: ?architecture.ClassicInventory = if (task.classic_family) |family| .{ .family = family } else null;
     while (true) {
         try checkCancel(cancel);
         if (iterator.cd_record_offset > iterator.cd_size or (iterator.cd_record_index < iterator.cd_record_count and iterator.cd_size - iterator.cd_record_offset < @sizeOf(std.zip.CentralDirectoryFileHeader))) return error.ZipSizeMismatch;
@@ -364,13 +388,20 @@ fn scanFile(a: Allocator, io: Io, file: Io.File, output: ?Io.Dir, task: Task, cp
             crc_offset = end;
         }
         if (crc.final() != entry.crc32) return error.ZipCrcMismatch;
-        if (!directory) if (cpu_arch) |arch| try architecture.validateChecked(payload, name, arch, cancel);
+        var compatible = true;
+        if (!directory) if (cpu_arch) |arch| {
+            if (classic) |*inventory| {
+                compatible = try inventory.validateMember(payload, name, arch, cancel);
+            } else {
+                try architecture.validateChecked(payload, name, arch, cancel);
+            }
+        };
         var excluded = false;
         for (task.exclude) |prefix| if (std.mem.startsWith(u8, name, prefix)) {
             excluded = true;
             break;
         };
-        if (excluded) continue;
+        if (excluded or !compatible) continue;
         try output_paths.add(name, true);
         if (output) |dest| {
             if (directory) {
@@ -403,6 +434,7 @@ fn scanFile(a: Allocator, io: Io, file: Io.File, output: ?Io.Dir, task: Task, cp
         try checkCancel(cancel);
         if (i > 0 and span.start < spans.items[i - 1].end) return error.ZipSizeMismatch;
     }
+    if (cpu_arch) |arch| if (classic) |inventory| try inventory.complete(arch);
 }
 
 fn checkLocalSizes(local: std.zip.LocalFileHeader, entry: std.zip.Iterator.Entry, extra: []const u8) !void {
@@ -437,6 +469,8 @@ test "reject unsafe archive names" {
     for ([_][]const u8{ "", "/native.so", "../x", "a/../b", "a\\b", "C:x", "a//b", "a/./b", "nul.dll", "a. ", "x\x00y" }) |name| try std.testing.expectError(error.UnsafePath, safeName(name));
     try safeName("linux/x64/native.so");
     try safeName("META-INF/");
+    try safeName("中文目录/库.so");
+    for ([_][]const u8{ "a\x1fb", "a\x7fb", "a\xc2\x80b", "a\xc2\x9fb", "\xff", "COM¹", "LPT².dll", "CON .json", "clock$.json", "CONIN$", "CONOUT$" }) |name| try std.testing.expectError(error.UnsafePath, safeName(name));
 }
 
 const Fixture = struct {
@@ -695,6 +729,69 @@ test "LWJGL metadata sidecars remain resources while renamed binaries retain CPU
     try architecture.validate(&matching, "linux/x64/libfreetype.so", "x86_64");
     try std.testing.expectError(error.NativeArchitectureMismatch, architecture.validate(&wrong_cpu, metadata ++ ".git", "x86_64"));
     try std.testing.expectError(error.InvalidNativePayload, architecture.validate(matching[0..20], metadata ++ ".sha1", "x86_64"));
+    const old = "linux/x64/org/lwjgl/liblwjgl.so";
+    const git = "ad602750ad87939276d1889b28a757061e90715b\n";
+    const sha1 = "b47ef1a16b9ff2143bca544d4fed43d51bb6b92d\r\n";
+    try architecture.validate(git, old ++ ".git", "x86_64");
+    try architecture.validate(sha1, old ++ ".sha1", "x86_64");
+    try architecture.validate(sha1, "linux/x64/org/lwjgl/openal/libopenal.so.sha1", "x86_64");
+    for ([_][]const u8{ "text", git[0..39], git ++ "\n", "g" ++ git[1..], sha1[0..41] }) |bad| {
+        try std.testing.expectError(error.InvalidNativePayload, architecture.validate(bad, old ++ ".sha1", "x86_64"));
+    }
+    for ([_][]const u8{ "liblwjgl.so.sha1", "linux/x64/liblwjgl.so.sha1", "linux/x64/org/other/liblwjgl.so.sha1", "linux/x64/org/lwjgl/../liblwjgl.so.sha1", "linux/x64/org/lwjgl/liblwjgl.so.1.sha1" }) |unrelated| {
+        try std.testing.expectError(error.InvalidNativePayload, architecture.validate(sha1, unrelated, "x86_64"));
+    }
+    try std.testing.expectError(error.NativeArchitectureMismatch, architecture.validate(&wrong_cpu, old ++ ".git", "x86_64"));
+    try std.testing.expectError(error.InvalidNativePayload, architecture.validate(matching[0..20], old ++ ".sha1", "x86_64"));
+}
+
+test "LWJGL 3.3.1 Linux inventory extracts digests without weakening archive and CPU checks" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const archive = try std.fs.path.join(a, &.{ root, "native.jar" });
+    defer a.free(archive);
+    const destination = try std.fs.path.join(a, &.{ root, "natives" });
+    defer a.free(destination);
+    const name = "linux/x64/org/lwjgl/liblwjgl.so";
+    // Exact sidecar bytes from the official lwjgl-3.3.1-natives-linux.jar.
+    const git = "ad602750ad87939276d1889b28a757061e90715b\n";
+    const sha1 = "b47ef1a16b9ff2143bca544d4fed43d51bb6b92d\r\n";
+    const matching = elfFixture(62);
+    const wrong = elfFixture(183);
+    const good = try fixtureZip(a, &.{
+        .{ .name = name, .data = &matching, .deflate = true },
+        .{ .name = name ++ ".git", .data = git },
+        .{ .name = name ++ ".sha1", .data = sha1, .deflate = true },
+    });
+    defer a.free(good);
+    try tmp.dir.writeFile(io, .{ .sub_path = "native.jar", .data = good });
+    try inspect(a, io, archive, "x86_64", null);
+    try std.testing.expectError(error.NativeArchiveLimitExceeded, inspectWithLimits(a, io, archive, "x86_64", null, .{ .max_uncompressed_bytes = matching.len + git.len + sha1.len - 1 }));
+    const task: Task = .{ .archive_path = archive, .destination = destination, .exclude = &.{} };
+    try extractChecked(a, io, &.{task}, "x86_64", null);
+    try expectFile(tmp.dir, "natives/" ++ name, &matching);
+    try expectFile(tmp.dir, "natives/" ++ name ++ ".git", git);
+    try expectFile(tmp.dir, "natives/" ++ name ++ ".sha1", sha1);
+    const Case = struct { member: Fixture, failure: anyerror };
+    for ([_]Case{
+        .{ .member = .{ .name = name ++ ".sha1", .data = "not a digest" }, .failure = error.InvalidNativePayload },
+        .{ .member = .{ .name = name ++ ".git", .data = &wrong }, .failure = error.NativeArchitectureMismatch },
+        .{ .member = .{ .name = name ++ ".sha1", .data = matching[0..20] }, .failure = error.InvalidNativePayload },
+        .{ .member = .{ .name = name ++ ".sha1", .data = sha1, .bad_crc = true }, .failure = error.ZipCrcMismatch },
+        .{ .member = .{ .name = name ++ ".git", .data = git, .attributes = 0xa1ff0000 }, .failure = error.UnsafeArchiveEntry },
+    }) |case| {
+        const bad = try fixtureZip(a, &.{case.member});
+        defer a.free(bad);
+        try tmp.dir.writeFile(io, .{ .sub_path = "native.jar", .data = bad });
+        try std.testing.expectError(case.failure, inspect(a, io, archive, "x86_64", null));
+        try std.testing.expectError(case.failure, extractChecked(a, io, &.{task}, "x86_64", null));
+        try expectFile(tmp.dir, "natives/" ++ name, &matching);
+        try expectFile(tmp.dir, "natives/" ++ name ++ ".sha1", sha1);
+    }
 }
 
 test "actual ELF PE Mach-O and universal headers determine native CPU" {
@@ -837,6 +934,123 @@ test "malformed executable tables fail closed" {
     var fat = fatFixture(false, .big);
     std.mem.writeInt(u32, fat[36..40], 72, .big);
     try std.testing.expectError(error.InvalidNativePayload, architecture.validate(&fat, "bad.dylib", "x86_64"));
+}
+
+test "authenticated classic layouts validate both CPUs and extract only compatible members" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Layout = struct { family: ClassicFamily, names: []const []const u8, windows: bool = false };
+    for ([_]Layout{
+        .{ .family = .lwjgl2_linux, .names = &.{ "liblwjgl.so", "liblwjgl64.so", "libopenal.so", "libopenal64.so" } },
+        .{ .family = .jinput_linux, .names = &.{ "libjinput-linux.so", "libjinput-linux64.so" } },
+        .{ .family = .lwjgl2_windows, .names = &.{ "lwjgl.dll", "lwjgl64.dll", "OpenAL32.dll", "OpenAL64.dll" }, .windows = true },
+        .{ .family = .jinput_windows, .names = &.{ "jinput-dx8.dll", "jinput-dx8_64.dll", "jinput-raw.dll", "jinput-raw_64.dll", "jinput-wintab.dll" }, .windows = true },
+    }) |layout| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const archive = try std.fs.path.join(a, &.{ root, "native.jar" });
+        defer a.free(archive);
+        const destination = try std.fs.path.join(a, &.{ root, "natives" });
+        defer a.free(destination);
+        var elf32 = elfFixture(3);
+        elf32[4] = 1;
+        std.mem.writeInt(u16, elf32[52..54], 0, .little);
+        std.mem.writeInt(u16, elf32[40..42], 52, .little);
+        const elf64 = elfFixture(62);
+        var pe32 = peFixture(0x14c);
+        std.mem.writeInt(u16, pe32[88..90], 0x10b, .little);
+        const pe64 = peFixture(0x8664);
+        const narrow: []const u8 = if (layout.windows) &pe32 else &elf32;
+        const wide: []const u8 = if (layout.windows) &pe64 else &elf64;
+        var entries: [5]Fixture = undefined;
+        for (layout.names, 0..) |name, i| entries[i] = .{ .name = name, .data = if (i % 2 == 0) narrow else wide, .deflate = true };
+        const zip = try fixtureZip(a, entries[0..layout.names.len]);
+        defer a.free(zip);
+        try tmp.dir.writeFile(io, .{ .sub_path = "native.jar", .data = zip });
+        const source = try tmp.dir.openFile(io, "native.jar", .{});
+        defer source.close(io);
+        const original = try source.stat(io);
+        try std.testing.expectError(error.NativeArchitectureMismatch, inspectFile(a, io, source, "x86_64", null));
+        try std.testing.expectError(error.NativeArchitectureMismatch, inspectFileWithFamily(a, io, source, "aarch64", null, layout.family));
+        const task: Task = .{ .archive_path = archive, .destination = destination, .exclude = &.{}, .classic_family = layout.family };
+        for ([_][]const u8{ "x86_64", "i386" }, 0..) |host, host_index| {
+            try inspectWithFamily(a, io, archive, host, null, layout.family);
+            try inspectFileWithFamily(a, io, source, host, null, layout.family);
+            try extractCheckedFilesWithStats(a, io, &.{task}, &.{source}, &.{original}, host, null);
+            const output = try tmp.dir.openDir(io, "natives", .{});
+            defer output.close(io);
+            for (layout.names, 0..) |name, i| {
+                const selected = (i % 2 == 1) == (host_index == 0);
+                if (!selected) {
+                    try std.testing.expectError(error.FileNotFound, output.statFile(io, name, .{}));
+                    continue;
+                }
+                const file = try output.openFile(io, name, .{});
+                defer file.close(io);
+                var reader = file.reader(io, &.{});
+                var bytes: [200]u8 = undefined;
+                const expected = entries[i].data;
+                try reader.interface.readSliceAll(bytes[0..expected.len]);
+                try std.testing.expectEqualSlices(u8, expected, bytes[0..expected.len]);
+                try std.testing.expectEqual(@as(u64, expected.len), (try file.stat(io)).size);
+            }
+        }
+    }
+}
+
+test "classic peers cannot bypass completeness CRC path links budgets or native CPU validation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const archive = try std.fs.path.join(a, &.{ root, "native.jar" });
+    defer a.free(archive);
+    const destination = try std.fs.path.join(a, &.{ root, "natives" });
+    defer a.free(destination);
+    var narrow = elfFixture(3);
+    narrow[4] = 1;
+    std.mem.writeInt(u16, narrow[52..54], 0, .little);
+    std.mem.writeInt(u16, narrow[40..42], 52, .little);
+    const wide = elfFixture(62);
+    const good_entries = [_]Fixture{
+        .{ .name = "libjinput-linux.so", .data = &narrow },
+        .{ .name = "libjinput-linux64.so", .data = &wide },
+    };
+    const good = try fixtureZip(a, &good_entries);
+    defer a.free(good);
+    const task: Task = .{ .archive_path = archive, .destination = destination, .exclude = &.{"libjinput-linux.so"}, .classic_family = .jinput_linux };
+    try tmp.dir.writeFile(io, .{ .sub_path = "native.jar", .data = good });
+    try extractChecked(a, io, &.{task}, "x86_64", null);
+    try std.testing.expectError(error.NativeArchiveLimitExceeded, inspectFamilyWithLimits(a, io, archive, "x86_64", null, .jinput_linux, .{ .max_uncompressed_bytes = narrow.len + wide.len - 1 }));
+    const Case = struct { peer: Fixture, failure: anyerror, omit_wide: bool = false, extra: ?Fixture = null };
+    for ([_]Case{
+        .{ .peer = good_entries[0], .failure = error.NativeArchitectureMismatch, .omit_wide = true },
+        .{ .peer = .{ .name = "libjinput-linux.so", .data = &wide }, .failure = error.NativeArchitectureMismatch },
+        .{ .peer = .{ .name = "libjinput-linux.so", .data = narrow[0..20] }, .failure = error.InvalidNativePayload },
+        .{ .peer = .{ .name = "libjinput-linux.so", .data = &narrow, .bad_crc = true }, .failure = error.ZipCrcMismatch },
+        .{ .peer = .{ .name = "libjinput-linux.so", .data = &narrow, .attributes = 0xa1ff0000 }, .failure = error.UnsafeArchiveEntry },
+        .{ .peer = .{ .name = "../libjinput-linux.so", .data = &narrow }, .failure = error.UnsafePath },
+        .{ .peer = .{ .name = "renamed.dat", .data = &narrow }, .failure = error.NativeArchitectureMismatch },
+        .{ .peer = good_entries[0], .failure = error.NativeArchitectureMismatch, .extra = .{ .name = "unrecognized.so", .data = &narrow } },
+    }) |case| {
+        var entries = [_]Fixture{ case.peer, good_entries[1], undefined };
+        var count: usize = if (case.omit_wide) 1 else 2;
+        if (case.extra) |extra| {
+            entries[count] = extra;
+            count += 1;
+        }
+        const bad = try fixtureZip(a, entries[0..count]);
+        defer a.free(bad);
+        try tmp.dir.writeFile(io, .{ .sub_path = "native.jar", .data = bad });
+        try std.testing.expectError(case.failure, inspectWithFamily(a, io, archive, "x86_64", null, .jinput_linux));
+        try std.testing.expectError(case.failure, extractChecked(a, io, &.{task}, "x86_64", null));
+        try expectFile(tmp.dir, "natives/libjinput-linux64.so", &wide);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "natives/libjinput-linux.so", .{}));
+    }
 }
 
 test "32 bit native headers and unrelated universal slices" {
@@ -1164,4 +1378,26 @@ test "native original baselines survive restored bytes and publication rollback"
         var it = listing.iterate();
         while (try it.next(io)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".native-stage-"));
     }
+}
+
+test "path contract native extraction creates Unicode host parents safely" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const archive = try std.fs.path.join(a, &.{ root, "native.zip" });
+    defer a.free(archive);
+    const destination = try std.fs.path.join(a, &.{ root, "中文实例", "缺失目录", "natives" });
+    defer a.free(destination);
+    const zip = try fixtureZip(a, &.{.{ .name = "中文库.so", .data = "native" }});
+    defer a.free(zip);
+    try tmp.dir.writeFile(io, .{ .sub_path = "native.zip", .data = zip });
+    const tasks = [_]Task{.{ .archive_path = archive, .destination = destination, .exclude = &.{} }};
+    try extract(a, io, &tasks, null);
+    try expectFile(tmp.dir, "中文实例/缺失目录/natives/中文库.so", "native");
+    try extract(a, io, &tasks, null);
+    try expectFile(tmp.dir, "中文实例/缺失目录/natives/中文库.so", "native");
+    try std.testing.expectError(error.UnsafePath, openParent(io, "../outside"));
 }

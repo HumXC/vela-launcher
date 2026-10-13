@@ -2,6 +2,63 @@
 const std = @import("std");
 const Cpu = enum { x86, x64, arm, arm64 };
 
+/// Supplied only from an authenticated plan's exact Maven family and classifier.
+pub const ClassicFamily = enum { lwjgl2_linux, jinput_linux, lwjgl2_windows, jinput_windows };
+const ClassicMember = struct { name: []const u8, target: Cpu };
+
+/// Fixed official layouts. Every member is validated, including filtered peers.
+pub const ClassicInventory = struct {
+    family: ClassicFamily,
+    seen: u8 = 0,
+
+    fn members(self: ClassicInventory) []const ClassicMember {
+        return switch (self.family) {
+            .lwjgl2_linux => &.{
+                .{ .name = "liblwjgl.so", .target = .x86 },  .{ .name = "liblwjgl64.so", .target = .x64 },
+                .{ .name = "libopenal.so", .target = .x86 }, .{ .name = "libopenal64.so", .target = .x64 },
+            },
+            .jinput_linux => &.{
+                .{ .name = "libjinput-linux.so", .target = .x86 }, .{ .name = "libjinput-linux64.so", .target = .x64 },
+            },
+            .lwjgl2_windows => &.{
+                .{ .name = "lwjgl.dll", .target = .x86 },    .{ .name = "lwjgl64.dll", .target = .x64 },
+                .{ .name = "OpenAL32.dll", .target = .x86 }, .{ .name = "OpenAL64.dll", .target = .x64 },
+            },
+            .jinput_windows => &.{
+                .{ .name = "jinput-dx8.dll", .target = .x86 },    .{ .name = "jinput-dx8_64.dll", .target = .x64 },
+                .{ .name = "jinput-raw.dll", .target = .x86 },    .{ .name = "jinput-raw_64.dll", .target = .x64 },
+                // Official 2.0.5 has only a 32-bit Wintab plugin, alongside both pairs.
+                .{ .name = "jinput-wintab.dll", .target = .x86 },
+            },
+        };
+    }
+
+    pub fn validateMember(self: *ClassicInventory, data: []const u8, name: []const u8, cpu_arch: []const u8, cancel: ?*const std.atomic.Value(bool)) !bool {
+        const wanted = try cpu(cpu_arch);
+        if (wanted != .x86 and wanted != .x64) return error.NativeArchitectureMismatch;
+        for (self.members(), 0..) |member, i| {
+            if (!std.mem.eql(u8, name, member.name)) continue;
+            const magic: []const u8 = switch (self.family) {
+                .lwjgl2_linux, .jinput_linux => "\x7fELF",
+                .lwjgl2_windows, .jinput_windows => "MZ",
+            };
+            if (!std.mem.startsWith(u8, data, magic)) return error.InvalidNativePayload;
+            try validateChecked(data, name, if (member.target == .x86) "x86" else "x86_64", cancel);
+            self.seen |= @as(u8, 1) << @intCast(i);
+            return member.target == wanted;
+        }
+        try validateChecked(data, name, cpu_arch, cancel);
+        return true;
+    }
+
+    pub fn complete(self: ClassicInventory, cpu_arch: []const u8) !void {
+        const wanted = try cpu(cpu_arch);
+        if (wanted != .x86 and wanted != .x64) return error.NativeArchitectureMismatch;
+        const required = (@as(u8, 1) << @as(u3, @intCast(self.members().len))) - 1;
+        if (self.seen != required) return error.NativeArchitectureMismatch;
+    }
+};
+
 fn cpu(name: []const u8) !Cpu {
     for ([_][]const u8{ "x86_64", "amd64", "x64" }) |s| if (std.ascii.eqlIgnoreCase(name, s)) return .x64;
     for ([_][]const u8{ "x86", "i386", "i486", "i586", "i686" }) |s| if (std.ascii.eqlIgnoreCase(name, s)) return .x86;
@@ -39,6 +96,30 @@ fn nativeName(name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(base[i..][0..4], ".so.")) return true;
     };
     return false;
+}
+
+// LWJGL 3.3.1 places these alongside Linux libraries rather than under META-INF.
+// Only its namespace, library filenames and exact textual digest format qualify.
+fn lwjglDigestSidecar(data: []const u8, name: []const u8) bool {
+    const namespace = for ([_][]const u8{
+        "linux/x64/org/lwjgl/",   "linux/x86/org/lwjgl/",
+        "linux/arm64/org/lwjgl/", "linux/arm32/org/lwjgl/",
+    }) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) break name[prefix.len..];
+    } else return false;
+    var components = std.mem.splitScalar(u8, namespace, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return false;
+        for (component) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '.') return false;
+    }
+    const base = std.fs.path.basename(name);
+    const suffix = if (std.mem.endsWith(u8, base, ".git")) @as(usize, 4) else if (std.mem.endsWith(u8, base, ".sha1")) @as(usize, 5) else return false;
+    const library = base[0 .. base.len - suffix];
+    if (library.len <= 6 or !std.mem.startsWith(u8, library, "lib") or !std.mem.endsWith(u8, library, ".so")) return false;
+    const digest = if (std.mem.endsWith(u8, data, "\r\n")) data[0 .. data.len - 2] else if (std.mem.endsWith(u8, data, "\n")) data[0 .. data.len - 1] else data;
+    if (digest.len != 40) return false;
+    for (digest) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
 }
 
 /// Unknown resource bytes are allowed; unknown native-library filenames are not.
@@ -80,7 +161,7 @@ pub fn validateChecked(data: []const u8, name: []const u8, cpu_arch: []const u8,
             else => {},
         }
     }
-    if (nativeName(name)) return error.InvalidNativePayload;
+    if (nativeName(name) and !lwjglDigestSidecar(data, name)) return error.InvalidNativePayload;
 }
 
 fn elf(data: []const u8, wanted: Cpu) !void {

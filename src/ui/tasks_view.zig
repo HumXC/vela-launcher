@@ -52,40 +52,25 @@ fn fraction(progress: tasks.Progress) f32 {
 }
 
 fn rowFont(options: Options) dvui.Font {
-    const body = dvui.themeGet().font_body;
-    return if (options.compact) body.withSize(14) else body;
+    _ = options;
+    return theme.bodyFont();
 }
 
 fn rowHeight(options: Options) f32 {
     const body = rowFont(options);
-    return 2 * body.lineHeight() + body.withSize(14).textHeight() + 24;
-}
-
-fn actionButton(bounds: R, tag: []const u8, label: []const u8) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(@src(), .{}, .{ .tag = tag, .rect = bounds, .label = .{ .text = label }, .min_size_content = .{ .w = 20, .h = 20 }, .max_size_content = .{ .w = 20, .h = 20 }, .padding = R.all(8), .margin = R.all(0), .border = R.all(0), .corners = .all(4) });
-    button.processEvents();
-    button.drawBackground();
-    dvui.icon(@src(), label, dvui.entypo.cross, .{}, button.style().override(.{ .min_size_content = .{ .w = 20, .h = 20 }, .max_size_content = .{ .w = 20, .h = 20 }, .padding = R.all(0), .margin = R.all(0), .role = .none, .gravity_x = 0.5, .gravity_y = 0.5 }));
-    button.drawFocus();
-    const clicked = button.clicked();
-    const rect = button.data().borderRectScale().r;
-    const control_id = button.data().id;
-    button.deinit();
-    components.tooltip(@src(), control_id, rect, label);
-    return clicked;
+    return 2 * body.lineHeight() + theme.captionFont().textHeight() + theme.spacing.panel_padding;
 }
 
 fn drawRow(task: *tasks.Task, options: Options) !bool {
     const body = rowFont(options);
-    const small = body.withSize(14);
+    const small = theme.captionFont();
     const height = rowHeight(options);
     const title_height = 2 * body.lineHeight();
     const arena = dvui.currentWindow().arena();
     const row = dvui.box(@src(), .{}, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-row", .{task.id}), .id_extra = @truncate(task.id), .expand = .horizontal, .min_size_content = .{ .h = height }, .max_size_content = .height(height), .padding = R.all(0), .margin = R.all(0) });
     defer row.deinit();
     const width = row.data().contentRect().w;
-    const details_width = @max(0, width - 44);
+    const details_width = @max(0, width - theme.sizing.task_icon_button - theme.spacing.list_row_padding);
     // Explicit tracks keep wrapped titles from taking space reserved for status and controls.
     {
         var end: usize = task.title.len;
@@ -96,7 +81,7 @@ fn drawRow(task: *tasks.Task, options: Options) !bool {
             const next = split + @intFromBool(task.title[split] == ' ');
             break :blk try std.fmt.allocPrint(arena, "{s}\n{s}", .{ task.title[0..split], task.title[next..] });
         } else task.title;
-        dvui.labelNoFmt(@src(), text, .{}, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-title", .{task.id}), .rect = .{ .x = 0, .y = 6, .w = details_width, .h = title_height }, .font = body, .padding = R.all(0), .margin = R.all(0) });
+        dvui.labelNoFmt(@src(), text, .{}, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-title", .{task.id}), .rect = .{ .x = 0, .y = theme.spacing.list_row_padding / 2, .w = details_width, .h = title_height }, .font = body, .padding = R.all(0), .margin = R.all(0) });
     }
     const progress = task.progress();
     const status = if (task.state == .failed)
@@ -108,13 +93,14 @@ fn drawRow(task: *tasks.Task, options: Options) !bool {
             try std.fmt.allocPrint(arena, "{s} · {s} · {d}", .{ stateName(task.state), stageName(progress.stage), progress.completed })
     else
         stateName(task.state);
-    dvui.labelNoFmt(@src(), status, .{}, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-status", .{task.id}), .rect = .{ .x = 0, .y = 8 + title_height, .w = details_width, .h = small.textHeight() }, .font = small, .color_text = .{ .color = if (task.state == .failed) dvui.Color.fromHex("F0A6A1") else theme.muted }, .padding = R.all(0), .margin = R.all(0) });
-    dvui.progress(@src(), .{ .percent = if (task.state == .succeeded) 1 else fraction(progress), .color = if (task.state == .failed) dvui.Color.fromHex("F0A6A1") else null }, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-progress", .{task.id}), .rect = .{ .x = 0, .y = height - 12, .w = details_width, .h = 4 }, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .corners = .all(2) });
-    const bounds: R = .{ .x = @max(0, width - 36), .y = (height - 36) / 2, .w = 36, .h = 36 };
+    dvui.labelNoFmt(@src(), status, .{}, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-status", .{task.id}), .rect = .{ .x = 0, .y = theme.spacing.row_gap + title_height, .w = details_width, .h = small.textHeight() }, .font = small, .color_text = .{ .color = if (task.state == .failed) theme.danger else theme.muted }, .padding = R.all(0), .margin = R.all(0) });
+    dvui.progress(@src(), .{ .percent = if (task.state == .succeeded) 1 else fraction(progress), .color = if (task.state == .failed) theme.danger else null }, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-progress", .{task.id}), .rect = .{ .x = 0, .y = height - theme.spacing.list_row_padding, .w = details_width, .h = theme.style.feedback.compact_progress_height }, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .corners = .all(theme.style.feedback.compact_progress_height / 2) });
+    const side = theme.sizing.task_icon_button;
+    const bounds: R = .{ .x = @max(0, width - side), .y = (height - side) / 2, .w = side, .h = side };
     if (task.state == .queued or task.state == .running)
-        return actionButton(bounds, try std.fmt.allocPrint(arena, "task-{d}-cancel", .{task.id}), "取消任务");
+        return components.iconButton(@src(), "取消任务", dvui.entypo.cross, .{ .rect = bounds, .size = side, .tag = try std.fmt.allocPrint(arena, "task-{d}-cancel", .{task.id}) });
     if (!active(task.state))
-        return actionButton(bounds, try std.fmt.allocPrint(arena, "task-{d}-dismiss", .{task.id}), "移除通知");
+        return components.iconButton(@src(), "移除通知", dvui.entypo.cross, .{ .rect = bounds, .size = side, .tag = try std.fmt.allocPrint(arena, "task-{d}-dismiss", .{task.id}) });
     return false;
 }
 
@@ -136,9 +122,9 @@ fn viewportSize(total: usize, height: f32, options: Options) struct { min: f32, 
 pub fn sectionHeight(registry: *tasks.Registry, options: Options) f32 {
     const count = counts(registry.tasks());
     const total = count.active + count.recent;
-    const heading = if (options.compact) dvui.themeGet().font_body.withSize(14) else dvui.themeGet().font_heading;
+    const heading = theme.headingFont();
     const content_height = if (total == 0) dvui.themeGet().font_body.textHeight() else viewportSize(total, rowHeight(options), options).min;
-    return (if (options.compact) @as(f32, 8 + 4) else 16 + 8) + heading.textHeight() + content_height;
+    return (if (options.compact) theme.spacing.row_gap + theme.spacing.detail_gap else theme.spacing.group_gap + theme.spacing.row_gap) + heading.textHeight() + content_height;
 }
 
 /// Main thread only. Draw all active tasks and the three newest terminal entries.
@@ -155,9 +141,9 @@ pub fn drawWithOptions(registry: *tasks.Registry, options: Options) !void {
     var actions: std.ArrayList(Action) = .empty;
     const arena = dvui.currentWindow().arena();
     {
-        const section = dvui.box(@src(), .{}, .{ .tag = "task-section", .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = if (options.compact) 8 else 16 } });
+        const section = dvui.box(@src(), .{}, .{ .tag = "task-section", .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = if (options.compact) theme.spacing.row_gap else theme.spacing.group_gap } });
         defer section.deinit();
-        dvui.labelNoFmt(@src(), "任务", .{}, .{ .tag = "task-heading", .font = if (options.compact) dvui.themeGet().font_body.withSize(14) else dvui.themeGet().font_heading, .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = if (options.compact) 4 else 8 } });
+        dvui.labelNoFmt(@src(), "任务", .{}, .{ .tag = "task-heading", .font = theme.headingFont(), .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = if (options.compact) theme.spacing.detail_gap else theme.spacing.row_gap } });
         const total = count.active + count.recent;
         if (total == 0) {
             dvui.labelNoFmt(@src(), "暂无任务", .{}, .{ .color_text = .{ .color = theme.muted }, .padding = R.all(0), .margin = R.all(0) });

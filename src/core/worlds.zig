@@ -14,6 +14,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const instances = @import("instances.zig");
 const tree = @import("worlds_tree.zig");
+const world_lock = @import("worlds_lock.zig");
 pub const parseLevelDat = @import("worlds_metadata.zig").parse;
 pub const listBackups = @import("worlds_recovery.zig").list;
 pub const Backup = @import("worlds_recovery.zig").Backup;
@@ -61,6 +62,8 @@ pub const ScopeStamp = struct {
 /// Provider contexts remain at their final address until every worker joins.
 pub const WorldScope = struct {
     context: ?*anyopaque,
+    /// Read providers may coexist with a running game; mutation entry rejects them.
+    read_only: bool = false,
     probe: *const fn (?*anyopaque, ScopeIds) anyerror!ScopeState,
     acquire: *const fn (?*anyopaque, ScopeIds) anyerror!ScopeStamp,
     recheck: *const fn (?*anyopaque, ScopeIds, ScopeStamp) anyerror!void,
@@ -113,13 +116,22 @@ pub fn checkStaticGuard(guard: Guard, ids: ScopeIds) !void {
 }
 /// Enter before opening files and release after all descriptors and cleanup finish.
 pub fn enterScope(options: Options, requested: ScopeIds) !ScopeEntry {
+    return enterScopeMode(options, requested, false);
+}
+/// Read scopes still exclude launcher mutations and remain held until descriptors close.
+pub fn enterReadScope(options: Options, requested: ScopeIds) !ScopeEntry {
+    return enterScopeMode(options, requested, true);
+}
+fn enterScopeMode(options: Options, requested: ScopeIds, allow_read_only: bool) !ScopeEntry {
     const ids = requested.normalized();
     if (!config.validId(ids.source)) return error.InvalidInstanceId;
     if (ids.target) |target| if (!config.validId(target)) return error.InvalidInstanceId;
     if (options.guard.is_running != null) return error.UnsupportedWorldGuard;
     if (options.scope == null and options.held_scope == null) return error.MissingWorldScope;
     if (options.scope != null and options.held_scope != null) return error.InvalidWorldScope;
-    try checkStaticGuard(options.guard, ids);
+    const read_only = if (options.held_scope) |held| held.scope.read_only else options.scope.?.read_only;
+    if (read_only and !allow_read_only) return error.ReadOnlyWorldScope;
+    if (!read_only) try checkStaticGuard(options.guard, ids);
     if (options.held_scope) |held| {
         if (!held.covers(ids)) return error.LeaseNotHeld;
         try held.recheck();
@@ -143,8 +155,10 @@ pub const Metadata = struct {
 };
 /// Adapter returns owned strings. ParserUnavailable is distinct from corrupt input.
 pub const MetadataParser = *const fn (A, []const u8) anyerror!Metadata;
+pub const WorldAccess = world_lock.Access;
 pub const World = struct {
     folder: []const u8,
+    access: WorldAccess = .available,
     directory: []const u8,
     icon_path: ?[]const u8 = null,
     metadata: Metadata = .{},
@@ -234,7 +248,7 @@ fn recentFirst(_: void, x: World, y: World) bool {
 }
 pub fn list(a: A, io: std.Io, paths: *const instances.Paths, instance: config.Instance, parser: ?MetadataParser, options: Options) !WorldList {
     try validateInstance(instance);
-    const scope = try enterScope(options, .{ .source = instance.id });
+    const scope = try enterReadScope(options, .{ .source = instance.id });
     defer scope.deinit();
     const dir = saves(a, io, paths, instance, false) catch |err| switch (err) {
         error.FileNotFound => return .{ .allocator = a, .items = try a.alloc(World, 0) },
@@ -262,6 +276,7 @@ pub fn list(a: A, io: std.Io, paths: *const instances.Paths, instance: config.In
         defer if (!owned) w.deinit(a);
         const world = try tree.child(io, dir, entry.name, false);
         defer world.close(io);
+        w.access = world_lock.probe(io, world, "session.lock");
         const bytes = tree.readBounded(a, io, world, "level.dat", 16 * 1024 * 1024) catch |err| blk: {
             if (err == error.OutOfMemory or err == error.Canceled) return err;
             w.metadata_status = if (err == error.FileNotFound) .missing else .corrupt;
@@ -307,7 +322,7 @@ fn validPng(bytes: []const u8) bool {
         const kind = bytes[offset + 4 ..][0..4];
         const data = bytes[offset + 8 ..][0..length];
         const crc = std.mem.readInt(u32, bytes[offset + 8 + length ..][0..4], .big);
-        if (std.hash.crc.Crc32.hash(bytes[offset + 4 ..][0 .. length + 4]) != crc) return false;
+        if (std.hash.crc.@"CRC-32/ISO-HDLC".hash(bytes[offset + 4 ..][0 .. length + 4]) != crc) return false;
         if (first) {
             if (!std.mem.eql(u8, kind, "IHDR") or length != 13) return false;
             const width = std.mem.readInt(u32, data[0..4], .big);
@@ -392,15 +407,45 @@ fn transact(a: A, io: std.Io, paths: *const instances.Paths, operation: Operatio
     const scope = try enterScope(options, ids);
     defer scope.deinit();
     try options.hooks.check(io);
+    try world_lock.requireSupported();
     const source_saves = try saves(a, io, paths, source_ref.instance, false);
     defer source_saves.close(io);
     const target_saves = if (target_ref) |target| try saves(a, io, paths, target.instance, true) else source_saves;
     defer if (target_ref != null) target_saves.close(io);
+    const live_source = if (restore_id == null) try tree.child(io, source_saves, source_ref.folder, false) else null;
+    defer if (live_source) |dir| dir.close(io);
+    const source_lock = if (live_source) |dir| try world_lock.acquire(io, dir, "session.lock") else null;
+    defer if (source_lock) |held| held.close(io);
+    // Stable repository lock files serialize other launcher processes too, including
+    // absent destinations. Acquire nonblocking so opposite-direction copies cannot deadlock.
+    const source_repository = try tree.child(io, source_saves, ".vela-worlds", true);
+    defer source_repository.close(io);
+    const source_repository_lock = world_lock.acquire(io, source_repository, ".operation.lock") catch |err| {
+        if (err == error.WorldLocked) return error.InstanceBusy;
+        return err;
+    };
+    defer source_repository_lock.close(io);
+    // Inode numbers alone collide across filesystems. Resolve both handles before
+    // sharing a repository lock, including case aliases of the same directory.
+    const source_saves_path = try source_saves.realPathFileAlloc(io, ".", a);
+    defer a.free(source_saves_path);
+    const target_saves_path = try target_saves.realPathFileAlloc(io, ".", a);
+    defer a.free(target_saves_path);
+    const same_saves = (try source_saves.stat(io)).inode == (try target_saves.stat(io)).inode and std.mem.eql(u8, source_saves_path, target_saves_path);
+    const repository = if (same_saves) source_repository else try tree.child(io, target_saves, ".vela-worlds", true);
+    defer if (!same_saves) repository.close(io);
+    const target_repository_lock = if (!same_saves) world_lock.acquire(io, repository, ".operation.lock") catch |err| {
+        if (err == error.WorldLocked) return error.InstanceBusy;
+        return err;
+    } else null;
+    defer if (target_repository_lock) |held| held.close(io);
     const collision = if (target_ref) |target| try collide(io, target_saves, target.folder, if (operation == .rename) source_ref.folder else null) else null;
     if (collision != null and operation == .rename) return error.NameCollision;
     if (collision != null and !options.confirmed_destructive) return error.ConfirmationRequired;
-    const repository = try tree.child(io, target_saves, ".vela-worlds", true);
-    defer repository.close(io);
+    const existing_target = if (collision != null and operation != .rename_display_name) try tree.child(io, target_saves, collision.?, false) else null;
+    defer if (existing_target) |dir| dir.close(io);
+    const target_lock = if (existing_target) |dir| try world_lock.acquire(io, dir, "session.lock") else null;
+    defer if (target_lock) |held| held.close(io);
     var random: [16]u8 = undefined;
     io.random(&random);
     const id = std.fmt.bytesToHex(random, .lower);
@@ -430,8 +475,10 @@ fn transact(a: A, io: std.Io, paths: *const instances.Paths, operation: Operatio
             restore_artifact = nested;
         }
         break :blk try tree.child(io, restore_artifact.?, "payload", false);
-    } else try tree.child(io, source_saves, source_ref.folder, false);
-    defer source.close(io);
+    } else live_source.?;
+    defer if (restore_id != null) source.close(io);
+    const archived_lock = if (restore_id != null) try world_lock.acquireExisting(io, source, "session.lock") else null;
+    defer if (archived_lock) |held| held.close(io);
     var expected = try tree.snapshot(a, io, source, payload, options.limits, options.hooks);
     defer expected.deinit();
     try verify(a, io, payload, expected, options);
@@ -441,30 +488,53 @@ fn transact(a: A, io: std.Io, paths: *const instances.Paths, operation: Operatio
         const parsed = try std.json.parseFromSlice(Manifest, a, bytes, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         if (parsed.value.format != 1 or !config.validId(parsed.value.source_instance) or !validFolder(parsed.value.source_folder)) return error.InvalidManifest;
-        const recorded: tree.Snapshot = .{ .allocator = a, .entries = @constCast(parsed.value.entries), .bytes = parsed.value.bytes };
+        // Legacy manifests included the transient session.lock. Verify every data
+        // entry while allowing fresh native lock state in the restored candidate.
+        const recorded_entries = try a.alloc(tree.Entry, parsed.value.entries.len);
+        defer a.free(recorded_entries);
+        var recorded_count: usize = 0;
+        var recorded_bytes = parsed.value.bytes;
+        for (parsed.value.entries) |entry| {
+            if (std.mem.eql(u8, entry.path, "session.lock") and !entry.directory) {
+                if (entry.size > recorded_bytes) return error.InvalidManifest;
+                recorded_bytes -= entry.size;
+                continue;
+            }
+            recorded_entries[recorded_count] = entry;
+            recorded_count += 1;
+        }
+        const recorded: tree.Snapshot = .{ .allocator = a, .entries = recorded_entries[0..recorded_count], .bytes = recorded_bytes };
         if (!tree.equal(expected, recorded)) return error.IntegrityMismatch;
     }
     try writeManifest(a, io, stage, .{ .operation = operation, .source_instance = source_ref.instance.id, .source_folder = source_ref.folder, .target_instance = if (target_ref) |t| t.instance.id else null, .target_folder = if (target_ref) |t| t.folder else null, .bytes = expected.bytes, .entries = expected.entries }, options);
+    // Keep the overwritten snapshot until the final precommit verification.
+    var previous_tree: ?tree.Snapshot = null;
+    defer if (previous_tree) |*snapshot| snapshot.deinit();
     // An overwrite gets its own independently verified recovery payload+manifest.
     if (if (operation == .rename_display_name) null else collision) |name| {
-        const existing = try tree.child(io, target_saves, name, false);
-        defer existing.close(io);
+        const existing = existing_target.?;
         const recovery = try tree.child(io, stage, "overwritten", true);
         defer recovery.close(io);
         const previous = try tree.child(io, recovery, "payload", true);
         defer previous.close(io);
-        var old_tree = try tree.snapshot(a, io, existing, previous, options.limits, options.hooks);
-        defer old_tree.deinit();
+        previous_tree = try tree.snapshot(a, io, existing, previous, options.limits, options.hooks);
+        const old_tree = previous_tree.?;
         try verify(a, io, previous, old_tree, options);
         try verify(a, io, existing, old_tree, options);
         try writeManifest(a, io, recovery, .{ .operation = operation, .source_instance = target_ref.?.instance.id, .source_folder = name, .bytes = old_tree.bytes, .entries = old_tree.entries }, options);
     }
+    var candidate_dir: ?Dir = null;
+    defer if (candidate_dir) |dir| dir.close(io);
+    var candidate_lock: ?world_lock.Held = null;
+    defer if (candidate_lock) |held| held.close(io);
     if (target_ref != null) {
-        const candidate = try tree.child(io, stage, "candidate", true);
-        defer candidate.close(io);
+        candidate_dir = try tree.child(io, stage, "candidate", true);
+        const candidate = candidate_dir.?;
         var copied = try tree.snapshot(a, io, payload, candidate, options.limits, options.hooks);
         defer copied.deinit();
         if (!tree.equal(expected, copied)) return error.IntegrityMismatch;
+        // A candidate gets a fresh inode, held across publication and world replacement.
+        candidate_lock = try world_lock.acquire(io, candidate, "session.lock");
         try verify(a, io, candidate, expected, options);
         if (operation == .rename_display_name) {
             const bytes = try tree.readBounded(a, io, candidate, "level.dat", 16 * 1024 * 1024);
@@ -495,6 +565,21 @@ fn transact(a: A, io: std.Io, paths: *const instances.Paths, operation: Operatio
     try scope.held.recheck();
     try checkStaticGuard(options.guard, ids);
     try options.hooks.check(io);
+    try source_repository_lock.recheck(io);
+    if (target_repository_lock) |held| try held.recheck(io);
+    try world_lock.sameDirectory(io, source_saves, ".vela-worlds", source_repository);
+    try world_lock.sameDirectory(io, target_saves, ".vela-worlds", repository);
+    if (source_lock) |held| {
+        try held.recheck(io);
+        try world_lock.sameDirectory(io, source_saves, source_ref.folder, live_source.?);
+    }
+    if (target_lock) |held| {
+        try held.recheck(io);
+        try world_lock.sameDirectory(io, target_saves, collision.?, existing_target.?);
+        try verify(a, io, existing_target.?, previous_tree.?, options);
+    }
+    if (archived_lock) |held| try held.recheck(io);
+    if (candidate_lock) |held| try held.recheck(io);
     // No cancellation points after publication. Preallocated outcome needs no fallible allocation.
     const old_protection = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(old_protection);

@@ -5,11 +5,13 @@ const download = @import("java_download_controller.zig");
 const theme = @import("theme.zig");
 const components = @import("components.zig");
 const download_view = @import("java_download_view.zig");
+const file_picker = @import("file_picker.zig");
 const R = dvui.Rect;
 
 const Choice = struct { game: []const u8, path: []const u8, required: u32 };
 const Command = union(enum) {
     search: []const u8,
+    browse_folder,
     cancel,
     cancel_search,
     remove: []const u8,
@@ -23,7 +25,7 @@ const Command = union(enum) {
     fn deinit(self: Command, a: std.mem.Allocator) void {
         switch (self) {
             .search, .remove, .forget, .hide, .unhide, .delete_files => |path| a.free(path),
-            .cancel, .cancel_search => {},
+            .cancel, .cancel_search, .browse_folder => {},
             .add => |paths| {
                 for (paths) |path| a.free(path);
                 a.free(paths);
@@ -46,6 +48,7 @@ pub const Ui = struct {
     choice_failure: ?anyerror = null,
     choice_context: ?u64 = null,
     acquisition_open: bool = true,
+    acquisition_mode: enum { download, local } = .download,
     search_started: bool = false,
     download_requested: bool = false,
     requested_major: u32 = 21,
@@ -56,12 +59,17 @@ pub const Ui = struct {
     show_hidden: bool = false,
     interactive: bool = true,
     download_controller: ?*download.Controller = null,
+    picker_service: ?*file_picker.Service = null,
+    picker_ticket: ?file_picker.Ticket = null,
+    picker_path_snapshot: [4096]u8 = @splat(0),
+    picker_path_changed: bool = false,
 
     pub fn init(a: std.mem.Allocator) Ui {
         return .{ .allocator = a };
     }
 
     pub fn deinit(self: *Ui) void {
+        discardPicker(self);
         for (self.commands.items) |command| command.deinit(self.allocator);
         self.commands.deinit(self.allocator);
         self.allocator.free(self.search_selection);
@@ -87,6 +95,7 @@ pub const Ui = struct {
     }
 
     fn queuePath(self: *Ui, path: []const u8, searching: bool) !void {
+        if (searching) discardPicker(self);
         const owned = try self.allocator.dupe(u8, path);
         try self.enqueue(if (searching) .{ .search = owned } else .{ .remove = owned });
     }
@@ -103,13 +112,6 @@ pub const Ui = struct {
             .unhide => .{ .unhide = owned },
             .delete_files => .{ .delete_files = owned },
         });
-    }
-    fn queueAddOne(self: *Ui, path: []const u8) !void {
-        const paths = try self.allocator.alloc([]const u8, 1);
-        errdefer self.allocator.free(paths);
-        paths[0] = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(paths[0]);
-        try self.commands.append(self.allocator, .{ .add = paths });
     }
     fn queueChoice(self: *Ui, game: []const u8, path: []const u8, required: u32) !void {
         const owned_game = try self.allocator.dupe(u8, game);
@@ -181,7 +183,7 @@ fn clippedLabel(src: std.builtin.SourceLocation, text: []const u8, small: bool) 
     dvui.labelNoFmt(src, text, .{}, .{
         .expand = .horizontal,
         .max_size_content = .width(0),
-        .font = if (small) dvui.themeGet().font_body.withSize(14) else dvui.themeGet().font_body,
+        .font = if (small) theme.captionFont() else theme.bodyFont(),
         .color_text = if (small) .{ .color = theme.muted } else null,
         .background = false,
         .padding = R.all(0),
@@ -191,47 +193,6 @@ fn clippedLabel(src: std.builtin.SourceLocation, text: []const u8, small: bool) 
 
 fn frameFmt(comptime format: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), format, args) catch "";
-}
-
-// Keep the button registered when concealed so keyboard focus can reveal it.
-fn iconButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8, revealed: bool) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{}, .{
-        .min_size_content = .{ .w = 20, .h = 20 },
-        .max_size_content = .{ .w = 20, .h = 20 },
-        .padding = R.all(10),
-        .margin = R.all(0),
-        .corners = .all(8),
-        .border = R.all(0),
-        .gravity_y = 0.5,
-        .label = .{ .text = name },
-    });
-    button.processEvents();
-    const visible = revealed or button.hover or dvui.focusedWidgetIdInCurrentSubwindow() == button.data().id;
-    const clicked = button.clicked();
-    const rect = button.data().borderRectScale().r;
-    const control_id = button.data().id;
-    if (visible) {
-        button.drawBackground();
-        dvui.icon(@src(), name, asset, .{}, button.style().override(.{
-            .min_size_content = .{ .w = 20, .h = 20 },
-            .max_size_content = .{ .w = 20, .h = 20 },
-            .padding = R.all(0),
-            .margin = R.all(0),
-            .gravity_x = 0.5,
-            .gravity_y = 0.5,
-            .role = .none,
-        }));
-        button.drawFocus();
-    }
-    button.deinit();
-    components.tooltip(src, control_id, rect, name);
-    return clicked;
-}
-
-fn textButton(src: std.builtin.SourceLocation, text: []const u8, disabled: bool, highlighted: bool) bool {
-    _ = highlighted;
-    return components.action(src, text, !disabled);
 }
 
 fn runtimeDetails(runtime: java.Runtime) void {
@@ -245,12 +206,12 @@ fn runtimeDetails(runtime: java.Runtime) void {
     const previous_clip = dvui.clip(details.data().contentRectScale().r);
     defer dvui.clipSet(previous_clip);
     clippedLabel(@src(), frameFmt("{s} · Java {d}", .{ runtime.vendor, runtime.major }), false);
-    gap(@src(), 4);
+    gap(@src(), theme.spacing.detail_gap);
     clippedLabel(@src(), runtime.path, true);
 }
 
 fn rowHeight() f32 {
-    return @max(40, dvui.themeGet().font_body.textSize("Java").h + 4 + dvui.themeGet().font_body.withSize(14).textSize("Java").h) + 20;
+    return @max(theme.style.sizing.control_height - theme.style.spacing.row_gap, theme.bodyFont().textSize("Java").h + theme.style.spacing.detail_gap + theme.captionFont().textSize("Java").h) + 2 * theme.style.spacing.list_row_padding;
 }
 
 pub fn setDownloadController(ui: *Ui, controller: *download.Controller) void {
@@ -259,9 +220,71 @@ pub fn setDownloadController(ui: *Ui, controller: *download.Controller) void {
 
 /// Discard commands when a launch/pack operation acquired the Java use lease.
 pub fn discardCommands(ui: *Ui) void {
+    discardPicker(ui);
     for (ui.commands.items) |command| command.deinit(ui.allocator);
     ui.commands.clearRetainingCapacity();
     ui.search_queued = false;
+}
+
+fn discardPickerReceipt(ui: *Ui) void {
+    if (ui.picker_ticket) |ticket| if (ui.picker_service) |service| service.discard(ticket);
+    ui.picker_ticket = null;
+    ui.picker_path_changed = false;
+}
+
+/// Call before syncing receipts when navigating away from the Java page.
+pub fn discardPicker(ui: *Ui) void {
+    discardPickerReceipt(ui);
+    var index: usize = 0;
+    while (index < ui.commands.items.len) {
+        if (ui.commands.items[index] == .browse_folder) {
+            _ = ui.commands.orderedRemove(index);
+        } else index += 1;
+    }
+}
+
+fn requestPicker(ui: *Ui) void {
+    if (ui.picker_ticket != null or !ui.acquisition_open or ui.acquisition_mode != .local or !ui.interactive or hasModal(ui)) return;
+    const service = ui.picker_service orelse return;
+    ui.picker_path_snapshot = ui.path_buffer;
+    const ticket = service.request(.{ .kind = .folder, .title = "选择 Java 搜索目录", .default_path = std.mem.sliceTo(&ui.path_buffer, 0) }) catch |err| {
+        ui.failure = err;
+        return;
+    };
+    ui.picker_ticket = ticket;
+    ui.picker_path_changed = false;
+    ui.failure = null;
+}
+
+fn applyPickerResult(ui: *Ui, result: *const file_picker.Result) void {
+    if (ui.picker_path_changed or !std.mem.eql(u8, std.mem.sliceTo(&ui.path_buffer, 0), std.mem.sliceTo(&ui.picker_path_snapshot, 0))) return;
+    if (result.failure) |err| {
+        ui.failure = err;
+        return;
+    }
+    const path = result.path orelse return;
+    if (path.len >= ui.path_buffer.len) {
+        ui.failure = error.JavaSearchPathTooLong;
+        return;
+    }
+    @memset(&ui.path_buffer, 0);
+    @memcpy(ui.path_buffer[0..path.len], path);
+    ui.failure = null;
+}
+
+/// App pumps the service and calls this after applying page navigation intents.
+pub fn syncPicker(ui: *Ui) void {
+    const ticket = ui.picker_ticket orelse return;
+    const service = ui.picker_service orelse return;
+    if (!ui.acquisition_open or ui.acquisition_mode != .local or !ui.interactive or hasModal(ui) or ui.search_queued) {
+        discardPickerReceipt(ui);
+        return;
+    }
+    var result = service.take(ticket) orelse return;
+    defer result.deinit();
+    ui.picker_ticket = null;
+    applyPickerResult(ui, &result);
+    ui.picker_path_changed = false;
 }
 
 fn registered(manager: *const java.Manager, path: []const u8) bool {
@@ -272,96 +295,211 @@ fn registered(manager: *const java.Manager, path: []const u8) bool {
 fn managementRuntime(ui: *const Ui, manager: *const java.Manager) ?java.Runtime {
     const path = ui.selected_path orelse return null;
     for (manager.allEntries()) |runtime| if (std.mem.eql(u8, runtime.path, path)) return runtime;
-    for (manager.searchResults()) |runtime| if (std.mem.eql(u8, runtime.path, path)) return runtime;
     for (manager.hiddenEntries()) |runtime| if (std.mem.eql(u8, runtime.path, path)) return runtime;
     return null;
 }
 
-fn sidebarRow(ui: *Ui, runtime: java.Runtime, interactive: bool, indent: f32) void {
+fn sidebarRow(ui: *Ui, runtime: java.Runtime, interactive: bool, last: bool) void {
     const row = dvui.box(@src(), .{}, .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, runtime.path))), .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
     defer row.deinit();
     const selected = !ui.acquisition_open and if (ui.selected_path) |path| std.mem.eql(u8, path, runtime.path) else false;
-    if (components.sidebarItem(@src(), runtime.path, frameFmt("{s} · Java {d}", .{ runtime.vendor, runtime.major }), .{ .selected = selected, .enabled = interactive and !hasModal(ui), .indent = indent, .subtitle = runtime.path })) {
+    const enabled = interactive and !hasModal(ui);
+    const border = if (selected) theme.style.sizing.selected_border else theme.style.sizing.control_border;
+    // Native design line boxes: 24/24/21 px, independent of font leading.
+    const body_height = theme.typography.body * theme.typography.body_line_height;
+    const path_height = theme.typography.caption * theme.typography.body_line_height;
+    const detail_gap = theme.style.spacing.row_gap;
+    const content_height = 2 * body_height + 2 * detail_gap + path_height;
+    var control: dvui.ButtonWidget = undefined;
+    control.init(@src(), .{ .grayed = !enabled, .draw_focus = enabled }, .{
+        .label = .{ .text = frameFmt("{s} · Java {d}", .{ runtime.vendor, runtime.major }) },
+        .expand = .horizontal,
+        .max_size_content = .width(0),
+        .min_size_content = .height(content_height),
+        .padding = R.all(theme.style.spacing.list_row_padding - border),
+        .border = R.all(border),
+        .corners = .all(theme.sizing.card_radius),
+        .margin = .{ .h = if (last) 0 else theme.spacing.card_gap },
+        .background = true,
+        .color_border = .{ .color = if (selected) theme.accent else theme.outline },
+        .color_fill = .{ .color = if (selected) theme.selected_surface else theme.sidebar },
+        .color_fill_hover = .{ .color = theme.selected_surface },
+        .color_fill_press = .{ .color = theme.outline },
+        .tab_index = if (enabled) null else 0,
+    });
+    defer control.deinit();
+    if (control.data().accesskit_node()) |node| {
+        dvui.AccessKit.nodeSetSelected(node, selected);
+        if (!enabled) {
+            dvui.AccessKit.nodeSetDisabled(node);
+            dvui.AccessKit.nodeRemoveAction(node, .click);
+            dvui.AccessKit.nodeRemoveAction(node, .focus);
+        }
+    }
+    if (enabled) control.processEvents() else control.processHover();
+    control.drawBackground();
+    const width = control.data().contentRect().w;
+    dvui.labelNoFmt(@src(), runtime.vendor, .{ .align_y = 0.5 }, control.style().override(.{ .font = theme.bodyFont(), .rect = .{ .x = 0, .y = 0, .w = width, .h = body_height }, .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = if (!enabled) theme.muted else if (selected) theme.selected_text else theme.foreground }, .role = .none, .tab_index = 0 }));
+    dvui.labelNoFmt(@src(), frameFmt("Java {d}", .{runtime.major}), .{ .align_y = 0.5 }, control.style().override(.{ .font = theme.bodyFont(), .rect = .{ .x = 0, .y = body_height + detail_gap, .w = width, .h = body_height }, .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = theme.muted }, .role = .none, .tab_index = 0 }));
+    dvui.labelNoFmt(@src(), runtime.path, .{ .align_y = 0.5 }, control.style().override(.{ .font = theme.captionFont(), .rect = .{ .x = 0, .y = 2 * (body_height + detail_gap), .w = width, .h = path_height }, .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = theme.muted }, .role = .none, .tab_index = 0 }));
+    if (enabled) control.drawFocus();
+    components.tooltip(@src(), control.data().id, control.data().borderRectScale().r, frameFmt("{s} · Java {d}\n{s}", .{ runtime.vendor, runtime.major, runtime.path }));
+    if (enabled and control.clicked()) {
         ui.selectPath(runtime.path) catch |err| {
             ui.failure = err;
             return;
         };
+        discardPicker(ui);
         ui.acquisition_open = false;
     }
-    gap(@src(), 8);
 }
 
 pub fn drawSidebar(ui: *Ui, manager: *java.Manager, interactive: bool) void {
     ui.interactive = interactive;
-    if (components.sidebarItem(@src(), "acquire-java", "获取 Java", .{ .icon = dvui.entypo.plus, .selected = ui.acquisition_open or managementRuntime(ui, manager) == null, .enabled = interactive and !hasModal(ui) })) ui.acquisition_open = true;
-    gap(@src(), 12);
-    const list = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .background = false });
+    if (components.sidebarAction(@src(), "acquire-java", "获取 Java", .{ .icon = dvui.entypo.plus, .selected = ui.acquisition_open or managementRuntime(ui, manager) == null, .enabled = interactive and !hasModal(ui), .gap_after = 0 })) ui.acquisition_open = true;
+    const list = components.scrollBody(@src());
     defer list.deinit();
     components.section(@src(), "已注册 Java");
     if (manager.entries().len == 0) components.emptyState(@src(), "暂无 Java");
-    for (manager.entries()) |runtime| sidebarRow(ui, runtime, interactive, 0);
+    const entries = manager.entries();
+    for (entries, 0..) |runtime, index| sidebarRow(ui, runtime, interactive, index + 1 == entries.len);
     const hidden = manager.hiddenEntries();
     if (hidden.len != 0) {
-        gap(@src(), 16);
-        if (components.sidebarItem(@src(), "hidden-java", frameFmt("已隐藏 ({d})", .{hidden.len}), .{ .icon = if (ui.show_hidden) dvui.entypo.chevron_down else dvui.entypo.chevron_right, .enabled = !hasModal(ui) })) ui.show_hidden = !ui.show_hidden;
-        if (ui.show_hidden) for (hidden) |runtime| sidebarRow(ui, runtime, interactive, 12);
+        gap(@src(), theme.spacing.section_gap);
+        if (components.sidebarItem(@src(), "hidden-java", frameFmt("已隐藏 ({d})", .{hidden.len}), .{ .icon = if (ui.show_hidden) dvui.entypo.chevron_down else dvui.entypo.chevron_right, .enabled = !hasModal(ui), .gap_after = if (ui.show_hidden) theme.spacing.section_label_gap else 0 })) ui.show_hidden = !ui.show_hidden;
+        if (ui.show_hidden) for (hidden, 0..) |runtime, index| sidebarRow(ui, runtime, interactive, index + 1 == hidden.len);
     }
 }
 
 pub fn drawPage(ui: *Ui, manager: *java.Manager, download_ui: *download_view.Ui, controller: *download.Controller) void {
-    const page = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .background = false });
-    defer page.deinit();
-    dvui.labelNoFmt(@src(), "Java 管理", .{}, .{ .font = dvui.themeGet().font_title, .expand = .horizontal, .margin = R.all(0), .padding = R.all(0) });
-    gap(@src(), 16);
     const runtime = managementRuntime(ui, manager);
-    if (ui.failure) |err| components.text(@src(), frameFmt("操作失败：{s}", .{@errorName(err)}), theme.muted);
-    if (!ui.interactive) components.text(@src(), "正在启动游戏或管理模组包，请稍后修改 Java。", theme.muted);
+    if (runtime == null) ui.acquisition_open = true;
+    const acquiring = ui.acquisition_open or runtime == null;
     const deletion = controller.ownedDeleteSnapshot();
+    const enabled = ui.interactive and !hasModal(ui) and deletion.phase != .running;
+    if (!acquiring) {
+        components.title(@src(), frameFmt("Java {d}", .{runtime.?.major}));
+        gap(@src(), theme.spacing.row_gap);
+    }
+    var download_action: download_view.Action = .none;
+    var search_action: SearchAction = .none;
+    if (acquiring) {
+        const methods = components.toolbar(@src());
+        defer methods.deinit();
+        if (components.button(@src(), "下载", .{ .primary = ui.acquisition_mode == .download, .enabled = ui.interactive and !hasModal(ui), .tag = "java-acquire-download" })) {
+            discardPicker(ui);
+            ui.acquisition_mode = .download;
+        }
+        if (components.button(@src(), "本机", .{ .primary = ui.acquisition_mode == .local, .enabled = ui.interactive and !hasModal(ui), .tag = "java-acquire-local" })) ui.acquisition_mode = .local;
+    }
+    if (acquiring) {
+        const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_y = 1, .padding = R.all(0), .margin = .{ .y = theme.spacing.footer_gap }, .tag = "java-actions" });
+        defer actions.deinit();
+        switch (ui.acquisition_mode) {
+            .download => download_action = download_view.drawActions(download_ui, controller, enabled),
+            .local => search_action = drawSearchActions(ui, manager, enabled),
+        }
+    } else {
+        const actions = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .gravity_y = 1, .padding = R.all(0), .margin = .{ .y = theme.spacing.footer_gap }, .tag = "java-actions" });
+        defer actions.deinit();
+        const selected = runtime.?;
+        const hidden = manager.isHidden(selected.path);
+        const is_registered = registered(manager, selected.path);
+        if ((hidden or is_registered) and components.button(@src(), if (hidden) "恢复显示" else "隐藏 Java", .{ .enabled = enabled })) ui.queueManagement(selected.path, if (hidden) .unhide else .hide) catch |err| {
+            ui.failure = err;
+        };
+        if (is_registered and components.button(@src(), "移除 Java", .{ .enabled = enabled, .destructive = true, .tag = "java-remove" })) ui.queuePath(selected.path, false) catch |err| {
+            ui.failure = err;
+        };
+    }
+    const body = dvui.box(@src(), .{}, .{ .id_extra = if (acquiring) @as(usize, @backingInt(ui.acquisition_mode)) + 1 else @as(usize, @truncate(std.hash.Wyhash.hash(3, runtime.?.path))), .expand = .both, .padding = R.all(0), .margin = R.all(0) });
+    defer body.deinit();
+    const page = components.scrollBody(@src());
+    defer page.deinit();
+    if (ui.failure) |err| components.text(@src(), frameFmt("操作失败：{s}", .{@errorName(err)}), theme.danger);
+    if (!ui.interactive) components.text(@src(), "正在启动游戏或管理模组包，请稍后修改 Java。", theme.muted);
     if (deletion.phase == .running) {
-        components.text(@src(), "正在删除启动器下载的 Java…", theme.muted);
+        components.text(@src(), "正在删除 Java…", theme.muted);
         if (components.action(@src(), "取消删除", ui.interactive)) ui.enqueue(.cancel) catch |err| {
             ui.failure = err;
         };
     } else if (deletion.failure) |err| {
-        components.text(@src(), frameFmt("删除未完成：{s}", .{@errorName(err)}), theme.muted);
-        if (deletion.files_deleted) components.text(@src(), "Java 文件已删除，条目保存失败；请再次移除条目。", theme.muted);
+        components.text(@src(), frameFmt("删除未完成：{s}", .{@errorName(err)}), theme.danger);
+        if (deletion.files_deleted) components.text(@src(), "Java 文件已删除，条目保存失败；请再次移除条目。", theme.warning);
     } else if (deletion.phase == .complete) {
-        components.text(@src(), "Java 文件已删除，条目已移除。", theme.muted);
+        components.text(@src(), "Java 已移除", theme.muted);
     } else if (deletion.phase == .canceled) {
-        components.text(@src(), "删除已取消；条目保留，部分文件可能已删除，可重试完成清理。", theme.muted);
+        components.text(@src(), "删除已取消；条目保留，部分文件可能已删除，可重试完成清理。", theme.warning);
     }
-    const enabled = ui.interactive and !hasModal(ui) and deletion.phase != .running;
-    if (ui.acquisition_open or runtime == null) {
-        components.section(@src(), "获取 Java");
-        components.text(@src(), "下载受支持的 Java，或添加本机已有的运行环境。", theme.muted);
-        components.section(@src(), "下载 Java");
-        download_view.drawInline(download_ui, controller, enabled);
-        gap(@src(), 16);
-        components.section(@src(), "查找本机 Java");
-        drawSearch(ui, manager, enabled);
+    if (acquiring) {
+        switch (ui.acquisition_mode) {
+            .download => {
+                download_view.drawInline(download_ui, controller, enabled);
+                download_view.applyAction(download_ui, download_action);
+            },
+            .local => {
+                drawSearch(ui, manager, enabled);
+                applySearchAction(ui, manager, search_action);
+            },
+        }
         return;
     }
+    const compact = dvui.windowRect().h < theme.style.layout.compact_height;
+    const panel = components.formPanel(@src(), .{ .tag = "java-runtime-detail", .compact = compact });
+    defer panel.deinit();
     const selected = runtime.?;
-    gap(@src(), 16);
-    runtimeDetails(selected);
-    const hidden = manager.isHidden(selected.path);
-    const is_registered = registered(manager, selected.path);
-    gap(@src(), 12);
-    components.text(@src(), if (hidden) "已隐藏 · 不参与游戏启动" else if (is_registered) "已注册" else "尚未添加", theme.muted);
-    {
-        const actions = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = 16 } });
-        defer actions.deinit();
-        if (!is_registered and !hidden and components.action(@src(), "添加 Java", enabled)) ui.queueAddOne(selected.path) catch |err| {
-            ui.failure = err;
-        };
-        if ((hidden or is_registered) and components.action(@src(), if (hidden) "恢复显示" else "隐藏 Java", enabled)) ui.queueManagement(selected.path, if (hidden) .unhide else .hide) catch |err| {
-            ui.failure = err;
-        };
-        if (is_registered and components.action(@src(), "删除 Java", enabled)) ui.queuePath(selected.path, false) catch |err| {
-            ui.failure = err;
-        };
+    components.text(@src(), selected.vendor, theme.muted);
+    gap(@src(), if (compact) theme.spacing.detail_gap else theme.spacing.section_gap);
+    components.fieldLabel(@src(), "路径");
+    components.hint(@src(), selected.path);
+    if (manager.isHidden(selected.path)) {
+        gap(@src(), if (compact) theme.spacing.detail_gap else theme.spacing.section_gap);
+        components.text(@src(), "已隐藏 · 不参与游戏启动", theme.muted);
     }
-    components.text(@src(), "系统 Java 只会移除启动器条目。启动器下载的 Java 可在确认后删除文件。", theme.muted);
+}
+
+const SearchAction = enum { none, search, cancel, add };
+
+fn drawSearchActions(ui: *Ui, manager: *java.Manager, enabled: bool) SearchAction {
+    const busy = ui.search_queued or manager.isSearching();
+    if (!busy and ui.search_started) {
+        ui.syncSelection(manager.searchResults()) catch |err| {
+            ui.failure = err;
+            return .none;
+        };
+        for (manager.searchResults(), 0..) |runtime, index| {
+            if (registered(manager, runtime.path)) ui.search_selection[index] = false;
+        }
+    }
+    const compact = dvui.parentGet().data().contentRect().w < 400;
+    if (!busy and ui.search_started and manager.searchResults().len != 0) {
+        if (components.button(@src(), if (compact) "添加所选" else "添加所选 Java", .{ .enabled = enabled and ui.selectedCount() != 0, .min_width = 0, .placement = .footer, .tag = "java-search-add", .tooltip = "添加所选 Java" })) return .add;
+    }
+    if (components.button(@src(), if (busy) "取消搜索" else if (compact) "搜索" else "搜索本机 Java", .{ .enabled = enabled and (!busy or !ui.search_queued), .primary = !busy, .min_width = 0, .gravity_x = 1, .placement = .footer, .tag = "java-search-start", .tooltip = if (busy) "取消搜索" else "搜索本机 Java" })) return if (busy) .cancel else .search;
+    return .none;
+}
+
+// Footer buttons reserve space first; read drafts after their widgets process input.
+fn applySearchAction(ui: *Ui, manager: *java.Manager, action: SearchAction) void {
+    switch (action) {
+        .none => {},
+        .cancel => ui.enqueue(.cancel_search) catch |err| {
+            ui.failure = err;
+        },
+        .search => {
+            ui.queuePath(std.mem.sliceTo(&ui.path_buffer, 0), true) catch |err| {
+                ui.failure = err;
+                return;
+            };
+            ui.search_queued = true;
+            ui.resetSearch();
+            ui.search_started = true;
+            ui.failure = null;
+        },
+        .add => ui.queueSelected(manager.searchResults()) catch |err| {
+            ui.add_failure = err;
+        },
+    }
 }
 
 fn clearDeleteConfirmation(ui: *Ui) void {
@@ -371,19 +509,15 @@ fn clearDeleteConfirmation(ui: *Ui) void {
 
 fn drawDeleteConfirmation(ui: *Ui) void {
     const path = ui.delete_confirmation orelse return;
-    const rect = dvui.windowRect();
     var open = true;
     {
-        const width = @min(560, rect.w - 16);
-        const height = @min(340, rect.h - 16);
-        const modal = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open, .resize = .none, .window_avoid = .none }, .{ .rect = .{ .x = rect.x + (rect.w - width) / 2, .y = rect.y + (rect.h - height) / 2, .w = width, .h = height }, .padding = R.all(20) });
+        const modal = components.modalWithClose(@src(), "删除启动器下载的 Java", theme.style.dialogs.java_delete_height, &open);
         defer modal.deinit();
-        clippedLabel(@src(), "删除启动器下载的 Java？", false);
         // Reserve all actions before allowing the information to fill the remainder.
         {
-            const actions = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .gravity_y = 1, .padding = R.all(0), .margin = R.all(0) });
+            const actions = components.modalActions(@src(), 3);
             defer actions.deinit();
-            if (textButton(@src(), "仅移除条目", !ui.interactive, false)) {
+            if (actions.action(@src(), 0, "仅移除条目", .{ .enabled = ui.interactive })) {
                 const owned = ui.allocator.dupe(u8, path) catch |err| {
                     ui.failure = err;
                     return;
@@ -394,19 +528,21 @@ fn drawDeleteConfirmation(ui: *Ui) void {
                 };
                 open = false;
             }
-            if (textButton(@src(), "删除 Java 文件", !ui.interactive, true)) {
+            if (actions.action(@src(), 1, "删除 Java 文件", .{ .enabled = ui.interactive, .primary = true, .destructive = true })) {
                 ui.queueManagement(path, .delete_files) catch |err| {
                     ui.failure = err;
                     return;
                 };
                 open = false;
             }
-            if (textButton(@src(), "取消", false, false)) open = false;
+            if (actions.action(@src(), 2, "取消", .{})) open = false;
         }
-        const information = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = .{ .y = 12, .h = 12 }, .background = false });
+        const information = components.scrollBody(@src());
         defer information.deinit();
+        const confirmation = components.modalSection(@src(), .{ .min_height = 172, .gap_after = 0, .tag = "java-delete-information" });
+        defer confirmation.deinit();
         components.text(@src(), path, theme.muted);
-        gap(@src(), 12);
+        gap(@src(), theme.spacing.card_gap);
         components.text(@src(), "删除文件只作用于经所有权凭据验证的 Java 安装目录。此操作无法撤销。", theme.muted);
     }
     if (!open) clearDeleteConfirmation(ui);
@@ -418,34 +554,25 @@ pub fn drawModal(ui: *Ui) void {
 
 fn drawSearch(ui: *Ui, manager: *java.Manager, enabled: bool) void {
     const busy = ui.search_queued or manager.isSearching();
-    const input = dvui.textEntry(@src(), .{ .text = .{ .buffer = &ui.path_buffer }, .placeholder = "目录或可执行文件 · 留空搜索 PATH" }, .{ .expand = .horizontal, .min_size_content = .{ .h = 20 }, .padding = R.all(10), .margin = .{ .h = 8 }, .corners = .all(4), .label = .{ .text = "Java 搜索路径" } });
-    input.deinit();
+    if (busy) discardPicker(ui);
     {
-        const actions = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
-        defer actions.deinit();
-        if (components.action(@src(), "搜索本机 Java", enabled and !busy)) {
-            ui.queuePath(std.mem.sliceTo(&ui.path_buffer, 0), true) catch |err| {
+        const panel = components.formPanel(@src(), .{ .tag = "java-search-form" });
+        defer panel.deinit();
+        if (components.field(@src(), "搜索路径", &ui.path_buffer, .{ .tag = "java-search-path", .gap_after = theme.style.spacing.row_gap }) and ui.picker_ticket != null) ui.picker_path_changed = true;
+        if (ui.picker_service) |service| {
+            if (components.button(@src(), "浏览文件夹", .{ .enabled = enabled and !busy and ui.picker_ticket == null and !service.isBusy(), .tag = "java-search-browse" })) ui.enqueue(.browse_folder) catch |err| {
                 ui.failure = err;
             };
-            ui.search_queued = ui.commands.items.len > 0 and ui.commands.items[ui.commands.items.len - 1] == .search;
-            if (ui.search_queued) {
-                ui.resetSearch();
-                ui.search_started = true;
-                ui.failure = null;
-            }
         }
-        if (busy and components.action(@src(), "取消搜索", enabled)) ui.enqueue(.cancel_search) catch |err| {
-            ui.failure = err;
-        };
+        components.hint(@src(), "目录或 Java 文件；留空搜索 PATH");
     }
-    components.text(@src(), "搜索结果不会自动添加；选择运行环境后添加到管理列表。", theme.muted);
     if (!ui.search_started and !busy) return;
     if (busy or ui.search_queued) {
         components.text(@src(), "正在搜索…", theme.muted);
         return;
     }
     if (manager.searchFailure()) |err| {
-        components.text(@src(), frameFmt("搜索失败：{s}", .{@errorName(err)}), theme.muted);
+        components.text(@src(), frameFmt("搜索失败：{s}", .{@errorName(err)}), theme.danger);
         return;
     }
     const results = manager.searchResults();
@@ -455,41 +582,39 @@ fn drawSearch(ui: *Ui, manager: *java.Manager, enabled: bool) void {
     };
     if (results.len == 0) components.emptyState(@src(), "未找到 Java，可修改搜索路径后重试。");
     if (results.len != 0) {
-        const list = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .horizontal, .min_size_content = .{ .h = @min(280, @as(f32, @floatFromInt(results.len)) * rowHeight()) }, .max_size_content = .height(280), .padding = R.all(0), .margin = .{ .y = 12 }, .border = R.all(0), .background = false });
+        const list = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = theme.spacing.card_gap }, .background = false });
         defer list.deinit();
         for (results, 0..) |result, index| {
-            const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, result.path))), .expand = .horizontal, .min_size_content = .{ .h = rowHeight() - 20 }, .padding = .{ .y = 10, .h = 10 }, .margin = R.all(0) });
+            const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, result.path))), .expand = .horizontal, .min_size_content = .{ .h = rowHeight() - 2 * theme.spacing.list_row_padding }, .padding = .{ .y = theme.spacing.list_row_padding, .h = theme.spacing.list_row_padding }, .margin = R.all(0) });
             {
                 defer row.deinit();
                 if (registered(manager, result.path)) {
                     ui.search_selection[index] = false;
-                    dvui.labelNoFmt(@src(), "已注册", .{}, .{ .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = 12 }, .color_text = .{ .color = theme.muted }, .background = false });
+                    dvui.labelNoFmt(@src(), "已注册", .{}, .{ .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.card_gap }, .color_text = .{ .color = theme.muted }, .background = false });
                 } else if (enabled) {
-                    _ = dvui.checkbox(@src(), &ui.search_selection[index], null, .{ .min_size_content = .{ .w = 20, .h = 20 }, .max_size_content = .{ .w = 20, .h = 20 }, .gravity_y = 0.5, .margin = .{ .w = 12 }, .padding = R.all(6), .label = .{ .text = frameFmt("选择 {s} Java {d} {s}", .{ result.vendor, result.major, result.path }) } });
+                    _ = dvui.checkbox(@src(), &ui.search_selection[index], null, .{ .min_size_content = .{ .w = theme.style.sizing.selection_diameter, .h = theme.style.sizing.selection_diameter }, .max_size_content = .{ .w = theme.style.sizing.selection_diameter, .h = theme.style.sizing.selection_diameter }, .gravity_y = 0.5, .margin = .{ .w = theme.spacing.card_gap }, .padding = R.all(theme.style.spacing.tooltip_padding), .label = .{ .text = frameFmt("选择 {s} Java {d} {s}", .{ result.vendor, result.major, result.path }) } });
                 }
                 runtimeDetails(result);
             }
             _ = dvui.separator(@src(), .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, result.path))), .expand = .horizontal, .margin = R.all(0) });
         }
     }
-    if (ui.add_failure) |err| components.text(@src(), frameFmt("添加失败：{s}", .{@errorName(err)}), theme.muted);
-    if (components.action(@src(), "添加所选 Java", enabled and ui.selectedCount() != 0)) ui.queueSelected(results) catch |err| {
-        ui.add_failure = err;
-    };
+    if (ui.add_failure) |err| components.text(@src(), frameFmt("添加失败：{s}", .{@errorName(err)}), theme.danger);
 }
 
 pub fn versionChoice(ui: *Ui, manager: *java.Manager, game: []const u8, required: u32) void {
     ui.syncChoiceContext(game, required);
     if (components.action(@src(), "获取 Java", ui.interactive and !hasModal(ui))) {
+        ui.acquisition_mode = .download;
         ui.requested_major = required;
         ui.download_requested = true;
     }
     const heading = frameFmt("Java {d}", .{required});
     clippedLabel(@src(), heading, true);
-    gap(@src(), 8);
+    gap(@src(), theme.spacing.row_gap);
     if (ui.choice_failure) |err| {
-        clippedLabel(@src(), frameFmt("选择失败：{s}", .{@errorName(err)}), true);
-        gap(@src(), 8);
+        components.text(@src(), frameFmt("选择失败：{s}", .{@errorName(err)}), theme.danger);
+        gap(@src(), theme.spacing.row_gap);
     }
     const entries = manager.entries();
     const selected = manager.resolve(game, required);
@@ -512,15 +637,7 @@ pub fn versionChoice(ui: *Ui, manager: *java.Manager, game: []const u8, required
         .selected_index = selected_index,
         .label = null,
         .placeholder = null,
-    }, .{
-        .expand = .horizontal,
-        .min_size_content = .{ .h = 24 },
-        .max_size_content = .width(0),
-        .padding = R.all(8),
-        .margin = R.all(0),
-        .corners = .all(8),
-        .label = .{ .text = heading },
-    });
+    }, components.entryOptions(heading, .{ .gap_after = 0 }));
     defer dropdown.deinit();
     {
         const control = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -529,10 +646,10 @@ pub fn versionChoice(ui: *Ui, manager: *java.Manager, game: []const u8, required
             .margin = R.all(0),
         });
         clippedLabel(@src(), current_label, false);
-        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8 } });
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = theme.spacing.row_gap } });
         dvui.icon(@src(), "展开 Java 选项", dvui.entypo.chevron_small_down, .{}, .{
-            .min_size_content = .{ .w = 16, .h = 16 },
-            .max_size_content = .{ .w = 16, .h = 16 },
+            .min_size_content = .{ .w = theme.style.sizing.compact_icon, .h = theme.style.sizing.compact_icon },
+            .max_size_content = .{ .w = theme.style.sizing.compact_icon, .h = theme.style.sizing.compact_icon },
             .gravity_y = 0.5,
             .padding = R.all(0),
             .margin = R.all(0),
@@ -547,8 +664,8 @@ pub fn versionChoice(ui: *Ui, manager: *java.Manager, game: []const u8, required
             {
                 const content = dvui.box(@src(), .{}, .{
                     .expand = .horizontal,
-                    .min_size_content = .{ .h = rowHeight() - 20 },
-                    .padding = .{ .y = 6, .h = 6 },
+                    .min_size_content = .{ .h = rowHeight() - 2 * theme.spacing.list_row_padding },
+                    .padding = .{ .y = theme.spacing.control_padding_y, .h = theme.spacing.control_padding_y },
                     .margin = R.all(0),
                     .label = .{ .text = frameFmt("{s} Java {d} {s}", .{ runtime.vendor, runtime.major, runtime.path }) },
                 });
@@ -572,7 +689,9 @@ pub fn finish(ui: *Ui, manager: *java.Manager) void {
     for (ui.commands.items) |command| {
         if (!ui.interactive and command != .cancel) continue;
         switch (command) {
+            .browse_folder => if (!manager.isSearching() and !ui.search_queued) requestPicker(ui),
             .search => |path| {
+                discardPickerReceipt(ui);
                 ui.failure = null;
                 manager.search(path) catch |err| {
                     ui.failure = err;
@@ -586,6 +705,7 @@ pub fn finish(ui: *Ui, manager: *java.Manager) void {
                 ui.clearSelection();
             },
             .cancel => {
+                discardPickerReceipt(ui);
                 manager.cancelSearch();
                 if (ui.download_controller) |controller| controller.cancel();
             },
@@ -713,7 +833,7 @@ fn exerciseQueueAllocations(a: std.mem.Allocator) !void {
 }
 
 test "deferred command ownership releases all partial allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseQueueAllocations, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, exerciseQueueAllocations, .{});
 }
 
 test "a new search clears selection even when results are identical" {
@@ -889,4 +1009,150 @@ test "restoring a forgotten hidden Java clears suppression without registering i
     try std.testing.expect(!registered(&manager, path));
     try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
     try std.testing.expect(manager.resolve("game", 21) == null);
+}
+
+test "UI layout Java search-only runtime cannot resolve management after all registered runtimes are removed" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var manager = try java.Manager.init(a, std.testing.io, root);
+    defer manager.deinit();
+    const runtime: java.Runtime = .{ .path = "/fixture/java", .vendor = "Fixture", .major = 21 };
+    try manager.addDownloaded(runtime);
+    var ui = Ui.init(a);
+    defer ui.deinit();
+    try ui.selectPath(runtime.path);
+    ui.acquisition_open = false;
+    try std.testing.expect(managementRuntime(&ui, &manager) != null);
+    try ui.queuePath(runtime.path, false);
+    finish(&ui, &manager);
+    try std.testing.expectEqual(@as(usize, 0), manager.allEntries().len);
+    try manager.state.search_visible.append(manager.state.arena.allocator(), runtime);
+    ui.search_started = true;
+    try std.testing.expectEqual(@as(usize, 1), manager.searchResults().len);
+    try std.testing.expect(managementRuntime(&ui, &manager) == null);
+    try ui.syncSelection(manager.searchResults());
+    ui.search_selection[0] = true;
+    try ui.queueSelected(manager.searchResults());
+    try std.testing.expectEqualStrings(runtime.path, ui.commands.items[0].add[0]);
+}
+
+test "UI layout Java picker receipts copy bounded paths and preserve canceled or edited drafts" {
+    var ui = Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    const original = "/draft/java";
+    @memcpy(ui.path_buffer[0..original.len], original);
+    ui.picker_path_snapshot = ui.path_buffer;
+    var receipt: file_picker.Result = .{};
+    receipt.path = null;
+    receipt.failure = null;
+    applyPickerResult(&ui, &receipt);
+    try std.testing.expectEqualStrings(original, std.mem.sliceTo(&ui.path_buffer, 0));
+    var picked = [_]u8{ '/', 'j', 'd', 'k' };
+    receipt.path = &picked;
+    applyPickerResult(&ui, &receipt);
+    @memset(&picked, 'x');
+    try std.testing.expectEqualStrings("/jdk", std.mem.sliceTo(&ui.path_buffer, 0));
+    ui.picker_path_snapshot = ui.path_buffer;
+    receipt.path = "/stale/java";
+    ui.picker_path_changed = true;
+    applyPickerResult(&ui, &receipt);
+    try std.testing.expectEqualStrings("/jdk", std.mem.sliceTo(&ui.path_buffer, 0));
+    ui.picker_path_changed = false;
+    ui.path_buffer[1] = 'e';
+    applyPickerResult(&ui, &receipt);
+    try std.testing.expectEqualStrings("/edk", std.mem.sliceTo(&ui.path_buffer, 0));
+    ui.picker_path_snapshot = ui.path_buffer;
+    const too_long: [4096]u8 = @splat('a');
+    receipt.path = &too_long;
+    applyPickerResult(&ui, &receipt);
+    try std.testing.expectEqual(error.JavaSearchPathTooLong, ui.failure.?);
+    try std.testing.expectEqualStrings("/edk", std.mem.sliceTo(&ui.path_buffer, 0));
+    ui.failure = null;
+    receipt.path = null;
+    receipt.failure = error.DialogFailed;
+    applyPickerResult(&ui, &receipt);
+    try std.testing.expectEqual(error.DialogFailed, ui.failure.?);
+}
+
+test "UI layout Java browse captures latest draft and discards canceled navigated and stale receipts" {
+    const Driver = struct {
+        pending: ?*file_picker.Pending = null,
+        fn start(context: ?*anyopaque, pending: *file_picker.Pending) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.pending = pending;
+        }
+        fn complete(self: *@This(), path: ?[]const u8) void {
+            const pending = self.pending.?;
+            self.pending = null;
+            pending.complete(.{ .path = path });
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var manager = try java.Manager.init(a, std.testing.io, root);
+    defer manager.deinit();
+    var service = file_picker.Service.init(a);
+    defer service.deinit();
+    var ui = Ui.init(a);
+    defer ui.deinit();
+    ui.picker_service = &service;
+    ui.acquisition_mode = .local;
+    var driver: Driver = .{};
+    const picker_driver: file_picker.Driver = .{ .context = &driver, .start = Driver.start };
+    const initial = "/draft/old";
+    @memcpy(ui.path_buffer[0..initial.len], initial);
+    try ui.enqueue(.browse_folder);
+    const latest = "/draft/latest";
+    @memset(&ui.path_buffer, 0);
+    @memcpy(ui.path_buffer[0..latest.len], latest);
+    finish(&ui, &manager);
+    try std.testing.expect(ui.picker_ticket != null);
+    service.startPending(picker_driver);
+    try std.testing.expectEqual(file_picker.Kind.folder, driver.pending.?.kind);
+    try std.testing.expectEqualStrings(latest, driver.pending.?.default_path);
+    driver.complete("/picked/jdk");
+    syncPicker(&ui);
+    try std.testing.expect(ui.picker_ticket == null);
+    try std.testing.expectEqualStrings("/picked/jdk", std.mem.sliceTo(&ui.path_buffer, 0));
+    try ui.enqueue(.browse_folder);
+    finish(&ui, &manager);
+    service.startPending(picker_driver);
+    driver.complete(null);
+    syncPicker(&ui);
+    try std.testing.expectEqualStrings("/picked/jdk", std.mem.sliceTo(&ui.path_buffer, 0));
+    try ui.enqueue(.browse_folder);
+    finish(&ui, &manager);
+    service.startPending(picker_driver);
+    ui.path_buffer[1] = 'e';
+    driver.complete("/stale/jdk");
+    syncPicker(&ui);
+    try std.testing.expectEqualStrings("/eicked/jdk", std.mem.sliceTo(&ui.path_buffer, 0));
+    try ui.enqueue(.browse_folder);
+    finish(&ui, &manager);
+    service.startPending(picker_driver);
+    ui.acquisition_mode = .download;
+    driver.complete("/departed/jdk");
+    syncPicker(&ui);
+    try std.testing.expect(ui.picker_ticket == null);
+    try std.testing.expectEqualStrings("/eicked/jdk", std.mem.sliceTo(&ui.path_buffer, 0));
+    try std.testing.expect(!service.isBusy());
+    ui.acquisition_mode = .local;
+    try ui.enqueue(.browse_folder);
+    discardPicker(&ui);
+    finish(&ui, &manager);
+    try std.testing.expect(!service.isBusy());
+    try ui.enqueue(.browse_folder);
+    finish(&ui, &manager);
+    service.startPending(picker_driver);
+    discardPicker(&ui);
+    driver.complete("/discarded/jdk");
+    syncPicker(&ui);
+    try std.testing.expectEqualStrings("/eicked/jdk", std.mem.sliceTo(&ui.path_buffer, 0));
+    try std.testing.expect(!service.isBusy());
 }

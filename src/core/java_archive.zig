@@ -26,10 +26,14 @@ pub const Adapter = struct {
         if (!std.fs.path.isAbsolute(destination_path)) return error.DestinationMustBeAbsolute;
         const destination = try Io.Dir.openDirAbsolute(io, destination_path, .{ .follow_symlinks = false });
         defer destination.close(io);
+        // JDK license trees use internal directory aliases. Copy them as bounded
+        // independent trees; shared pack/loader extraction keeps its default refusal.
+        var limits = self.limits;
+        limits.materialize_directory_links = true;
         var result = try safe_archive.extract(a, io, archive_path, destination, switch (format) {
             .zip => .zip,
             .tar_gz => .tar_gz,
-        }, self.limits, self.cancel);
+        }, limits, self.cancel);
         defer result.deinit(a);
         try self.check(hooks);
         const relative_java = try selectJava(result.entries, format);
@@ -39,17 +43,32 @@ pub const Adapter = struct {
     }
 };
 
+fn javaPrefix(path: []const u8, suffix: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, path, suffix)) return null;
+    const prefix_len = path.len - suffix.len;
+    if (prefix_len != 0 and path[prefix_len - 1] != '/') return null;
+    return path[0..prefix_len];
+}
+
 fn selectJava(entries: []const safe_archive.Entry, format: java_download.Archive) ![]const u8 {
     const suffix = if (format == .zip) "bin/java.exe" else "bin/java";
-    var selected: ?safe_archive.Entry = null;
-    for (entries) |entry| {
-        if (!std.mem.endsWith(u8, entry.path, suffix)) continue;
-        const prefix_len = entry.path.len - suffix.len;
-        if (prefix_len != 0 and entry.path[prefix_len - 1] != '/') continue;
-        if (selected != null) return error.JavaAmbiguous;
-        selected = entry;
+    var selected_index: ?usize = null;
+    for (entries, 0..) |entry, index| {
+        _ = javaPrefix(entry.path, suffix) orelse continue;
+        if (selected_index == null or entry.path.len < entries[selected_index.?].path.len) selected_index = index;
     }
-    const java = selected orelse return error.JavaNotFound;
+    const index = selected_index orelse return error.JavaNotFound;
+    const java = entries[index];
+    const prefix = javaPrefix(java.path, suffix).?;
+    // A JDK 8 includes both its launcher and an embedded JRE launcher. Prefer
+    // the outer JDK, but reject unrelated or deeper runtimes regardless of order.
+    for (entries, 0..) |entry, other_index| {
+        if (other_index == index) continue;
+        const other_prefix = javaPrefix(entry.path, suffix) orelse continue;
+        if (other_prefix.len != prefix.len + "jre/".len or
+            !std.mem.startsWith(u8, other_prefix, prefix) or
+            !std.mem.eql(u8, other_prefix[prefix.len..], "jre/")) return error.JavaAmbiguous;
+    }
     if (java.kind != .file) return error.JavaNotRegular;
     // ZIP is the Windows artifact: its .exe need not carry POSIX mode bits.
     if (format == .tar_gz and !java.executable) return error.JavaNotExecutable;
@@ -323,4 +342,46 @@ test "Java verification and destination opening do not follow symlinks" {
         std.testing.allocator.free(java);
         return error.ExpectedNoFollowFailure;
     } else |_| {}
+}
+
+test "Java selection prefers the JDK over its embedded JRE independent of entry order" {
+    for ([_][]const u8{ "", "jdk-8/", "jdk-8.jdk/Contents/Home/" }) |prefix| {
+        for ([_]java_download.Archive{ .zip, .tar_gz }) |format| {
+            const suffix = if (format == .zip) "bin/java.exe" else "bin/java";
+            const root = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ prefix, suffix });
+            defer std.testing.allocator.free(root);
+            const nested = try std.fmt.allocPrint(std.testing.allocator, "{s}jre/{s}", .{ prefix, suffix });
+            defer std.testing.allocator.free(nested);
+            for ([_]bool{ false, true }) |reverse| {
+                const entries = if (reverse) [_]safe_archive.Entry{ metadata(nested, true), metadata(root, true) } else [_]safe_archive.Entry{ metadata(root, true), metadata(nested, true) };
+                try std.testing.expectEqualStrings(root, try selectJava(&entries, format));
+            }
+            try std.testing.expectEqualStrings(nested, try selectJava(&.{metadata(nested, true)}, format));
+        }
+    }
+}
+
+test "Java selection still rejects independent and deeper runtime bundles in every order" {
+    const root = "jdk/bin/java";
+    for ([_][]const u8{ "other/bin/java", "jdk-other/jre/bin/java", "jdk/other/bin/java", "jdk/jre/jre/bin/java" }) |other| {
+        const entries = [_]safe_archive.Entry{ metadata(root, true), metadata("jdk/jre/bin/java", true), metadata(other, true) };
+        for (0..3) |rotation| {
+            const rotated = [_]safe_archive.Entry{ entries[rotation], entries[(rotation + 1) % 3], entries[(rotation + 2) % 3] };
+            try std.testing.expectError(error.JavaAmbiguous, selectJava(&rotated, .tar_gz));
+        }
+    }
+    try std.testing.expectError(error.JavaNotExecutable, selectJava(&.{ metadata(root, false), metadata("jdk/jre/bin/java", true) }, .tar_gz));
+    try std.testing.expectError(error.JavaNotRegular, selectJava(&.{ .{ .path = root, .kind = .directory, .size = 0, .executable = false }, metadata("jdk/jre/bin/java", true) }, .tar_gz));
+}
+
+test "adapter extracts JDK ZIP with embedded JRE and selects outer launcher" {
+    for ([_]bool{ false, true }) |reverse| {
+        const entries = if (reverse) [_]FixtureEntry{ .{ .path = "jdk/jre/bin/java.exe" }, .{ .path = "jdk/bin/java.exe" } } else [_]FixtureEntry{ .{ .path = "jdk/bin/java.exe" }, .{ .path = "jdk/jre/bin/java.exe" } };
+        var fixture = try TestArchive.init(&entries);
+        defer fixture.deinit();
+        var adapter: Adapter = .{};
+        const java = try fixture.extract(&adapter, .{});
+        defer std.testing.allocator.free(java);
+        try std.testing.expectEqualStrings("jdk/bin/java.exe", java);
+    }
 }

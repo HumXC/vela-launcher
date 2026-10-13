@@ -117,11 +117,11 @@ const Budget = struct {
             .optional => |o| if (value) |item| try self.copy(o.child, item) else null,
             .@"struct" => blk: {
                 var out: T = undefined;
-                inline for (std.meta.fields(T)) |field| @field(out, field.name) = try self.copy(field.type, @field(value, field.name));
+                inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |field_name, field_type| @field(out, field_name) = try self.copy(field_type, @field(value, field_name));
                 break :blk out;
             },
             .@"union" => blk: {
-                inline for (std.meta.fields(T)) |field| if (std.meta.activeTag(value) == @field(std.meta.Tag(T), field.name)) break :blk @unionInit(T, field.name, try self.copy(field.type, @field(value, field.name)));
+                inline for (@typeInfo(T).@"union".field_names, @typeInfo(T).@"union".field_types) |field_name, field_type| if (std.meta.activeTag(value) == @field(std.meta.Tag(T), field_name)) break :blk @unionInit(T, field_name, try self.copy(field_type, @field(value, field_name)));
                 unreachable;
             },
             else => value,
@@ -139,10 +139,10 @@ fn measure(comptime T: type, value: T, remaining: *usize) !void {
             if (p.child != u8) for (value) |item| try measure(p.child, item, remaining);
         },
         .optional => |o| if (value) |item| try measure(o.child, item, remaining),
-        .@"struct" => inline for (std.meta.fields(T)) |field| try measure(field.type, @field(value, field.name), remaining),
-        .@"union" => inline for (std.meta.fields(T)) |field| {
-            if (std.meta.activeTag(value) == @field(std.meta.Tag(T), field.name)) {
-                try measure(field.type, @field(value, field.name), remaining);
+        .@"struct" => inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |field_name, field_type| try measure(field_type, @field(value, field_name), remaining),
+        .@"union" => inline for (@typeInfo(T).@"union".field_names, @typeInfo(T).@"union".field_types) |field_name, field_type| {
+            if (std.meta.activeTag(value) == @field(std.meta.Tag(T), field_name)) {
+                try measure(field_type, @field(value, field_name), remaining);
                 break;
             }
         },
@@ -323,7 +323,7 @@ fn inheritanceAllocationCase(a: std.mem.Allocator) !void {
 
 test "inheritance allocations clean up and legacy replacement retains rule variants" {
     const a = std.testing.allocator;
-    try std.testing.checkAllAllocationFailures(a, inheritanceAllocationCase, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, inheritanceAllocationCase, .{});
     var resolved: own.Owned(v.Version) = undefined;
     {
         var parent = try v.parseSlice(a, "{\"id\":\"base\",\"mainClass\":\"net.minecraft.Main\",\"minecraftArguments\":\"--username ${auth_player_name} --version ${version_name}\",\"downloads\":{\"client\":{\"url\":\"https://example/client\"}},\"libraries\":[{\"name\":\"g:lib:1\"}],\"arguments\":{\"jvm\":[\"-cp\",\"${classpath}\"]}}");

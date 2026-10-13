@@ -30,6 +30,7 @@ fn azulFixture(allocator: std.mem.Allocator, major: u8, p: java.Platform) ![]u8 
 
 const Fixture = struct {
     metadata: []const u8 = "[]",
+    archive_body: []const u8 = "abc",
     catalogue_major: u8 = 21,
     calls: usize = 0,
     extracts: usize = 0,
@@ -87,7 +88,7 @@ const Fixture = struct {
         try hooks.check();
         const file = try std.Io.Dir.cwd().createFile(use_io, path, .{ .exclusive = true });
         defer file.close(use_io);
-        try file.writeStreamingAll(use_io, "abc");
+        try file.writeStreamingAll(use_io, self.archive_body);
     }
     fn extract(context: *anyopaque, allocator: std.mem.Allocator, use_io: std.Io, archive: java.Archive, source: []const u8, dest: []const u8, hooks: java.Hooks) ![]u8 {
         _ = archive;
@@ -120,6 +121,69 @@ fn rootPath(tmp: *std.testing.TmpDir) ![]u8 {
 fn expectEmpty(tmp: *std.testing.TmpDir) !void {
     var iter = tmp.dir.iterate();
     try std.testing.expect((try iter.next(io)) == null);
+}
+
+test "Azul literal size precision is scoped and nearest kilobyte boundaries are strict" {
+    const bytes = try azulFixture(a, 21, linux_x64);
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer parsed.deinit();
+    parsed.value.object.getPtr("size").?.* = .{ .integer = 213089000 };
+    const rounded_bytes = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(rounded_bytes);
+    var release = try java.parseAzul(a, rounded_bytes, 21, linux_x64);
+    defer release.deinit();
+    try std.testing.expectEqual(@as(?u64, 213089000), release.size);
+    try std.testing.expectEqual(.azul_rounded_kilobyte, release.size_precision);
+    try std.testing.expect(release.acceptsSize(213089356));
+    try std.testing.expect(release.acceptsSize(213088500));
+    try std.testing.expect(release.acceptsSize(213089499));
+    try std.testing.expect(!release.acceptsSize(213088499));
+    try std.testing.expect(!release.acceptsSize(213089500));
+    release.vendor = .microsoft;
+    try std.testing.expect(!release.acceptsSize(213089356));
+    release.vendor = .azul;
+    release.size_precision = .exact;
+    try std.testing.expect(!release.acceptsSize(213089356));
+    try std.testing.expect(release.acceptsSize(213089000));
+    var precise = try java.parseAzul(a, bytes, 21, linux_x64);
+    defer precise.deinit();
+    try std.testing.expectEqual(.exact, precise.size_precision);
+    try std.testing.expect(!precise.acceptsSize(4));
+}
+
+test "rounded Azul archive still requires exact SHA256 and never publishes bad sizes" {
+    const body: [501]u8 = @splat('x');
+    for (0..4) |scenario| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const root = try rootPath(&tmp);
+        defer a.free(root);
+        const metadata = try azulFixture(a, 21, linux_x64);
+        defer a.free(metadata);
+        var release = try java.parseAzul(a, metadata, 21, linux_x64);
+        defer release.deinit();
+        release.vendor = .azul;
+        release.size = 1000;
+        release.size_precision = .azul_rounded_kilobyte;
+        std.crypto.hash.sha2.Sha256.hash(&body, &release.sha256, .{});
+        var fixture: Fixture = .{ .archive_body = &body };
+        switch (scenario) {
+            1 => release.sha256 = @splat(0),
+            2 => fixture.archive_body = body[0..499],
+            3 => release.size_precision = .exact,
+            else => {},
+        }
+        if (scenario == 0) {
+            var installed = try java.install(a, io, fixture.transport(), &release, root, fixture.extractor(), fixture.callbacks());
+            defer installed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), fixture.extracts);
+        } else {
+            try std.testing.expectError(if (scenario == 1) error.Sha256Mismatch else error.ArchiveSizeMismatch, java.install(a, io, fixture.transport(), &release, root, fixture.extractor(), fixture.callbacks()));
+            try std.testing.expectEqual(@as(usize, 0), fixture.extracts);
+            try expectEmpty(&tmp);
+        }
+    }
 }
 
 test "official providers cover supported majors and all six target platforms" {
@@ -187,7 +251,7 @@ test "Zulu Java 16 resolves official metadata with exact target and Microsoft re
     try std.testing.expectEqual(@as(u8, 16), release.major);
     try std.testing.expectEqualStrings("16.0.1", release.version);
     try std.testing.expectEqualStrings("https://cdn.azul.com/zulu/bin/fixture.tar.gz", release.url);
-    try std.testing.expectEqual([_]u8{0} ** 32, release.sha256);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), release.sha256);
     try std.testing.expectEqual(@as(?u64, 3), release.size);
     try std.testing.expectError(error.ReleaseMismatch, java.parseAzul(a, json, 17, linux_x64));
     try std.testing.expectError(error.ReleaseMismatch, java.parseAzul(a, json, 16, .{ .os = .linux, .arch = .aarch64 }));
@@ -329,6 +393,6 @@ fn allocationInstall(allocator: std.mem.Allocator) !void {
 }
 
 test "provider parsing and installation ownership survive every allocation failure" {
-    try std.testing.checkAllAllocationFailures(a, allocationCatalog, .{});
-    try std.testing.checkAllAllocationFailures(a, allocationInstall, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, allocationCatalog, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, allocationInstall, .{});
 }

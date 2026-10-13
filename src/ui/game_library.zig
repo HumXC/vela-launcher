@@ -7,9 +7,14 @@ const metadata = @import("../core/minecraft/metadata/root.zig");
 const install = @import("../core/minecraft/install.zig");
 const native = @import("../core/minecraft/native_extract.zig");
 const tasks = @import("../core/tasks.zig");
+const metadata_loader = @import("../core/minecraft/metadata_loader.zig");
+const loaders = @import("../core/loaders/root.zig");
 
 pub const InstalledEntry = struct { id: []const u8, java_major: u32 = 8 };
-pub const CatalogEntry = struct { id: []const u8, kind: []const u8 };
+pub const CatalogEntry = struct { id: []const u8, kind: []const u8, release_time: []const u8 = "", url: []const u8 = "", sha1: ?metadata.Sha1 = null };
+/// Preview is metadata-only: it never downloads artifacts or installs Java.
+pub const PreviewPhase = @import("version_preview_types.zig").Phase;
+pub const PreviewSnapshot = @import("version_preview_types.zig").Snapshot;
 pub const Phase = enum { idle, loading, installing, complete, failed };
 pub const Snapshot = struct {
     installed: []const InstalledEntry,
@@ -27,6 +32,8 @@ pub const Options = struct {
     task_registry: ?*tasks.Registry = null,
     cache_root: ?[]const u8 = null,
     download_connections: u16 = 8,
+    /// Borrowed immutable adapter context must outlive the controller and joins.
+    preview_transport: ?loaders.Transport = null,
 };
 
 const worker_allocator = std.heap.page_allocator;
@@ -63,6 +70,146 @@ const Job = struct {
     }
 };
 
+const PreviewCacheEntry = struct { version: []u8, java_major: u32 };
+const PreviewJob = struct {
+    arena: std.heap.ArenaAllocator = .init(worker_allocator),
+    io: std.Io,
+    root: []const u8,
+    manifest_url: []const u8,
+    version_id: []const u8,
+    generation: u64,
+    catalogue: []const metadata.manifest.Entry = &.{},
+    cache_root: ?[]const u8 = null,
+    transport: ?loaders.Transport = null,
+    service: ?*dl.Service = null,
+    thread: ?std.Thread = null,
+    canceled: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    java_major: ?u32 = null,
+    failure: ?anyerror = null,
+    deadline_ms: u64 = 0,
+
+    fn destroy(self: *PreviewJob) void {
+        std.debug.assert(self.thread == null);
+        self.arena.deinit();
+        worker_allocator.destroy(self);
+    }
+    fn now(raw: ?*anyopaque) u64 {
+        const self: *PreviewJob = @ptrCast(@alignCast(raw.?));
+        return @intCast(@max(0, @divFloor(std.Io.Clock.awake.now(self.io).nanoseconds, std.time.ns_per_ms)));
+    }
+    fn control(self: *PreviewJob) loaders.Control {
+        return .{ .cancel = &self.canceled, .deadline_ms = self.deadline_ms, .context = self, .now_ms = now };
+    }
+    fn work(self: *PreviewJob) void {
+        defer self.done.store(true, .release);
+        self.deadline_ms = now(self) + 30_000;
+        self.perform() catch |err| {
+            self.failure = err;
+        };
+    }
+    fn perform(self: *PreviewJob) !void {
+        try self.control().check();
+        // Catalogue URLs/hashes are authoritative only for the official manifest.
+        if (!std.mem.eql(u8, self.manifest_url, metadata.version_manifest_url)) return error.UntrustedManifestUrl;
+        if (self.transport == null) self.service = try dl.Service.init(worker_allocator, self.io, 1);
+        defer {
+            if (self.service) |service| service.deinit();
+            self.service = null;
+        }
+        var fetched_manifest: ?metadata.Owned(metadata.manifest.Manifest) = null;
+        defer if (fetched_manifest) |*manifest| manifest.deinit();
+        const manifest: metadata.manifest.Manifest = if (self.catalogue.len != 0)
+            .{ .latest = .{ .release = "", .snapshot = "" }, .versions = self.catalogue }
+        else blk: {
+            const bytes = try self.fetch(worker_allocator, metadata.version_manifest_url, null, 16 * 1024 * 1024);
+            defer worker_allocator.free(bytes);
+            fetched_manifest = try metadata.manifest.parseSlice(worker_allocator, bytes);
+            break :blk fetched_manifest.?.value;
+        };
+        try self.control().check();
+        var loaded = try metadata_loader.loadTrusted(worker_allocator, self.io, .{
+            .root = self.root,
+            .version_id = self.version_id,
+            .manifest = manifest,
+            .cancel = &self.canceled,
+        }, .{ .context = self, .fetch = fetchMetadata });
+        defer loaded.deinit();
+        try self.control().check();
+        const major = metadata.version.requiredJavaMajor(loaded.version.value);
+        if (major == 0 or major > std.math.maxInt(u32)) return error.InvalidJavaVersion;
+        self.java_major = @intCast(major);
+    }
+    fn fetchMetadata(raw: ?*anyopaque, a: std.mem.Allocator, _: std.Io, request: metadata_loader.Request) anyerror![]u8 {
+        const self: *PreviewJob = @ptrCast(@alignCast(raw.?));
+        return self.fetch(a, request.url, request.sha1, request.max_bytes);
+    }
+    fn fetch(self: *PreviewJob, a: std.mem.Allocator, url: []const u8, sha1: ?metadata.Sha1, max_bytes: usize) ![]u8 {
+        try self.control().check();
+        if (self.transport) |transport| {
+            const response = try transport.get(transport.context, a, url, max_bytes, self.control());
+            defer a.free(response.final_url);
+            errdefer a.free(response.bytes);
+            try self.control().check();
+            if (!std.mem.eql(u8, response.final_url, url)) return error.UnexpectedRedirect;
+            if (response.status != 200) return error.MetadataHttpFailure;
+            if (response.bytes.len > max_bytes) return error.MetadataTooLarge;
+            return response.bytes;
+        }
+        const cache_path = try self.cachePath(a, url);
+        defer if (cache_path) |path| a.free(path);
+        try self.control().check();
+        const remaining = self.deadline_ms -| now(self);
+        if (remaining == 0) return error.DeadlineExceeded;
+        const task = try self.service.?.submit(.{
+            .url = url,
+            .expected_sha1 = sha1,
+            .max_bytes = max_bytes,
+            .cache_path = cache_path,
+            .timeout_ms = @intCast(remaining),
+            .https_only = true,
+            .follow_redirects = false,
+            .require_public_address = true,
+        });
+        defer {
+            task.cancel();
+            while (!dl.terminal(task.snapshot().progress.phase)) self.io.sleep(.fromMilliseconds(10), .awake) catch {};
+            task.release() catch unreachable;
+        }
+        while (true) {
+            try self.control().check();
+            const state = task.snapshot();
+            if (dl.terminal(state.progress.phase)) {
+                if (state.failure) |err| return err;
+                if (state.progress.phase != .complete) return error.DownloadFailed;
+                const bytes = try a.dupe(u8, state.result.?.bytes);
+                errdefer a.free(bytes);
+                try self.control().check();
+                return bytes;
+            }
+            try self.io.sleep(.fromMilliseconds(10), .awake);
+        }
+    }
+    fn cachePath(self: *PreviewJob, a: std.mem.Allocator, url: []const u8) !?[]u8 {
+        const root = self.cache_root orelse return null;
+        // Downloader cache paths cannot be shared by concurrent Service owners.
+        const directory = try std.fs.path.join(a, &.{ root, "http", "version-preview" });
+        defer a.free(directory);
+        try self.control().check();
+        try std.Io.Dir.cwd().createDirPath(self.io, directory);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(url, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const filename = try std.fmt.allocPrint(a, "{s}.json", .{hex});
+        defer a.free(filename);
+        return try std.fs.path.join(a, &.{ directory, filename });
+    }
+};
+
+fn cloneCatalogEntry(a: std.mem.Allocator, source: CatalogEntry) !CatalogEntry {
+    return .{ .id = try a.dupe(u8, source.id), .kind = try a.dupe(u8, source.kind), .release_time = try a.dupe(u8, source.release_time), .url = try a.dupe(u8, source.url), .sha1 = source.sha1 };
+}
+
 // The install API's callback has no context parameter. Each installer runs on
 // its own OS thread, so this pointer is never shared between controllers.
 threadlocal var reporting_job: ?*Job = null;
@@ -91,6 +238,15 @@ pub const Controller = struct {
     phase: Phase = .idle,
     failure: ?anyerror = null,
     installed_generation: u64 = 0,
+    preview_transport: ?loaders.Transport = null,
+    preview_active: ?*PreviewJob = null,
+    preview_version: ?[]u8 = null,
+    preview_generation: u64 = 0,
+    preview_phase: PreviewPhase = .idle,
+    preview_major: ?u32 = null,
+    preview_failure: ?anyerror = null,
+    preview_cache: [8]?PreviewCacheEntry = @splat(null),
+    preview_cache_next: usize = 0,
 
     pub fn init(a: std.mem.Allocator, io: std.Io) !Controller {
         return initWithOptions(a, io, .{});
@@ -110,10 +266,17 @@ pub const Controller = struct {
         } else null;
         errdefer if (cache_root) |path| a.free(path);
         try curl.globalInit();
-        return .{ .allocator = a, .io = io, .root = root, .manifest_url = manifest_url, .task_registry = options.task_registry, .cache_root = cache_root, .download_connections = options.download_connections };
+        return .{ .allocator = a, .io = io, .root = root, .manifest_url = manifest_url, .task_registry = options.task_registry, .cache_root = cache_root, .download_connections = options.download_connections, .preview_transport = options.preview_transport };
     }
     pub fn deinit(self: *Controller) void {
         self.cancel();
+        self.cancelPreview();
+        if (self.preview_active) |job| {
+            job.thread.?.join();
+            job.thread = null;
+            job.destroy();
+        }
+        for (self.preview_cache) |entry| if (entry) |cached| self.allocator.free(cached.version);
         if (self.active) |job| {
             job.thread.?.join();
             job.thread = null;
@@ -128,6 +291,7 @@ pub const Controller = struct {
         self.* = undefined;
     }
     pub fn tick(self: *Controller) void {
+        self.tickPreview();
         const job = self.active orelse return;
         if (!job.done.load(.acquire)) return;
         job.thread.?.join();
@@ -153,6 +317,101 @@ pub const Controller = struct {
             .total = if (progress) |job| job.total.load(.acquire) else 0,
             .installing_version = if (progress) |job| job.version_id else null,
         };
+    }
+    /// Idempotent for a frame-by-frame selection. Failure stays visible until the
+    /// selection changes or cancelPreview clears it; no implicit retry loop.
+    pub fn previewVersion(self: *Controller, version_id: []const u8) !void {
+        metadata.version.validateId(version_id) catch |err| {
+            self.cancelPreview();
+            self.preview_phase = .failed;
+            self.preview_failure = err;
+            return err;
+        };
+        if (self.preview_version) |current| if (std.mem.eql(u8, current, version_id)) return;
+        const owned = try self.allocator.dupe(u8, version_id);
+        self.cancelPreview();
+        self.preview_version = owned;
+        self.preview_phase = .loading;
+        for (self.preview_cache) |entry| if (entry) |cached| {
+            if (std.mem.eql(u8, cached.version, version_id)) {
+                self.preview_major = cached.java_major;
+                self.preview_phase = .complete;
+                return;
+            }
+        };
+        if (self.preview_active == null) self.startPreviewJob() catch |err| {
+            self.preview_failure = err;
+            self.preview_phase = .failed;
+            return err;
+        };
+    }
+    /// Nonblocking cancellation. tick/deinit join the worker before freeing it.
+    pub fn cancelPreview(self: *Controller) void {
+        if (self.preview_active) |job| job.canceled.store(true, .release);
+        if (self.preview_version) |version| self.allocator.free(version);
+        self.preview_version = null;
+        self.preview_generation +%= 1;
+        self.preview_phase = .idle;
+        self.preview_major = null;
+        self.preview_failure = null;
+    }
+    /// UI-thread snapshot; version remains valid until selection/cancel/deinit.
+    pub fn previewSnapshot(self: *const Controller) PreviewSnapshot {
+        return .{ .version = self.preview_version, .java_major = self.preview_major, .phase = self.preview_phase, .failure = self.preview_failure };
+    }
+    fn tickPreview(self: *Controller) void {
+        if (self.preview_active) |job| {
+            if (!job.done.load(.acquire)) return;
+            job.thread.?.join();
+            job.thread = null;
+            self.preview_active = null;
+            if (job.generation == self.preview_generation and !job.canceled.load(.acquire)) {
+                if (self.preview_version) |version| if (std.mem.eql(u8, version, job.version_id)) {
+                    self.preview_failure = job.failure;
+                    self.preview_major = if (job.failure == null) job.java_major else null;
+                    self.preview_phase = if (job.failure == null) .complete else .failed;
+                    if (self.preview_major) |major| self.cachePreview(version, major);
+                };
+            }
+            job.destroy();
+        }
+        if (self.preview_phase == .loading and self.preview_version != null) self.startPreviewJob() catch |err| {
+            self.preview_failure = err;
+            self.preview_phase = .failed;
+        };
+    }
+    fn cachePreview(self: *Controller, version: []const u8, major: u32) void {
+        const owned = self.allocator.dupe(u8, version) catch return;
+        if (self.preview_cache[self.preview_cache_next]) |entry| self.allocator.free(entry.version);
+        self.preview_cache[self.preview_cache_next] = .{ .version = owned, .java_major = major };
+        self.preview_cache_next = (self.preview_cache_next + 1) % self.preview_cache.len;
+    }
+    fn startPreviewJob(self: *Controller) !void {
+        std.debug.assert(self.preview_active == null);
+        const job = try worker_allocator.create(PreviewJob);
+        job.* = .{ .io = self.io, .root = undefined, .manifest_url = undefined, .version_id = undefined, .generation = self.preview_generation, .transport = self.preview_transport };
+        errdefer job.destroy();
+        const a = job.arena.allocator();
+        job.root = try a.dupe(u8, self.root);
+        job.manifest_url = try a.dupe(u8, self.manifest_url);
+        job.version_id = try a.dupe(u8, self.preview_version.?);
+        if (self.cache_root) |root| job.cache_root = try a.dupe(u8, root);
+        if (self.published) |published| {
+            // Copy every source before spawning, including inherited metadata.
+            const sources = try a.alloc(metadata.manifest.Entry, published.available.len);
+            var count: usize = 0;
+            for (published.available) |entry| {
+                if (entry.url.len == 0) continue;
+                const copy = try cloneCatalogEntry(a, entry);
+                sources[count] = .{ .id = copy.id, .kind = copy.kind, .url = copy.url, .time = "", .release_time = copy.release_time, .sha1 = copy.sha1, .compliance_level = null };
+                count += 1;
+            }
+            // Older literal fixtures may not contain sources; use official fallback.
+            const catalogue: metadata.manifest.Manifest = .{ .latest = .{ .release = "", .snapshot = "" }, .versions = sources[0..count] };
+            if (catalogue.find(job.version_id) != null) job.catalogue = catalogue.versions;
+        }
+        job.thread = try std.Thread.spawn(.{}, PreviewJob.work, .{job});
+        self.preview_active = job;
     }
     pub fn refreshInstalled(self: *Controller) !void {
         try self.start(.refresh_installed, null);
@@ -204,12 +463,18 @@ pub const Controller = struct {
             for (installed, data.installed) |*target, source| target.* = .{ .id = try a.dupe(u8, source.id), .java_major = source.java_major };
             job.installed = installed;
             const available = try a.alloc(CatalogEntry, data.available.len);
-            for (available, data.available) |*target, source| target.* = .{ .id = try a.dupe(u8, source.id), .kind = try a.dupe(u8, source.kind) };
+            for (available, data.available) |*target, source| target.* = try cloneCatalogEntry(a, source);
             job.available = available;
         }
-        errdefer |err| {
+        self.startTaskJob(job) catch |err| {
             if (job.task) |task| self.task_registry.?.finish(task, .{ .failed = err });
-        }
+            return err;
+        };
+    }
+
+    fn startTaskJob(self: *Controller, job: *Job) !void {
+        const operation = job.operation;
+        const a = job.arena.allocator();
         if (operation == .install_version) {
             if (self.task_registry) |registry| {
                 const title = try std.fmt.allocPrint(a, "Install Minecraft {s}", .{job.version_id.?});
@@ -344,8 +609,7 @@ fn fetchManifest(job: *Job, service: *dl.Service) ![]u8 {
     }
 }
 pub fn validateVersionId(id: []const u8) !void {
-    try component(id);
-    for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '-' and c != '_') return error.UnsafePath;
+    metadata.version.validateId(id) catch return error.UnsafePath;
 }
 
 /// Local-only validation shared by catalogue scanning and launch preparation.
@@ -388,7 +652,7 @@ fn parseCatalogue(a: std.mem.Allocator, bytes: []const u8) ![]const CatalogEntry
     for (parsed.value.versions) |entry| {
         try component(entry.id);
         for (result.items) |existing| if (std.mem.eql(u8, existing.id, entry.id)) return error.DuplicateVersion;
-        try result.append(a, .{ .id = try a.dupe(u8, entry.id), .kind = try a.dupe(u8, entry.kind) });
+        try result.append(a, .{ .id = try a.dupe(u8, entry.id), .kind = try a.dupe(u8, entry.kind), .release_time = try a.dupe(u8, entry.release_time), .url = try a.dupe(u8, entry.url), .sha1 = entry.sha1 });
     }
     return result.toOwnedSlice(a);
 }
@@ -498,7 +762,7 @@ fn openBelow(root: std.Io.Dir, io: std.Io, path: []const u8) !std.Io.File {
     var directory = root;
     var owned = false;
     defer if (owned) directory.close(io);
-    var parts = std.mem.splitScalar(u8, path, '/');
+    var parts = std.mem.splitAny(u8, path, if (builtin.os.tag == .windows) "/\\" else "/");
     var part = parts.next() orelse return error.UnsafePath;
     while (parts.next()) |next| {
         try component(part);
@@ -523,9 +787,15 @@ fn readRegular(root: std.Io.Dir, io: std.Io, path: []const u8, max: usize) ![]u8
     return bytes;
 }
 fn relativePath(root: []const u8, absolute: []const u8) ![]const u8 {
-    if (!std.mem.startsWith(u8, absolute, root)) return error.UnsafePath;
-    const rest = absolute[root.len..];
-    if (rest.len < 2 or rest[0] != '/') return error.UnsafePath;
+    // Planner paths use host separators. Strip only a component-boundary prefix;
+    // opening the result still validates each component and refuses symlinks.
+    var end = root.len;
+    while (end > 0 and std.fs.path.isSep(root[end - 1])) end -= 1;
+    const prefix = root[0..end];
+    if (root.len == 0) return error.UnsafePath;
+    if (!std.mem.startsWith(u8, absolute, prefix)) return error.UnsafePath;
+    const rest = absolute[prefix.len..];
+    if (rest.len < 2 or !std.fs.path.isSep(rest[0])) return error.UnsafePath;
     return rest[1..];
 }
 fn completePlan(io: std.Io, root_dir: std.Io.Dir, root: []const u8, version: metadata.version.Version, cancel_flag: *const std.atomic.Value(bool)) !bool {
@@ -550,7 +820,7 @@ fn completePlan(io: std.Io, root_dir: std.Io.Dir, root: []const u8, version: met
     };
     defer assets.deinit();
     const planner = @import("../core/minecraft/install_plan.zig");
-    var plan = planner.build(worker_allocator, version, assets.value, try hostEnvironment(), .{ .root = root, .native_arch = if (@sizeOf(usize) == 8) .bits64 else .bits32, .cpu_arch = @tagName(builtin.cpu.arch) }) catch |err| switch (err) {
+    var plan = planner.buildInstalled(worker_allocator, version, assets.value, try hostEnvironment(), .{ .root = root, .native_arch = if (@sizeOf(usize) == 8) .bits64 else .bits32, .cpu_arch = @tagName(builtin.cpu.arch) }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return false,
     };
@@ -569,6 +839,27 @@ fn completePlan(io: std.Io, root_dir: std.Io.Dir, root: []const u8, version: met
         const stat = try file.stat(io);
         if (stat.kind != .file) return false;
         if (artifact.size) |size| if (stat.size != size) return false;
+        if (artifact.url.len == 0) {
+            if (stat.nlink != 1) return false;
+            const expected = artifact.sha1 orelse return false;
+            var hash = std.crypto.hash.Sha1.init(.{});
+            var buffer: [64 * 1024]u8 = undefined;
+            var offset: u64 = 0;
+            while (offset < stat.size) {
+                if (cancel_flag.load(.acquire)) return error.Canceled;
+                const count: usize = @intCast(@min(buffer.len, stat.size - offset));
+                if (try file.readPositionalAll(io, buffer[0..count], offset) != count) return false;
+                hash.update(buffer[0..count]);
+                offset += count;
+            }
+            var actual: [20]u8 = undefined;
+            hash.final(&actual);
+            if (!std.mem.eql(u8, &actual, &expected)) return false;
+            const after = try file.stat(io);
+            if (after.kind != stat.kind or after.inode != stat.inode or after.size != stat.size or
+                after.mtime.nanoseconds != stat.mtime.nanoseconds or
+                after.ctime.nanoseconds != stat.ctime.nanoseconds) return false;
+        }
     }
     // Launch rebuilds extracted outputs from these checked source archives.
     for (plan.value.native_checks) |check| {
@@ -578,7 +869,7 @@ fn completePlan(io: std.Io, root_dir: std.Io.Dir, root: []const u8, version: met
             else => return err,
         };
         defer file.close(io);
-        native.inspectFile(worker_allocator, io, file, @tagName(builtin.cpu.arch), cancel_flag) catch |err| switch (err) {
+        native.inspectFileWithFamily(worker_allocator, io, file, @tagName(builtin.cpu.arch), cancel_flag, check.classic_family) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled => return err,
             else => return false,
         };
@@ -1061,9 +1352,15 @@ fn startWaitingTestJob(controller: *Controller) !*tasks.Task {
     errdefer job.destroy();
     const registry = controller.task_registry.?;
     const task = try registry.create(.game_install, "Install fixture");
-    errdefer |err| registry.finish(task, .{ .failed = err });
     job.task = task;
-    try registry.start(task);
+    return startWaitingTestJobInner(controller, job, task) catch |err| {
+        registry.finish(task, .{ .failed = err });
+        return err;
+    };
+}
+
+fn startWaitingTestJobInner(controller: *Controller, job: *Job, task: *tasks.Task) !*tasks.Task {
+    try controller.task_registry.?.start(task);
     const Worker = struct {
         fn run(current: *Job) void {
             while (!current.cancelFlag().load(.acquire)) std.atomic.spinLoopHint();
@@ -1182,4 +1479,390 @@ test "download limits validate and leave an active job unchanged" {
     controller.active = null;
     try controller.setDownloadConnections(1);
     try std.testing.expectEqual(@as(u16, 1), controller.download_connections);
+}
+
+// Adapter fixtures retain official request identities without opening sockets.
+const PreviewDocument = struct { id: []const u8, bytes: []const u8 };
+const preview_documents = [_]PreviewDocument{
+    .{ .id = "future", .bytes = "{\"id\":\"future\",\"javaVersion\":{\"component\":\"fixture\",\"majorVersion\":25},\"downloads\":{\"client\":{\"url\":\"https://piston-data.mojang.com/fixture.jar\"}}}" },
+    .{ .id = "1.7.10", .bytes = "{\"id\":\"1.7.10\",\"downloads\":{\"client\":{\"url\":\"https://piston-data.mojang.com/fixture.jar\"}}}" },
+    .{ .id = "parent", .bytes = "{\"id\":\"parent\",\"javaVersion\":{\"component\":\"fixture\",\"majorVersion\":17},\"downloads\":{\"client\":{\"url\":\"https://piston-data.mojang.com/fixture.jar\"}}}" },
+    .{ .id = "child", .bytes = "{\"id\":\"child\",\"inheritsFrom\":\"parent\"}" },
+    .{ .id = "zero", .bytes = "{\"id\":\"zero\",\"javaVersion\":{\"component\":\"fixture\",\"majorVersion\":0}}" },
+    .{ .id = "overflow", .bytes = "{\"id\":\"overflow\",\"javaVersion\":{\"component\":\"fixture\",\"majorVersion\":4294967296},\"downloads\":{\"client\":{\"url\":\"https://piston-data.mojang.com/fixture.jar\"}}}" },
+};
+const PreviewFixture = struct {
+    manifest_calls: std.atomic.Value(usize) = .init(0),
+    metadata_calls: std.atomic.Value(usize) = .init(0),
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    returned: std.atomic.Value(bool) = .init(false),
+    pause: bool = false,
+    ignore_cancel: bool = false,
+    corrupt: bool = false,
+    redirect: bool = false,
+    untrusted: bool = false,
+
+    fn transport(self: *PreviewFixture) loaders.Transport {
+        return .{ .context = self, .get = get };
+    }
+    fn manifest(self: *PreviewFixture, a: std.mem.Allocator) ![]u8 {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const WireEntry = struct { id: []const u8, type: []const u8 = "release", url: []const u8, time: []const u8 = "modified", releaseTime: []const u8 = "2026-03-24T09:00:00+00:00", sha1: []const u8 };
+        const entries = try owned.alloc(WireEntry, preview_documents.len);
+        for (preview_documents, entries) |document, *entry| {
+            var hash: metadata.Sha1 = undefined;
+            std.crypto.hash.Sha1.hash(document.bytes, &hash, .{});
+            const hex = std.fmt.bytesToHex(hash, .lower);
+            entry.* = .{
+                .id = document.id,
+                .url = try std.fmt.allocPrint(owned, "https://{s}/v1/packages/fixture/{s}.json", .{ if (self.untrusted) @as([]const u8, "example.invalid") else "piston-meta.mojang.com", document.id }),
+                .sha1 = try owned.dupe(u8, &hex),
+            };
+        }
+        return std.json.Stringify.valueAlloc(a, .{ .latest = .{ .release = "future", .snapshot = "future" }, .versions = entries }, .{});
+    }
+    fn publishCatalogue(self: *PreviewFixture, controller: *Controller) !void {
+        const bytes = try self.manifest(std.testing.allocator);
+        defer std.testing.allocator.free(bytes);
+        const job = try worker_allocator.create(Job);
+        job.* = .{ .io = controller.io, .operation = .catalogue, .root = controller.root, .manifest_url = controller.manifest_url, .version_id = null };
+        errdefer job.destroy();
+        job.available = try parseCatalogue(job.arena.allocator(), bytes);
+        if (controller.published) |old| old.destroy();
+        controller.published = job;
+    }
+    fn get(raw: ?*anyopaque, a: std.mem.Allocator, url: []const u8, max_bytes: usize, control: loaders.Control) !loaders.Response {
+        const self: *PreviewFixture = @ptrCast(@alignCast(raw.?));
+        try control.check();
+        const body = if (std.mem.eql(u8, url, metadata.version_manifest_url)) blk: {
+            _ = self.manifest_calls.fetchAdd(1, .monotonic);
+            break :blk try self.manifest(a);
+        } else blk: {
+            _ = self.metadata_calls.fetchAdd(1, .monotonic);
+            self.entered.store(true, .release);
+            defer self.returned.store(true, .release);
+            while (self.pause and !self.release.load(.acquire)) {
+                if (!self.ignore_cancel) try control.check();
+                if (control.now_ms(control.context) >= control.deadline_ms) return error.DeadlineExceeded;
+                std.atomic.spinLoopHint();
+            }
+            // Inspect the borrowed URL only after the catalogue owner may be gone.
+            for (preview_documents) |document| {
+                var path: [512]u8 = undefined;
+                const expected = try std.fmt.bufPrint(&path, "https://piston-meta.mojang.com/v1/packages/fixture/{s}.json", .{document.id});
+                if (std.mem.eql(u8, url, expected)) break :blk try a.dupe(u8, if (self.corrupt) "{\"id\":\"tampered\"}" else document.bytes);
+            }
+            return error.UnexpectedFixtureRequest;
+        };
+        errdefer a.free(body);
+        if (body.len > max_bytes) return error.MetadataTooLarge;
+        const final_url = try a.dupe(u8, if (self.redirect) "https://example.invalid/redirect" else url);
+        return .{ .bytes = body, .final_url = final_url, .status = 200 };
+    }
+};
+fn waitPreviewTest(controller: *Controller) !void {
+    const start = std.Io.Clock.awake.now(controller.io).nanoseconds;
+    while (controller.previewSnapshot().phase == .loading or controller.preview_active != null) {
+        if (std.Io.Clock.awake.now(controller.io).nanoseconds - start > 5_000_000_000) return error.TestTimeout;
+        controller.tick();
+        try controller.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+fn waitPreviewFlag(io: std.Io, flag: *const std.atomic.Value(bool)) !void {
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
+    while (!flag.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).nanoseconds - start > 5_000_000_000) return error.TestTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+test "catalogue releaseTime is copied independently of time and retained by cloning" {
+    var fixture: PreviewFixture = .{};
+    const bytes = try fixture.manifest(std.testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const entries = parseCatalogue(arena.allocator(), bytes) catch |err| {
+        std.testing.allocator.free(bytes);
+        return err;
+    };
+    @memset(bytes, 'x');
+    std.testing.allocator.free(bytes);
+    const copy = try cloneCatalogEntry(arena.allocator(), entries[0]);
+    try std.testing.expectEqualStrings("2026-03-24T09:00:00+00:00", entries[0].release_time);
+    try std.testing.expectEqualStrings(entries[0].release_time, copy.release_time);
+    try std.testing.expectEqualStrings(entries[0].url, copy.url);
+    try std.testing.expectEqual(entries[0].sha1, copy.sha1);
+    try std.testing.expect(entries[0].release_time.ptr != copy.release_time.ptr);
+    try std.testing.expectEqualStrings("", (CatalogEntry{ .id = "fixture", .kind = "release" }).release_time);
+}
+
+test "preview downloads only trusted metadata and follows declared inherited Java requirements" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var fixture: PreviewFixture = .{};
+    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .preview_transport = fixture.transport() });
+    defer controller.deinit();
+    try std.testing.expectEqual(PreviewPhase.idle, (PreviewSnapshot{}).phase);
+    try controller.previewVersion("future");
+    try std.testing.expectEqual(PreviewPhase.loading, controller.previewSnapshot().phase);
+    try std.testing.expect(controller.previewSnapshot().java_major == null);
+    try waitPreviewTest(&controller);
+    try std.testing.expectEqual(@as(u32, 25), controller.previewSnapshot().java_major.?);
+    try std.testing.expectEqual(Phase.idle, controller.snapshot().phase);
+    try std.testing.expectEqual(@as(usize, 1), fixture.manifest_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), fixture.metadata_calls.load(.acquire));
+    try controller.previewVersion("1.7.10");
+    try waitPreviewTest(&controller);
+    try std.testing.expectEqual(@as(u32, 8), controller.previewSnapshot().java_major.?);
+    try controller.previewVersion("child");
+    try waitPreviewTest(&controller);
+    try std.testing.expectEqual(@as(u32, 17), controller.previewSnapshot().java_major.?);
+    try std.testing.expectEqual(@as(usize, 4), fixture.metadata_calls.load(.acquire));
+    const calls = fixture.manifest_calls.load(.acquire);
+    try controller.previewVersion("future");
+    try controller.previewVersion("future");
+    try std.testing.expectEqual(PreviewPhase.complete, controller.previewSnapshot().phase);
+    try std.testing.expectEqual(@as(u32, 25), controller.previewSnapshot().java_major.?);
+    try std.testing.expectEqual(calls, fixture.manifest_calls.load(.acquire));
+    try std.testing.expect(controller.preview_active == null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "versions", .{}));
+}
+
+test "preview copies selection and catalogue while local refresh replaces published ownership" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var fixture: PreviewFixture = .{ .pause = true };
+    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .preview_transport = fixture.transport() });
+    defer controller.deinit();
+    defer fixture.release.store(true, .release);
+    try fixture.publishCatalogue(&controller);
+    var selected = "future".*;
+    try controller.previewVersion(&selected);
+    @memset(&selected, 'x');
+    try waitPreviewFlag(std.testing.io, &fixture.entered);
+    const old = controller.published.?;
+    try controller.refreshInstalled();
+    try waitForTest(&controller);
+    try std.testing.expect(controller.published.? != old);
+    try std.testing.expectEqualStrings("2026-03-24T09:00:00+00:00", controller.snapshot().available[0].release_time);
+    fixture.release.store(true, .release);
+    try waitPreviewTest(&controller);
+    try std.testing.expectEqualStrings("future", controller.previewSnapshot().version.?);
+    try std.testing.expectEqual(@as(u32, 25), controller.previewSnapshot().java_major.?);
+    try std.testing.expectEqual(@as(usize, 0), fixture.manifest_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), fixture.metadata_calls.load(.acquire));
+}
+
+test "preview replacement queues one worker and ignores canceled late completion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var fixture: PreviewFixture = .{ .pause = true, .ignore_cancel = true };
+    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .preview_transport = fixture.transport() });
+    defer controller.deinit();
+    defer fixture.release.store(true, .release);
+    try controller.previewVersion("future");
+    try waitPreviewFlag(std.testing.io, &fixture.entered);
+    const first = controller.preview_active.?;
+    try controller.previewVersion("1.7.10");
+    try controller.previewVersion("1.7.10");
+    try std.testing.expect(controller.preview_active.? == first);
+    try std.testing.expect(first.canceled.load(.acquire));
+    try std.testing.expectEqualStrings("1.7.10", controller.previewSnapshot().version.?);
+    try std.testing.expect(controller.previewSnapshot().java_major == null);
+    fixture.release.store(true, .release);
+    try waitPreviewTest(&controller);
+    try std.testing.expectEqual(@as(u32, 8), controller.previewSnapshot().java_major.?);
+    try std.testing.expectEqual(@as(usize, 2), fixture.metadata_calls.load(.acquire));
+    // The obsolete result must not have entered the successful-result cache.
+    try controller.previewVersion("future");
+    try std.testing.expectEqual(PreviewPhase.loading, controller.previewSnapshot().phase);
+    try waitPreviewTest(&controller);
+    try std.testing.expectEqual(@as(usize, 3), fixture.metadata_calls.load(.acquire));
+    // Even cancellation after worker completion, before UI publication, wins.
+    controller.cancelPreview();
+    try controller.previewVersion("parent");
+    try waitPreviewFlag(std.testing.io, &controller.preview_active.?.done);
+    controller.cancelPreview();
+    controller.tick();
+    try std.testing.expectEqual(PreviewPhase.idle, controller.previewSnapshot().phase);
+    try std.testing.expect(controller.previewSnapshot().version == null);
+    try std.testing.expect(controller.previewSnapshot().java_major == null);
+    try controller.previewVersion("parent");
+    try std.testing.expectEqual(PreviewPhase.loading, controller.previewSnapshot().phase);
+    try waitPreviewTest(&controller);
+}
+
+test "preview deinit cancels and joins independently of a live installer worker" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var fixture: PreviewFixture = .{ .pause = true };
+    var registry = tasks.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .preview_transport = fixture.transport(), .task_registry = &registry });
+    var needs_deinit = true;
+    defer if (needs_deinit) controller.deinit();
+    const task = try startWaitingTestJob(&controller);
+    try controller.previewVersion("future");
+    try waitPreviewFlag(std.testing.io, &fixture.entered);
+    try std.testing.expectEqual(tasks.State.running, task.state);
+    controller.deinit();
+    needs_deinit = false;
+    try std.testing.expect(fixture.returned.load(.acquire));
+    try std.testing.expectEqual(tasks.State.canceled, task.state);
+}
+
+test "preview preserves metadata trust and rejects malformed Java instead of guessing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const cases = [_]struct { fixture: PreviewFixture, version: []const u8, expected: anyerror }{
+        .{ .fixture = .{ .corrupt = true }, .version = "future", .expected = error.ChecksumMismatch },
+        .{ .fixture = .{ .redirect = true }, .version = "future", .expected = error.UnexpectedRedirect },
+        .{ .fixture = .{ .untrusted = true }, .version = "future", .expected = error.UntrustedMetadataUrl },
+        .{ .fixture = .{}, .version = "zero", .expected = error.InvalidJavaVersion },
+        .{ .fixture = .{}, .version = "overflow", .expected = error.InvalidJavaVersion },
+    };
+    for (cases) |case| {
+        var fixture = case.fixture;
+        var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .preview_transport = fixture.transport() });
+        defer controller.deinit();
+        try controller.previewVersion(case.version);
+        try waitPreviewTest(&controller);
+        try std.testing.expectEqual(PreviewPhase.failed, controller.previewSnapshot().phase);
+        try std.testing.expectEqual(case.expected, controller.previewSnapshot().failure.?);
+        try std.testing.expect(controller.previewSnapshot().java_major == null);
+        const calls = fixture.manifest_calls.load(.acquire);
+        try controller.previewVersion(case.version);
+        try std.testing.expectEqual(calls, fixture.manifest_calls.load(.acquire));
+    }
+    var fixture: PreviewFixture = .{};
+    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .manifest_url = "invalid://fixture", .preview_transport = fixture.transport() });
+    defer controller.deinit();
+    try controller.previewVersion("future");
+    try waitPreviewTest(&controller);
+    try std.testing.expectEqual(error.UntrustedManifestUrl, controller.previewSnapshot().failure.?);
+    try std.testing.expectEqual(@as(usize, 0), fixture.manifest_calls.load(.acquire));
+    try std.testing.expectError(error.UnsafeVersionId, controller.previewVersion(""));
+    try std.testing.expect(controller.previewSnapshot().version == null);
+    try std.testing.expectError(error.UnsafeVersionId, controller.previewVersion("../escape"));
+    try std.testing.expectEqual(@as(usize, 0), fixture.metadata_calls.load(.acquire));
+}
+
+test "preview result cache is bounded and HTTP paths are separate from installer cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root });
+    defer controller.deinit();
+    for (0..10) |i| {
+        var id: [24]u8 = undefined;
+        controller.cachePreview(try std.fmt.bufPrint(&id, "fixture-{d}", .{i}), @intCast(i + 8));
+    }
+    var occupied: usize = 0;
+    for (controller.preview_cache) |entry| if (entry) |cached| {
+        occupied += 1;
+        try std.testing.expect(!std.mem.eql(u8, cached.version, "fixture-0"));
+        try std.testing.expect(!std.mem.eql(u8, cached.version, "fixture-1"));
+    };
+    try std.testing.expectEqual(@as(usize, 8), occupied);
+    var preview: PreviewJob = .{ .io = std.testing.io, .root = root, .manifest_url = metadata.version_manifest_url, .version_id = "future", .generation = 1, .cache_root = root, .deadline_ms = std.math.maxInt(u64) };
+    const preview_path = (try preview.cachePath(std.testing.allocator, metadata.version_manifest_url)).?;
+    defer std.testing.allocator.free(preview_path);
+    var catalogue: Job = .{ .io = std.testing.io, .operation = .catalogue, .root = root, .manifest_url = metadata.version_manifest_url, .version_id = null, .cache_root = root };
+    const catalogue_path = (try manifestCachePath(&catalogue)).?;
+    defer worker_allocator.free(catalogue_path);
+    try std.testing.expect(!std.mem.eql(u8, preview_path, catalogue_path));
+    try std.testing.expect(std.mem.indexOf(u8, preview_path, "/http/version-preview/") != null);
+}
+
+test "installed embedded library readiness rejects same-size corruption and missing files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets/indexes");
+    try tmp.dir.createDirPath(io, "versions/fixture");
+    try tmp.dir.createDirPath(io, "libraries/fixture");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/indexes/fixture.json", .data = "{\"objects\":{}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "versions/fixture/fixture.jar", .data = "game" });
+    const body = "embedded";
+    try tmp.dir.writeFile(io, .{ .sub_path = "libraries/fixture/embedded.jar", .data = body });
+    var hash: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(body, &hash, .{});
+    const hex = std.fmt.bytesToHex(&hash, .lower);
+    const bytes = try std.json.Stringify.valueAlloc(a, .{
+        .id = "fixture",
+        .downloads = .{ .client = .{ .url = "https://example/client", .size = 4 } },
+        .assetIndex = .{ .id = "fixture", .url = "https://example/index" },
+        .libraries = .{.{
+            .name = "fixture:embedded:1",
+            .downloads = .{ .artifact = .{ .url = "", .path = "fixture/embedded.jar", .sha1 = &hex, .size = body.len } },
+        }},
+    }, .{});
+    defer a.free(bytes);
+    var version = try metadata.version.parseSlice(a, bytes);
+    defer version.deinit();
+    var root_buffer: [4096]u8 = undefined;
+    const root_length = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_length];
+    var canceled = std.atomic.Value(bool).init(false);
+    try std.testing.expect(try completePlan(io, tmp.dir, root, version.value, &canceled));
+    try tmp.dir.writeFile(io, .{ .sub_path = "libraries/fixture/embedded.jar", .data = "tampered" });
+    try std.testing.expect(!try completePlan(io, tmp.dir, root, version.value, &canceled));
+    try tmp.dir.deleteFile(io, "libraries/fixture/embedded.jar");
+    try std.testing.expect(!try completePlan(io, tmp.dir, root, version.value, &canceled));
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, completePlan(io, tmp.dir, root, version.value, &canceled));
+}
+
+test "path contract installed readiness uses Unicode and host separators" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets/indexes");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/indexes/fixture.json", .data = "{\"objects\":{}}" });
+    try writeVersionFixtureWithJava(tmp.dir, "中文实例", "中文实例", true, 21);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const installed = try scanInstalled(arena.allocator(), io, root, &canceled);
+    try std.testing.expectEqual(@as(usize, 1), installed.len);
+    try std.testing.expectEqualStrings("中文实例", installed[0].id);
+    var version = try loadInstalled(a, io, root, "中文实例", &canceled);
+    defer version.deinit();
+    for ([_][]const u8{ "../outside", "a/b", "a\\b", "a:b", "a\xc2\x80b", "\xff", "COM¹", "LPT².dll", "CON .json" }) |unsafe_id|
+        try std.testing.expectError(error.UnsafePath, loadInstalled(a, io, root, unsafe_id, &canceled));
+    const absolute = try std.fs.path.join(a, &.{ root, "libraries", "fixture", "中文实例.jar" });
+    defer a.free(absolute);
+    const relative = try relativePath(root, absolute);
+    const file = try openBelow(tmp.dir, io, relative);
+    defer file.close(io);
+    try std.testing.expectEqual(@as(u64, 3), (try file.stat(io)).size);
+    const trailing_root = try std.fmt.allocPrint(a, "{s}{c}", .{ root, std.fs.path.sep });
+    defer a.free(trailing_root);
+    try std.testing.expectEqualStrings(relative, try relativePath(trailing_root, absolute));
+    try std.testing.expectError(error.UnsafePath, relativePath("/safe", "/safe-other/file"));
+    try std.testing.expectError(error.UnsafePath, relativePath("", "/file"));
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqualStrings("libraries\\x.jar", try relativePath("C:\\game", "C:\\game\\libraries\\x.jar"));
+        try std.testing.expectError(error.UnsafePath, relativePath("C:\\game", "C:\\game-other\\x.jar"));
+    } else {
+        try std.testing.expectError(error.UnsafePath, relativePath("/safe", "/safe\\file"));
+    }
 }

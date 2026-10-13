@@ -70,7 +70,7 @@ fn less(_: void, x: Backup, y: Backup) bool {
 }
 pub fn list(a: A, io: std.Io, paths: *const instances.Paths, instance: config.Instance, options: w.Options) !BackupList {
     if (!config.validId(instance.id) or !config.validId(instance.name)) return error.UnsafeInstance;
-    const scope = try w.enterScope(options, .{ .source = instance.id });
+    const scope = try w.enterReadScope(options, .{ .source = instance.id });
     defer scope.deinit();
     const directory = try std.fs.path.join(a, &.{ paths.root, ".minecraft", "versions", instance.name, "saves", ".vela-worlds" });
     defer a.free(directory);

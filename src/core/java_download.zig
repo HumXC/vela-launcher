@@ -50,7 +50,25 @@ pub const RuntimeRelease = struct {
     url: []const u8,
     archive: Archive,
     sha256: [32]u8,
+    /// Literal catalogue size. Exact unless parseAzul explicitly marks the observed
+    /// decimal-kB precision of an official CA package (SHA256 is always mandatory).
     size: ?u64 = null,
+    size_precision: enum { exact, azul_rounded_kilobyte } = .exact,
+
+    pub fn acceptsSize(self: *const RuntimeRelease, actual: u64) bool {
+        const reported = self.size orelse return true;
+        if (self.size_precision == .exact) return actual == reported;
+        if (self.vendor != .azul or reported == 0 or reported % 1000 != 0) return false;
+        return (actual +| 500) / 1000 == reported / 1000;
+    }
+
+    fn downloadLimit(self: *const RuntimeRelease) usize {
+        if (self.size) |reported| {
+            const upper = if (self.size_precision == .azul_rounded_kilobyte) reported +| 499 else reported;
+            return @intCast(@min(max_archive_bytes, upper));
+        }
+        return max_archive_bytes;
+    }
 
     pub fn deinit(self: *RuntimeRelease) void {
         self.allocator.free(self.version);
@@ -60,7 +78,7 @@ pub const RuntimeRelease = struct {
 };
 
 pub const Phase = enum { metadata, downloading, verifying, extracting, publishing, complete };
-pub const Progress = struct { phase: Phase, received: u64 = 0, total: ?u64 = null };
+pub const Progress = struct { phase: Phase, received: u64 = 0, total: ?u64 = null, bytes_per_second: f64 = 0 };
 /// Called on the backend worker, never implicitly on the UI thread.
 pub const Hooks = struct {
     context: ?*anyopaque = null,
@@ -212,7 +230,11 @@ pub fn parseAzul(a: Allocator, bytes: []const u8, major: u8, platform: Platform)
     }
     const version_owned = try a.dupe(u8, version.written());
     errdefer a.free(version_owned);
-    return .{ .allocator = a, .vendor = .azul, .major = major, .platform = platform, .version = version_owned, .url = try a.dupe(u8, download_url), .archive = platform.archive(), .sha256 = sha256, .size = @intCast(size) };
+    // Observed official CA package details report 213089000 for 213089356 bytes,
+    // and 106675000 for 106674581 bytes. The API schema only says integer, with
+    // no precision contract. Keep the literal size and restrict compatibility to
+    // its nearest decimal-kB bucket; mandatory SHA256 still pins the exact bytes.
+    return .{ .allocator = a, .vendor = .azul, .major = major, .platform = platform, .version = version_owned, .url = try a.dupe(u8, download_url), .archive = platform.archive(), .sha256 = sha256, .size = @intCast(size), .size_precision = if (@mod(size, 1000) == 0) .azul_rounded_kilobyte else .exact };
 }
 
 fn resolveMicrosoft(a: Allocator, t: Transport, major: u8, platform: Platform, hooks: Hooks) !RuntimeRelease {
@@ -383,7 +405,7 @@ fn verify(io: Io, path: []const u8, release: *const RuntimeRelease, hooks: Hooks
     defer file.close(io);
     const stat = try file.stat(io);
     if (stat.kind != .file or stat.size == 0 or stat.size > max_archive_bytes) return error.InvalidArchiveSize;
-    if (release.size) |size| if (size != stat.size) return error.ArchiveSizeMismatch;
+    if (!release.acceptsSize(stat.size)) return error.ArchiveSizeMismatch;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     var count: u64 = 0;
@@ -426,6 +448,9 @@ pub fn ServiceTransport(comptime Service: type) type {
                     task.cancel();
                 };
                 const snapshot = task.snapshot();
+                // Forward the terminal measurement before releasing this child task.
+                // Keep the backend phase: archive verification owns completion/failure.
+                hooks.report(.{ .phase = phase, .received = snapshot.progress.received, .total = snapshot.progress.total, .bytes_per_second = if (!canceled and phase == .downloading and snapshot.progress.phase == .downloading) snapshot.progress.bytes_per_second else 0 });
                 switch (snapshot.progress.phase) {
                     .complete => {
                         if (canceled) return error.Canceled;
@@ -434,7 +459,6 @@ pub fn ServiceTransport(comptime Service: type) type {
                     .failed, .canceled => return if (canceled) error.Canceled else snapshot.failure orelse error.DownloadFailed,
                     else => {},
                 }
-                hooks.report(.{ .phase = phase, .received = snapshot.progress.received, .total = snapshot.progress.total });
                 // Drain accepted task cancellation before release, even when Io
                 // itself was canceled. No live Task or Service borrower escapes.
                 self.io.sleep(.fromMilliseconds(5), .awake) catch {
@@ -463,7 +487,7 @@ pub fn ServiceTransport(comptime Service: type) type {
             _ = io;
             const self: *Self = @ptrCast(@alignCast(context));
             try hooks.check();
-            const task = try self.service.submit(.{ .url = release.url, .output = .{ .file = path }, .expected_size = release.size, .max_bytes = max_archive_bytes, .timeout_ms = 600_000, .https_only = true });
+            const task = try self.service.submit(.{ .url = release.url, .output = .{ .file = path }, .expected_size = if (release.size_precision == .exact) release.size else null, .max_bytes = release.downloadLimit(), .timeout_ms = 600_000, .https_only = true });
             defer task.release() catch unreachable;
             try self.wait(task, hooks, .downloading);
             try hooks.check();

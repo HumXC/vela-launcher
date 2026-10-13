@@ -2,31 +2,31 @@
     .name = .vela_launcher,
     .fingerprint = 0x722af1a98fa1f513,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ziglang/translate-c#02ff0c523fb92a38939b04d0145c4a9602a74d56",
+            .hash = "translate_c-2.0.0-Q_BUWltOBwBYABF84EUL208pIFeUIwbBs29FmVBaafN5",
+        },
         .dvui = .{
-            .url = "git+https://github.com/david-vanderson/dvui#f719b09b7d23b5e734fa10f2c9e5004ca42590f6",
-            .hash = "dvui-0.5.0-dev-AQFJmZPiAwGJlkO3EpYY907g1uWyms6mXSz-zj_HQ2h8",
+            .url = "https://github.com/david-vanderson/dvui/archive/164b69f397419b8d06e4579b9b8a86fa0b1ed071.tar.gz",
+            .hash = "dvui-0.6.0-dev-AQFJmVUKBAGK70x-BA-UMgh0NAyduhaNExbFdypjWuvO",
         },
         .sdl = .{
             .url = "git+https://github.com/allyourcodebase/SDL#0a9d5c36488aad32fcf989d465eb879db6e356b4",
             .hash = "sdl-1.0.3+3.4.16-i4QD0e0HqgDYP8m4T3rMJShyaDLy8ksp8qzCrCSncaPB",
         },
         .curl = .{
-            .url = "git+https://github.com/jiacai2050/zig-curl#1ac5ec3d10afa1c4591464ed24550e3874ce865c",
-            .hash = "curl-0.5.0-P4tT4e_-AABZBa1zBmiSKFQo7xV0DJ2cUxFfH4KiQKj2",
+            .url = "https://github.com/jiacai2050/zig-curl/archive/9c0f1d211ad22dd0f4c20aa54060c1d9f163595a.tar.gz",
+            .hash = "curl-0.6.0-dev-P4tT4W7_AAAEPibcTLuVEkwsmt61vws3n0pBs0DpAmv9",
         },
         .clap = .{
-            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
-            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
-        },
-        .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#v0.18.0",
-            .hash = "zio-0.18.0-xHbVVELgKQAU2hnwYL9MA0iXUydUZYlBfXxOUUM6v_Uv",
+            .url = "https://github.com/Hejsil/zig-clap/archive/05faf3905e8548f5cc269a8836e154065e70128d.tar.gz",
+            .hash = "clap-0.12.0-oBajB4XpAQCF1WRKnD5KOKPsnwwT_NNdAJ7Ww3irYJac",
         },
         .nbt = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/nbt-zig#517afb14c20857b1ce0e1eeb9218ea08402c3bf6",
-            .hash = "nbt-1.0.0-iJUBvhqIAQD5ahfn4dAaKmv4WazDZp5LTG6oDoyYQ0VM",
+            .url = "https://github.com/Bedrock-Phanatics/nbt-zig/archive/e162b97a76099f53d630124a2c6f3e3ff6f6a794.tar.gz",
+            .hash = "nbt-1.1.5-iJUBvvdJBAB2nW0FSVjwF8EPjsEgwIHj1JsVjOzlQ5HS",
         },
     },
     .paths = .{

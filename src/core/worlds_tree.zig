@@ -53,13 +53,95 @@ pub fn openAbsolute(io: std.Io, path: []const u8) !Dir {
     return dir;
 }
 
-pub fn child(io: std.Io, dir: Dir, name: []const u8, create: bool) !Dir {
+/// Move-only private stage owner. The parent handle and name outlive this owner.
+/// Acquisition and removal block native future cancellation; token cancellation
+/// remains the caller's responsibility before entering either bounded operation.
+pub const StageOwner = struct {
+    parent: Dir,
+    name: []const u8,
+    directory: ?Dir,
+    identity: Dir.Stat,
+    armed: bool = true,
+
+    pub fn create(io: std.Io, parent: Dir, name: []const u8, permissions: Dir.Permissions) !StageOwner {
+        try validateChild(name);
+        try io.checkCancel();
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        // Exclusive creation never adopts a preexisting directory as our stage.
+        try parent.createDir(io, name, permissions);
+        // Without an identity, deletion cannot be proved safe. Preserve the
+        // uncertain path and report recovery instead of deleting a replacement.
+        const identity = parent.statFile(io, name, .{ .follow_symlinks = false }) catch return error.RecoveryRequired;
+        if (identity.kind != .directory) return error.RecoveryRequired;
+        var owner: StageOwner = .{ .parent = parent, .name = name, .directory = null, .identity = identity };
+        errdefer owner.close(io);
+        owner.directory = parent.openDir(io, name, .{ .iterate = true, .follow_symlinks = false }) catch |err| {
+            owner.cleanup(io) catch return error.RecoveryRequired;
+            return err;
+        };
+        owner.verify(io) catch |err| {
+            owner.cleanup(io) catch return error.RecoveryRequired;
+            return err;
+        };
+        syncDir(io, parent) catch |err| {
+            owner.cleanup(io) catch return error.RecoveryRequired;
+            return err;
+        };
+        return owner;
+    }
+
+    pub fn verify(self: *const StageOwner, io: std.Io) !void {
+        const named = try self.parent.statFile(io, self.name, .{ .follow_symlinks = false });
+        if (named.kind != .directory or named.inode != self.identity.inode) return error.TreeChanged;
+        if (self.directory) |dir| {
+            const opened = try dir.stat(io);
+            if (opened.kind != .directory or opened.inode != self.identity.inode) return error.TreeChanged;
+        }
+    }
+
+    pub fn close(self: *StageOwner, io: std.Io) void {
+        if (self.directory) |dir| dir.close(io);
+        self.directory = null;
+    }
+
+    pub fn cleanup(self: *StageOwner, io: std.Io) !void {
+        if (!self.armed) return;
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        self.verify(io) catch |err| switch (err) {
+            error.FileNotFound => {
+                self.close(io);
+                self.armed = false;
+                return;
+            },
+            else => return err,
+        };
+        self.close(io);
+        try self.parent.deleteTree(io, self.name);
+        self.armed = false;
+        try syncDir(io, self.parent);
+    }
+};
+
+fn validateChild(name: []const u8) !void {
     if (!instances.safeRelativePath(name) or std.mem.indexOfScalar(u8, name, '/') != null) return error.UnsafePath;
-    if (create) dir.createDir(io, name, .default_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    if (create) try syncDir(io, dir);
+}
+
+pub fn child(io: std.Io, dir: Dir, name: []const u8, create: bool) !Dir {
+    try validateChild(name);
+    if (create) {
+        var owner = StageOwner.create(io, dir, name, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                // Existing shared ancestors are never armed for cleanup.
+                try syncDir(io, dir);
+                return dir.openDir(io, name, .{ .iterate = true, .follow_symlinks = false });
+            },
+            else => return err,
+        };
+        owner.armed = false;
+        return owner.directory.?;
+    }
     return dir.openDir(io, name, .{ .iterate = true, .follow_symlinks = false });
 }
 
@@ -107,6 +189,13 @@ fn walk(a: A, io: std.Io, source: Dir, destination: ?Dir, prefix: []const u8, de
         if (relative.len > 4096) return error.ResourceLimit;
         const stat = try source.statFile(io, item.name, .{ .follow_symlinks = false });
         if (stat.kind != .directory and stat.kind != .file) return error.UnsafeFileType;
+        // Root session.lock is ephemeral OS lock state, never backup/game data.
+        // Do not open/close its descriptor: POSIX process locks can be released by
+        // unrelated closes, and Windows locks also exclude reading these bytes.
+        if (prefix.len == 0 and std.ascii.eqlIgnoreCase(item.name, "session.lock")) {
+            if (stat.kind != .file or !std.mem.eql(u8, item.name, "session.lock")) return error.UnsafeFileType;
+            continue;
+        }
         if (stat.kind == .directory) {
             const src = try child(io, source, item.name, false);
             defer src.close(io);

@@ -29,6 +29,9 @@ pub const Fake = struct {
     fail_check_at: usize = 0,
     moves: usize = 0,
     closes: usize = 0,
+    writer_in_use: bool = false,
+    writer_owned: bool = false,
+    writer_acquires: usize = 0,
     discards: usize = 0,
     temp_open: bool = false,
     temp_exists: bool = false,
@@ -68,7 +71,7 @@ pub const Fake = struct {
     }
 
     fn ops(self: *Fake) fs.NativeOps {
-        return .{ .context = self, .open = open, .close = close, .check_cancel = checkCancel, .validate_root = validate, .load = load, .ensure_directory = ensure, .random = random, .create_temp = create, .write = write, .flush = flush, .verify_temp = verifyTemp, .move = move, .verify_final = final, .close_file = closeFile, .discard_temp = discard };
+        return .{ .context = self, .open = open, .close = close, .acquire_writer = acquireWriter, .check_cancel = checkCancel, .validate_root = validate, .load = load, .ensure_directory = ensure, .random = random, .create_temp = create, .write = write, .flush = flush, .verify_temp = verifyTemp, .move = move, .verify_final = final, .close_file = closeFile, .discard_temp = discard };
     }
     /// Separately owned fixture context survives capability close, unlike native
     /// Windows context. Every call opens a new Root through the complete ops seam.
@@ -83,11 +86,18 @@ pub const Fake = struct {
         try validate(ctx);
         if (privacy == .private_journal and self.directory_exists and !self.directory_private) return error.InsecureJournal;
     }
+    fn acquireWriter(ctx: *anyopaque) fs.Error!void {
+        const self = cast(ctx);
+        if (self.writer_in_use) return error.LauncherRootInUse;
+        self.writer_owned = true;
+        self.writer_acquires += 1;
+    }
     fn close(ctx: *anyopaque) void {
         const self = cast(ctx);
         std.debug.assert(!self.temp_open);
         self.event(.close);
         self.closes += 1;
+        self.writer_owned = false;
     }
     fn checkCancel(ctx: *anyopaque) fs.Error!void {
         const self = cast(ctx);
@@ -380,5 +390,5 @@ fn allocationScenario(a: Allocator) !void {
     try fs.publish(&root, "auth-cleanup.json", owned.bytes, fake.precommit());
 }
 test "injected allocation failure releases owned normalization and loaded bytes" {
-    try testing.checkAllAllocationFailures(testing.allocator, allocationScenario, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, allocationScenario, .{});
 }

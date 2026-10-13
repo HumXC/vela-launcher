@@ -601,7 +601,7 @@ test "override targets refuse protected paths case aliases and ancestor collisio
 }
 
 fn testRemoteIndex(a: Allocator, paths: []const []const u8) ![]u8 {
-    const Remote = struct { path: []const u8, hashes: struct { sha1: []const u8 = "0" ** 40, sha512: []const u8 = "0" ** 128 } = .{}, fileSize: u64 = 3, downloads: []const []const u8 = &.{"https://cdn.modrinth.com/a.jar"} };
+    const Remote = struct { path: []const u8, hashes: struct { sha1: []const u8 = &@as([40]u8, @splat('0')), sha512: []const u8 = &@as([128]u8, @splat('0')) } = .{}, fileSize: u64 = 3, downloads: []const []const u8 = &.{"https://cdn.modrinth.com/a.jar"} };
     const files = try a.alloc(Remote, paths.len);
     defer a.free(files);
     for (paths, files) |path, *file| file.* = .{ .path = path };
@@ -685,7 +685,7 @@ test "import allocation failures free owned plans and remove partial private sta
     try testZip(fixture.tmp.dir, "local.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = test_mrpack }, .{ .path = "overrides/config/a.txt", .bytes = "a" }, .{ .path = "client-overrides/config/a.txt", .bytes = "client" } });
     const path = try fixture.path("local.mrpack");
     defer a.free(path);
-    try std.testing.checkAllAllocationFailures(a, testAllocationFailure, .{ &fixture.paths, path });
+    try @import("test_allocations").checkAllAllocationFailures(a, testAllocationFailure, .{ &fixture.paths, path });
     const stage_root = try fixture.path(".vela/pack-imports");
     defer a.free(stage_root);
     const stages = try fs.openAbsolute(io, stage_root);
@@ -796,7 +796,7 @@ test "pack inspection cancellation and allocation failure leave no private stage
     defer a.free(path);
     var cancel = CancelToken.init(true);
     try std.testing.expectError(error.Canceled, inspect(a, io, &fixture.paths, path, &cancel));
-    try std.testing.checkAllAllocationFailures(a, testInspectionAllocationFailure, .{ &fixture.paths, path });
+    try @import("test_allocations").checkAllAllocationFailures(a, testInspectionAllocationFailure, .{ &fixture.paths, path });
     const stages_path = try fixture.path(".vela/pack-imports");
     defer a.free(stages_path);
     const stages = try fs.openAbsolute(io, stages_path);

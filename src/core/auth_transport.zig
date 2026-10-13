@@ -169,7 +169,7 @@ const WipeAllocator = struct {
     fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *WipeAllocator = @ptrCast(@alignCast(ctx));
         self.frees += 1;
-        const poison: u8 = if (@import("builtin").mode == .Debug or @import("builtin").mode == .ReleaseSafe) 0xaa else 0;
+        const poison: u8 = if (@import("builtin").mode == .debug or @import("builtin").mode == .safe) 0xaa else 0;
         for (bytes) |byte| if (byte != poison) {
             self.all_wiped = false;
         };

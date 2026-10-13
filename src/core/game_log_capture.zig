@@ -242,7 +242,7 @@ fn allocationCase(a: Allocator) !void {
     defer capture.deinit(std.testing.io);
 }
 test "capture allocation ownership and bounded ring handoff" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
     const capture = try Capture.init(std.testing.allocator, .{ .max_packets = 2 }, &.{});
     defer capture.deinit(std.testing.io);
     capture.queue.push(.stdout, "old\n");

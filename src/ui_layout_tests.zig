@@ -21,16 +21,32 @@ const worlds_manager = @import("ui/worlds_manager.zig");
 const worlds_view = @import("ui/worlds_view.zig");
 const servers = @import("core/servers.zig");
 const components = @import("ui/components.zig");
+const vela_theme = @import("ui/theme.zig");
 const games = @import("ui/game_library.zig");
 const launch = @import("ui/game_launch.zig");
 const logs_view = @import("ui/logs_view.zig");
 const shutdown_view = @import("ui/shutdown_view.zig");
 const lifecycle = @import("core/lifecycle.zig");
+
+comptime {
+    _ = @import("ui/avatar_manager.zig");
+    _ = @import("ui/avatar_image.zig");
+    _ = @import("ui/avatar_layout_tests.zig");
+    _ = @import("ui/game_library.zig");
+    _ = @import("ui/instances_view.zig");
+    _ = @import("ui/instance_wizard_layout_tests.zig");
+    _ = @import("ui/instance_settings_layout_tests.zig");
+    _ = @import("ui/card_grid_layout_tests.zig");
+    _ = @import("ui/logs_layout_tests.zig");
+}
 const accounts_view = @import("ui/accounts_view.zig");
 const accounts_manager = @import("ui/accounts_manager.zig");
 
 test {
     _ = @import("ui/curseforge_key_editor.zig");
+    _ = @import("game_selection_tests.zig");
+    _ = @import("instances_view_tests.zig");
+    _ = @import("server_picker_tests.zig");
     _ = settings_view;
 }
 
@@ -65,20 +81,54 @@ const HomeFrame = struct {
     var manager: *java.Manager = undefined;
     var services: view.Services = undefined;
     var pending: ?model.Msg = null;
+    var library_phase: games.Phase = .loading;
+    var process_phase: launch.Phase = .idle;
+    var page: enum { home, games, accounts } = .home;
+    var rendered_texts: usize = 0;
+    var start_labels: usize = 0;
 
     fn draw() !dvui.App.Result {
+        const win = dvui.currentWindow();
+        var commands: std.ArrayList(dvui.RenderCommand) = .empty;
+        defer commands.deinit(win.arena());
+        const previous_commands = win.defer_render_cmds;
+        const previous_rendering = win.render_target.rendering;
+        win.defer_render_cmds = &commands;
+        win.render_target.rendering = false;
+        defer {
+            win.defer_render_cmds = previous_commands;
+            win.render_target.rendering = previous_rendering;
+        }
         const root = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both, .padding = dvui.Rect.all(0), .margin = dvui.Rect.all(0) });
         defer root.deinit();
         // Match the real sidebar's 260px width plus its 16px left margin.
         _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 276 } });
         const pane = dvui.box(@src(), .{}, .{ .expand = .both, .padding = dvui.Rect.all(if (dvui.windowRect().h < 520) 12 else 32) });
         defer pane.deinit();
-        try view.drawHome(&state, .{ .installed = &.{}, .available = &.{}, .phase = .idle, .failure = null, .completed = 0, .total = 0, .installing_version = null }, manager, .{ .phase = .idle, .failure = null, .exit_code = null, .version = null, .version_id = null, .debug = false, .attempt_id = 0 }, &pending, services);
+        const library: games.Snapshot = .{ .installed = &.{}, .available = &.{}, .phase = library_phase, .failure = null, .completed = 0, .total = 0, .installing_version = null };
+        const process: launch.Snapshot = .{ .phase = process_phase, .failure = null, .exit_code = null, .version = null, .version_id = null, .debug = false, .attempt_id = 0 };
+        switch (page) {
+            .home => try view.drawHome(&state, library, manager, process, &pending, services),
+            .games => view.drawGameSelection(&state, library, process, &pending, services),
+            .accounts => {
+                view.drawAccountSelection(&state, library, process, &pending, services);
+                @import("ui/accounts_view.zig").finish(services.accounts_ui.?, services.configuration, services.accounts.?);
+            },
+        }
+        rendered_texts = 0;
+        start_labels = 0;
+        for (commands.items) |command| switch (command.cmd) {
+            .text => |text| {
+                rendered_texts += 1;
+                if (std.mem.eql(u8, if (process_phase == .preparing) "正在启动" else state.labels.start, text.text)) start_labels += 1;
+            },
+            else => {},
+        };
         return .ok;
     }
 };
 
-test "UI layout complete Home selected server and 23 tasks retains rows and Start footer" {
+test "UI layout Home Choose Game and Choose Account reserve Start and preserve native activation gates" {
     if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -93,6 +143,14 @@ test "UI layout complete Home selected server and 23 tasks retains rows and Star
     defer manager.deinit();
     var server_ui = servers_view.Ui.init(a);
     defer server_ui.deinit();
+    var account_service = try @import("ui/accounts_manager.zig").Manager.init(a, std.testing.io, root);
+    defer account_service.deinit();
+    var account_ui = try @import("ui/accounts_view.zig").Ui.init(a);
+    defer account_ui.deinit();
+    var server_service = server_manager.Manager.initWithQuery(a, std.testing.io, EditorsFrame.rejectQuery);
+    defer server_service.deinit();
+    var ordinary_creation = try @import("ui/instance_creation_controller.zig").Controller.init(a, std.testing.io, root, .{});
+    defer ordinary_creation.deinit(undefined);
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var java_download = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
@@ -113,12 +171,48 @@ test "UI layout complete Home selected server and 23 tasks retains rows and Star
         .settings = undefined,
         .java_download = &java_download,
         .java_download_ui = undefined,
-        .servers = undefined,
+        .servers = &server_service,
+        .ordinary_creation = &ordinary_creation,
+        .accounts = &account_service,
+        .accounts_ui = &account_ui,
         .logs = undefined,
         .worlds = undefined,
         .worlds_ui = undefined,
     };
-    for ([_]dvui.Size{ .{ .w = 640, .h = 400 }, .{ .w = 1280, .h = 720 } }) |size| {
+    for ([_]struct { size: dvui.Size, page: @TypeOf(HomeFrame.page), account_kind: config.AccountKind = .offline }{
+        .{ .size = .{ .w = 640, .h = 400 }, .page = .home },
+        .{ .size = .{ .w = 1280, .h = 720 }, .page = .home },
+        .{ .size = .{ .w = 640, .h = 400 }, .page = .games },
+        .{ .size = .{ .w = 1280, .h = 720 }, .page = .games },
+        .{ .size = .{ .w = 640, .h = 400 }, .page = .accounts },
+        .{ .size = .{ .w = 1280, .h = 720 }, .page = .accounts },
+        .{ .size = .{ .w = 640, .h = 400 }, .page = .accounts, .account_kind = .microsoft },
+        .{ .size = .{ .w = 1280, .h = 720 }, .page = .accounts, .account_kind = .microsoft },
+    }) |fixture| {
+        const size = fixture.size;
+        HomeFrame.page = fixture.page;
+        if (fixture.page == .accounts) {
+            var document = store.snapshot().*;
+            document.accounts = &.{.{ .id = "fixture-account", .name = "Player_A", .uuid = "00000000000000000000000000000000", .kind = fixture.account_kind }};
+            document.selected_account = "fixture-account";
+            try store.update(document);
+        }
+        HomeFrame.services.allow_mutations = true;
+        const start_tag = switch (fixture.page) {
+            .home => "home-start",
+            .games => "game-selection-start",
+            .accounts => "account-selection-start",
+        };
+        const layout_tag = switch (fixture.page) {
+            .home => "home-layout",
+            .games => "game-selection-layout",
+            .accounts => "account-selection-layout",
+        };
+        const footer_tag = switch (fixture.page) {
+            .home => "home-footer",
+            .games => "game-selection-footer",
+            .accounts => "account-selection-footer",
+        };
         var window = try dvui.testing.init(.{ .window_size = size });
         defer window.deinit();
         // testing.init defaults to 2x pixels; exercise the requested physical window sizes.
@@ -129,65 +223,265 @@ test "UI layout complete Home selected server and 23 tasks retains rows and Star
         theme.font_title = theme.font_body.withSize(24);
         window.window.themeSet(theme);
         HomeFrame.services.task_viewport_height = size.h;
+        HomeFrame.library_phase = .loading;
+        HomeFrame.process_phase = .idle;
         HomeFrame.pending = null;
+        try std.testing.expectEqual(@as(usize, if (fixture.page == .accounts) 1 else 0), store.snapshot().accounts.len);
+        try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
         try dvui.testing.settle(HomeFrame.draw);
-        const home = try dvui.testing.tagGet("home-layout");
-        const header = try dvui.testing.tagGet("home-header");
-        const viewport = try dvui.testing.tagGet("task-viewport");
-        const footer = try dvui.testing.tagGet("home-footer");
-        const start = try dvui.testing.tagGet("home-start");
-        const row = try dvui.testing.tagGet("task-23-row");
+        if (fixture.page == .home) try std.testing.expectEqual(@as(usize, 1), HomeFrame.rendered_texts);
+        try std.testing.expectEqual(@as(usize, 1), HomeFrame.start_labels);
+        const home = try dvui.testing.tagGet(layout_tag);
+        const footer = try dvui.testing.tagGet(footer_tag);
+        const start = try dvui.testing.tagGet(start_tag);
         try expectInside(.{ .x = 0, .y = 0, .w = size.w, .h = size.h }, home.rect);
-        for ([_]dvui.TagData{ header, viewport, footer, start }) |part| {
+        for ([_]dvui.TagData{ footer, start }) |part| {
             try std.testing.expect(part.visible);
             try expectInside(home.rect, part.rect);
         }
-        for ([_][]const u8{ "home-server-target", "home-server-address", "home-server-instance" }) |tag| {
-            const part = try dvui.testing.tagGet(tag);
-            try std.testing.expect(part.visible);
-            try expectInside(header.rect, part.rect);
-        }
-        try std.testing.expect(header.rect.y + header.rect.h <= viewport.rect.y);
-        try std.testing.expect(viewport.rect.y + viewport.rect.h <= footer.rect.y);
         try expectInside(footer.rect, start.rect);
         try std.testing.expectApproxEqAbs(@as(f32, 48), start.rect.h, 0.1);
-        try expectInside(viewport.rect, row.rect);
-        for ([_][]const u8{ "task-23-title", "task-23-status", "task-23-progress", "task-23-cancel" }) |tag| {
-            const part = try dvui.testing.tagGet(tag);
-            try std.testing.expect(part.visible);
-            try expectInside(row.rect, part.rect);
+        try std.testing.expectApproxEqAbs(home.rect.x + home.rect.w, start.rect.x + start.rect.w, 0.1);
+        try std.testing.expectApproxEqAbs(home.rect.y + home.rect.h, start.rect.y + start.rect.h, 0.1);
+        if (fixture.page != .home) {
+            const body = try dvui.testing.tagGet(if (fixture.page == .games) "game-selection-body" else "account-selection-body");
+            try std.testing.expect(body.visible);
+            try expectInside(home.rect, body.rect);
+            try std.testing.expect(body.rect.y + body.rect.h <= footer.rect.y + 0.1);
         }
-        if (size.h >= 520) try expectInside(viewport.rect, (try dvui.testing.tagGet("task-22-row")).rect);
-        try std.testing.expectApproxEqAbs(row.rect.h * (if (size.h < 520) @as(f32, 1) else 2), viewport.rect.h, 0.1);
-        try dvui.testing.moveTo("home-start");
-        try dvui.testing.click(.left);
-        try dvui.testing.settle(HomeFrame.draw);
-        try std.testing.expect(HomeFrame.pending == null);
-        try dvui.testing.expectNotFocused("home-start");
-        for (window.window.tab_index_prev.items) |entry| try std.testing.expect(entry.widgetId != start.id);
-        dvui.focusWidget(start.id, null, null);
-        _ = try window.window.addEventKey(.{ .code = .enter, .action = .down, .mod = .none });
-        _ = try window.window.addEventKey(.{ .code = .enter, .action = .up, .mod = .none });
-        try dvui.testing.settle(HomeFrame.draw);
-        try std.testing.expect(HomeFrame.pending == null);
-        dvui.focusWidget(null, null, null);
-        if (size.h >= 520) {
-            try dvui.testing.moveTo("task-23-cancel");
+        if (fixture.page == .games and size.w == 1280) {
+            const group = try dvui.testing.tagGet("game-instances-panel");
+            const header = try dvui.testing.tagGet("game-instances");
+            const servers_before = try dvui.testing.tagGet("game-servers-panel");
+            // Tag bounds include the bottom margin separating expanded cards.
+            try std.testing.expectApproxEqAbs(@as(f32, 44), header.rect.h - 30, 0.1);
+            try std.testing.expectApproxEqAbs(group.rect.x + 24, header.rect.x, 0.1);
+            try std.testing.expectApproxEqAbs(group.rect.y + 14, header.rect.y, 0.1);
+            try std.testing.expectApproxEqAbs(group.rect.w - 48, header.rect.w, 0.1);
+            try dvui.testing.moveTo("game-instances");
+            try dvui.testing.settle(HomeFrame.draw);
             try dvui.testing.click(.left);
             try dvui.testing.settle(HomeFrame.draw);
-            try std.testing.expect(registry.tasks()[22].canceled());
+            const collapsed = try dvui.testing.tagGet("game-instances-panel");
+            try std.testing.expectApproxEqAbs(@as(f32, 72), collapsed.rect.h - vela_theme.spacing.panel_padding, 0.1);
+            try std.testing.expect(dvui.tagGet("game-instance-fixture-game") == null);
+            try std.testing.expect((try dvui.testing.tagGet("game-servers-panel")).rect.y < servers_before.rect.y);
+            try dvui.testing.expectFocused("game-instances");
+            try dvui.testing.pressKey(.enter, .none);
+            try dvui.testing.settle(HomeFrame.draw);
+            try std.testing.expect(dvui.tagGet("game-instance-fixture-game") != null);
+            try std.testing.expectApproxEqAbs(group.rect.h, (try dvui.testing.tagGet("game-instances-panel")).rect.h, 0.1);
+            try dvui.testing.moveTo("game-servers");
+            try dvui.testing.settle(HomeFrame.draw);
+            try dvui.testing.click(.left);
+            try dvui.testing.settle(HomeFrame.draw);
+            try std.testing.expectApproxEqAbs(@as(f32, 72), (try dvui.testing.tagGet("game-servers-panel")).rect.h - vela_theme.spacing.panel_padding, 0.1);
+            try std.testing.expect(dvui.tagGet("game-server-fixture-server") == null);
+            try dvui.testing.pressKey(.enter, .none);
+            try dvui.testing.settle(HomeFrame.draw);
+            try std.testing.expect(dvui.tagGet("game-server-fixture-server") != null);
+            try std.testing.expectEqualStrings("fixture-server", store.snapshot().selected_server.?);
+            try std.testing.expectEqualStrings("fixture-game", store.snapshot().selected_instance.?);
         }
-        try dvui.testing.moveTo("task-viewport");
-        _ = try window.window.addEventMouseWheel(-100000, .vertical, null);
+        for ([_][]const u8{ "home-header", "home-server-target", "home-server-address", "home-server-instance", "task-viewport" }) |tag| {
+            try std.testing.expect(dvui.tagGet(tag) == null);
+        }
+        var tag_buffer: [64]u8 = undefined;
+        for (registry.tasks()) |task| {
+            for ([_][]const u8{ "row", "title", "status", "progress", "cancel" }) |part| {
+                const tag = try std.fmt.bufPrint(&tag_buffer, "task-{d}-{s}", .{ task.id, part });
+                try std.testing.expect(dvui.tagGet(tag) == null);
+            }
+        }
+        var start_tabstops: usize = 0;
+        for (window.window.tab_index_prev.items) |entry| if (entry.widgetId == start.id) {
+            start_tabstops += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), start_tabstops);
+        try dvui.testing.moveTo(start_tag);
+        try dvui.testing.click(.left);
         try dvui.testing.settle(HomeFrame.draw);
-        const oldest = try dvui.testing.tagGet("task-1-row");
-        try std.testing.expect(oldest.visible);
-        try expectInside(viewport.rect, oldest.rect);
+        try std.testing.expect(HomeFrame.pending != null and std.meta.activeTag(HomeFrame.pending.?) == .start);
+        try dvui.testing.expectFocused(start_tag);
+        HomeFrame.pending = null;
+        try dvui.testing.pressKey(.enter, .none);
+        try dvui.testing.settle(HomeFrame.draw);
+        try std.testing.expect(HomeFrame.pending != null and std.meta.activeTag(HomeFrame.pending.?) == .start);
+        if (fixture.page == .accounts) {
+            const body = try dvui.testing.tagGet("account-selection-body");
+            const edit = try dvui.testing.tagGet("account-edit");
+            const add = try dvui.testing.tagGet("account-add");
+            const card = try dvui.testing.tagGet("account-card-fixture-account");
+            for ([_]dvui.TagData{ edit, add, card }) |part| {
+                try std.testing.expect(part.visible);
+                try expectInside(body.rect, part.rect);
+            }
+            try std.testing.expect(edit.rect.x + edit.rect.w <= add.rect.x + 0.1);
+            try std.testing.expectApproxEqAbs(edit.rect.y, add.rect.y, 0.1);
+            try std.testing.expect(edit.rect.y + edit.rect.h <= card.rect.y + 0.1);
+            try std.testing.expect(dvui.tagGet("account-delete") == null);
+            try std.testing.expect(dvui.tagGet("account-sign-out") == null);
+            try dvui.testing.moveTo("account-edit");
+            try dvui.testing.click(.left);
+            try dvui.testing.settle(HomeFrame.draw);
+            try std.testing.expect(account_ui.editor_open and account_ui.confirmation == null);
+            const delete = try dvui.testing.tagGet("account-delete");
+            const cancel = try dvui.testing.tagGet("account-cancel");
+            try std.testing.expect(delete.visible and cancel.visible);
+            var modal_count: usize = 0;
+            for (window.window.subwindows.stack.items) |subwindow| if (subwindow.modal) {
+                modal_count += 1;
+                try expectInside(subwindow.rect_pixels, delete.rect);
+                try expectInside(subwindow.rect_pixels, cancel.rect);
+            };
+            try std.testing.expectEqual(@as(usize, 1), modal_count);
+            try expectInside(.{ .x = 0, .y = 0, .w = size.w, .h = size.h }, delete.rect);
+            try dvui.testing.moveTo("account-cancel");
+            try dvui.testing.click(.left);
+            try dvui.testing.settle(HomeFrame.draw);
+            try std.testing.expect(!account_ui.editor_open and account_ui.confirmation == null);
+            try std.testing.expect(dvui.tagGet("account-delete") == null);
+            try dvui.testing.moveTo("account-add");
+            try dvui.testing.click(.left);
+            try dvui.testing.settle(HomeFrame.draw);
+            try std.testing.expect(account_ui.editor_open and account_ui.draft.id == null);
+            try std.testing.expect(dvui.tagGet("account-delete") == null);
+            try dvui.testing.moveTo("account-cancel");
+            try dvui.testing.click(.left);
+            try dvui.testing.settle(HomeFrame.draw);
+            try std.testing.expect(!account_ui.editor_open and account_ui.failure == null);
+            try std.testing.expectEqualStrings("fixture-account", store.snapshot().selected_account.?);
+            try std.testing.expectEqualStrings("Player_A", store.snapshot().accounts[0].name);
+            try std.testing.expectEqual(start.rect, (try dvui.testing.tagGet(start_tag)).rect);
+        }
+        for ([_]struct { library: games.Phase, process: launch.Phase, allow_mutations: bool = true, creation_phase: @import("ui/instance_creation_controller.zig").Phase = .idle }{
+            .{ .library = .loading, .process = .preparing },
+            .{ .library = .loading, .process = .running },
+            .{ .library = .installing, .process = .idle },
+            .{ .library = .loading, .process = .idle, .allow_mutations = false },
+            .{ .library = .loading, .process = .idle, .creation_phase = .preparing },
+            .{ .library = .loading, .process = .idle, .creation_phase = .awaiting_publication },
+        }) |busy| {
+            HomeFrame.library_phase = busy.library;
+            HomeFrame.process_phase = busy.process;
+            HomeFrame.services.allow_mutations = busy.allow_mutations;
+            // Model task snapshots without starting workers, native Java, or network requests.
+            ordinary_creation.core.phase = busy.creation_phase;
+            HomeFrame.pending = null;
+            dvui.focusWidget(null, null, null);
+            try dvui.testing.settle(HomeFrame.draw);
+            for (window.window.tab_index_prev.items) |entry| try std.testing.expect(entry.widgetId != start.id);
+            try dvui.testing.moveTo(start_tag);
+            try dvui.testing.click(.left);
+            try dvui.testing.settle(HomeFrame.draw);
+            try std.testing.expect(HomeFrame.pending == null);
+            try dvui.testing.expectNotFocused(start_tag);
+            dvui.focusWidget(start.id, null, null);
+            try dvui.testing.pressKey(.enter, .none);
+            try dvui.testing.settle(HomeFrame.draw);
+            try std.testing.expect(HomeFrame.pending == null);
+            try std.testing.expectEqual(start.rect, (try dvui.testing.tagGet(start_tag)).rect);
+        }
+        ordinary_creation.core.phase = .idle;
+        dvui.focusWidget(null, null, null);
         try std.testing.expectEqual(@as(usize, 23), registry.tasks().len);
         try std.testing.expectEqualStrings("fixture-server", store.snapshot().selected_server.?);
-        try std.testing.expectEqual(start.rect, (try dvui.testing.tagGet("home-start")).rect);
-        try std.testing.expectEqual(viewport.rect, (try dvui.testing.tagGet("task-viewport")).rect);
-        std.debug.print("Home {d}x{d}: header={d:.1}..{d:.1}, tasks={d:.1}..{d:.1}, footer={d:.1}..{d:.1}, Start={d:.1}x{d:.1}, registry=23\n", .{ size.w, size.h, header.rect.y, header.rect.y + header.rect.h, viewport.rect.y, viewport.rect.y + viewport.rect.h, footer.rect.y, footer.rect.y + footer.rect.h, start.rect.w, start.rect.h });
+        try std.testing.expectEqual(start.rect, (try dvui.testing.tagGet(start_tag)).rect);
+        for (registry.tasks()) |task| {
+            try std.testing.expectEqual(tasks.State.running, task.state);
+            try std.testing.expect(!task.canceled());
+            const progress = task.progress();
+            try std.testing.expectEqual(tasks.Stage.scanning, progress.stage);
+            try std.testing.expectEqual(@as(u64, 42), progress.completed);
+            try std.testing.expectEqual(@as(?u64, 100), progress.total);
+        }
+    }
+}
+
+const ServerCardFrame = struct {
+    var status: *const servers.OwnedStatus = undefined;
+    var rendered_instance = false;
+    var rendered_motd = false;
+    var rendered_counts = false;
+    var rendered_people_label = false;
+
+    fn draw() !dvui.App.Result {
+        const win = dvui.currentWindow();
+        var commands: std.ArrayList(dvui.RenderCommand) = .empty;
+        defer commands.deinit(win.arena());
+        const previous_commands = win.defer_render_cmds;
+        const previous_rendering = win.render_target.rendering;
+        win.defer_render_cmds = &commands;
+        win.render_target.rendering = false;
+        defer {
+            win.defer_render_cmds = previous_commands;
+            win.render_target.rendering = previous_rendering;
+        }
+        const root = dvui.box(@src(), .{}, .{ .expand = .both, .padding = dvui.Rect.all(16) });
+        defer root.deinit();
+        const server: config.Server = .{ .id = "card-server", .name = "Fixture server", .address = "fixture.invalid", .instance_id = "card-instance" };
+        const document: config.Document = .{ .instances = &.{.{ .id = "card-instance", .name = "Fixture instance", .minecraft_version = "1.21" }} };
+        _ = @import("ui/game_selection_view.zig").serverCard(@src(), server, &document, .{ .state = .online, .server = server, .status = status }, false, true, 280, "server-card");
+        _ = components.selectionCard(@src(), "bounded-instance", "Fixture game", .{ .width = 280, .bounded_text = true, .description = "Minecraft 1.21", .tag = "instance-card" });
+        rendered_instance = false;
+        rendered_motd = false;
+        rendered_counts = false;
+        rendered_people_label = false;
+        const card = (try dvui.testing.tagGet("server-card")).rect;
+        for (commands.items) |command| switch (command.cmd) {
+            .text => |text| {
+                const content = std.mem.trim(u8, text.text, " \n\r");
+                if (std.mem.eql(u8, content, "Fixture instance")) {
+                    try expectInside(card, text.rs.r);
+                    try expectInside(command.clip, text.rs.r);
+                    rendered_instance = true;
+                }
+                if (std.mem.indexOf(u8, content, "Welcome") != null or std.mem.indexOf(u8, content, "Survival") != null) rendered_motd = true;
+                if (std.mem.indexOf(u8, content, "3/20") != null) rendered_counts = true;
+                if (std.mem.indexOf(u8, content, "人在线") != null) rendered_people_label = true;
+            },
+            else => {},
+        };
+        return .ok;
+    }
+};
+
+test "UI layout server cards show bound instance without MOTD or redundant tooltips" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    var status = try servers.parseStatus(std.testing.allocator,
+        \\{ "version": { "name": "Fixture", "protocol": 767 }, "players": { "online": 3, "max": 20 }, "description": { "text": "Welcome\n", "color": "red", "bold": true, "extra": [{ "text": "Survival", "color": "green" }] } }
+    );
+    defer status.deinit();
+    try std.testing.expectEqualStrings("Welcome\nSurvival", status.motd);
+    ServerCardFrame.status = &status;
+    for ([_]dvui.Size{ .{ .w = 640, .h = 400 }, .{ .w = 1280, .h = 720 } }) |size| {
+        var window = try dvui.testing.init(.{ .window_size = size });
+        defer window.deinit();
+        window.backend.size_pixels = .{ .w = size.w, .h = size.h };
+        try dvui.testing.settle(ServerCardFrame.draw);
+        try std.testing.expect(ServerCardFrame.rendered_instance);
+        try std.testing.expect(!ServerCardFrame.rendered_motd);
+        try std.testing.expect(ServerCardFrame.rendered_counts);
+        try std.testing.expect(!ServerCardFrame.rendered_people_label);
+        const server = try dvui.testing.tagGet("server-card");
+        try std.testing.expect(server.visible);
+        try expectInside(dvui.windowRectPixels(), server.rect);
+        try dvui.testing.moveTo("server-card");
+        for (0..12) |_| _ = try dvui.testing.step(ServerCardFrame.draw);
+        try std.testing.expectEqual(@as(usize, 1), window.window.subwindows.stack.items.len);
+        try std.testing.expect(ServerCardFrame.rendered_instance);
+        try std.testing.expect(!ServerCardFrame.rendered_motd);
+        try std.testing.expect(ServerCardFrame.rendered_counts);
+        try std.testing.expect(!ServerCardFrame.rendered_people_label);
+        // Ordinary bounded game cards retain their shared delayed tooltip.
+        try dvui.testing.moveTo("instance-card");
+        for (0..12) |_| _ = try dvui.testing.step(ServerCardFrame.draw);
+        try std.testing.expectEqual(@as(usize, 2), window.window.subwindows.stack.items.len);
+        const tooltip = window.window.subwindows.stack.items[1];
+        try std.testing.expect(dvui.dataGet(null, tooltip.id, "_showing", bool) orelse false);
+        _ = try window.window.addEventMouseMotion(.{ .pt = .{ .x = 1, .y = 1 } });
+        try dvui.testing.settle(ServerCardFrame.draw);
+        try std.testing.expectEqual(@as(usize, 1), window.window.subwindows.stack.items.len);
     }
 }
 
@@ -398,6 +692,7 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
     defer a.free(root);
     var store = try config.Store.init(a, std.testing.io, root);
     defer store.deinit();
+    try store.update(.{ .instances = &.{.{ .id = "saved-game", .name = "Saved Fixture", .minecraft_version = "1.21" }}, .selected_instance = "saved-game", .accounts = &.{.{ .id = "offline-avatar", .name = "Player", .uuid = "a01e3843e5213998958af459800e4d11" }}, .selected_account = "offline-avatar" });
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var manager = try java.Manager.init(a, std.testing.io, root);
@@ -416,6 +711,8 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
     defer settings.deinit();
     var server_ui = servers_view.Ui.init(a);
     defer server_ui.deinit();
+    var server_service = server_manager.Manager.initWithQuery(a, std.testing.io, EditorsFrame.rejectQuery);
+    defer server_service.deinit();
     @memcpy(server_ui.draft.name[0..12], "Server Draft");
     const original_draft = server_ui.draft;
     var logs: logs_view.View = .{};
@@ -423,7 +720,7 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
     RootHomeFrame.manager = &manager;
     RootHomeFrame.java_ui = &java_ui;
     RootHomeFrame.launcher = &launcher;
-    RootHomeFrame.services = .{ .configuration = &store, .tasks = &registry, .settings = &settings, .java_download = &download, .java_download_ui = &download_ui, .servers_ui = &server_ui, .servers = undefined, .logs = &logs, .worlds = undefined, .worlds_ui = undefined, .allow_mutations = false };
+    RootHomeFrame.services = .{ .configuration = &store, .tasks = &registry, .settings = &settings, .java_download = &download, .java_download_ui = &download_ui, .servers_ui = &server_ui, .servers = &server_service, .logs = &logs, .worlds = undefined, .worlds_ui = undefined, .allow_mutations = false };
     for ([_]dvui.Size{ .{ .w = 640, .h = 400 }, .{ .w = 1280, .h = 720 } }) |size| {
         var window = try dvui.testing.init(.{ .window_size = size });
         defer window.deinit();
@@ -434,7 +731,22 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
         theme.font_title = theme.font_body.withSize(24);
         window.window.themeSet(theme);
         RootHomeFrame.state = .{};
-        try dvui.testing.settle(RootHomeFrame.draw);
+        try std.testing.expect(RootHomeFrame.state.active_game.set("Saved Fixture"));
+        for ([_]games.Phase{ .idle, .loading }) |phase| {
+            library.phase = phase;
+            try std.testing.expectEqual(@as(usize, 0), library.snapshot().installed.len);
+            try std.testing.expectEqual(phase, library.snapshot().phase);
+            try dvui.testing.settle(RootHomeFrame.draw);
+            try std.testing.expectEqualStrings("Saved Fixture", RootHomeFrame.state.active_game.get());
+            try std.testing.expectEqualStrings("saved-game", store.snapshot().selected_instance.?);
+        }
+        const player_card = try dvui.testing.tagGet("sidebar-player");
+        const player_avatar = try dvui.testing.tagGet("player-avatar");
+        try expectInside(player_card.rect, player_avatar.rect);
+        try std.testing.expect(player_avatar.rect.x >= player_card.rect.x + 4);
+        try std.testing.expectApproxEqAbs(@as(f32, 48), player_avatar.rect.w, 0.1);
+        try std.testing.expectApproxEqAbs(@as(f32, 48), player_avatar.rect.h, 0.1);
+        try std.testing.expectEqualStrings("a01e3843e5213998958af459800e4d11", store.snapshot().accounts[0].uuid);
         const initial = RootHomeFrame.layout orelse return error.RootPanedMissing;
         const initial_home = (try dvui.testing.tagGet("home-layout")).rect;
         try expectInside(initial.right, initial_home);
@@ -476,7 +788,9 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
         try std.testing.expect(library.active == null and launcher.job == null);
         try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
         try std.testing.expectEqual(@as(usize, 0), store.snapshot().servers.len);
-        try std.testing.expectEqual(@as(usize, 0), store.snapshot().instances.len);
+        try std.testing.expectEqual(@as(usize, 1), store.snapshot().instances.len);
+        try std.testing.expectEqualStrings("Saved Fixture", RootHomeFrame.state.active_game.get());
+        try std.testing.expectEqualStrings("saved-game", store.snapshot().selected_instance.?);
     }
 }
 
@@ -533,6 +847,37 @@ test "UI layout actual task rows retain status progress and working cancellation
     }
 }
 
+const SettingsTextFrame = struct {
+    const Text = struct { rect: dvui.Rect.Physical, clip: dvui.Rect.Physical, font_size: f32, font_height: f32 };
+    var bounds: [2]?Text = @splat(null);
+
+    fn draw() !dvui.App.Result {
+        const win = dvui.currentWindow();
+        var commands: std.ArrayList(dvui.RenderCommand) = .empty;
+        defer commands.deinit(win.arena());
+        const previous_commands = win.defer_render_cmds;
+        const previous_rendering = win.render_target.rendering;
+        win.defer_render_cmds = &commands;
+        win.render_target.rendering = false;
+        defer {
+            win.defer_render_cmds = previous_commands;
+            win.render_target.rendering = previous_rendering;
+        }
+        bounds = @splat(null);
+        const result = try Frame.draw();
+        const samples = [_][]const u8{ std.mem.sliceTo(&Frame.settings.memory_buffer, 0), std.mem.sliceTo(&Frame.settings.connections_buffer, 0) };
+        for (commands.items) |command| switch (command.cmd) {
+            .text => |text| {
+                for (samples, 0..) |sample, index| if (std.mem.eql(u8, sample, text.text)) {
+                    bounds[index] = .{ .rect = text.rs.r, .clip = command.clip, .font_size = text.font.size, .font_height = text.font.textHeight() * text.rs.s };
+                };
+            },
+            else => {},
+        };
+        return result;
+    }
+};
+
 test "UI layout settings numeric entries contain complete font metrics and accept edits" {
     if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     var window = try dvui.testing.init(.{ .window_size = .{ .w = 340, .h = 400 } });
@@ -544,13 +889,19 @@ test "UI layout settings numeric entries contain complete font metrics and accep
     defer ui.deinit();
     Frame.settings = &ui;
     Frame.show_settings = true;
-    try dvui.testing.settle(Frame.draw);
+    try dvui.testing.settle(SettingsTextFrame.draw);
     const memory = try dvui.testing.tagGet("默认游戏内存-border");
     const connections = try dvui.testing.tagGet("下载连接数-border");
     try std.testing.expect(memory.visible and connections.visible);
-    const glyph_height = dvui.themeGet().font_body.textHeight() * window.window.natural_scale;
-    try std.testing.expect(memory.rect.h >= glyph_height + 16 * window.window.natural_scale);
-    try std.testing.expect(connections.rect.h >= glyph_height + 16 * window.window.natural_scale);
+    for ([_]dvui.TagData{ memory, connections }, SettingsTextFrame.bounds) |entry, captured| {
+        try std.testing.expectApproxEqAbs(@as(f32, 48) * window.window.natural_scale, entry.rect.h, 0.1);
+        const text = captured orelse return error.SettingsNumberNotRendered;
+        try std.testing.expectApproxEqAbs(@as(f32, 24), text.font_size, 0.01);
+        try std.testing.expect(text.rect.h >= text.font_height - 0.01);
+        try expectInside(entry.rect, text.rect);
+        try expectInside(text.clip, text.rect);
+        try std.testing.expectApproxEqAbs(entry.rect.y + entry.rect.h / 2, text.rect.y + text.rect.h / 2, window.window.natural_scale);
+    }
     try std.testing.expect(memory.rect.y + memory.rect.h <= connections.rect.y);
     const memory_caret = try dvui.testing.tagGet("默认游戏内存-caret");
     const connections_caret = try dvui.testing.tagGet("下载连接数-caret");
@@ -563,11 +914,11 @@ test "UI layout settings numeric entries contain complete font metrics and accep
     }
     try dvui.testing.moveTo("默认游戏内存");
     try dvui.testing.click(.left);
-    try dvui.testing.settle(Frame.draw);
+    try dvui.testing.settle(SettingsTextFrame.draw);
     try dvui.testing.pressKey(.home, .none);
-    try dvui.testing.settle(Frame.draw);
+    try dvui.testing.settle(SettingsTextFrame.draw);
     try dvui.testing.writeText("1");
-    try dvui.testing.settle(Frame.draw);
+    try dvui.testing.settle(SettingsTextFrame.draw);
     try std.testing.expectEqualStrings("14096", std.mem.sliceTo(&ui.memory_buffer, 0));
     try std.testing.expect(ui.pending == null);
 }
@@ -607,13 +958,16 @@ const EditorsFrame = struct {
         instance_pane.deinit();
         for (commands.items) |command| switch (command.cmd) {
             .text => |text| {
-                for (FormFrame.labels, 0..) |label, index| if (std.mem.eql(u8, text.text, label)) {
+                for (FormFrame.labels, 0..) |label, index| if (std.mem.eql(u8, text.text, label) or (index == 1 and std.mem.eql(u8, text.text, "完成"))) {
                     const pane: usize = if (JavaFrame.contains(server_rect, text.rs.r.center())) 0 else if (JavaFrame.contains(instance_rect, text.rs.r.center())) 1 else continue;
                     for (win.tab_index.items) |entry| {
                         const rect = entry.rect orelse continue;
                         if (!JavaFrame.contains(rect, text.rs.r.center())) continue;
                         const slot = pane * 2 + index;
-                        try std.testing.expect(footers[slot] == null);
+                        if (footers[slot]) |existing| {
+                            if (existing.id == entry.widgetId) continue;
+                            if (existing.rect.w * existing.rect.h <= rect.w * rect.h) continue;
+                        }
                         footers[slot] = .{ .id = entry.widgetId, .rect = rect, .text = text.rs.r, .clip = command.clip };
                     }
                 };
@@ -669,6 +1023,7 @@ test "UI layout server and instance editor widget IDs keep independent focus and
     defer paths.deinit();
     var store = try config.Store.init(a, std.testing.io, root);
     defer store.deinit();
+    try store.update(.{ .instances = &.{.{ .id = "fixture-instance", .name = "Fixture", .minecraft_version = "1.21" }}, .selected_instance = "fixture-instance" });
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var server_service = server_manager.Manager.initWithQuery(a, std.testing.io, EditorsFrame.rejectQuery);
@@ -678,6 +1033,7 @@ test "UI layout server and instance editor widget IDs keep independent focus and
     var server_ui = servers_view.Ui.init(a);
     defer server_ui.deinit();
     server_ui.editor_open = true;
+    server_ui.adding = true;
     @memset(&server_ui.draft.port, 0);
     var instance_ui = instances_view.Ui.init(a);
     defer instance_ui.deinit();
@@ -698,7 +1054,7 @@ test "UI layout server and instance editor widget IDs keep independent focus and
     try dvui.testing.settle(EditorsFrame.draw);
 
     const Input = struct { id: dvui.Id, rect: dvui.Rect.Physical };
-    var inputs: [5]Input = undefined;
+    var inputs: [6]Input = undefined;
     var count: usize = 0;
     // TextEntryWidget stores this state on its actual registered, focusable ID.
     for (window.window.tab_index_prev.items) |entry| {
@@ -710,9 +1066,10 @@ test "UI layout server and instance editor widget IDs keep independent focus and
         count += 1;
     }
     try std.testing.expectEqual(inputs.len, count);
-    const buffers = [_][]u8{ &server_ui.draft.name, &server_ui.draft.address, &server_ui.draft.port, &instance_ui.draft.name, &instance_ui.draft.memory };
-    const typed = [_][]const u8{ "Server Draft", "fixture.invalid", "25a566", "Instance Draft", "4x096" };
-    const expected = [_][]const u8{ "Server Draft", "fixture.invalid", "25566", "Instance Draft", "4096" };
+    const buffers = [_][]u8{ &server_ui.draft.name, &server_ui.draft.address, &server_ui.draft.port, &instance_ui.draft.name, &instance_ui.draft.min_memory, &instance_ui.draft.memory };
+    const typed = [_][]const u8{ "Server Draft", "fixture.invalid", "25a566", "Instance Draft", "1x024", "4x096" };
+    // The port keeps raw text for validation; both installed memory entries filter digits.
+    const expected = [_][]const u8{ "Server Draft", "fixture.invalid", "25a566", "Instance Draft", "1024", "4096" };
     for (inputs, 0..) |input, index| {
         // Edits can change either pane's minimum width; use this frame's real input rectangle.
         var live_rect: ?dvui.Rect.Physical = null;
@@ -774,13 +1131,308 @@ test "UI layout server and instance editor widget IDs keep independent focus and
     try std.testing.expect(!server_service.isBusy());
     try std.testing.expect(!instance_service.isBusy());
     try std.testing.expectEqual(@as(usize, 0), store.snapshot().servers.len);
-    try std.testing.expectEqual(@as(usize, 0), store.snapshot().instances.len);
+    try std.testing.expectEqual(@as(usize, 1), store.snapshot().instances.len);
+}
+
+const ServerLayoutFrame = struct {
+    const Mode = enum { servers, java, instances };
+    const Control = struct { id: dvui.Id, rect: dvui.Rect.Physical, text: dvui.Rect.Physical, clip: dvui.Rect.Physical, border: dvui.Color, color: dvui.Color };
+    const labels = [_][]const u8{ "添加服务器", "获取 Java", "新建实例", "刷新状态", "编辑", "删除", "取消", "完成", "确认删除" };
+    var controls: [labels.len]?Control = @splat(null);
+    var card_text: [3]bool = @splat(false);
+    var mode: Mode = .servers;
+    var server_ui: *servers_view.Ui = undefined;
+    var store: *config.Store = undefined;
+    var server_service: *server_manager.Manager = undefined;
+    var java_ui: *java_view.Ui = undefined;
+    var java_service: *java.Manager = undefined;
+    var instance_ui: *instances_view.Ui = undefined;
+    var instance_service: *instances_manager.Manager = undefined;
+
+    fn observe(commands: []const dvui.RenderCommand) !void {
+        controls = @splat(null);
+        const capture = dvui.debug.lastCapture() orelse return error.ServerLayoutCaptureMissing;
+        for (commands) |command| switch (command.cmd) {
+            .text => |text| {
+                const clipped = text.rs.r.intersect(command.clip);
+                if (clipped.w <= 0 or clipped.h <= 0) continue;
+                for (labels, 0..) |label, index| {
+                    if (!std.mem.eql(u8, text.text, label) and !(index == 7 and std.mem.eql(u8, text.text, "保存"))) continue;
+                    for (capture.widgets.items) |widget| {
+                        if (!std.mem.eql(u8, widget.name orelse "", "Button") or !JavaFrame.contains(widget.rect_border, clipped.center()) or !JavaFrame.insideScrollClips(capture.widgets.items, widget.parent_id, clipped.center())) continue;
+                        if (controls[index]) |previous| {
+                            // Floating dialogs may cover an underlying button. Keep the
+                            // smallest actual button containing the rendered label.
+                            if (previous.rect.w * previous.rect.h <= widget.rect_border.w * widget.rect_border.h) continue;
+                        }
+                        controls[index] = .{ .id = widget.id, .rect = widget.rect_border, .text = text.rs.r, .clip = command.clip, .border = widget.color_border, .color = widget.color_text };
+                    }
+                }
+            },
+            else => {},
+        };
+    }
+
+    fn draw() !dvui.App.Result {
+        const win = dvui.currentWindow();
+        var commands: std.ArrayList(dvui.RenderCommand) = .empty;
+        defer commands.deinit(win.arena());
+        const previous_commands = win.defer_render_cmds;
+        const previous_rendering = win.render_target.rendering;
+        win.defer_render_cmds = &commands;
+        win.render_target.rendering = false;
+        dvui.debug.captureScopeBegin(win.gpa);
+        defer {
+            dvui.debug.captureScopeEnd();
+            win.defer_render_cmds = previous_commands;
+            win.render_target.rendering = previous_rendering;
+        }
+        {
+            const root = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both, .padding = dvui.Rect.all(8) });
+            defer root.deinit();
+            {
+                const sidebar = dvui.box(@src(), .{}, .{ .tag = "server-layout-sidebar", .expand = .vertical, .min_size_content = .{ .w = if (dvui.windowRect().w < 800) 212 else 260 }, .padding = dvui.Rect.all(8) });
+                defer sidebar.deinit();
+                switch (mode) {
+                    .servers => servers_view.drawSidebar(server_ui, store, server_service),
+                    .java => java_view.drawSidebar(java_ui, java_service, true),
+                    .instances => instances_view.drawSidebar(instance_ui, store, instance_service, true),
+                }
+            }
+            {
+                const page = dvui.box(@src(), .{}, .{ .tag = "server-layout-page", .expand = .both, .padding = dvui.Rect.all(12) });
+                defer page.deinit();
+                if (mode == .servers) servers_view.draw(server_ui, store, server_service);
+            }
+        }
+        if (mode == .servers) servers_view.drawModal(server_ui, store.snapshot());
+        for (win.subwindows.stack.items) |*subwindow| {
+            try commands.appendSlice(win.arena(), subwindow.render_cmds.items);
+            try commands.appendSlice(win.arena(), subwindow.render_cmds_after.items);
+        }
+        try observe(commands.items);
+        card_text = @splat(false);
+        if (mode == .servers) {
+            const card = (try dvui.testing.tagGet("server-option-legacy")).rect;
+            for (commands.items) |command| switch (command.cmd) {
+                .text => |text| {
+                    if (!JavaFrame.contains(card, text.rs.r.center())) continue;
+                    for ([_][]const u8{ "Legacy", "Fixture", "尚未查询" }, 0..) |label, index| if (std.mem.eql(u8, text.text, label)) {
+                        try expectInside(card, text.rs.r);
+                        try expectInside(command.clip, text.rs.r);
+                        card_text[index] = true;
+                    };
+                },
+                else => {},
+            };
+        }
+        return .ok;
+    }
+
+    fn visible(index: usize) !Control {
+        const control = controls[index] orelse return error.ServerLayoutControlMissing;
+        try expectInside(dvui.windowRectPixels(), control.rect);
+        try expectInside(control.rect, control.text);
+        try expectInside(control.clip, control.text);
+        var registered: usize = 0;
+        for (dvui.currentWindow().tab_index_prev.items) |entry| if (entry.widgetId == control.id) {
+            registered += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), registered);
+        return control;
+    }
+
+    fn click(index: usize) !void {
+        if (index == 5 and server_ui.editor_open) {
+            for (0..8) |_| {
+                const candidate = controls[index] orelse return error.ServerLayoutControlMissing;
+                const viewport = candidate.clip.intersect(dvui.windowRectPixels());
+                if (candidate.rect.y >= viewport.y and candidate.rect.y + candidate.rect.h <= viewport.y + viewport.h + 0.1) break;
+                _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = viewport.center() });
+                _ = try dvui.currentWindow().addEventMouseWheel(-160, .vertical, null);
+                try dvui.testing.settle(draw);
+            }
+        }
+        const control = try visible(index);
+        _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = control.rect.center() });
+        try dvui.testing.click(.left);
+        try dvui.testing.settle(draw);
+    }
+
+    fn scrollPage(amount: f32) !void {
+        _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = (try dvui.testing.tagGet("server-layout-page")).rect.center() });
+        _ = try dvui.currentWindow().addEventMouseWheel(amount, .vertical, null);
+        try dvui.testing.settle(draw);
+    }
+
+    fn clearPending() void {
+        if (server_ui.pending) |pending| if (pending.id) |id| server_ui.allocator.free(id);
+        server_ui.pending = null;
+    }
+
+    fn taggedButton(key: []const u8) !dvui.Debug.CapturedWidget {
+        const tagged = try dvui.testing.tagGet(key);
+        const capture = dvui.debug.lastCapture() orelse return error.ServerLayoutCaptureMissing;
+        for (capture.widgets.items) |widget| if (widget.id == tagged.id) {
+            try std.testing.expectEqualStrings("Button", widget.name orelse "");
+            try expectInside((try dvui.testing.tagGet("server-layout-sidebar")).rect, widget.rect_border);
+            var registered: usize = 0;
+            for (dvui.currentWindow().tab_index_prev.items) |entry| if (entry.widgetId == widget.id) {
+                registered += 1;
+            };
+            try std.testing.expectEqual(@as(usize, 1), registered);
+            return widget;
+        };
+        return error.ServerCardButtonMissing;
+    }
+
+    fn noCheckbox() !void {
+        const capture = dvui.debug.lastCapture() orelse return error.ServerLayoutCaptureMissing;
+        for (capture.widgets.items) |widget| try std.testing.expect(!std.mem.eql(u8, widget.name orelse "", "Checkbox"));
+    }
+};
+
+test "UI layout Servers cards keep legacy targets available and shared sidebar actions aligned" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var paths = try instances.Paths.init(a, std.testing.io, root);
+    defer paths.deinit();
+    var store = try config.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    try store.update(.{ .instances = &.{.{ .id = "fixture-instance", .name = "Fixture", .minecraft_version = "1.21" }}, .servers = &.{.{ .id = "legacy", .name = "Legacy", .address = "localhost:25565", .instance_id = "fixture-instance", .show_on_home = false }}, .selected_instance = "fixture-instance" });
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var server_service = server_manager.Manager.initWithQuery(a, std.testing.io, EditorsFrame.rejectQuery);
+    defer server_service.deinit();
+    var instance_service = try instances_manager.Manager.init(a, std.testing.io, &paths, &registry, .{}, .{ .context = null, .acquire = EditorsFrame.rejectLease, .recheck = EditorsFrame.rejectLease, .release = EditorsFrame.releaseLease });
+    defer instance_service.deinit();
+    var java_service = try java.Manager.init(a, std.testing.io, root);
+    defer java_service.deinit();
+    ServerLayoutFrame.store = &store;
+    ServerLayoutFrame.server_service = &server_service;
+    ServerLayoutFrame.instance_service = &instance_service;
+    ServerLayoutFrame.java_service = &java_service;
+    EditorsFrame.service_calls = 0;
+    for ([_]dvui.Size{ .{ .w = 640, .h = 400 }, .{ .w = 1280, .h = 720 } }) |size| {
+        for ([_]f32{ 16, 24 }) |font_size| {
+            errdefer std.debug.print("Servers layout: size={any}, font={d}\n", .{ size, font_size });
+            var document = store.snapshot().*;
+            document.selected_server = null;
+            try store.update(document);
+            try std.testing.expectError(error.InvalidAddress, servers_view.selectLaunchTarget(&store, &server_service, "legacy"));
+            try std.testing.expect(store.snapshot().selected_server == null);
+            var server_ui = servers_view.Ui.init(a);
+            defer server_ui.deinit();
+            var instance_ui = instances_view.Ui.init(a);
+            defer instance_ui.deinit();
+            var java_ui = java_view.Ui.init(a);
+            defer java_ui.deinit();
+            ServerLayoutFrame.server_ui = &server_ui;
+            ServerLayoutFrame.instance_ui = &instance_ui;
+            ServerLayoutFrame.java_ui = &java_ui;
+            ServerLayoutFrame.mode = .servers;
+            var window = try dvui.testing.init(.{ .window_size = size });
+            defer window.deinit();
+            window.backend.size_pixels = .{ .w = size.w, .h = size.h };
+            var theme = dvui.themeGet();
+            theme.font_body = theme.font_body.withSize(font_size);
+            theme.font_heading = theme.font_body.withSize(18);
+            theme.font_title = theme.font_body.withSize(24);
+            window.window.themeSet(theme);
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+            const card = try ServerLayoutFrame.taggedButton("server-option-legacy");
+            for (ServerLayoutFrame.card_text) |rendered| try std.testing.expect(rendered);
+            _ = try window.window.addEventMouseMotion(.{ .pt = .{ .x = card.rect_border.x + card.rect_border.w - 4, .y = card.rect_border.y + card.rect_border.h - 4 } });
+            try dvui.testing.click(.left);
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+            try std.testing.expectEqual(.select_sidebar, server_ui.pending.?.action);
+            try std.testing.expectEqualStrings("legacy", server_ui.pending.?.id.?);
+            servers_view.finish(&server_ui, &store, &server_service);
+            try std.testing.expectEqual(error.InvalidAddress, server_ui.failure.?);
+            try std.testing.expectEqualStrings("legacy", store.snapshot().selected_server.?);
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+            const accent = @import("ui/theme.zig").accent;
+            try std.testing.expectEqual(accent, (try ServerLayoutFrame.taggedButton("server-option-legacy")).color_border);
+            try std.testing.expect(server_ui.editor_open);
+            try std.testing.expect(ServerLayoutFrame.controls[3] == null and ServerLayoutFrame.controls[4] == null);
+            try std.testing.expect(ServerLayoutFrame.controls[6] == null and ServerLayoutFrame.controls[7] == null);
+            try ServerLayoutFrame.scrollPage(-100000);
+            try expectInside((try dvui.testing.tagGet("server-layout-page")).rect, (try ServerLayoutFrame.visible(5)).rect);
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+            try std.testing.expect(server_ui.editor_open and !server_ui.draft.show_on_home);
+            try std.testing.expectEqualStrings("localhost:25565", std.mem.sliceTo(&server_ui.draft.address, 0));
+            const original_draft = server_ui.draft;
+            // A queued sidebar target can disappear while this editor is open.
+            const editor_card = try ServerLayoutFrame.taggedButton("server-option-legacy");
+            _ = try window.window.addEventMouseMotion(.{ .pt = editor_card.rect_border.center() });
+            try dvui.testing.click(.left);
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+            try std.testing.expectEqual(.select_sidebar, server_ui.pending.?.action);
+            const missing_target = try a.dupe(u8, "missing-target");
+            a.free(server_ui.pending.?.id.?);
+            server_ui.pending.?.id = missing_target;
+            servers_view.finish(&server_ui, &store, &server_service);
+            try std.testing.expectEqual(error.ServerNotFound, server_ui.failure.?);
+            try std.testing.expect(server_ui.editor_open);
+            try std.testing.expectEqual(original_draft, server_ui.draft);
+            try std.testing.expectEqualStrings("legacy", store.snapshot().selected_server.?);
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+            try ServerLayoutFrame.noCheckbox();
+            try std.testing.expect(ServerLayoutFrame.controls[6] == null and ServerLayoutFrame.controls[7] == null);
+            try ServerLayoutFrame.click(5);
+            try std.testing.expectEqual(.ask_delete, server_ui.pending.?.action);
+            servers_view.finish(&server_ui, &store, &server_service);
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+            _ = try ServerLayoutFrame.visible(8);
+            try ServerLayoutFrame.click(6);
+            try std.testing.expectEqual(.cancel_delete, server_ui.pending.?.action);
+            servers_view.finish(&server_ui, &store, &server_service);
+            try std.testing.expect(server_ui.deleting_id == null);
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+
+            // Compare selected first actions with identical actual sidebar wrappers.
+            try ServerLayoutFrame.click(0);
+            servers_view.finish(&server_ui, &store, &server_service);
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+            const server_action = try ServerLayoutFrame.visible(0);
+            instance_ui.mode = .create;
+            ServerLayoutFrame.mode = .instances;
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+            const instance_action = try ServerLayoutFrame.visible(2);
+            ServerLayoutFrame.mode = .java;
+            try dvui.testing.settle(ServerLayoutFrame.draw);
+            const java_action = try ServerLayoutFrame.visible(1);
+            for ([_]ServerLayoutFrame.Control{ server_action, java_action }) |action| {
+                try std.testing.expectApproxEqAbs(instance_action.rect.x, action.rect.x, 0.1);
+                try std.testing.expectApproxEqAbs(instance_action.rect.y, action.rect.y, 0.1);
+                try std.testing.expectApproxEqAbs(instance_action.rect.w, action.rect.w, 0.1);
+                try std.testing.expectApproxEqAbs(instance_action.rect.h, action.rect.h, 0.1);
+                try std.testing.expectApproxEqAbs(instance_action.text.x - instance_action.rect.x, action.text.x - action.rect.x, 0.1);
+                try std.testing.expectApproxEqAbs(instance_action.text.center().y, action.text.center().y, 0.1);
+                try std.testing.expectEqual(accent, action.border);
+                try std.testing.expectEqual(vela_theme.selected_text, action.color);
+            }
+            try std.testing.expectEqual(accent, instance_action.border);
+            try std.testing.expectEqual(vela_theme.selected_text, instance_action.color);
+            try std.testing.expect(server_ui.pending == null and instance_ui.pending == null and java_ui.commands.items.len == 0);
+            try std.testing.expectEqual(@as(usize, 0), EditorsFrame.service_calls);
+            try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
+            try std.testing.expectEqual(@as(usize, 1), store.snapshot().servers.len);
+            try std.testing.expect(!store.snapshot().servers[0].show_on_home);
+            try std.testing.expectEqualStrings("legacy", store.snapshot().selected_server.?);
+        }
+    }
 }
 
 const JavaFrame = struct {
     const Control = struct { id: dvui.Id, rect: dvui.Rect.Physical };
-    const Text = enum { empty, visible, disclosure, hidden, hidden_status, acquire, download, search, visible_path, hidden_path, acquisition_heading, details_nav, restore, add };
-    var labels = [_][]const u8{ "暂无 Java", "Fixture Visible · Java 21", "已隐藏 (1)", "Fixture Hidden · Java 17", "已隐藏 · 不参与游戏启动", "获取 Java", "下载 Java", "搜索本机 Java", "", "", "获取 Java", "查看所选 Java", "恢复显示", "添加 Java" };
+    const Text = enum { empty, visible, disclosure, hidden, hidden_status, acquire, download, search, visible_path, hidden_path, acquisition_heading, details_nav, restore, add, vendor, major, search_path };
+    const default_labels = [_][]const u8{ "暂无 Java", "Fixture Visible · Java 21", "已隐藏 (1)", "Fixture Hidden · Java 17", "已隐藏 · 不参与游戏启动", "获取 Java", "下载 Java", "搜索本机 Java", "", "", "获取 Java", "查看所选 Java", "恢复显示", "添加 Java", "发行商", "版本", "搜索路径" };
+    var labels = default_labels;
     const Observation = struct { rect: dvui.Rect.Physical, clip: dvui.Rect.Physical, control: ?Control, fill: ?dvui.Color, border: ?dvui.Color, focused: bool, background: bool };
     var observations: [labels.len]?Observation = @splat(null);
     var ui: *java_view.Ui = undefined;
@@ -788,6 +1440,16 @@ const JavaFrame = struct {
     var download_ui: *java_download_view.Ui = undefined;
     var controller: *java_download_controller.Controller = undefined;
     var interactive = true;
+
+    fn reset() void {
+        labels = default_labels;
+        observations = @splat(null);
+        ui = undefined;
+        manager = undefined;
+        download_ui = undefined;
+        controller = undefined;
+        interactive = true;
+    }
 
     fn draw() !dvui.App.Result {
         const win = dvui.currentWindow();
@@ -825,7 +1487,7 @@ const JavaFrame = struct {
         for (commands.items) |command| switch (command.cmd) {
             .text => |text| {
                 for (labels, 0..) |_, index| if (matchesLabel(index, text.text)) {
-                    const kind: Text = @enumFromInt(index);
+                    const kind: Text = @fromBackingInt(@intCast(index));
                     const visible_rect = text.rs.r.intersect(command.clip);
                     if (visible_rect.w <= 0 or visible_rect.h <= 0) continue;
                     const in_sidebar = contains(sidebar_rect, visible_rect.center());
@@ -836,7 +1498,7 @@ const JavaFrame = struct {
                     }
                     var sample: Observation = .{ .rect = text.rs.r, .clip = command.clip, .control = null, .fill = null, .border = null, .focused = false, .background = false };
                     for (capture.widgets.items) |widget| {
-                        if (!std.mem.eql(u8, widget.name orelse continue, "Button") or !contains(widget.rect_border, visible_rect.center())) continue;
+                        if (!std.mem.eql(u8, widget.name orelse continue, "Button") or !contains(widget.rect_border, visible_rect.center()) or !insideScrollClips(capture.widgets.items, widget.parent_id, visible_rect.center())) continue;
                         try std.testing.expect(sample.control == null);
                         sample.control = .{ .id = widget.id, .rect = widget.rect_border };
                         sample.fill = widget.color_fill;
@@ -850,7 +1512,53 @@ const JavaFrame = struct {
             },
             else => {},
         };
+        // A wrapped runtime name is complete only when every ordered fragment
+        // belongs to the same real sidebar Button, including its final Java version.
+        for ([_]Text{ .visible, .hidden }) |kind| {
+            const index = @backingInt(kind);
+            observations[index] = null;
+            for (capture.widgets.items) |widget| {
+                if (!std.mem.eql(u8, widget.name orelse continue, "Button") or !contains(sidebar_rect, widget.rect_border.center())) continue;
+                if (completeName(commands.items, widget, labels[index])) |sample| {
+                    try std.testing.expect(observations[index] == null);
+                    observations[index] = sample;
+                }
+            }
+        }
         return .ok;
+    }
+
+    fn completeName(commands: []const dvui.RenderCommand, widget: dvui.Debug.CapturedWidget, name: []const u8) ?Observation {
+        var consumed: usize = 0;
+        var sample: ?Observation = null;
+        for (commands) |command| switch (command.cmd) {
+            .text => |text| {
+                const visible = text.rs.r.intersect(command.clip);
+                if (visible.w <= 0 or visible.h <= 0 or !contains(widget.rect_border, visible.center())) continue;
+                const fragment = std.mem.trim(u8, text.text, " ");
+                const remaining = std.mem.trimStart(u8, name[consumed..], " ");
+                if (fragment.len == 0 or !std.mem.startsWith(u8, remaining, fragment)) continue;
+                consumed = name.len - remaining.len + fragment.len;
+                // Wrapped lines include a trailing blank in the render rectangle.
+                // Check the nonblank title advance, retaining strict glyph containment.
+                var content_rect = text.rs.r;
+                const content = std.mem.trimEnd(u8, text.text, " ");
+                if (content.len != text.text.len) content_rect.w = text.font.textSizeEx(content, .{ .kerning = text.kerning orelse command.kerning, .kern_in = text.kern_in }).w * text.rs.s;
+                if (sample) |*previous| {
+                    const x = @min(previous.rect.x, content_rect.x);
+                    const y = @min(previous.rect.y, content_rect.y);
+                    const right = @max(previous.rect.x + previous.rect.w, content_rect.x + content_rect.w);
+                    const bottom = @max(previous.rect.y + previous.rect.h, content_rect.y + content_rect.h);
+                    previous.rect = .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
+                    previous.clip = previous.clip.intersect(command.clip);
+                } else {
+                    sample = .{ .rect = content_rect, .clip = command.clip, .control = .{ .id = widget.id, .rect = widget.rect_border }, .fill = widget.color_fill, .border = widget.color_border, .focused = widget.focused, .background = widget.background };
+                }
+                if (consumed == name.len) return sample;
+            },
+            else => {},
+        };
+        return null;
     }
 
     fn matchesLabel(index: usize, rendered: []const u8) bool {
@@ -858,8 +1566,9 @@ const JavaFrame = struct {
         if (label.len == 0 or rendered.len == 0) return false;
         if (std.mem.eql(u8, label, rendered)) return true;
         // One-line TextLayout clipping emits only the visible prefix for long labels.
-        return switch (@as(Text, @enumFromInt(index))) {
+        return switch (@as(Text, @fromBackingInt(@intCast(index)))) {
             .visible, .hidden, .visible_path, .hidden_path => std.mem.startsWith(u8, label, rendered),
+            .search => std.mem.eql(u8, rendered, "搜索"),
             else => false,
         };
     }
@@ -868,12 +1577,51 @@ const JavaFrame = struct {
         return point.x >= rect.x and point.x <= rect.x + rect.w and point.y >= rect.y and point.y <= rect.y + rect.h;
     }
 
+    fn insideScrollClips(widgets: []const dvui.Debug.CapturedWidget, parent_id: dvui.Id, point: dvui.Point.Physical) bool {
+        var current = parent_id;
+        for (0..widgets.len) |_| {
+            // The window root predates this scoped capture.
+            const parent = for (widgets) |widget| {
+                if (widget.id == current) break widget;
+            } else return true;
+            if (std.mem.eql(u8, parent.name orelse "", "ScrollContainer") and !contains(parent.rect_content, point)) return false;
+            if (parent.parent_id == parent.id) return true;
+            current = parent.parent_id;
+        }
+        return false;
+    }
+
     fn observed(text: Text) !Observation {
-        return observations[@intFromEnum(text)] orelse error.JavaTextNotRendered;
+        return observations[@backingInt(text)] orelse error.JavaTextNotRendered;
     }
 
     fn control(text: Text) !Control {
         return (try observed(text)).control orelse error.JavaControlNotRegistered;
+    }
+
+    fn dropdownControl(key: []const u8) !Control {
+        const tagged = try dvui.testing.tagGet(key);
+        const capture = dvui.debug.lastCapture() orelse return error.JavaCaptureMissing;
+        var found: ?Control = null;
+        for (capture.widgets.items) |widget| {
+            if (!std.mem.eql(u8, widget.name orelse continue, "Menu Item") or !contains(widget.rect_border, tagged.rect.center())) continue;
+            try std.testing.expect(found == null);
+            found = .{ .id = widget.id, .rect = widget.rect_border };
+        }
+        return found orelse error.JavaDropdownNotRegistered;
+    }
+
+    fn searchCheckboxControl() !Control {
+        const capture = dvui.debug.lastCapture() orelse return error.JavaCaptureMissing;
+        var found: ?Control = null;
+        for (capture.widgets.items) |widget| {
+            if (!std.mem.eql(u8, widget.name orelse continue, "Checkbox")) continue;
+            try std.testing.expect(found == null);
+            try std.testing.expect(insideScrollClips(capture.widgets.items, widget.parent_id, widget.rect_border.center()));
+            try expectInside((try dvui.testing.tagGet("java-page")).rect, widget.rect_border);
+            found = .{ .id = widget.id, .rect = widget.rect_border };
+        }
+        return found orelse error.JavaCheckboxNotRegistered;
     }
 
     fn expectVisible(text: Text, pane: []const u8) !void {
@@ -898,6 +1646,16 @@ const JavaFrame = struct {
         _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = target.center() });
         try dvui.testing.click(.left);
         try dvui.testing.settle(draw);
+    }
+
+    fn clickTag(key: []const u8) !Control {
+        const tagged = try dvui.testing.tagGet(key);
+        const target: Control = .{ .id = tagged.id, .rect = tagged.rect };
+        try expectInside((try dvui.testing.tagGet("java-page")).rect, target.rect);
+        _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = target.rect.center() });
+        try dvui.testing.click(.left);
+        try dvui.testing.settle(draw);
+        return target;
     }
 
     fn expectTabRegistration(target: Control, enabled: bool) !void {
@@ -932,6 +1690,12 @@ const JavaFrame = struct {
         try dvui.testing.settle(draw);
     }
 
+    fn scrollSidebar(amount: f32) !void {
+        try dvui.testing.moveTo("java-sidebar");
+        _ = try dvui.currentWindow().addEventMouseWheel(amount, .vertical, null);
+        try dvui.testing.settle(draw);
+    }
+
     fn expectNoCommands() !void {
         try std.testing.expectEqual(@as(usize, 0), ui.commands.items.len);
         try std.testing.expect(!ui.download_requested and !ui.search_queued);
@@ -961,6 +1725,7 @@ fn expectJavaSidebarTooltips(controls: []const JavaFrame.Control) !void {
         const tip = tooltip.rect_pixels;
         const trigger = control.rect;
         const gap = @max(@max(trigger.x - tip.x - tip.w, tip.x - trigger.x - trigger.w), @max(trigger.y - tip.y - tip.h, tip.y - trigger.y - trigger.h));
+        errdefer std.debug.print("Java tooltip gap: viewport={any}, trigger={any}, tooltip={any}, gap={d}\n", .{ dvui.windowRect(), trigger, tip, gap });
         try std.testing.expect(gap >= components.tooltip_gap_px - 0.5);
         try std.testing.expect(tooltip.focused_widget_id == null);
         try std.testing.expectEqual(focus, dvui.focusedWidgetId());
@@ -1067,8 +1832,8 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
     defer controller.deinit();
     JavaFrame.controller = &controller;
     JavaFrame.manager = &manager;
-    JavaFrame.labels[@intFromEnum(JavaFrame.Text.visible_path)] = visible_path;
-    JavaFrame.labels[@intFromEnum(JavaFrame.Text.hidden_path)] = hidden_path;
+    JavaFrame.labels[@backingInt(JavaFrame.Text.visible_path)] = visible_path;
+    JavaFrame.labels[@backingInt(JavaFrame.Text.hidden_path)] = hidden_path;
     defer JavaFrame.interactive = true;
     for ([_]dvui.Size{ .{ .w = 640, .h = 400 }, .{ .w = 1280, .h = 720 } }) |size| {
         var ui = java_view.Ui.init(a);
@@ -1088,15 +1853,16 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
         try std.testing.expect(acquisition.rect.y + acquisition.rect.h <= visible_row.rect.y);
         try std.testing.expect(acquisition.id != visible_row.id);
         try JavaFrame.expectTabRegistration(acquisition, true);
-        try std.testing.expect((try JavaFrame.observed(.acquisition_heading)).control == null);
-        try std.testing.expect(JavaFrame.observations[@intFromEnum(JavaFrame.Text.details_nav)] == null);
-        try std.testing.expect(JavaFrame.observations[@intFromEnum(JavaFrame.Text.hidden_path)] == null);
+        const download_method = try dvui.testing.tagGet("java-acquire-download");
+        try JavaFrame.expectTabRegistration(.{ .id = download_method.id, .rect = download_method.rect }, true);
+        try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.details_nav)] == null);
+        try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.hidden_path)] == null);
         const unselected_fill = (try JavaFrame.observed(.visible)).fill.?;
         const unselected_border = (try JavaFrame.observed(.visible)).border.?;
         const acquisition_fill = (try JavaFrame.observed(.acquire)).fill.?;
         const acquisition_border = (try JavaFrame.observed(.acquire)).border.?;
-        try std.testing.expectEqual(@as(u8, 0), unselected_fill.a);
-        try std.testing.expectEqual(@as(u8, 0), acquisition_fill.a);
+        try std.testing.expectEqual(vela_theme.sidebar, unselected_fill);
+        try std.testing.expectEqual(vela_theme.selected_surface, acquisition_fill);
 
         // A click in the second line must focus and select the same whole Button.
         try JavaFrame.clickText(.visible_path);
@@ -1108,8 +1874,7 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
         try std.testing.expect((try JavaFrame.observed(.visible)).focused);
         try std.testing.expect(!std.meta.eql(unselected_border, (try JavaFrame.observed(.visible)).border.?));
         try std.testing.expect(!std.meta.eql(acquisition_border, (try JavaFrame.observed(.acquire)).border.?));
-        try std.testing.expect(JavaFrame.observations[@intFromEnum(JavaFrame.Text.acquisition_heading)] == null);
-        try std.testing.expect(JavaFrame.observations[@intFromEnum(JavaFrame.Text.details_nav)] == null);
+        try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.details_nav)] == null);
         try JavaFrame.expectNoCommands();
 
         try JavaFrame.clickText(.acquire);
@@ -1117,7 +1882,7 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
         try std.testing.expectEqualStrings(visible_path, ui.selected_path.?);
         try std.testing.expectEqual(unselected_fill, (try JavaFrame.observed(.visible)).fill.?);
         try std.testing.expectEqual(acquisition_fill, (try JavaFrame.observed(.acquire)).fill.?);
-        try JavaFrame.expectVisible(.acquisition_heading, "java-page");
+        try expectInside((try dvui.testing.tagGet("java-page")).rect, (try dvui.testing.tagGet("java-acquire-download")).rect);
         try JavaFrame.clickText(.visible);
         try std.testing.expect(!ui.acquisition_open);
         try std.testing.expectEqualStrings(visible_path, ui.selected_path.?);
@@ -1128,7 +1893,7 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
         try std.testing.expect(ui.show_hidden);
         const hidden_row = try JavaFrame.expectWholeRow(.hidden, .hidden_path, true);
         try std.testing.expect(hidden_row.id != visible_row.id and hidden_row.id != acquisition.id);
-        try std.testing.expect(hidden_row.rect.x > visible_row.rect.x);
+        try std.testing.expectApproxEqAbs(visible_row.rect.x, hidden_row.rect.x, 0.1);
         const hidden_unselected_border = (try JavaFrame.observed(.hidden)).border.?;
         try JavaFrame.clickText(.hidden_path);
         try std.testing.expectEqualStrings(hidden_path, ui.selected_path.?);
@@ -1174,7 +1939,7 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
         try dvui.testing.settle(JavaFrame.draw);
         try JavaFrame.clickText(.hidden_path);
         try JavaFrame.expectVisible(.restore, "java-page");
-        try std.testing.expect(JavaFrame.observations[@intFromEnum(JavaFrame.Text.add)] == null);
+        try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.add)] == null);
         try JavaFrame.click(.restore);
         try std.testing.expectEqual(@as(usize, 1), ui.commands.items.len);
         try std.testing.expectEqualStrings(hidden_path, ui.commands.items[0].unhide);
@@ -1216,10 +1981,18 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
     var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
     defer controller.deinit();
     JavaFrame.controller = &controller;
-    JavaFrame.labels[@intFromEnum(JavaFrame.Text.visible_path)] = visible_path;
-    JavaFrame.labels[@intFromEnum(JavaFrame.Text.hidden_path)] = hidden_path;
+    JavaFrame.labels[@backingInt(JavaFrame.Text.visible_path)] = visible_path;
+    JavaFrame.labels[@backingInt(JavaFrame.Text.hidden_path)] = hidden_path;
     JavaFrame.interactive = true;
-    for ([_]dvui.Size{ .{ .w = 640, .h = 400 }, .{ .w = 1280, .h = 720 } }) |size| {
+    const Viewport = struct { size: dvui.Size, font_size: f32 };
+    for ([_]Viewport{
+        .{ .size = .{ .w = 640, .h = 400 }, .font_size = 16 },
+        .{ .size = .{ .w = 1280, .h = 720 }, .font_size = 16 },
+        .{ .size = .{ .w = 640, .h = 400 }, .font_size = 24 },
+        .{ .size = .{ .w = 1280, .h = 720 }, .font_size = 24 },
+    }) |viewport| {
+        const size = viewport.size;
+        errdefer std.debug.print("Java acquisition viewport={any}, font={d}\n", .{ size, viewport.font_size });
         var ui = java_view.Ui.init(a);
         defer ui.deinit();
         var download_ui = java_download_view.Ui.init(a);
@@ -1230,26 +2003,35 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
         var window = try dvui.testing.init(.{ .window_size = size });
         defer window.deinit();
         window.backend.size_pixels = .{ .w = size.w, .h = size.h };
+        var test_theme = dvui.themeGet();
+        test_theme.font_body = test_theme.font_body.withSize(viewport.font_size);
+        test_theme.font_heading = test_theme.font_body.withSize(18);
+        test_theme.font_title = test_theme.font_body.withSize(24);
+        window.window.themeSet(test_theme);
         try dvui.testing.settle(JavaFrame.draw);
         try JavaFrame.expectVisible(.empty, "java-sidebar");
         try JavaFrame.expectVisible(.acquire, "java-sidebar");
-        try JavaFrame.expectVisible(.acquisition_heading, "java-page");
         const acquisition = try JavaFrame.control(.acquire);
         try expectInside((try dvui.testing.tagGet("java-sidebar")).rect, acquisition.rect);
         try std.testing.expect(acquisition.rect.y + acquisition.rect.h <= (try JavaFrame.observed(.empty)).rect.y);
-        try std.testing.expect((try JavaFrame.observed(.acquisition_heading)).control == null);
-        try std.testing.expect(JavaFrame.observations[@intFromEnum(JavaFrame.Text.details_nav)] == null);
-        try std.testing.expect(JavaFrame.observations[@intFromEnum(JavaFrame.Text.disclosure)] == null);
+        try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.details_nav)] == null);
+        try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.disclosure)] == null);
+        try JavaFrame.expectNoCommands();
+        const download_method = try JavaFrame.clickTag("java-acquire-download");
+        try JavaFrame.expectTabRegistration(download_method, true);
+        try std.testing.expect(download_ui.start_admitted);
+        try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.search)] == null);
+        const local_method = try JavaFrame.clickTag("java-acquire-local");
+        try JavaFrame.expectTabRegistration(local_method, true);
+        try std.testing.expect(download_method.id != local_method.id);
+        try std.testing.expect(!download_ui.start_admitted);
         try JavaFrame.expectNoCommands();
         try JavaFrame.scrollPage(-100000);
         try JavaFrame.expectVisible(.search, "java-page");
-        var input: ?JavaFrame.Control = null;
-        for (window.window.tab_index_prev.items) |entry| {
-            if (dvui.dataGet(null, entry.widgetId, "_edited_outside", bool) == null) continue;
-            try std.testing.expect(input == null);
-            input = .{ .id = entry.widgetId, .rect = entry.rect orelse return error.InputRectangleMissing };
-        }
-        const path_input = input orelse return error.JavaSearchInputMissing;
+        try JavaFrame.expectVisible(.search_path, "java-page");
+        const input_tag = try dvui.testing.tagGet("java-search-path");
+        const path_input: JavaFrame.Control = .{ .id = input_tag.id, .rect = input_tag.rect };
+        try JavaFrame.expectTabRegistration(path_input, true);
         try expectInside((try dvui.testing.tagGet("java-page")).rect, path_input.rect);
         _ = try window.window.addEventMouseMotion(.{ .pt = path_input.rect.center() });
         try dvui.testing.click(.left);
@@ -1259,23 +2041,40 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
         try dvui.testing.settle(JavaFrame.draw);
         try std.testing.expectEqualStrings("/fixture/search-only", std.mem.sliceTo(&ui.path_buffer, 0));
         try JavaFrame.expectNoCommands();
+        JavaFrame.interactive = false;
+        defer JavaFrame.interactive = true;
+        try dvui.testing.settle(JavaFrame.draw);
+        try JavaFrame.expectTabRegistration(local_method, false);
+        _ = try JavaFrame.clickTag("java-acquire-download");
+        try std.testing.expect(!download_ui.start_admitted);
+        try JavaFrame.expectVisible(.search, "java-page");
+        try JavaFrame.expectTabRegistration(try JavaFrame.control(.search), false);
+        try JavaFrame.click(.search);
+        try JavaFrame.expectNoCommands();
+        JavaFrame.interactive = true;
+        try dvui.testing.settle(JavaFrame.draw);
 
         JavaFrame.manager = &manager;
         try dvui.testing.settle(JavaFrame.draw);
         try JavaFrame.expectVisible(.visible, "java-sidebar");
         try JavaFrame.expectVisible(.disclosure, "java-sidebar");
-        try std.testing.expect(JavaFrame.observations[@intFromEnum(JavaFrame.Text.hidden)] == null);
+        try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.hidden)] == null);
         const visible_control = try JavaFrame.control(.visible);
         const disclosure = try JavaFrame.control(.disclosure);
         try std.testing.expect(visible_control.id != path_input.id and disclosure.id != path_input.id);
         try expectJavaSidebarTooltips(&.{ visible_control, disclosure });
         try JavaFrame.click(.disclosure);
         try std.testing.expect(ui.show_hidden);
+        try JavaFrame.scrollSidebar(-100000);
         try JavaFrame.expectVisible(.hidden, "java-sidebar");
         const hidden_control = try JavaFrame.control(.hidden);
         try std.testing.expect(hidden_control.id != path_input.id);
         dvui.focusWidget(path_input.id, null, null);
-        try expectJavaSidebarTooltips(&.{ visible_control, disclosure, hidden_control });
+        // Check each hover using settled hitboxes at the current sidebar scroll.
+        try expectJavaSidebarTooltips(&.{hidden_control});
+        try JavaFrame.scrollSidebar(100000);
+        try expectJavaSidebarTooltips(&.{ try JavaFrame.control(.visible), try JavaFrame.control(.disclosure) });
+        try JavaFrame.scrollSidebar(-100000);
         // Name and path now share a two-line Button; click the visible name text.
         try JavaFrame.clickText(.hidden);
         try std.testing.expect(!ui.acquisition_open);
@@ -1295,32 +2094,260 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
         try std.testing.expect(found_input);
         try std.testing.expectEqualStrings("/fixture/search-only", std.mem.sliceTo(&ui.path_buffer, 0));
         try JavaFrame.expectNoCommands();
-        if (size.h >= 520) {
-            // Real action clicks only queue requests; no finish/tick or worker runs.
-            try JavaFrame.expectVisible(.download, "java-page");
-            const download_control = try JavaFrame.control(.download);
-            const search_control = try JavaFrame.control(.search);
-            try std.testing.expect(download_control.id != search_control.id);
-            try std.testing.expect(download_control.id != path_input.id and search_control.id != path_input.id);
-            try JavaFrame.click(.download);
-            try std.testing.expect(download_ui.pending != null and download_ui.pending.? == .start);
-            try std.testing.expectEqual(download_ui.vendor, download_ui.pending.?.start.vendor);
-            try std.testing.expectEqual(download_ui.major, download_ui.pending.?.start.major);
-            try std.testing.expectEqual(@as(usize, 0), ui.commands.items.len);
-            download_ui.pending = null;
-            try dvui.testing.settle(JavaFrame.draw);
-            try JavaFrame.click(.search);
-            try std.testing.expectEqual(@as(usize, 1), ui.commands.items.len);
-            try std.testing.expect(ui.commands.items[0] == .search);
-            try std.testing.expectEqualStrings("/fixture/search-only", ui.commands.items[0].search);
-            try std.testing.expect(ui.search_queued and ui.search_started);
-            try std.testing.expect(download_ui.pending == null);
-            java_view.discardCommands(&ui);
-        }
+        // Method navigation preserves the draft and only the visible method admits work.
+        try JavaFrame.scrollPage(100000);
+        const download_method_again = try JavaFrame.clickTag("java-acquire-download");
+        try std.testing.expectEqual(download_method.id, download_method_again.id);
+        try std.testing.expect(download_ui.start_admitted);
+        try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.search)] == null);
+        try JavaFrame.scrollPage(100000);
+        try JavaFrame.expectVisible(.vendor, "java-page");
+        const vendor = try JavaFrame.dropdownControl("java-download-vendor");
+        try expectInside((try dvui.testing.tagGet("java-page")).rect, vendor.rect);
+        try JavaFrame.expectTabRegistration(.{ .id = vendor.id, .rect = vendor.rect }, true);
+        try JavaFrame.scrollPage(-100000);
+        try JavaFrame.expectVisible(.major, "java-page");
+        const major = try JavaFrame.dropdownControl("java-download-major");
+        try expectInside((try dvui.testing.tagGet("java-page")).rect, major.rect);
+        try JavaFrame.expectTabRegistration(.{ .id = major.id, .rect = major.rect }, true);
+        try std.testing.expect(vendor.id != major.id);
+        try JavaFrame.expectVisible(.download, "java-page");
+        const download_control = try JavaFrame.control(.download);
+        try std.testing.expect(download_control.id != path_input.id);
+        try JavaFrame.click(.download);
+        try std.testing.expect(download_ui.pending != null and download_ui.pending.? == .start);
+        try std.testing.expectEqual(download_ui.vendor, download_ui.pending.?.start.vendor);
+        try std.testing.expectEqual(download_ui.major, download_ui.pending.?.start.major);
+        try std.testing.expectEqual(@as(usize, 0), ui.commands.items.len);
+        download_ui.pending = null;
+        try dvui.testing.settle(JavaFrame.draw);
+        try JavaFrame.scrollPage(100000);
+        const local_method_again = try JavaFrame.clickTag("java-acquire-local");
+        try std.testing.expectEqual(local_method.id, local_method_again.id);
+        try std.testing.expect(!download_ui.start_admitted);
+        try JavaFrame.scrollPage(-100000);
+        try JavaFrame.expectVisible(.search, "java-page");
+        const search_control = try JavaFrame.control(.search);
+        try std.testing.expect(download_control.id != search_control.id);
+        try std.testing.expect(search_control.id != path_input.id);
+        try std.testing.expectEqualStrings("/fixture/search-only", std.mem.sliceTo(&ui.path_buffer, 0));
+        // Text edits and Search are delivered in one event batch.
+        dvui.focusWidget((try dvui.testing.tagGet("java-search-path")).id, null, null);
+        try dvui.testing.pressKey(.a, .lcontrol);
+        try dvui.testing.pressKey(.backspace, .none);
+        try dvui.testing.writeText("/fixture/search-latest");
+        try JavaFrame.click(.search);
+        try std.testing.expectEqual(@as(usize, 1), ui.commands.items.len);
+        try std.testing.expect(ui.commands.items[0] == .search);
+        try std.testing.expectEqualStrings("/fixture/search-latest", std.mem.sliceTo(&ui.path_buffer, 0));
+        try std.testing.expectEqualStrings("/fixture/search-latest", ui.commands.items[0].search);
+        ui.path_buffer[0] = 'x';
+        try std.testing.expectEqualStrings("/fixture/search-latest", ui.commands.items[0].search);
+        try std.testing.expect(ui.search_queued and ui.search_started);
+        try std.testing.expect(download_ui.pending == null);
+        java_view.discardCommands(&ui);
         try JavaFrame.expectNoCommands();
         try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
         try std.testing.expectEqual(@as(usize, 1), manager.hiddenEntries().len);
+
+        // A refreshed result of the same length must invalidate the old selection
+        // before the fixed footer handles an already-visible Add button click.
+        manager.state.search_visible.clearRetainingCapacity();
+        try manager.state.search_visible.append(manager.state.arena.allocator(), .{ .path = "/fixture/search-previous", .vendor = "Fixture Search", .major = 21 });
+        try dvui.testing.settle(JavaFrame.draw);
+        try std.testing.expectEqual(@as(usize, 1), ui.search_selection.len);
+        ui.search_selection[0] = true;
+        try dvui.testing.settle(JavaFrame.draw);
+        const add = try dvui.testing.tagGet("java-search-add");
+        try JavaFrame.expectTabRegistration(.{ .id = add.id, .rect = add.rect }, true);
+        manager.state.search_visible.items[0].path = "/fixture/search-replaced";
+        _ = try JavaFrame.clickTag("java-search-add");
+        try std.testing.expect(!ui.search_selection[0]);
+        try JavaFrame.expectNoCommands();
+
+        ui.search_selection[0] = true;
+        try JavaFrame.scrollPage(-100000);
+        const checkbox = try JavaFrame.searchCheckboxControl();
+        const add_selected = try dvui.testing.tagGet("java-search-add");
+        try JavaFrame.expectTabRegistration(.{ .id = add_selected.id, .rect = add_selected.rect }, true);
+        // Deselect and Add are delivered together; the footer must see no selection.
+        _ = try window.window.addEventMouseMotion(.{ .pt = checkbox.rect.center() });
+        try dvui.testing.click(.left);
+        _ = try window.window.addEventMouseMotion(.{ .pt = add_selected.rect.center() });
+        try dvui.testing.click(.left);
+        try dvui.testing.settle(JavaFrame.draw);
+        try std.testing.expect(!ui.search_selection[0]);
+        try JavaFrame.expectNoCommands();
     }
+}
+
+test "UI layout Java removing all registered runtimes keeps a new scan in local acquisition" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    JavaFrame.reset();
+    defer JavaFrame.reset();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var manager = try java.Manager.init(a, std.testing.io, root);
+    defer manager.deinit();
+    const runtime: java.Runtime = .{ .path = "/fixture/rescanned/bin/java", .vendor = "Rescanned Java", .major = 21 };
+    try manager.addDownloaded(runtime);
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
+    defer controller.deinit();
+    var download_ui = java_download_view.Ui.init(a);
+    defer download_ui.deinit();
+    var ui = java_view.Ui.init(a);
+    defer ui.deinit();
+    JavaFrame.ui = &ui;
+    JavaFrame.download_ui = &download_ui;
+    JavaFrame.controller = &controller;
+    JavaFrame.manager = &manager;
+    JavaFrame.interactive = true;
+    ui.selected_path = try a.dupe(u8, runtime.path);
+    ui.acquisition_open = false;
+    ui.acquisition_mode = .local;
+    var window = try dvui.testing.init(.{ .window_size = .{ .w = 640, .h = 400 } });
+    defer window.deinit();
+    window.backend.size_pixels = .{ .w = 640, .h = 400 };
+    try dvui.testing.settle(JavaFrame.draw);
+    _ = try JavaFrame.clickTag("java-remove");
+    java_view.finish(&ui, &manager);
+    try std.testing.expect(ui.failure == null);
+    try std.testing.expectEqual(@as(usize, 0), manager.allEntries().len);
+    try dvui.testing.settle(JavaFrame.draw);
+    try std.testing.expect(ui.acquisition_open);
+    try JavaFrame.expectVisible(.search, "java-page");
+    // Inject the refreshed scanner snapshot with the previously selected path.
+    try manager.state.search_visible.append(manager.state.arena.allocator(), runtime);
+    ui.search_started = true;
+    // Even a retained old selection cannot open a search-only management detail.
+    ui.acquisition_open = false;
+    try dvui.testing.settle(JavaFrame.draw);
+    try std.testing.expect(ui.acquisition_open);
+    try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.add)] == null);
+    try JavaFrame.expectVisible(.search, "java-page");
+    try JavaFrame.scrollPage(-100000);
+    const checkbox = try JavaFrame.searchCheckboxControl();
+    _ = try window.window.addEventMouseMotion(.{ .pt = checkbox.rect.center() });
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(JavaFrame.draw);
+    try std.testing.expect(ui.search_selection[0]);
+    const add = try dvui.testing.tagGet("java-search-add");
+    const search = try dvui.testing.tagGet("java-search-start");
+    try std.testing.expect(add.rect.x + add.rect.w <= search.rect.x);
+    _ = try JavaFrame.clickTag("java-search-add");
+    try std.testing.expectEqual(@as(usize, 1), ui.commands.items.len);
+    try std.testing.expectEqualStrings(runtime.path, ui.commands.items[0].add[0]);
+}
+
+test "UI layout Java folder browse queues after draft edits and blocks stale completion" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    JavaFrame.reset();
+    defer JavaFrame.reset();
+    const picker = @import("ui/file_picker.zig");
+    const Driver = struct {
+        fn start(_: ?*anyopaque, pending: *picker.Pending) void {
+            pending.complete(.{ .path = "/picked/java" });
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var manager = try java.Manager.init(a, std.testing.io, root);
+    defer manager.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
+    defer controller.deinit();
+    var download_ui = java_download_view.Ui.init(a);
+    defer download_ui.deinit();
+    var service = picker.Service.init(a);
+    defer service.deinit();
+    var ui = java_view.Ui.init(a);
+    defer ui.deinit();
+    ui.picker_service = &service;
+    ui.acquisition_mode = .local;
+    JavaFrame.ui = &ui;
+    JavaFrame.download_ui = &download_ui;
+    JavaFrame.controller = &controller;
+    JavaFrame.manager = &manager;
+    JavaFrame.interactive = true;
+    var window = try dvui.testing.init(.{ .window_size = .{ .w = 640, .h = 400 } });
+    defer window.deinit();
+    window.backend.size_pixels = .{ .w = 640, .h = 400 };
+    try dvui.testing.settle(JavaFrame.draw);
+    const browse = try dvui.testing.tagGet("java-search-browse");
+    try expectInside((try dvui.testing.tagGet("java-page")).rect, browse.rect);
+    try JavaFrame.expectTabRegistration(.{ .id = browse.id, .rect = browse.rect }, true);
+    const field = try dvui.testing.tagGet("java-search-path");
+    dvui.focusWidget(field.id, null, null);
+    try dvui.testing.writeText("/draft/latest");
+    _ = try JavaFrame.clickTag("java-search-browse");
+    try std.testing.expectEqual(@as(usize, 1), ui.commands.items.len);
+    try std.testing.expect(!service.isBusy());
+    java_view.finish(&ui, &manager);
+    try std.testing.expectEqualStrings("/draft/latest", service.pending.?.default_path);
+    try dvui.testing.settle(JavaFrame.draw);
+    const disabled_browse = try dvui.testing.tagGet("java-search-browse");
+    try JavaFrame.expectTabRegistration(.{ .id = disabled_browse.id, .rect = disabled_browse.rect }, false);
+    // An edit and undo still invalidates the pending receipt.
+    dvui.focusWidget(field.id, null, null);
+    try dvui.testing.pressKey(.a, .lcontrol);
+    try dvui.testing.pressKey(.backspace, .none);
+    try dvui.testing.writeText("/edited/java");
+    try dvui.testing.settle(JavaFrame.draw);
+    try std.testing.expect(ui.picker_path_changed);
+    @memset(&ui.path_buffer, 0);
+    @memcpy(ui.path_buffer[0.."/draft/latest".len], "/draft/latest");
+    service.startPending(.{ .start = Driver.start });
+    java_view.syncPicker(&ui);
+    try std.testing.expectEqualStrings("/draft/latest", std.mem.sliceTo(&ui.path_buffer, 0));
+    try std.testing.expect(!service.isBusy());
+    try dvui.testing.settle(JavaFrame.draw);
+    // A completed picker and Search compete in the same frame. Search owns the
+    // current draft and discards the picker before the app synchronizes receipts.
+    _ = try JavaFrame.clickTag("java-search-browse");
+    java_view.finish(&ui, &manager);
+    service.startPending(.{ .start = Driver.start });
+    try std.testing.expect(ui.picker_ticket != null);
+    try std.testing.expect(service.isBusy());
+    _ = try JavaFrame.clickTag("java-search-start");
+    try std.testing.expect(ui.picker_ticket == null);
+    try std.testing.expect(!service.isBusy());
+    try std.testing.expectEqual(@as(usize, 1), ui.commands.items.len);
+    try std.testing.expectEqualStrings("/draft/latest", ui.commands.items[0].search);
+    java_view.syncPicker(&ui);
+    try std.testing.expectEqualStrings("/draft/latest", std.mem.sliceTo(&ui.path_buffer, 0));
+    java_view.discardCommands(&ui);
+    try dvui.testing.settle(JavaFrame.draw);
+    _ = try JavaFrame.clickTag("java-search-browse");
+    java_view.finish(&ui, &manager);
+    _ = try JavaFrame.clickTag("java-acquire-download");
+    try std.testing.expect(ui.picker_ticket == null);
+    try std.testing.expect(!service.isBusy());
+    _ = try JavaFrame.clickTag("java-acquire-local");
+    try manager.state.search_visible.append(manager.state.arena.allocator(), .{ .path = "/fixture/previous/java", .vendor = "Previous", .major = 21 });
+    try dvui.testing.settle(JavaFrame.draw);
+    ui.search_selection[0] = true;
+    _ = try JavaFrame.clickTag("java-search-browse");
+    java_view.finish(&ui, &manager);
+    service.startPending(.{ .start = Driver.start });
+    // A scan started independently also invalidates the picker before sync,
+    // while checkbox choices stay untouched until scanner results change.
+    try manager.search("/fixture/old-search-root");
+    try std.testing.expect(manager.isSearching());
+    try dvui.testing.settle(JavaFrame.draw);
+    java_view.syncPicker(&ui);
+    try std.testing.expect(ui.picker_ticket == null);
+    try std.testing.expect(!service.isBusy());
+    try std.testing.expectEqualStrings("/draft/latest", std.mem.sliceTo(&ui.path_buffer, 0));
+    try std.testing.expect(ui.search_selection[0]);
 }
 
 const ShutdownFrame = struct {
@@ -1587,7 +2614,7 @@ const JavaDeleteFrame = struct {
     }
 
     fn visibleControl(action: Action) !Control {
-        const sample = observations[@intFromEnum(action)] orelse return error.JavaDeleteLabelNotRendered;
+        const sample = observations[@backingInt(action)] orelse return error.JavaDeleteLabelNotRendered;
         const control = sample.control orelse return error.JavaDeleteControlNotRegistered;
         const win = dvui.currentWindow();
         const modal = win.subwindows.get(control.window_id) orelse return error.JavaDeleteModalMissing;
@@ -1604,7 +2631,7 @@ const JavaDeleteFrame = struct {
     fn expectStable(controls: [labels.len]Control) !void {
         const win = dvui.currentWindow();
         for (controls, 0..) |previous, index| {
-            const current = try visibleControl(@enumFromInt(index));
+            const current = try visibleControl(@fromBackingInt(@intCast(index)));
             try std.testing.expectEqual(previous.id, current.id);
             try std.testing.expectEqual(previous.window_id, current.window_id);
             var registered: usize = 0;
@@ -1631,7 +2658,12 @@ test "UI layout real Java deletion modal keeps all actions visible focusable and
     const a = std.testing.allocator;
     const paths = [_][]const u8{
         "/fixture/managed-java/bin/java",
-        "/fixture/managed-java/" ++ ("nested-runtime-directory-with-a-long-name/" ** 16) ++ "bin/java",
+        "/fixture/managed-java/" ++ (comptime blk: {
+            const segment = "nested-runtime-directory-with-a-long-name/";
+            var repeated: [segment.len * 16]u8 = undefined;
+            for (0..16) |i| @memcpy(repeated[i * segment.len ..][0..segment.len], segment);
+            break :blk repeated;
+        }) ++ "bin/java",
     };
     for ([_]dvui.Size{ .{ .w = 640, .h = 400 }, .{ .w = 1280, .h = 720 } }) |size| {
         for (paths) |path| {
@@ -1654,7 +2686,7 @@ test "UI layout real Java deletion modal keeps all actions visible focusable and
                 try dvui.testing.settle(JavaDeleteFrame.draw);
                 var controls: [JavaDeleteFrame.labels.len]JavaDeleteFrame.Control = undefined;
                 for (&controls, 0..) |*control, index| {
-                    control.* = try JavaDeleteFrame.visibleControl(@enumFromInt(index));
+                    control.* = try JavaDeleteFrame.visibleControl(@fromBackingInt(@intCast(index)));
                     for (controls[0..index]) |previous| try std.testing.expect(previous.id != control.id);
                 }
                 try JavaDeleteFrame.expectStable(controls);
@@ -1745,7 +2777,9 @@ const EditorTextFrame = struct {
         const previous_rendering = win.render_target.rendering;
         win.defer_render_cmds = &commands;
         win.render_target.rendering = false;
+        dvui.debug.captureScopeBegin(win.gpa);
         defer {
+            dvui.debug.captureScopeEnd();
             win.defer_render_cmds = previous_commands;
             win.render_target.rendering = previous_rendering;
         }
@@ -1762,6 +2796,7 @@ const EditorTextFrame = struct {
         // Observe real text-layout render commands and their effective scissor,
         // rather than reconstructing field geometry or testing an outer box.
         observeTextBounds(commands.items, &samples, &bounds);
+        try ServerLayoutFrame.observe(commands.items);
         return .ok;
     }
 };
@@ -1777,6 +2812,7 @@ test "UI layout real server and instance editor font lines are not clipped at co
     defer paths.deinit();
     var store = try config.Store.init(a, std.testing.io, root);
     defer store.deinit();
+    try store.update(.{ .instances = &.{.{ .id = "fixture-font-instance", .name = "Fixture", .minecraft_version = "1.21" }}, .selected_instance = "fixture-font-instance" });
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var server_service = server_manager.Manager.initWithQuery(a, std.testing.io, EditorsFrame.rejectQuery);
@@ -1786,12 +2822,13 @@ test "UI layout real server and instance editor font lines are not clipped at co
     var server_ui = servers_view.Ui.init(a);
     defer server_ui.deinit();
     server_ui.editor_open = true;
+    server_ui.draft.id = try a.dupe(u8, "fixture-font-server");
     var instance_ui = instances_view.Ui.init(a);
     defer instance_ui.deinit();
     instance_ui.draft = try instances_view.Draft.fromInstance(a, .{ .id = "fixture-font-instance", .name = "Fixture", .minecraft_version = "1.21" });
     instance_ui.mode = .options;
-    const samples = [_][]const u8{ "Server gypQ", "gypQ.invalid", "25565", "Instance gypQ", "4096" };
-    const buffers = [_][]u8{ &server_ui.draft.name, &server_ui.draft.address, &server_ui.draft.port, &instance_ui.draft.name, &instance_ui.draft.memory };
+    const samples = [_][]const u8{ "Server gypQ", "gypQ.invalid", "25565", "Instance gypQ", "1024", "4096" };
+    const buffers = [_][]u8{ &server_ui.draft.name, &server_ui.draft.address, &server_ui.draft.port, &instance_ui.draft.name, &instance_ui.draft.min_memory, &instance_ui.draft.memory };
     for (buffers, samples) |buffer, sample| {
         @memset(buffer, 0);
         @memcpy(buffer[0..sample.len], sample);
@@ -1815,10 +2852,21 @@ test "UI layout real server and instance editor font lines are not clipped at co
                 window.window.themeSet(theme);
                 EditorTextFrame.server = server;
                 const offset: usize = if (server) 0 else 3;
-                const field_count: usize = if (server) 3 else 2;
+                const field_count: usize = 3;
                 EditorTextFrame.samples = @splat("");
                 @memcpy(EditorTextFrame.samples[0..field_count], samples[offset..][0..field_count]);
                 try dvui.testing.settle(EditorTextFrame.draw);
+                const cancel_before = if (!server) try ServerLayoutFrame.visible(6) else null;
+                const save_before = if (!server) try ServerLayoutFrame.visible(7) else null;
+                if (server) {
+                    try std.testing.expect(ServerLayoutFrame.controls[6] == null and ServerLayoutFrame.controls[7] == null);
+                    _ = try dvui.testing.tagGet("server-delete");
+                } else {
+                    const cancel = try ServerLayoutFrame.visible(6);
+                    const save_control = try ServerLayoutFrame.visible(7);
+                    try std.testing.expect(cancel.id != save_control.id);
+                }
+                if (server) try ServerLayoutFrame.noCheckbox();
                 var inputs: [3]dvui.Id = undefined;
                 var widths: [3]f32 = undefined;
                 var count: usize = 0;
@@ -1827,13 +2875,30 @@ test "UI layout real server and instance editor font lines are not clipped at co
                     try std.testing.expect(count < inputs.len);
                     inputs[count] = entry.widgetId;
                     widths[count] = (entry.rect orelse return error.InputRectangleMissing).w;
-                    try std.testing.expect(widths[count] >= size.w - 64);
+                    if (server and count == 2) {
+                        // The server port keeps its native 240px numeric entry.
+                        try std.testing.expectApproxEqAbs(@as(f32, 240), widths[count], 0.01);
+                    } else {
+                        // Entries fill the Bento panel within the page margins.
+                        if (!server and count > 0 and size.w >= 1280) {
+                            try std.testing.expect(widths[count] >= vela_theme.bodyFont().textSize("最大内存（MiB）").w);
+                            try std.testing.expect(widths[count] < size.w - 112);
+                        } else try std.testing.expect(widths[count] >= size.w - 112);
+                    }
                     count += 1;
                 }
                 try std.testing.expectEqual(field_count, count);
                 for (inputs[0..count], 0..) |id, index| {
                     dvui.focusWidget(id, null, null);
                     try dvui.testing.settle(EditorTextFrame.draw);
+                    if (!server) {
+                        const current_cancel = try ServerLayoutFrame.visible(6);
+                        const current_save = try ServerLayoutFrame.visible(7);
+                        try std.testing.expectEqual(cancel_before.?.id, current_cancel.id);
+                        try std.testing.expectEqual(save_before.?.id, current_save.id);
+                        try std.testing.expectApproxEqAbs(cancel_before.?.rect.y, current_cancel.rect.y, 0.1);
+                        try std.testing.expectApproxEqAbs(save_before.?.rect.y, current_save.rect.y, 0.1);
+                    }
                     var focused_width: ?f32 = null;
                     for (window.window.tab_index_prev.items) |entry| if (entry.widgetId == id) {
                         focused_width = (entry.rect orelse return error.InputRectangleMissing).w;
@@ -1850,7 +2915,7 @@ test "UI layout real server and instance editor font lines are not clipped at co
                 try std.testing.expect(instance_ui.pending == null);
                 try std.testing.expectEqual(@as(usize, 0), EditorsFrame.service_calls);
                 try std.testing.expectEqual(@as(usize, 0), registry.entries.items.len);
-                try std.testing.expectEqual(@as(usize, 0), store.snapshot().instances.len);
+                try std.testing.expectEqual(@as(usize, 1), store.snapshot().instances.len);
                 try std.testing.expectEqual(@as(usize, 0), store.snapshot().servers.len);
             }
         }
@@ -1860,18 +2925,22 @@ test "UI layout real server and instance editor font lines are not clipped at co
 const WorldsTextFrame = struct {
     const source: config.Instance = .{ .id = "fixture-world-font", .name = "Fixture", .minecraft_version = "1.21.4" };
     const recovery_id = "0123456789abcdef0123456789abcdef";
-    const samples = [_][]const u8{
+    var samples = [_][]const u8{
         "World gypQ",
-        "文件夹：world-gypQ",
-        "版本：1.21.4 gypQ",
-        "最后游玩：2025-01-01 00:00 UTC",
-        "recovery-gypQ · 原始数据",
-        recovery_id ++ " · 2025-01-02 00:00 UTC",
+        // The card description retains its explicit line separator in commands.
+        "文件夹：world-gypQ · 生存模式\n",
+        "最后游玩：",
         "世界备份",
+        "",
+        "备份 · 6",
+        "正在游玩",
+        "世界备份 · 被替换数据",
     };
     var ui: *worlds_view.Ui = undefined;
     var manager: *worlds_manager.Manager = undefined;
     var document: *const config.Document = undefined;
+    var controls_enabled = true;
+    var native_geometry = false;
     const TextFragments = struct {
         bytes: [128]u8 = undefined,
         length: usize = 0,
@@ -1879,17 +2948,45 @@ const WorldsTextFrame = struct {
         count: usize = 0,
     };
     var observed: [samples.len]TextFragments = @splat(.{});
+    var preview_corners: ?dvui.CornerRect = null;
+    var playing_card_has_date = false;
+    var playing_status_accent = false;
+    var card_has_version = false;
+    var card_text: [512]u8 = undefined;
+    var card_text_length: usize = 0;
 
     fn observeFragments(commands: []const dvui.RenderCommand) !void {
         observed = @splat(.{});
+        preview_corners = null;
+        playing_card_has_date = false;
+        playing_status_accent = false;
+        card_has_version = false;
+        card_text_length = 0;
+        const first_card = dvui.tagGet("world-card-world-gypQ");
+        const preview = dvui.tagGet("world-preview-world-gypQ");
         var active: ?usize = null;
         for (commands) |command| switch (command.cmd) {
             .text => |text| {
+                if (first_card) |card| if (card.rect.contains(text.rs.r.center())) {
+                    if (card_text_length + text.text.len > card_text.len) return error.WorldCardTextCaptureOverflow;
+                    @memcpy(card_text[card_text_length..][0..text.text.len], text.text);
+                    card_text_length += text.text.len;
+                    const date = if (std.mem.startsWith(u8, samples[2], "最后游玩：")) samples[2]["最后游玩：".len..] else samples[2];
+                    const local_date = date[0..10];
+                    if (std.mem.indexOf(u8, text.text, "版本：") != null or std.mem.indexOf(u8, text.text, "1.21.4 gypQ") != null) card_has_version = true;
+                    if (std.mem.indexOf(u8, text.text, "最后游玩") != null or std.mem.indexOf(u8, text.text, local_date) != null) playing_card_has_date = true;
+                    if (std.mem.eql(u8, text.text, "正在游玩")) playing_status_accent = std.meta.eql(text.color, @import("ui/theme.zig").accent);
+                };
                 if (text.text.len == 0) continue;
                 var matched: ?usize = null;
                 if (active) |index| {
                     const remaining = samples[index][observed[index].length..];
-                    if (std.mem.startsWith(u8, remaining, text.text)) matched = index else active = null;
+                    if (std.mem.startsWith(u8, remaining, text.text)) matched = index else {
+                        // A short action label such as 备份 can also prefix the
+                        // recovery title. Discard that incomplete candidate.
+                        observed[index] = .{};
+                        active = null;
+                    }
                 }
                 if (matched == null) {
                     for (samples, 0..) |sample, index| {
@@ -1912,6 +3009,11 @@ const WorldsTextFrame = struct {
                     active = if (capture.length == samples[index].len) null else index;
                 }
             },
+            .texture => |texture| {
+                if (preview) |image| if (std.meta.eql(texture.rs.r, image.rect)) {
+                    preview_corners = texture.opts.corners;
+                };
+            },
             else => {},
         };
     }
@@ -1933,13 +3035,15 @@ const WorldsTextFrame = struct {
         };
     }
 
-    fn ownedBackup(a: std.mem.Allocator) !worlds.Backup {
-        const id = try a.dupe(u8, recovery_id);
+    fn ownedBackup(a: std.mem.Allocator, recovery: []const u8, source_id: ?[]const u8, source_folder: []const u8) !worlds.Backup {
+        const id = try a.dupe(u8, recovery);
         errdefer a.free(id);
         const directory = try a.dupe(u8, "/unused/recovery-renderer-fixture");
         errdefer a.free(directory);
-        const folder = try a.dupe(u8, "recovery-gypQ");
-        return .{ .id = id, .part = .original, .directory = directory, .source_folder = folder, .operation = .backup, .created_ms = 1735776000000 };
+        const folder = try a.dupe(u8, source_folder);
+        errdefer a.free(folder);
+        const instance = if (source_id) |value| try a.dupe(u8, value) else null;
+        return .{ .id = id, .part = .original, .directory = directory, .source_instance = instance, .source_folder = folder, .operation = .backup, .created_ms = 1735776000000 };
     }
 
     fn work(a: std.mem.Allocator, io: std.Io, _: *const instances.Paths, instance: config.Instance, request: ?worlds_manager.Request, options: worlds.Options) anyerror!worlds_manager.Result {
@@ -1952,18 +3056,42 @@ const WorldsTextFrame = struct {
         items[0] = try ownedWorld(a, "world-gypQ", "World gypQ");
         errdefer items[0].deinit(a);
         items[0].metadata.last_played_ms = 1735689600000;
-        // Another real row makes recovery require scrolling at the compact size.
+        items[0].metadata.game_type = 0;
+        // A second card exercises responsive wrapping and selection changes.
         items[1] = try ownedWorld(a, "filler", "Filler");
         errdefer items[1].deinit(a);
         // Keep every observed label unique, including version and timestamp.
         a.free(items[1].metadata.version_name.?);
         items[1].metadata.version_name = null;
-        const backups = try a.alloc(worlds.Backup, 1);
+        const backups = try a.alloc(worlds.Backup, 6);
         errdefer a.free(backups);
-        backups[0] = try ownedBackup(a);
+        backups[0] = try ownedBackup(a, recovery_id, source.id, "world-gypQ");
+        errdefer backups[0].deinit(a);
+        backups[1] = try ownedBackup(a, "11111111111111111111111111111111", source.id, "world-gypQ");
+        errdefer backups[1].deinit(a);
+        backups[1].created_ms += 60000;
+        backups[2] = try ownedBackup(a, "22222222222222222222222222222222", source.id, "world-gypQ");
+        errdefer backups[2].deinit(a);
+        backups[2].created_ms += 120000;
+        backups[2].part = .overwritten;
+        // Keep records for other instances, old folders and unknown provenance
+        // visible in the instance repository; invalid manifests cannot restore.
+        backups[3] = try ownedBackup(a, "33333333333333333333333333333333", "other-instance", "world-gypQ");
+        errdefer backups[3].deinit(a);
+        backups[4] = try ownedBackup(a, "44444444444444444444444444444444", source.id, "other-world");
+        errdefer backups[4].deinit(a);
+        backups[5] = try ownedBackup(a, "55555555555555555555555555555555", null, "world-gypQ");
+        errdefer backups[5].deinit(a);
+        const previews = try a.alloc(worlds_manager.Preview, 1);
+        errdefer a.free(previews);
+        previews[0].folder = try a.dupe(u8, items[0].folder);
+        errdefer a.free(previews[0].folder);
+        previews[0].png = try a.dupe(u8, @embedFile("assets/default_skins/alex.png"));
         return .{
             .world_list = .{ .allocator = a, .items = items },
             .backup_list = .{ .allocator = a, .items = backups },
+            .previews = previews,
+            .preview_allocator = a,
         };
     }
 
@@ -1979,6 +3107,8 @@ const WorldsTextFrame = struct {
 
     fn draw() !dvui.App.Result {
         const win = dvui.currentWindow();
+        dvui.debug.captureScopeBegin(win.gpa);
+        defer dvui.debug.captureScopeEnd();
         var commands: std.ArrayList(dvui.RenderCommand) = .empty;
         defer commands.deinit(win.arena());
         const previous_commands = win.defer_render_cmds;
@@ -1990,27 +3120,150 @@ const WorldsTextFrame = struct {
             win.render_target.rendering = previous_rendering;
         }
         {
-            const root = dvui.box(@src(), .{}, .{ .tag = "world-font-page", .expand = .both, .padding = dvui.Rect.all(12) });
+            const root = dvui.box(@src(), .{ .dir = .horizontal }, .{ .tag = "world-font-page", .expand = .both, .padding = dvui.Rect.all(if (native_geometry) 32 else 12) });
             defer root.deinit();
+            {
+                const sidebar_width: f32 = if (native_geometry) 260 else 240;
+                const sidebar = dvui.box(@src(), .{}, .{ .expand = .vertical, .min_size_content = .{ .w = sidebar_width }, .max_size_content = .width(sidebar_width), .margin = .{ .w = if (native_geometry) 24 else 0 } });
+                defer sidebar.deinit();
+                worlds_view.drawSidebar(ui, document, manager, controls_enabled);
+            }
             // Publication stays immutable through rendering; no finish/tick here.
-            try worlds_view.drawWithEnabled(ui, document, manager, true);
+            try worlds_view.drawWithEnabled(ui, document, manager, controls_enabled);
         }
         try observeFragments(commands.items);
         return .ok;
     }
 
-    fn scrollPage(amount: f32) !void {
-        const page = try dvui.testing.tagGet("world-font-page");
-        // The lower center lies in the production scroll area, below its header.
-        _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = .{ .x = page.rect.center().x, .y = page.rect.y + page.rect.h - 24 } });
+    fn bodyViewport() !dvui.Rect.Physical {
+        const page = try dvui.testing.tagGet("worlds-page");
+        const capture = dvui.debug.lastCapture() orelse return error.WorldBodyCaptureMissing;
+        var body: ?dvui.Debug.CapturedWidget = null;
+        for (capture.widgets.items) |widget| {
+            if (widget.parent_id != page.id or !std.mem.eql(u8, widget.name orelse continue, "ScrollAreaWidget")) continue;
+            if (body != null) return error.WorldBodyViewportDuplicate;
+            body = widget;
+        }
+        return (body orelse return error.WorldBodyViewportMissing).rect_content;
+    }
+
+    fn recoveryViewport() !dvui.Rect.Physical {
+        const list = try dvui.testing.tagGet("world-recovery-list");
+        const capture = dvui.debug.lastCapture() orelse return error.WorldBodyCaptureMissing;
+        for (capture.widgets.items) |widget| {
+            if (widget.id == list.id) return widget.rect_content;
+        }
+        return error.WorldRecoveryViewportMissing;
+    }
+
+    fn scrollRecovery(amount: f32) !void {
+        const viewport = try recoveryViewport();
+        _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = viewport.center() });
         _ = try dvui.currentWindow().addEventMouseWheel(amount, .vertical, null);
         try dvui.testing.settle(draw);
+    }
+
+    fn scrollPage(amount: f32) !void {
+        const viewport = try bodyViewport();
+        // Wheel over the captured viewport; the fixed footer never scrolls.
+        _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = viewport.center() });
+        _ = try dvui.currentWindow().addEventMouseWheel(amount, .vertical, null);
+        try dvui.testing.settle(draw);
+    }
+
+    fn expectTabStop(tag: []const u8, enabled: bool) !void {
+        const widget = try dvui.testing.tagGet(tag);
+        var count: usize = 0;
+        for (dvui.currentWindow().tab_index_prev.items) |entry| if (entry.widgetId == widget.id) {
+            count += 1;
+        };
+        try std.testing.expectEqual(@as(usize, if (enabled) 1 else 0), count);
+    }
+
+    fn reveal(tag: []const u8) !void {
+        for (0..6) |_| {
+            const widget = try dvui.testing.tagGet(tag);
+            const recovery = std.mem.startsWith(u8, tag, "world-backup-item-") or std.mem.startsWith(u8, tag, "world-restore-");
+            const viewport = if (recovery) try recoveryViewport() else try bodyViewport();
+            const footer = dvui.tagGet("world-selected-actions");
+            if (footer) |actions| {
+                if (widget.visible and widget.rect.y >= actions.rect.y - 0.1 and widget.rect.y + widget.rect.h <= actions.rect.y + actions.rect.h + 0.1) return;
+            }
+            if (std.mem.eql(u8, tag, "world-backups-toggle")) {
+                const dock = try dvui.testing.tagGet("world-backups");
+                try expectInside((try dvui.testing.tagGet("worlds-page")).rect, dock.rect);
+                try expectInside(dock.rect, widget.rect);
+                try std.testing.expect(widget.visible);
+                return;
+            }
+            // Oversized cards and recovery rows remain accessible when only outer padding is clipped.
+            if ((std.mem.startsWith(u8, tag, "world-card-") or std.mem.startsWith(u8, tag, "world-backup-item-")) and widget.rect.h > viewport.h and widget.visible and viewport.contains(widget.rect.center())) return;
+            if (widget.visible and widget.rect.y >= viewport.y - 0.1 and widget.rect.y + widget.rect.h <= viewport.y + viewport.h + 0.1) return;
+            if (recovery) try scrollRecovery(viewport.center().y - widget.rect.center().y) else try scrollPage(viewport.center().y - widget.rect.center().y);
+        }
+        const widget = try dvui.testing.tagGet(tag);
+        const page = try dvui.testing.tagGet("worlds-page");
+        const footer = dvui.tagGet("world-selected-actions");
+        std.debug.print("world reveal failed {s}: widget={any}, visible={}, page={any}, footer={any}, viewport={any}\n", .{ tag, widget.rect, widget.visible, page.rect, if (footer) |actions| actions.rect else null, try bodyViewport() });
+        return error.WorldWidgetNotFullyVisible;
+    }
+
+    fn toggleBackups() !void {
+        const previous = ui.backups_expanded;
+        try reveal("world-backups-toggle");
+        try dvui.testing.moveTo("world-backups-toggle");
+        try dvui.testing.settle(draw);
+        try dvui.testing.click(.left);
+        try dvui.testing.settle(draw);
+        if (ui.backups_expanded == previous) {
+            const toggle = try dvui.testing.tagGet("world-backups-toggle");
+            std.debug.print("backup toggle failed: window={any} font={any} toggle={any} expanded={}\n", .{ dvui.windowRect(), @import("ui/theme.zig").bodyFont().size, toggle.rect, previous });
+        }
+        try std.testing.expectEqual(!previous, ui.backups_expanded);
+    }
+
+    fn expectFooter() !dvui.Rect.Physical {
+        const page = try dvui.testing.tagGet("worlds-page");
+        const footer = try dvui.testing.tagGet("world-selected-actions");
+        try expectInside(page.rect, footer.rect);
+        try std.testing.expectApproxEqAbs(page.rect.y + page.rect.h, footer.rect.y + footer.rect.h, 0.1);
+        try std.testing.expect(footer.rect.y > page.rect.y + 50);
+        for (mutation_tags ++ [_][]const u8{"world-open"}) |tag| {
+            const button = try dvui.testing.tagGet(tag);
+            try std.testing.expect(button.visible);
+            try expectInside(footer.rect, button.rect);
+        }
+        return footer.rect;
+    }
+
+    fn clickTag(tag: []const u8, enabled: bool) !void {
+        // Dismiss floating metadata from the previous card before pointer selection.
+        try dvui.testing.moveTo("world-refresh");
+        try dvui.testing.settle(draw);
+        try reveal(tag);
+        try expectTabStop(tag, enabled);
+        try dvui.testing.moveTo(tag);
+        try dvui.testing.click(.left);
+        try dvui.testing.settle(draw);
+    }
+
+    const mutation_tags = [_][]const u8{ "world-backup", "world-copy", "world-rename", "world-rename-folder", "world-delete" };
+
+    fn expectMutationControls(enabled: bool) !void {
+        for (mutation_tags) |tag| try expectTabStop(tag, enabled);
+    }
+
+    fn expectNoIntents() !void {
+        try std.testing.expect(ui.failure == null and ui.draft == null);
+        try std.testing.expect(ui.requests.items.len == 0 and ui.directory_open == null);
+        try std.testing.expect(!ui.refresh_queued and !ui.cancel_queued and !ui.select_queued);
     }
 
     fn expectLines(start: usize, end: usize, size: dvui.Size, font_size: f32) !void {
         for (start..end) |index| {
             const capture = &observed[index];
-            errdefer std.debug.print("World/recovery text incomplete: size={any}, font={d}, label={s}, rendered={s}, fragments={d}\n", .{ size, font_size, samples[index], capture.bytes[0..capture.length], capture.count });
+            errdefer std.debug.print("World/recovery text incomplete: size={any}, font={d}, label={s}, rendered={s}, fragments={d}, card text={s}\n", .{ size, font_size, samples[index], capture.bytes[0..capture.length], capture.count, card_text[0..card_text_length] });
+            errdefer std.debug.print("World/recovery allocation: viewport={any}, footer={any}, dock={any}, first row={any}\n", .{ recoveryViewport() catch dvui.Rect.Physical{}, dvui.tagGet("world-selected-actions"), dvui.tagGet("world-backups"), dvui.tagGet("world-backup-item-" ++ recovery_id ++ "-original") });
             // Exact concatenation in command order requires every chunk. A
             // missing, reordered or altered chunk (including spaces) fails.
             try std.testing.expect(capture.count > 0);
@@ -2021,7 +3274,9 @@ const WorldsTextFrame = struct {
                 try std.testing.expect(text.rect.h >= text.font_height - 0.01);
                 try expectInside(text.clip, text.rect);
                 try expectInside(.{ .x = 0, .y = 0, .w = size.w, .h = size.h }, text.rect);
-                if (font_size == 24) try std.testing.expect(text.font_height > 20);
+                // Card headings/captions keep their semantic font sizes;
+                // Backup dates follow the selected body font.
+                if (font_size == 24 and index == 4) try std.testing.expect(text.font_height > 20);
                 if (fragment > 0) {
                     const previous = capture.fragments[fragment - 1].rect;
                     try std.testing.expect(text.rect.y >= previous.y + previous.h - 0.1);
@@ -2031,9 +3286,17 @@ const WorldsTextFrame = struct {
     }
 };
 
-test "UI layout real World and recovery metadata font lines are not clipped at compact and wide sizes" {
+test "UI layout world cards, selected actions and recovery remain responsive and safe" {
     if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     const a = std.testing.allocator;
+    // Labels borrow these test-scope buffers across every rendered frame.
+    var world_time_buffer: [16]u8 = undefined;
+    var backup_time_buffer: [16]u8 = undefined;
+    var world_date_label: [64]u8 = undefined;
+    const world_time = @import("ui/local_time.zig").format(&world_time_buffer, 1735689600000) orelse return error.WorldLocalTimestampUnavailable;
+    const backup_time = @import("ui/local_time.zig").format(&backup_time_buffer, 1735776000000) orelse return error.BackupLocalTimestampUnavailable;
+    WorldsTextFrame.samples[2] = try std.fmt.bufPrint(&world_date_label, "最后游玩：{s}", .{world_time});
+    WorldsTextFrame.samples[4] = backup_time;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
@@ -2047,7 +3310,8 @@ test "UI layout real World and recovery metadata font lines are not clipped at c
     defer manager.deinit();
     var ui = try worlds_view.Ui.init(a);
     defer ui.deinit();
-    const document: config.Document = .{ .instances = &.{WorldsTextFrame.source}, .selected_instance = WorldsTextFrame.source.id };
+    const target: config.Instance = .{ .id = "fixture-world-target", .name = "Target", .minecraft_version = "1.21.4" };
+    const document: config.Document = .{ .instances = &.{ WorldsTextFrame.source, target }, .selected_instance = WorldsTextFrame.source.id };
     WorldsTextFrame.ui = &ui;
     WorldsTextFrame.manager = &manager;
     WorldsTextFrame.document = &document;
@@ -2056,8 +3320,20 @@ test "UI layout real World and recovery metadata font lines are not clipped at c
     const snapshot = manager.snapshot();
     try std.testing.expect(snapshot.failure == null and !snapshot.loading and !snapshot.worker_active);
     try std.testing.expectEqual(@as(usize, 2), snapshot.worlds.len);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.backups.len);
-    for ([_]dvui.Size{ .{ .w = 640, .h = 400 }, .{ .w = 1280, .h = 720 } }) |size| {
+    try std.testing.expectEqual(@as(usize, 6), snapshot.backups.len);
+    const Layout = struct { size: dvui.Size, native_geometry: bool = false };
+    for ([_]Layout{
+        .{ .size = .{ .w = 640, .h = 400 } },
+        .{ .size = .{ .w = 640, .h = 400 }, .native_geometry = true },
+        .{ .size = .{ .w = 1280, .h = 720 } },
+    }) |layout| {
+        const size = layout.size;
+        WorldsTextFrame.native_geometry = layout.native_geometry;
+        // Compact cards show each metadata field on its own bounded line.
+        WorldsTextFrame.samples[0] = "World gypQ";
+        WorldsTextFrame.samples[1] = if (layout.native_geometry) "world-gypQ\n生存模式" else if (size.w == 640) "world-gypQ\n生存模式\n" else "文件夹：world-gypQ · 生存模式\n";
+        WorldsTextFrame.samples[2] = if (size.w == 640) world_time else world_date_label[0 .. "最后游玩：".len + world_time.len];
+        WorldsTextFrame.samples[7] = if (size.w == 640) "世界备份 · 已替换" else "世界备份 · 被替换数据";
         for ([_]f32{ 16, 24 }) |font_size| {
             var window = try dvui.testing.init(.{ .window_size = size });
             defer window.deinit();
@@ -2067,26 +3343,215 @@ test "UI layout real World and recovery metadata font lines are not clipped at c
             theme.font_heading = theme.font_body.withSize(18);
             theme.font_title = theme.font_body.withSize(24);
             window.window.themeSet(theme);
+            if (ui.selected_world) |old| a.free(old);
+            ui.selected_world = null;
+            ui.backups_expanded = false;
+            WorldsTextFrame.controls_enabled = true;
             try dvui.testing.settle(WorldsTextFrame.draw);
             try WorldsTextFrame.scrollPage(100000);
-            try WorldsTextFrame.expectLines(0, 4, size, font_size);
+            try WorldsTextFrame.expectLines(0, 1, size, font_size);
+            try WorldsTextFrame.expectLines(1, 3, size, font_size);
+            try std.testing.expect(!WorldsTextFrame.card_has_version);
+            try std.testing.expect(dvui.tagGet("world-selected-details") == null);
+            try std.testing.expect(dvui.tagGet("world-selected-actions") == null);
+            try std.testing.expect(dvui.tagGet("world-backups") != null);
+            try std.testing.expect(dvui.tagGet("world-backups-toggle") != null);
+            try std.testing.expect(dvui.tagGet("world-recovery-list") == null);
+            for (WorldsTextFrame.mutation_tags) |tag| try std.testing.expect(dvui.tagGet(tag) == null);
+            const card = try dvui.testing.tagGet("world-card-world-gypQ");
+            const second = try dvui.testing.tagGet("world-card-filler");
+            const preview = try dvui.testing.tagGet("world-preview-world-gypQ");
+            try std.testing.expectApproxEqAbs(@as(f32, 64), preview.rect.w, 0.1);
+            try std.testing.expectApproxEqAbs(@as(f32, 64), preview.rect.h, 0.1);
+            try expectInside(card.rect, preview.rect);
+            if (layout.native_geometry) {
+                const date = &WorldsTextFrame.observed[2];
+                for (date.fragments[0..date.count]) |fragment| {
+                    try expectInside(card.rect, fragment.rect);
+                    try std.testing.expect(fragment.rect.y >= preview.rect.y + preview.rect.h or fragment.rect.x >= preview.rect.x + preview.rect.w);
+                }
+            }
+            try std.testing.expectEqualDeep(dvui.CornerRect.round(10), WorldsTextFrame.preview_corners orelse return error.WorldPreviewRenderMissing);
+            try WorldsTextFrame.expectTabStop("world-preview-world-gypQ", false);
+            try WorldsTextFrame.expectTabStop("world-refresh", true);
+            if (size.w == 640) {
+                try std.testing.expectApproxEqAbs(card.rect.x, second.rect.x, 0.1);
+                try std.testing.expect(second.rect.y >= card.rect.y + card.rect.h);
+            } else {
+                try std.testing.expectApproxEqAbs(card.rect.y, second.rect.y, 0.1);
+                try std.testing.expect(second.rect.x > card.rect.x + card.rect.w);
+            }
             const top_y = WorldsTextFrame.observed[0].fragments[0].rect.y;
-            try WorldsTextFrame.scrollPage(-100000);
-            try WorldsTextFrame.expectLines(4, WorldsTextFrame.samples.len, size, font_size);
-            if (size.h == 400 and font_size == 24) {
-                // The full recovery ID plus date must exercise actual wrapping.
-                try std.testing.expect(WorldsTextFrame.observed[5].count > 1);
+            try WorldsTextFrame.clickTag("world-card-world-gypQ", true);
+            try std.testing.expectEqualStrings("world-gypQ", ui.selected_world.?);
+            const selected_check = try dvui.testing.tagGet("world-card-world-gypQ-selected");
+            const selected_preview = try dvui.testing.tagGet("world-preview-world-gypQ");
+            try std.testing.expectApproxEqAbs(selected_preview.rect.center().y, selected_check.rect.center().y, 0.1);
+            const footer = try WorldsTextFrame.expectFooter();
+            try WorldsTextFrame.expectMutationControls(true);
+            try std.testing.expect(dvui.tagGet("world-selected-details") == null);
+            if (layout.native_geometry) {
+                const page = try dvui.testing.tagGet("worlds-page");
+                try std.testing.expectApproxEqAbs(@as(f32, 292), page.rect.w, 0.1);
+                try std.testing.expectApproxEqAbs(@as(f32, 336), page.rect.h, 0.1);
+                if (font_size == 16) {
+                    const viewport = try WorldsTextFrame.bodyViewport();
+                    const selected_card = try dvui.testing.tagGet("world-card-world-gypQ");
+                    const visible_card = selected_card.rect.intersect(viewport);
+                    try std.testing.expect(visible_card.w > 0 and visible_card.h > 0);
+                    try std.testing.expect(viewport.y + viewport.h <= footer.y + 0.1);
+                    for (WorldsTextFrame.observed[0..3]) |text| for (text.fragments[0..text.count]) |fragment| {
+                        const visible_text = fragment.rect.intersect(fragment.clip);
+                        if (visible_text.w > 0 and visible_text.h > 0) try expectInside(viewport, visible_text);
+                    };
+                    // The compact body can be shorter than its selected card.
+                    // Real wheel input reveals the complete bottom caption and preview.
+                    try WorldsTextFrame.scrollPage(@min(@as(f32, 0), viewport.y + viewport.h - selected_card.rect.y - selected_card.rect.h) - 1);
+                    const scrolled_card = try dvui.testing.tagGet("world-card-world-gypQ");
+                    try std.testing.expect(scrolled_card.rect.y < selected_card.rect.y);
+                    try std.testing.expect(scrolled_card.rect.y + scrolled_card.rect.h <= viewport.y + viewport.h + 0.1);
+                    try expectInside(viewport, (try dvui.testing.tagGet("world-preview-world-gypQ")).rect);
+                    try WorldsTextFrame.expectLines(2, 3, size, font_size);
+                    try std.testing.expectEqualDeep(footer, try WorldsTextFrame.expectFooter());
+                    try WorldsTextFrame.scrollPage(100000);
+                }
             }
+            try std.testing.expect(!ui.backups_expanded);
+            try std.testing.expect(dvui.tagGet("world-recovery-list") == null);
+            const restore_tag = "world-restore-" ++ WorldsTextFrame.recovery_id ++ "-original";
+            try std.testing.expect(dvui.tagGet(restore_tag) == null);
+            try WorldsTextFrame.reveal("world-backups-toggle");
+            try WorldsTextFrame.expectLines(5, 6, size, font_size);
+            const backup_section = try dvui.testing.tagGet("world-backups");
+            try std.testing.expect(backup_section.rect.y + backup_section.rect.h <= footer.y + 0.1);
+
+            try WorldsTextFrame.toggleBackups();
+            try std.testing.expect(dvui.tagGet("world-recovery-list") != null);
+            const first_row_tag = "world-backup-item-" ++ WorldsTextFrame.recovery_id ++ "-original";
+            try std.testing.expect(dvui.tagGet(first_row_tag) != null);
+            try std.testing.expect(dvui.tagGet("world-backup-item-11111111111111111111111111111111-original") != null);
+            try std.testing.expect(dvui.tagGet("world-backup-item-22222222222222222222222222222222-overwritten") != null);
+            for ([_][]const u8{
+                "world-backup-item-33333333333333333333333333333333-original",
+                "world-backup-item-44444444444444444444444444444444-original",
+                "world-backup-item-55555555555555555555555555555555-original",
+            }) |tag| try std.testing.expect(dvui.tagGet(tag) != null);
+            try WorldsTextFrame.expectTabStop("world-restore-55555555555555555555555555555555-original", false);
+            try WorldsTextFrame.reveal(first_row_tag);
+            try WorldsTextFrame.expectLines(3, 5, size, font_size);
+            const first_row = try dvui.testing.tagGet(first_row_tag);
+            const viewport = try WorldsTextFrame.recoveryViewport();
+            const visible_first_row = first_row.rect.intersect(viewport);
+            try std.testing.expect(visible_first_row.w > 0 and visible_first_row.h > 0);
+            const first_restore = try dvui.testing.tagGet(restore_tag);
+            try expectInside(first_row.rect, first_restore.rect);
+            try expectInside(viewport, first_restore.rect);
+            const date = WorldsTextFrame.observed[4].fragments[0];
+            const caption = WorldsTextFrame.observed[3].fragments[0];
+            try expectInside(first_row.rect, date.rect);
+            try expectInside(first_row.rect, caption.rect);
+            try expectInside(viewport, date.rect);
+            try expectInside(viewport, caption.rect);
+            try std.testing.expect(caption.rect.y >= date.rect.y + date.rect.h - 0.1);
+            try std.testing.expect(first_restore.rect.x >= date.rect.x + date.rect.w - 0.1);
+            try WorldsTextFrame.expectTabStop(restore_tag, true);
+            try std.testing.expectEqualDeep(footer, try WorldsTextFrame.expectFooter());
+            try WorldsTextFrame.scrollRecovery(-100000);
+            try WorldsTextFrame.reveal("world-backup-item-22222222222222222222222222222222-overwritten");
+            try WorldsTextFrame.expectLines(7, 8, size, font_size);
+            const last_row = try dvui.testing.tagGet("world-backup-item-22222222222222222222222222222222-overwritten");
+            const last_viewport = try WorldsTextFrame.recoveryViewport();
+            const visible_last_row = last_row.rect.intersect(last_viewport);
+            try std.testing.expect(visible_last_row.w > 0 and visible_last_row.h > 0);
+            try expectInside(last_viewport, (try dvui.testing.tagGet("world-restore-22222222222222222222222222222222-overwritten")).rect);
+            try WorldsTextFrame.expectTabStop("world-restore-22222222222222222222222222222222-overwritten", true);
+            try std.testing.expectEqualDeep(footer, try WorldsTextFrame.expectFooter());
             if (size.h == 400) {
-                // The title must move up or be culled after leaving the viewport.
                 const first = &WorldsTextFrame.observed[0];
-                try std.testing.expect(first.count == 0 or first.fragments[0].rect.y < top_y - 1);
+                try std.testing.expect(first.count == 0 or @abs(first.fragments[0].rect.y - top_y) < 1);
             }
-            try WorldsTextFrame.scrollPage(100000);
-            try WorldsTextFrame.expectLines(0, 4, size, font_size);
-            try std.testing.expect(ui.failure == null and ui.draft == null);
-            try std.testing.expect(ui.requests.items.len == 0 and ui.directory_open == null);
-            try std.testing.expect(!ui.refresh_queued and !ui.cancel_queued and !ui.select_queued);
+            // A retained failure occupies the body without displacing the actions.
+            ui.failure = error.PermissionDenied;
+            try dvui.testing.settle(WorldsTextFrame.draw);
+            try std.testing.expectEqualDeep(footer, try WorldsTextFrame.expectFooter());
+            ui.failure = null;
+            try dvui.testing.settle(WorldsTextFrame.draw);
+            try WorldsTextFrame.toggleBackups();
+            try std.testing.expect(dvui.tagGet("world-recovery-list") == null);
+            try std.testing.expect(dvui.tagGet(restore_tag) == null);
+            try std.testing.expectEqualDeep(footer, try WorldsTextFrame.expectFooter());
+
+            try WorldsTextFrame.toggleBackups();
+            // The instance backup repository stays visible when the live world changes.
+            try WorldsTextFrame.clickTag("world-card-world-gypQ", true);
+            try std.testing.expect(ui.backups_expanded);
+            try WorldsTextFrame.clickTag("world-card-filler", true);
+            try std.testing.expectEqualStrings("filler", ui.selected_world.?);
+            try std.testing.expect(ui.backups_expanded);
+            try std.testing.expect(dvui.tagGet("world-backups-toggle") != null);
+            try std.testing.expect(dvui.tagGet("world-recovery-list") != null);
+            try std.testing.expect(dvui.tagGet(restore_tag) != null);
+            _ = try WorldsTextFrame.expectFooter();
+            try WorldsTextFrame.clickTag("world-card-world-gypQ", true);
+            try std.testing.expect(ui.backups_expanded);
+            try std.testing.expect(dvui.tagGet("world-backups-toggle") != null);
+            try std.testing.expect(dvui.tagGet("world-recovery-list") != null);
+            try WorldsTextFrame.toggleBackups();
+            try WorldsTextFrame.expectNoIntents();
+
+            // A running instance keeps inspection available and blocks every mutation.
+            if (size.w == 1280) {
+                try WorldsTextFrame.toggleBackups();
+                try coordinator.reserveLaunch(WorldsTextFrame.source.id);
+                try dvui.testing.settle(WorldsTextFrame.draw);
+                try WorldsTextFrame.expectMutationControls(false);
+                try WorldsTextFrame.expectTabStop("world-open", true);
+                try WorldsTextFrame.expectTabStop(restore_tag, false);
+                for (WorldsTextFrame.mutation_tags) |tag| try WorldsTextFrame.clickTag(tag, false);
+                try WorldsTextFrame.clickTag(restore_tag, false);
+                try WorldsTextFrame.expectNoIntents();
+                coordinator.releaseLaunch();
+                coordinator.tick();
+
+                // The world lock is separate from the instance running guard.
+                manager.published.?.result.world_list.?.items[0].access = .in_use;
+                try dvui.testing.settle(WorldsTextFrame.draw);
+                try WorldsTextFrame.scrollPage(100000);
+                try WorldsTextFrame.expectLines(6, 7, size, font_size);
+                try std.testing.expect(!WorldsTextFrame.playing_card_has_date);
+                try std.testing.expect(WorldsTextFrame.playing_status_accent);
+                try WorldsTextFrame.expectMutationControls(false);
+                try WorldsTextFrame.expectTabStop("world-open", true);
+                for (WorldsTextFrame.mutation_tags) |tag| try WorldsTextFrame.clickTag(tag, false);
+                try WorldsTextFrame.expectTabStop(restore_tag, false);
+                try WorldsTextFrame.clickTag(restore_tag, false);
+                try WorldsTextFrame.expectNoIntents();
+                manager.published.?.result.world_list.?.items[0].access = .available;
+
+                // A pending scan retains selectable cards but disables modifications.
+                try manager.refresh();
+                try dvui.testing.settle(WorldsTextFrame.draw);
+                try WorldsTextFrame.expectMutationControls(false);
+                try WorldsTextFrame.expectTabStop("world-open", true);
+                for (WorldsTextFrame.mutation_tags) |tag| try WorldsTextFrame.clickTag(tag, false);
+                try WorldsTextFrame.clickTag("world-card-filler", true);
+                try std.testing.expectEqualStrings("filler", ui.selected_world.?);
+                try WorldsTextFrame.clickTag("world-card-world-gypQ", true);
+                try std.testing.expect(ui.backups_expanded);
+                try WorldsTextFrame.clickTag(restore_tag, false);
+                try WorldsTextFrame.expectNoIntents();
+                manager.cancel();
+
+                WorldsTextFrame.controls_enabled = false;
+                try dvui.testing.settle(WorldsTextFrame.draw);
+                try WorldsTextFrame.expectMutationControls(false);
+                try WorldsTextFrame.clickTag("world-card-filler", false);
+                try WorldsTextFrame.clickTag("world-open", false);
+                try WorldsTextFrame.clickTag(restore_tag, false);
+                try std.testing.expectEqualStrings("world-gypQ", ui.selected_world.?);
+                try WorldsTextFrame.expectNoIntents();
+                WorldsTextFrame.controls_enabled = true;
+            }
             try std.testing.expect(!manager.snapshot().worker_active);
             try std.testing.expectEqual(@as(usize, 0), registry.entries.items.len);
         }
@@ -2094,12 +3559,14 @@ test "UI layout real World and recovery metadata font lines are not clipped at c
 }
 
 const AccountEditorFrame = struct {
-    const validation_text = "名称须为 3–16 位字母、数字或下划线";
+    const validation_text = "用户名须为 3–16 位字母、数字或下划线";
+    const labels = [_][]const u8{ "取消", "离线登录", "微软登录" };
+    const tags = [_][]const u8{ "account-cancel", "account-offline-login", "account-microsoft-login" };
     const Footer = struct { id: dvui.Id, parent_id: dvui.Id, window_id: dvui.Id, label_id: dvui.Id, rect: dvui.Rect.Physical, text: dvui.Rect.Physical, clip: dvui.Rect.Physical };
     var ui: *accounts_view.Ui = undefined;
     var store: *config.Store = undefined;
     var manager: *accounts_manager.Manager = undefined;
-    var footers: [2]?Footer = @splat(null);
+    var footers: [labels.len]?Footer = @splat(null);
     var validation_bytes: [128]u8 = undefined;
     var validation_length: usize = 0;
     var validation_fragments: [16]RenderedTextBounds = undefined;
@@ -2125,7 +3592,7 @@ const AccountEditorFrame = struct {
         {
             const root = dvui.box(@src(), .{}, .{ .expand = .both, .padding = dvui.Rect.all(12) });
             defer root.deinit();
-            accounts_view.draw(ui, store, manager);
+            accounts_view.draw(ui, store, manager, null);
         }
         const capture = dvui.debug.lastCapture() orelse return error.AccountEditorCaptureMissing;
         var floating: ?dvui.Debug.CapturedWidget = null;
@@ -2138,32 +3605,21 @@ const AccountEditorFrame = struct {
         const modal_id = (floating orelse return error.AccountEditorModalMissing).id;
         const modal = win.subwindows.get(modal_id) orelse return error.AccountEditorModalMissing;
         try std.testing.expect(modal.modal and modal.used);
-        var footer: ?dvui.Debug.CapturedWidget = null;
-        for (capture.widgets.items) |widget| {
-            if (widget.subwindow_id != modal_id or
-                !std.mem.eql(u8, widget.name orelse continue, "Box") or
-                !std.mem.eql(u8, widget.src_fn, "drawEditor") or
-                !std.mem.endsWith(u8, widget.src_file, "accounts_view.zig")) continue;
-            try uniqueWidget(&footer, widget);
+        var controls: [tags.len]dvui.Debug.CapturedWidget = undefined;
+        for (tags, 0..) |tag_name, index| {
+            const tag = try dvui.testing.tagGet(tag_name);
+            var button: ?dvui.Debug.CapturedWidget = null;
+            for (capture.widgets.items) |widget| {
+                if (widget.id != tag.id) continue;
+                try std.testing.expectEqual(modal_id, widget.subwindow_id);
+                try std.testing.expectEqualStrings("Button", widget.name orelse "");
+                try std.testing.expectEqualStrings("drawEditor", widget.src_fn);
+                try std.testing.expect(std.mem.endsWith(u8, widget.src_file, "accounts_view.zig"));
+                try uniqueWidget(&button, widget);
+            }
+            controls[index] = button orelse return error.AccountEditorFooterMissing;
+            try std.testing.expectEqual(tag.rect, controls[index].rect_border);
         }
-        const footer_id = (footer orelse return error.AccountEditorFooterContainerMissing).id;
-        var buttons: [2]?dvui.Debug.CapturedWidget = @splat(null);
-        for (capture.widgets.items) |widget| {
-            if (widget.subwindow_id != modal_id or widget.parent_id != footer_id or
-                !std.mem.eql(u8, widget.name orelse continue, "Button") or
-                !std.mem.eql(u8, widget.src_fn, "formActions") or
-                !std.mem.endsWith(u8, widget.src_file, "components.zig")) continue;
-            const index: usize = switch (widget.style) {
-                .control => 0,
-                .highlight => 1,
-                else => return error.AccountEditorFooterStyleUnexpected,
-            };
-            try uniqueWidget(&buttons[index], widget);
-        }
-        const controls: [2]dvui.Debug.CapturedWidget = .{
-            buttons[0] orelse return error.AccountEditorCancelMissing,
-            buttons[1] orelse return error.AccountEditorSaveMissing,
-        };
         // Inspect only the identified account modal, never overlapping base widgets.
         try observe(modal.render_cmds.items, modal_id, controls);
         try observe(modal.render_cmds_after.items, modal_id, controls);
@@ -2181,7 +3637,7 @@ const AccountEditorFrame = struct {
         } else found.* = widget;
     }
 
-    fn observe(commands: []const dvui.RenderCommand, modal_id: dvui.Id, controls: [2]dvui.Debug.CapturedWidget) !void {
+    fn observe(commands: []const dvui.RenderCommand, modal_id: dvui.Id, controls: [labels.len]dvui.Debug.CapturedWidget) !void {
         const capture = dvui.debug.lastCapture() orelse return error.AccountEditorCaptureMissing;
         for (commands) |command| switch (command.cmd) {
             .text => |text| {
@@ -2194,13 +3650,22 @@ const AccountEditorFrame = struct {
                     validation_fragments[validation_count] = .{ .rect = text.rs.r, .clip = command.clip, .font_height = text.font.textHeight() * text.rs.s };
                     validation_count += 1;
                 }
-                for (FormFrame.labels, 0..) |label, index| if (std.mem.eql(u8, text.text, label)) {
+                for (labels, 0..) |label, index| if (std.mem.eql(u8, text.text, label)) {
                     const widget = controls[index];
-                    var owned_label: ?dvui.Debug.CapturedWidget = null;
+                    var row: ?dvui.Debug.CapturedWidget = null;
                     for (capture.widgets.items) |child| {
                         if (child.subwindow_id != modal_id or child.parent_id != widget.id or
+                            !std.mem.eql(u8, child.name orelse continue, "Box") or
+                            !std.mem.eql(u8, child.src_fn, "button") or
+                            !std.mem.endsWith(u8, child.src_file, "components.zig")) continue;
+                        try uniqueWidget(&row, child);
+                    }
+                    const row_id = (row orelse return error.AccountEditorFooterRowMissing).id;
+                    var owned_label: ?dvui.Debug.CapturedWidget = null;
+                    for (capture.widgets.items) |child| {
+                        if (child.subwindow_id != modal_id or child.parent_id != row_id or
                             !std.mem.eql(u8, child.name orelse continue, "Label") or
-                            !std.mem.eql(u8, child.src_fn, "formButton") or
+                            !std.mem.eql(u8, child.src_fn, "button") or
                             !std.mem.endsWith(u8, child.src_file, "components.zig") or
                             !JavaFrame.contains(child.rect_content, text.rs.r.center())) continue;
                         try uniqueWidget(&owned_label, child);
@@ -2219,6 +3684,9 @@ const AccountEditorFrame = struct {
 
     fn visibleFooter(index: usize) !Footer {
         const footer = footers[index] orelse return error.AccountEditorFooterMissing;
+        const tag = try dvui.testing.tagGet(tags[index]);
+        try std.testing.expect(tag.visible);
+        try std.testing.expectEqual(footer.id, tag.id);
         const modal = dvui.currentWindow().subwindows.get(footer.window_id) orelse return error.AccountEditorModalMissing;
         // endFrame resets used; draw already verified live modal ownership.
         try std.testing.expect(modal.modal);
@@ -2230,8 +3698,8 @@ const AccountEditorFrame = struct {
         for (dvui.currentWindow().tab_index_prev.items) |entry| if (entry.widgetId == footer.id and entry.windowId == footer.window_id) {
             registered += 1;
         };
-        // Invalid names retain a reachable Cancel and a disabled Save.
-        try std.testing.expectEqual(@as(usize, if (index == 0) 1 else 0), registered);
+        // Name validation happens on submission; all three actions stay reachable.
+        try std.testing.expectEqual(@as(usize, 1), registered);
         return footer;
     }
 
@@ -2253,7 +3721,7 @@ const AccountEditorFrame = struct {
     }
 };
 
-test "UI layout real account editor keeps full validation and footer visible with native draft cancellation" {
+test "UI layout real account editor keeps submission errors and three footer actions visible with native cancellation" {
     if (dvui.Backend.kind != .testing) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2284,21 +3752,71 @@ test "UI layout real account editor keeps full validation and footer visible wit
             @memset(&ui.draft.name, 0);
             @memcpy(ui.draft.name[0..invalid_name.len], invalid_name);
             try dvui.testing.settle(AccountEditorFrame.draw);
-            const cancel = try AccountEditorFrame.visibleFooter(0);
-            const save = try AccountEditorFrame.visibleFooter(1);
+            var controls: [AccountEditorFrame.labels.len]AccountEditorFrame.Footer = undefined;
+            for (&controls, 0..) |*control, index| control.* = try AccountEditorFrame.visibleFooter(index);
+            try std.testing.expect(ui.failure == null and ui.pending == null);
+            try std.testing.expectEqual(@as(usize, 0), AccountEditorFrame.validation_count);
+            try std.testing.expectEqual(@as(usize, 0), AccountEditorFrame.validation_length);
+            _ = try window.window.addEventMouseMotion(.{ .pt = .{ .x = size.w / 2, .y = size.h / 2 } });
+            _ = try window.window.addEventMouseWheel(-100000, .vertical, null);
+            try dvui.testing.settle(AccountEditorFrame.draw);
+            try std.testing.expectEqual(@as(usize, 0), AccountEditorFrame.validation_count);
+            for (controls, 0..) |control, index| try std.testing.expectEqual(control.rect, (try AccountEditorFrame.visibleFooter(index)).rect);
+            // An invalid name remains editable and is validated by the real submit action.
+            try AccountEditorFrame.click(1);
+            try std.testing.expect(ui.pending != null and ui.pending.?.action == .save and ui.editor_open);
+            try std.testing.expectEqualStrings(invalid_name, ui.pending.?.text.?);
+            accounts_view.finish(&ui, &store, &manager);
+            try std.testing.expect(ui.pending == null and ui.editor_open);
+            try std.testing.expectEqual(error.InvalidAccountName, ui.failure.?);
+            try std.testing.expectEqualStrings(invalid_name, std.mem.sliceTo(&ui.draft.name, 0));
+            try dvui.testing.settle(AccountEditorFrame.draw);
             if (size.h >= 400) try AccountEditorFrame.expectValidation();
             _ = try window.window.addEventMouseMotion(.{ .pt = .{ .x = size.w / 2, .y = size.h / 2 } });
             _ = try window.window.addEventMouseWheel(-100000, .vertical, null);
             try dvui.testing.settle(AccountEditorFrame.draw);
             try AccountEditorFrame.expectValidation();
-            try std.testing.expectEqual(cancel.rect, (try AccountEditorFrame.visibleFooter(0)).rect);
-            try std.testing.expectEqual(save.rect, (try AccountEditorFrame.visibleFooter(1)).rect);
-            try AccountEditorFrame.click(1);
-            try std.testing.expect(ui.pending == null and ui.editor_open);
-            try AccountEditorFrame.click(0);
-            try std.testing.expect(ui.pending != null and ui.editor_open);
+            for (controls, 0..) |control, index| try std.testing.expectEqual(control.rect, (try AccountEditorFrame.visibleFooter(index)).rect);
+            // Tab reaches every action, including offline submission despite the invalid draft.
+            var visited: [AccountEditorFrame.labels.len]bool = @splat(false);
+            const tab_steps = window.window.tab_index_prev.items.len + 1;
+            for (0..tab_steps) |_| {
+                try dvui.testing.pressKey(.tab, .none);
+                try dvui.testing.settle(AccountEditorFrame.draw);
+                for (controls, 0..) |control, index| if (dvui.focusedWidgetId() == control.id) {
+                    visited[index] = true;
+                };
+                try std.testing.expect(ui.pending == null and ui.editor_open);
+            }
+            for (visited) |seen| try std.testing.expect(seen);
+            for (0..tab_steps) |_| {
+                if (dvui.focusedWidgetId() == controls[1].id) break;
+                try dvui.testing.pressKey(.tab, .none);
+                try dvui.testing.settle(AccountEditorFrame.draw);
+            }
+            try std.testing.expectEqual(controls[1].id, dvui.focusedWidgetId().?);
+            try dvui.testing.pressKey(.enter, .none);
+            try dvui.testing.settle(AccountEditorFrame.draw);
+            try std.testing.expect(ui.pending != null and ui.pending.?.action == .save);
+            accounts_view.finish(&ui, &store, &manager);
+            try std.testing.expectEqual(error.InvalidAccountName, ui.failure.?);
+            try std.testing.expectEqualStrings(invalid_name, std.mem.sliceTo(&ui.draft.name, 0));
+            if (font_size == 16) {
+                try AccountEditorFrame.click(0);
+            } else {
+                for (0..tab_steps) |_| {
+                    if (dvui.focusedWidgetId() == controls[0].id) break;
+                    try dvui.testing.pressKey(.tab, .none);
+                    try dvui.testing.settle(AccountEditorFrame.draw);
+                }
+                try std.testing.expectEqual(controls[0].id, dvui.focusedWidgetId().?);
+                try dvui.testing.pressKey(.enter, .none);
+                try dvui.testing.settle(AccountEditorFrame.draw);
+            }
+            try std.testing.expect(ui.pending != null and ui.pending.?.action == .close_editor and ui.editor_open);
             accounts_view.finish(&ui, &store, &manager);
             try std.testing.expect(ui.pending == null and !ui.editor_open and ui.failure == null);
+            try std.testing.expectEqualStrings("", std.mem.sliceTo(&ui.draft.name, 0));
             try std.testing.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
             try std.testing.expect(store.snapshot().selected_account == null);
             try std.testing.expect(!manager.snapshot().busy);
@@ -2306,142 +3824,132 @@ test "UI layout real account editor keeps full validation and footer visible wit
     }
 }
 
-test "UI layout first Content visit preserves the real pack review handoff" {
-    if (comptime dvui.Backend.kind != .testing) return error.SkipZigTest;
-    try @import("gui_acceptance.zig").testFirstContentReviewHandoff();
-}
+const FixedModalFrame = struct {
+    var custom_header = false;
+    var open = true;
+    var clicks: usize = 0;
+    var rect: dvui.Rect = .{};
+    var id: dvui.Id = undefined;
 
-test "UI layout pack content hold allows first navigation and normal cancellation" {
-    if (comptime dvui.Backend.kind != .testing) return error.SkipZigTest;
-    try @import("gui_acceptance.zig").testPackContentHoldFirstNavigation();
-}
-
-const ContentManualFrame = struct {
-    const content = @import("ui/content_manager.zig");
-    const modal_view = @import("ui/content_view.zig");
-    const labels = [_][]const u8{
-        "Included archive file · source verified",
-        "Included archive file · source needs verification",
-        "Local source verified",
-        "missing_url",
-        "distribution_disabled",
-        "Official download page",
-        "/tmp/source.jar",
-    };
-    var ui: *modal_view.Ui = undefined;
-    var service: *content.Manager = undefined;
-    var document: *const config.Document = undefined;
-    var seen: [labels.len]bool = @splat(false);
-
-    fn rejectPicker(_: ?*anyopaque, _: std.mem.Allocator, _: modal_view.PickerKind) anyerror!?[:0]const u8 {
-        return error.UnexpectedPicker;
-    }
-    fn rejectLease(_: ?*anyopaque, _: []const u8) anyerror!void {
-        return error.UnexpectedLease;
-    }
-    fn releaseLease(_: ?*anyopaque, _: []const u8) void {
-        unreachable;
-    }
-    fn observe(commands: []const dvui.RenderCommand) void {
-        for (commands) |command| switch (command.cmd) {
-            .text => |text| {
-                for (labels, 0..) |label, index| {
-                    if (std.mem.indexOf(u8, text.text, label) != null) seen[index] = true;
-                }
-            },
-            else => {},
-        };
-    }
     fn draw() !dvui.App.Result {
-        const win = dvui.currentWindow();
-        var commands: std.ArrayList(dvui.RenderCommand) = .empty;
-        defer commands.deinit(win.arena());
-        const previous_commands = win.defer_render_cmds;
-        const previous_rendering = win.render_target.rendering;
-        win.defer_render_cmds = &commands;
-        win.render_target.rendering = false;
-        defer {
-            win.defer_render_cmds = previous_commands;
-            win.render_target.rendering = previous_rendering;
+        const modal = if (custom_header)
+            components.modalPanel(@src(), "固定弹窗", 560, &open)
+        else
+            components.modalWithClose(@src(), "固定弹窗", 280, &open);
+        defer modal.deinit();
+        rect = modal.data().rect;
+        id = modal.data().id;
+        if (custom_header) components.title(@src(), "自定义标题");
+        const body = dvui.box(@src(), .{}, .{ .expand = .both });
+        body.deinit();
+        if (components.button(@src(), "关闭", .{ .tag = "fixed-modal-close" })) clicks += 1;
+        return .ok;
+    }
+
+    fn expectCentered(size: dvui.Size) !void {
+        try std.testing.expectApproxEqAbs(size.w / 2, rect.x + rect.w / 2, 0.1);
+        try std.testing.expectApproxEqAbs(size.h / 2, rect.y + rect.h / 2, 0.1);
+        try std.testing.expect(rect.x >= 16 and rect.y >= 16);
+        try std.testing.expect(rect.x + rect.w <= size.w - 16 + 0.1);
+        try std.testing.expect(rect.y + rect.h <= size.h - 16 + 0.1);
+    }
+};
+
+test "UI layout fixed modals stay centered through resize and ignore mouse dragging" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |custom_header| {
+        for ([_]f32{ 1, 2 }) |scale| {
+            FixedModalFrame.custom_header = custom_header;
+            FixedModalFrame.open = true;
+            FixedModalFrame.clicks = 0;
+            var window = try dvui.testing.init(.{ .window_size = .{ .w = 1280, .h = 720 } });
+            defer window.deinit();
+            for ([_]dvui.Size{ .{ .w = 1280, .h = 720 }, .{ .w = 640, .h = 400 }, .{ .w = 420, .h = 300 }, .{ .w = 1560, .h = 900 } }) |size| {
+                window.backend.size = .cast(size);
+                window.backend.size_pixels = size.scale(scale, dvui.Size.Physical);
+                _ = try dvui.testing.step(FixedModalFrame.draw);
+                try dvui.testing.settle(FixedModalFrame.draw);
+                try FixedModalFrame.expectCentered(size);
+                const before = FixedModalFrame.rect;
+                // Exercise both the header and unused body: DVUI normally drags either.
+                for ([_]f32{ 30, before.h / 2 }) |offset| {
+                    const start: dvui.Point.Physical = .{ .x = (before.x + 100) * scale, .y = (before.y + offset) * scale };
+                    _ = try window.window.addEventMouseMotion(.{ .pt = start });
+                    try dvui.testing.settle(FixedModalFrame.draw);
+                    _ = try window.window.addEventMouseButton(.left, .press);
+                    try dvui.testing.settle(FixedModalFrame.draw);
+                    try std.testing.expect(!dvui.captured(FixedModalFrame.id));
+                    _ = try window.window.addEventMouseMotion(.{ .pt = .{ .x = start.x + 50 * scale, .y = start.y + 30 * scale } });
+                    try dvui.testing.settle(FixedModalFrame.draw);
+                    _ = try window.window.addEventMouseButton(.left, .release);
+                    try dvui.testing.settle(FixedModalFrame.draw);
+                    try std.testing.expectEqual(before, FixedModalFrame.rect);
+                    try FixedModalFrame.expectCentered(size);
+                }
+                try dvui.testing.moveTo("fixed-modal-close");
+                try dvui.testing.settle(FixedModalFrame.draw);
+                try dvui.testing.click(.left);
+                try dvui.testing.settle(FixedModalFrame.draw);
+            }
+            try std.testing.expect(FixedModalFrame.open);
+            try std.testing.expectEqual(@as(usize, 4), FixedModalFrame.clicks);
         }
-        seen = @splat(false);
-        try modal_view.drawModal(ui, document, service);
-        observe(commands.items);
-        for (win.subwindows.stack.items) |subwindow| {
-            observe(subwindow.render_cmds.items);
-            observe(subwindow.render_cmds_after.items);
+    }
+}
+
+const FixedAlertFrame = struct {
+    var pending = true;
+
+    fn draw() !dvui.App.Result {
+        if (pending) {
+            pending = false;
+            components.alert(@src(), "无法启动游戏", "请选择可用的游戏实例，然后重新启动游戏。");
         }
         return .ok;
     }
 };
 
-test "UI layout content manual rows render archive and checked sources without remote fallback" {
-    if (comptime dvui.Backend.kind != .testing) return error.SkipZigTest;
-    const content = @import("ui/content_manager.zig");
-    const modal_view = @import("ui/content_view.zig");
-    const manifest = @import("core/content_manifest.zig");
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    var paths = try instances.Paths.init(a, io, root);
-    defer paths.deinit();
-    var registry = tasks.Registry.init(a);
-    defer registry.deinit();
-    var service = try content.Manager.init(a, io, &paths, &registry, .{ .context = null, .acquire = ContentManualFrame.rejectLease, .recheck = ContentManualFrame.rejectLease, .release = ContentManualFrame.releaseLease });
-    defer service.deinit();
-    const source: config.Instance = .{ .id = "fixture-content", .name = "Fixture", .minecraft_version = "1.21" };
-    const document: config.Document = .{ .instances = &.{source}, .selected_instance = source.id };
-    // Set an owned selection without starting the manager's local snapshot worker.
-    const Selection = @typeInfo(@typeInfo(@TypeOf(service.selected)).optional.child).pointer.child;
-    service.selected = try a.create(Selection);
-    service.selected.?.* = .{ .arena = .init(a), .instance = source };
-    ContentManualFrame.service = &service;
-    ContentManualFrame.document = &document;
-    for (0..10) |scenario| {
-        const archive = scenario < 2;
-        const checked = scenario == 0 or scenario == 4 or scenario == 8 or scenario == 9;
-        var file: manifest.InstallFile = .{ .record = .{ .path = if (archive) "config/fixture-pack.cfg" else "mods/manual.jar", .provider = if (archive) .modrinth else .curseforge, .project_id = "12", .version_id = "34", .hashes = .{}, .identity_provenance = if (archive) .pack_override else .official_file, .role = if (archive or scenario == 7) .override else .content }, .download = .{ .manual_required = .{ .official_page = if (archive or scenario == 6 or scenario == 7) "" else "https://www.curseforge.com/minecraft/mc-mods/example/files/34", .reason = if (scenario == 3) .distribution_disabled else .missing_url } } };
-        if (scenario == 5) {
-            file.required = false;
-            file.selected = true;
-        }
-        const status: content.ManualSourceStatus = .{ .path = file.record.path, .source_absolute_path = "/tmp/source.jar", .verified = true };
-        const proposal: content.Proposal = .{ .files = &.{file}, .plan = .{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = source.id, .pack_version = "v1" }, .ready = checked, .fully_applied = checked }, .manual_source_status = if (checked) &.{status} else &.{} };
-        var ui = try modal_view.Ui.initOptions(a, .{ .picker_runner = .{ .pick = ContentManualFrame.rejectPicker } });
-        defer ui.deinit();
-        ui.draft = .{ .arena = .init(a), .source = source, .proposal = proposal, .candidates = &.{}, .issues = &.{}, .manual = &.{} };
-        const aa = ui.draft.?.arena.allocator();
-        const Manual = @typeInfo(@TypeOf(ui.draft.?.manual)).pointer.child;
-        ui.draft.?.manual = try aa.alloc(Manual, 1);
-        ui.draft.?.manual[0] = .{ .path = file.record.path, .source_dirty = scenario == 8 };
-        const source_path = "/tmp/source.jar";
-        @memcpy(ui.draft.?.manual[0].absolute[0..source_path.len], source_path);
-        ui.draft.?.dirty = scenario == 9;
-        if (scenario == 5) try ui.draft.?.optional.append(aa, .{ .path = file.record.path, .include = false });
-        ContentManualFrame.ui = &ui;
-        var window = try dvui.testing.init(.{ .window_size = .{ .w = 1200, .h = 1000 } });
+test "UI layout fixed modals include queued launch alerts and preserve confirmation" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |keyboard| {
+        FixedAlertFrame.pending = true;
+        var window = try dvui.testing.init(.{ .window_size = .{ .w = 1280, .h = 720 } });
         defer window.deinit();
-        window.backend.size_pixels = .{ .w = 1200, .h = 1000 };
-        try dvui.testing.settle(ContentManualFrame.draw);
-        const seen = ContentManualFrame.seen;
-        std.debug.print("manual scenario {d}: labels={any}\n", .{ scenario, seen });
-        const external_required = !archive and scenario != 4 and scenario != 5 and scenario != 9;
-        try std.testing.expectEqual(scenario == 0, seen[0]);
-        try std.testing.expectEqual(scenario == 1, seen[1]);
-        try std.testing.expectEqual(scenario == 4 or scenario == 9, seen[2]);
-        try std.testing.expectEqual(external_required and scenario != 3, seen[3]);
-        try std.testing.expectEqual(scenario == 3, seen[4]);
-        try std.testing.expectEqual(external_required and scenario != 6 and scenario != 7, seen[5]);
-        try std.testing.expectEqual(external_required, seen[6]);
-        var local_inputs: usize = 0;
-        for (window.window.tab_index_prev.items) |entry| {
-            if (dvui.dataGet(null, entry.widgetId, "_edited_outside", bool) != null) local_inputs += 1;
+        try dvui.testing.settle(FixedAlertFrame.draw);
+        try std.testing.expectEqual(@as(usize, 1), window.window.dialogs.stack.items.len);
+        const modal_id = window.window.subwindows.focused().?.id;
+        for ([_]dvui.Size{ .{ .w = 1280, .h = 720 }, .{ .w = 640, .h = 400 }, .{ .w = 420, .h = 300 }, .{ .w = 1560, .h = 900 } }) |size| {
+            window.backend.size = .cast(size);
+            window.backend.size_pixels = .cast(size);
+            _ = try dvui.testing.step(FixedAlertFrame.draw);
+            try dvui.testing.settle(FixedAlertFrame.draw);
+            const before = window.window.subwindows.get(modal_id).?.rect;
+            FixedModalFrame.rect = before;
+            try FixedModalFrame.expectCentered(size);
+            for ([_]f32{ 30, before.h / 2 }) |offset| {
+                const start: dvui.Point.Physical = .{ .x = before.x + 100, .y = before.y + offset };
+                _ = try window.window.addEventMouseMotion(.{ .pt = start });
+                try dvui.testing.settle(FixedAlertFrame.draw);
+                _ = try window.window.addEventMouseButton(.left, .press);
+                try dvui.testing.settle(FixedAlertFrame.draw);
+                try std.testing.expect(!dvui.captured(modal_id));
+                _ = try window.window.addEventMouseMotion(.{ .pt = .{ .x = start.x + 50, .y = start.y + 30 } });
+                try dvui.testing.settle(FixedAlertFrame.draw);
+                _ = try window.window.addEventMouseButton(.left, .release);
+                try dvui.testing.settle(FixedAlertFrame.draw);
+                try std.testing.expectEqual(before, window.window.subwindows.get(modal_id).?.rect);
+            }
+            try std.testing.expect(dvui.tagGet("alert-confirm").?.visible);
         }
-        try std.testing.expectEqual(@as(usize, if (external_required) 1 else 0), local_inputs);
-        try std.testing.expect(ui.picker == null and ui.pending == null);
-        try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
+        try dvui.testing.moveTo("alert-confirm");
+        try dvui.testing.settle(FixedAlertFrame.draw);
+        if (keyboard) {
+            dvui.focusWidget(dvui.tagGet("alert-confirm").?.id, modal_id, null);
+            try dvui.testing.pressKey(.enter, .none);
+        } else {
+            try dvui.testing.click(.left);
+        }
+        try dvui.testing.settle(FixedAlertFrame.draw);
+        try std.testing.expectEqual(@as(usize, 0), window.window.dialogs.stack.items.len);
     }
 }

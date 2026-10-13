@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+exec nix develop "$repo_dir" --command nix shell \
+  nixpkgs#cage nixpkgs#grim nixpkgs#wtype nixpkgs#fontconfig nixpkgs#procps \
+  --command python3 "$repo_dir/scripts/ui_shot.py" "$@" --_prepared

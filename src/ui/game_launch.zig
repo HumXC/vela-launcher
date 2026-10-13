@@ -26,7 +26,7 @@ pub const Snapshot = struct {
     debug: bool,
     attempt_id: u64,
 };
-pub const Request = struct { version: []const u8, java_path: []const u8, java_major: u32, username: []const u8, max_memory_mb: u32 = 2048 };
+pub const Request = struct { version: []const u8, java_path: []const u8, java_major: u32, username: []const u8, min_memory_mb: ?u32 = null, max_memory_mb: u32 = 2048 };
 pub const ServerEndpoint = struct { address: []const u8, port: u16 = 25565 };
 pub const LaunchOptions = struct {
     /// Stable configuration ID and explicit launcher base opt into guarded recovery checks.
@@ -34,6 +34,9 @@ pub const LaunchOptions = struct {
     launcher_root: ?[]const u8 = null,
     instance_directory: ?[]const u8 = null,
     metadata_path: ?[]const u8 = null,
+    /// Resolve the required Java version in the worker from installed metadata.
+    resolve_java_from_metadata: bool = false,
+    java_candidates: []const java.Runtime = &.{},
     debug: bool = false,
     identity: ?launch.Identity = null,
     server: ?ServerEndpoint = null,
@@ -251,9 +254,13 @@ pub const Controller = struct {
     }
     fn startInner(self: *Controller, request: Request, options: LaunchOptions) !void {
         try metadata.version.validateId(request.version);
-        if (!std.fs.path.isAbsolute(request.java_path) or std.mem.indexOfScalar(u8, request.java_path, 0) != null) return error.AbsoluteJavaPathRequired;
-        if (request.java_major == 0) return error.InvalidJavaVersion;
+        if (!(options.resolve_java_from_metadata and request.java_path.len == 0) and
+            (!std.fs.path.isAbsolute(request.java_path) or std.mem.indexOfScalar(u8, request.java_path, 0) != null)) return error.AbsoluteJavaPathRequired;
+        if (request.java_major == 0 and !options.resolve_java_from_metadata) return error.InvalidJavaVersion;
         if (request.max_memory_mb == 0) return error.InvalidMemory;
+        if (request.min_memory_mb) |minimum| {
+            if (minimum == 0 or minimum > request.max_memory_mb) return error.InvalidMemory;
+        }
         if (request.username.len == 0 or request.username.len > 16) return error.InvalidUsername;
         for (request.username) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return error.InvalidUsername;
         if ((options.instance_id == null) != (options.launcher_root == null)) return error.IncompleteInstanceContext;
@@ -276,7 +283,7 @@ pub const Controller = struct {
         job.root = try a.dupe(u8, self.root);
         job.log_directory = try a.dupe(u8, self.log_directory);
         job.request.version = try a.dupe(u8, request.version);
-        job.request.java_path = try std.fs.path.resolve(a, &.{request.java_path});
+        job.request.java_path = if (request.java_path.len == 0) "" else try std.fs.path.resolve(a, &.{request.java_path});
         job.request.username = try a.dupe(u8, request.username);
         job.options = try cloneOptions(a, options);
         var secrets: std.ArrayList([]const u8) = .empty;
@@ -310,6 +317,13 @@ fn cloneOptions(a: std.mem.Allocator, options: LaunchOptions) !LaunchOptions {
     result.secrets = try cloneStrings(a, options.secrets);
     result.extra_jvm = try cloneStrings(a, options.extra_jvm);
     result.extra_game = try cloneStrings(a, options.extra_game);
+    const candidates = try a.alloc(java.Runtime, options.java_candidates.len);
+    for (options.java_candidates, candidates) |source, *dest| dest.* = .{
+        .path = try a.dupe(u8, source.path),
+        .major = source.major,
+        .vendor = try a.dupe(u8, source.vendor),
+    };
+    result.java_candidates = candidates;
     if (options.instance_id) |id| result.instance_id = try a.dupe(u8, id);
     if (options.launcher_root) |root| result.launcher_root = try a.dupe(u8, root);
     if (options.instance_directory) |path| result.instance_directory = try a.dupe(u8, path);
@@ -362,12 +376,25 @@ fn perform(job: *Job) !EndReason {
     defer loaded.deinit();
     const version = loaded.version.value;
     const required = metadata.version.requiredJavaMajor(version);
+    if (job.options.resolve_java_from_metadata) {
+        try job.checkCancel();
+        const required_major = std.math.cast(u32, required) orelse return error.InvalidJavaVersion;
+        const java_path = if (job.request.java_path.len != 0) job.request.java_path else blk: {
+            for (job.options.java_candidates) |candidate| {
+                if (java.compatible(candidate.major, required_major)) break :blk candidate.path;
+            }
+            return error.NoCompatibleJava;
+        };
+        if (!std.fs.path.isAbsolute(java_path) or std.mem.indexOfScalar(u8, java_path, 0) != null) return error.AbsoluteJavaPathRequired;
+        job.request.java_path = try std.fs.path.resolve(a, &.{java_path});
+        job.request.java_major = required_major;
+    }
     if (required != job.request.java_major) return error.JavaMajorMismatch;
     var assets = try library.loadAssets(a, job.io, job.root, (version.asset_index orelse return error.MissingAssetIndex).id);
     defer assets.deinit();
     var env = try library.hostEnvironment();
     const cpu_arch = @tagName(@import("builtin").cpu.arch);
-    var plan = try planner.build(a, version, assets.value, env, .{ .root = job.root, .instance_name = job.request.version, .game_directory = job.options.instance_directory, .native_arch = if (@sizeOf(usize) == 8) .bits64 else .bits32, .cpu_arch = cpu_arch });
+    var plan = try planner.buildInstalled(a, version, assets.value, env, .{ .root = job.root, .instance_name = job.request.version, .game_directory = job.options.instance_directory, .native_arch = if (@sizeOf(usize) == 8) .bits64 else .bits32, .cpu_arch = cpu_arch });
     defer plan.deinit();
     try validateLocalPlan(job, plan.value);
     try prepareNatives(job, plan.value, cpu_arch);
@@ -391,7 +418,7 @@ fn perform(job: *Job) !EndReason {
         features[env.features.len] = .{ .name = "has_custom_resolution", .enabled = true };
         env.features = features;
     }
-    var command = try launch.build(a, version, plan.value, env, .{ .root = job.root, .java_executable = job.request.java_path, .identity = job.options.identity orelse .{ .name = job.request.username, .uuid = &uuid }, .game_directory = job.options.instance_directory, .max_memory_mb = job.request.max_memory_mb, .extra_jvm = job.options.extra_jvm, .extra_game = game_args.items, .resolution_width = job.options.resolution_width, .resolution_height = job.options.resolution_height, .quick_play_path = quick_path, .quick_play_multiplayer = quick_play });
+    var command = try launch.build(a, version, plan.value, env, .{ .root = job.root, .java_executable = job.request.java_path, .identity = job.options.identity orelse .{ .name = job.request.username, .uuid = &uuid }, .game_directory = job.options.instance_directory, .min_memory_mb = job.request.min_memory_mb, .max_memory_mb = job.request.max_memory_mb, .extra_jvm = job.options.extra_jvm, .extra_game = game_args.items, .resolution_width = job.options.resolution_width, .resolution_height = job.options.resolution_height, .quick_play_path = quick_path, .quick_play_multiplayer = quick_play });
     defer command.deinit();
     // Command arguments contain credentials; never send argv to diagnostics.
     defer for (command.value.argv) |arg| std.crypto.secureZero(u8, @constCast(arg));
@@ -493,7 +520,7 @@ fn prepareNatives(job: *Job, plan: planner.Plan, cpu_arch: []const u8) !void {
             return error.NativeArchiveTooLarge;
         hashes[i] = try validateOpenFile(job, files[i], expected);
         if (!sameLocalFile(stats[i], try files[i].stat(job.io))) return error.IncompleteInstall;
-        try native_extract.inspectFile(a, job.io, files[i], cpu_arch, &job.canceled);
+        try native_extract.inspectFileWithFamily(a, job.io, files[i], cpu_arch, &job.canceled, check.classic_family);
         const after = try validateOpenFile(job, files[i], expected);
         if (!std.mem.eql(u8, &hashes[i], &after) or
             !sameLocalFile(stats[i], try files[i].stat(job.io))) return error.IncompleteInstall;
@@ -560,7 +587,7 @@ fn forceStop(child: *std.process.Child, io: std.Io) void {
     const old_protection = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(old_protection);
     if (@import("builtin").os.tag == .windows) {
-        _ = std.os.windows.ntdll.NtTerminateProcess(id, @enumFromInt(1));
+        _ = std.os.windows.ntdll.NtTerminateProcess(id, @fromBackingInt(@intCast(1)));
     } else {
         std.posix.kill(id, .KILL) catch {};
     }
@@ -623,6 +650,21 @@ test "controller rejects unsafe launch input and joins missing installation" {
     unsafe = request;
     unsafe.java_path = "java";
     try std.testing.expectError(error.AbsoluteJavaPathRequired, controller.start(unsafe));
+    unsafe = request;
+    unsafe.java_path = "";
+    try std.testing.expectError(error.AbsoluteJavaPathRequired, controller.start(unsafe));
+    unsafe = request;
+    unsafe.java_major = 0;
+    try std.testing.expectError(error.InvalidJavaVersion, controller.start(unsafe));
+    unsafe.java_path = "java";
+    try std.testing.expectError(error.AbsoluteJavaPathRequired, controller.startWithOptions(unsafe, .{ .resolve_java_from_metadata = true }));
+    unsafe.java_path = "/java\x00hidden";
+    try std.testing.expectError(error.AbsoluteJavaPathRequired, controller.startWithOptions(unsafe, .{ .resolve_java_from_metadata = true }));
+    unsafe = request;
+    unsafe.min_memory_mb = 0;
+    try std.testing.expectError(error.InvalidMemory, controller.start(unsafe));
+    unsafe.min_memory_mb = request.max_memory_mb + 1;
+    try std.testing.expectError(error.InvalidMemory, controller.start(unsafe));
     try controller.start(request);
     try std.testing.expectError(error.Busy, controller.start(request));
     try waitForTest(&controller);
@@ -1050,7 +1092,7 @@ test "fake Java receives real argv absolute cwd identity classpath and natives" 
     var controller = try Controller.init(std.testing.allocator, std.testing.io, path[0..len]);
     defer controller.deinit();
     var username = [_]u8{ 'P', 'l', 'a', 'y', 'e', 'r' };
-    try controller.start(.{ .version = "fixture", .java_path = java_path, .java_major = 21, .username = &username, .max_memory_mb = 3072 });
+    try controller.start(.{ .version = "fixture", .java_path = java_path, .java_major = 21, .username = &username, .min_memory_mb = 1024, .max_memory_mb = 3072 });
     username[0] = 'X';
     try waitForTest(&controller);
     try std.testing.expectEqual(Phase.exited, controller.snapshot().phase);
@@ -1060,6 +1102,7 @@ test "fake Java receives real argv absolute cwd identity classpath and natives" 
     const output = try tmp.dir.readFileAlloc(std.testing.io, log_name, std.testing.allocator, .limited(16 * 1024));
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.startsWith(u8, output, path[0..len]));
+    try std.testing.expect(std.mem.indexOf(u8, output, "-Xms1024M") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "-Xmx3072M") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Player") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Xlayer") == null);
@@ -1069,6 +1112,157 @@ test "fake Java receives real argv absolute cwd identity classpath and natives" 
     try std.testing.expect(std.mem.indexOf(u8, output, "versions/fixture/fixture.jar") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "versions/fixture/natives") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "net.minecraft.client.main.Main") != null);
+}
+
+test "deferred Java cancellation keeps reservation until worker join" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &path);
+    var gate: NativeWorkerGate = .{};
+    native_worker_gate = &gate;
+    defer native_worker_gate = null;
+    var vtable = io.vtable.*;
+    vtable.concurrent = NativeWorkerGate.concurrent;
+    const controlled_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    var guard: TestGuard = .{};
+    var controller = try Controller.initWithOptions(a, controlled_io, path[0..len], .{ .launch_guard = guard.callbacks() });
+    defer controller.deinit();
+    defer gate.release();
+    try controller.startWithOptions(.{ .version = "fixture", .java_path = "", .java_major = 0, .username = "Player" }, .{ .resolve_java_from_metadata = true });
+    gate.waitEntered();
+    controller.stop();
+    try std.testing.expect(guard.held and guard.released == 0);
+    gate.release();
+    try waitForTest(&controller);
+    try std.testing.expect(controller.takeEndEvent().?.reason == .stopped);
+    try std.testing.expect(!guard.held and guard.released == 1);
+    try std.testing.expect(controller.job.?.future == null);
+}
+
+test "deferred Java launch reads worker metadata without a published catalogue and owns candidates" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [4096]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &path);
+    const java_path = try std.fs.path.join(a, &.{ path[0..len], "fake-java" });
+    defer a.free(java_path);
+    var vendor = [_]u8{ 'F', 'i', 'x', 't', 'u', 'r', 'e' };
+    var candidates = [_]java.Runtime{
+        .{ .path = "/not/java8", .major = 8, .vendor = "Old" },
+        .{ .path = java_path, .major = 21, .vendor = &vendor },
+        .{ .path = "/not/second/java21", .major = 21, .vendor = "Later" },
+    };
+    var gate: NativeWorkerGate = .{};
+    native_worker_gate = &gate;
+    defer native_worker_gate = null;
+    var vtable = io.vtable.*;
+    vtable.concurrent = NativeWorkerGate.concurrent;
+    const controlled_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    var controller = try Controller.init(a, controlled_io, path[0..len]);
+    defer controller.deinit();
+    defer gate.release();
+    // Admission needs neither version metadata nor a catalogue snapshot.
+    try controller.startWithOptions(.{ .version = "fixture", .java_path = "", .java_major = 0, .username = "Player" }, .{ .resolve_java_from_metadata = true, .java_candidates = &candidates });
+    gate.waitEntered();
+    try std.testing.expectEqual(Phase.preparing, controller.snapshot().phase);
+    try std.testing.expectEqualStrings("", controller.job.?.request.java_path);
+    try std.testing.expectEqual(@as(u32, 0), controller.job.?.request.java_major);
+    try writeFixture(tmp.dir, 21);
+    try writeFakeJava(tmp.dir, 21, "printf launched > launched");
+    // Caller storage can change while the worker is waiting to load metadata.
+    java_path[java_path.len - 1] = 'X';
+    vendor[0] = 'X';
+    candidates[1].major = 8;
+    candidates[1].path = "/not/replacement/java";
+    try std.testing.expectEqualStrings("Fixture", controller.job.?.options.java_candidates[1].vendor);
+    gate.release();
+    try waitForTest(&controller);
+    try std.testing.expectEqual(Phase.exited, controller.snapshot().phase);
+    try std.testing.expectEqual(@as(u32, 21), controller.job.?.request.java_major);
+    const selected = try std.fs.path.join(a, &.{ path[0..len], "fake-java" });
+    defer a.free(selected);
+    try std.testing.expectEqualStrings(selected, controller.job.?.request.java_path);
+    _ = try tmp.dir.statFile(io, "launched", .{});
+}
+
+test "deferred Java keeps explicit binding and validates the real executable" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFixture(tmp.dir, 21);
+    try writeFakeJava(tmp.dir, 8, "printf launched > launched");
+    var candidate_tmp = std.testing.tmpDir(.{});
+    defer candidate_tmp.cleanup();
+    try writeFakeJava(candidate_tmp.dir, 21, "printf launched > launched");
+    var path: [4096]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &path);
+    var candidate_path: [4096]u8 = undefined;
+    const candidate_len = try candidate_tmp.dir.realPath(io, &candidate_path);
+    const bound_java = try std.fs.path.join(a, &.{ path[0..len], "fake-java" });
+    defer a.free(bound_java);
+    const compatible_java = try std.fs.path.join(a, &.{ candidate_path[0..candidate_len], "fake-java" });
+    defer a.free(compatible_java);
+    var controller = try Controller.init(a, io, path[0..len]);
+    defer controller.deinit();
+    var request: Request = .{ .version = "fixture", .java_path = bound_java, .java_major = 0, .username = "Player" };
+    const candidates = [_]java.Runtime{.{ .path = compatible_java, .major = 21, .vendor = "Fixture" }};
+    try controller.startWithOptions(request, .{ .resolve_java_from_metadata = true, .java_candidates = &candidates });
+    try waitForTest(&controller);
+    try std.testing.expectEqual(error.JavaMajorMismatch, controller.snapshot().failure.?);
+    try std.testing.expectEqualStrings(bound_java, controller.job.?.request.java_path);
+    try std.testing.expectEqual(@as(u32, 21), controller.job.?.request.java_major);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "launched", .{}));
+    try writeFakeJava(tmp.dir, 21, "printf launched > launched");
+    // An explicit binding works even when the candidate list is empty.
+    try controller.startWithOptions(request, .{ .resolve_java_from_metadata = true });
+    try waitForTest(&controller);
+    try std.testing.expectEqual(Phase.exited, controller.snapshot().phase);
+    try tmp.dir.deleteFile(io, "launched");
+    // Candidate registry metadata cannot authorize a mismatched executable.
+    try writeFakeJava(candidate_tmp.dir, 8, "printf launched > launched");
+    request.java_path = "";
+    try controller.startWithOptions(request, .{ .resolve_java_from_metadata = true, .java_candidates = &candidates });
+    try waitForTest(&controller);
+    try std.testing.expectEqual(error.JavaMajorMismatch, controller.snapshot().failure.?);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "launched", .{}));
+}
+
+test "deferred Java reports no compatible candidate and uses legacy metadata default" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFixture(tmp.dir, 21);
+    try writeFakeJava(tmp.dir, 8, "exit 0");
+    var path: [4096]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &path);
+    const java_path = try std.fs.path.join(a, &.{ path[0..len], "fake-java" });
+    defer a.free(java_path);
+    var controller = try Controller.init(a, io, path[0..len]);
+    defer controller.deinit();
+    const request: Request = .{ .version = "fixture", .java_path = "", .java_major = 0, .username = "Player" };
+    const candidates = [_]java.Runtime{.{ .path = java_path, .major = 8, .vendor = "Fixture" }};
+    try controller.startWithOptions(request, .{ .resolve_java_from_metadata = true });
+    try waitForTest(&controller);
+    try std.testing.expectEqual(error.NoCompatibleJava, controller.snapshot().failure.?);
+    try controller.startWithOptions(request, .{ .resolve_java_from_metadata = true, .java_candidates = &candidates });
+    try waitForTest(&controller);
+    try std.testing.expectEqual(error.NoCompatibleJava, controller.snapshot().failure.?);
+    try writeFixture(tmp.dir, null);
+    try controller.startWithOptions(request, .{ .resolve_java_from_metadata = true, .java_candidates = &candidates });
+    try waitForTest(&controller);
+    try std.testing.expectEqual(Phase.exited, controller.snapshot().phase);
+    try std.testing.expectEqual(@as(u32, 8), controller.job.?.request.java_major);
 }
 
 test "metadata and actual Java must both match exactly and partial data never launches" {
@@ -1143,7 +1337,7 @@ test "running child prevents duplicate launch and shutdown cancels wait and reap
     const pid = try std.fmt.parseInt(i32, pid_text, 10);
     controller.deinit();
     alive = false;
-    try std.testing.expectEqual(std.os.linux.E.SRCH, std.os.linux.errno(std.os.linux.kill(pid, @enumFromInt(0))));
+    try std.testing.expectEqual(std.os.linux.E.SRCH, std.os.linux.errno(std.os.linux.kill(pid, @fromBackingInt(@intCast(0)))));
 }
 
 const TestGuard = struct {
@@ -1328,7 +1522,7 @@ test "explicit stop reaps the child and releases reservation before terminal eve
     try std.testing.expect(controller.snapshot().failure == null);
     try std.testing.expect(!guard.held);
     try std.testing.expectEqual(@as(usize, 1), guard.released);
-    try std.testing.expectEqual(std.os.linux.E.SRCH, std.os.linux.errno(std.os.linux.kill(pid, @enumFromInt(0))));
+    try std.testing.expectEqual(std.os.linux.E.SRCH, std.os.linux.errno(std.os.linux.kill(pid, @fromBackingInt(@intCast(0)))));
 }
 
 test "instance launch context is paired bounded absolute and requires a reservation" {
@@ -1347,10 +1541,10 @@ test "instance launch context is paired bounded absolute and requires a reservat
     var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, root, .{ .launch_guard = guard.callbacks() });
     defer controller.deinit();
     try std.testing.expectError(error.UnsafeInstanceId, controller.startWithOptions(request, .{ .instance_id = "../instance", .launcher_root = root }));
-    try std.testing.expectError(error.UnsafeInstanceId, controller.startWithOptions(request, .{ .instance_id = "x" ** 201, .launcher_root = root }));
+    try std.testing.expectError(error.UnsafeInstanceId, controller.startWithOptions(request, .{ .instance_id = &(comptime @as([201]u8, @splat('x'))), .launcher_root = root }));
     try std.testing.expectError(error.AbsolutePathRequired, controller.startWithOptions(request, .{ .instance_id = "instance", .launcher_root = "relative" }));
     try std.testing.expectError(error.UnsafePath, controller.startWithOptions(request, .{ .instance_id = "instance", .launcher_root = "/tmp\x00root" }));
-    try std.testing.expectError(error.UnsafeDataRoot, controller.startWithOptions(request, .{ .instance_id = "instance", .launcher_root = "/" ++ "x" ** 4096 }));
+    try std.testing.expectError(error.UnsafeDataRoot, controller.startWithOptions(request, .{ .instance_id = "instance", .launcher_root = "/" ++ @as([4096]u8, @splat('x')) }));
     try std.testing.expectEqual(guard.acquired, guard.released);
     try std.testing.expect(!guard.held);
 }
@@ -1396,7 +1590,7 @@ test "guarded launch blocks pending and malformed journals before probing but ac
     defer java_file.close(io);
     try java_file.setPermissions(io, .fromMode(0o755));
 
-    const txn_id = "txn-" ++ "1" ** 32;
+    const txn_id = "txn-" ++ @as([32]u8, @splat('1'));
     const txn_path = "versions/fixture/.vela-content/" ++ txn_id;
     _ = try minecraft.createDirPathStatus(io, txn_path, .fromMode(0o700));
     const txn = try minecraft.openDir(io, txn_path, .{ .iterate = true });
@@ -1467,4 +1661,44 @@ test "guarded launch blocks pending and malformed journals before probing but ac
     try std.testing.expectEqual(@as(usize, 4), guard.acquired);
     try std.testing.expectEqual(guard.acquired, guard.released);
     try std.testing.expect(!guard.held);
+}
+
+test "path contract Unicode instance launches with fresh legacy natives" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFixture(tmp.dir, 21);
+    const original = try tmp.dir.readFileAlloc(io, "versions/fixture/fixture.json", a, .limited(64 * 1024));
+    defer a.free(original);
+    var document = try std.json.parseFromSlice(std.json.Value, a, original, .{});
+    defer document.deinit();
+    document.value.object.getPtr("id").?.* = .{ .string = "中文实例" };
+    const bytes = try std.json.Stringify.valueAlloc(a, document.value, .{});
+    defer a.free(bytes);
+    try tmp.dir.rename("versions/fixture", tmp.dir, "versions/中文实例", io);
+    try tmp.dir.rename("versions/中文实例/fixture.jar", tmp.dir, "versions/中文实例/中文实例.jar", io);
+    try tmp.dir.deleteFile(io, "versions/中文实例/fixture.json");
+    try tmp.dir.writeFile(io, .{ .sub_path = "versions/中文实例/中文实例.json", .data = bytes });
+    try tmp.dir.deleteTree(io, "versions/中文实例/natives");
+    try writeFakeJava(tmp.dir, 21, "test -f versions/中文实例/natives/libfixture.so || exit 89");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const java_path = try std.fs.path.join(a, &.{ root, "fake-java" });
+    defer a.free(java_path);
+    // Exercise the same readiness gate used by installed-list consumers first.
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var installed = try library.loadInstalled(a, io, root, "中文实例", &canceled);
+    defer installed.deinit();
+    var controller = try Controller.init(a, io, root);
+    defer controller.deinit();
+    try controller.start(.{ .version = "中文实例", .java_path = java_path, .java_major = 21, .username = "Player" });
+    try waitForTest(&controller);
+    try std.testing.expectEqual(Phase.exited, controller.snapshot().phase);
+    try std.testing.expectEqual(@as(?u8, 0), controller.snapshot().exit_code);
+    const output = try tmp.dir.readFileAlloc(io, "versions/中文实例/natives/libfixture.so", a, .limited(128));
+    defer a.free(output);
+    const payload = nativePayload(try hostNativeMachine());
+    try std.testing.expectEqualSlices(u8, &payload, output);
 }

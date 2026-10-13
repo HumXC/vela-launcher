@@ -483,8 +483,18 @@ fn openRecoveryTransactions(io: Io, paths: *const instances.Paths, id: []const u
 }
 
 fn transactionPending(a: A, io: Io, transactions: Dir, id: []const u8, name: []const u8, transaction_id: []const u8) !bool {
-    const txn = try fs.child(transactions, io, transaction_id, false, true);
+    // scanPending supplies the exact full ID spelling observed in enumeration.
+    // Re-enumerating its parent per child would make history scans quadratic.
+    std.debug.assert(validTransactionId(transaction_id));
+    const named = try transactions.statFile(io, transaction_id, .{ .follow_symlinks = false });
+    try fs.rejectReparse(named);
+    if (named.kind != .directory) return error.UnsafeFileType;
+    const txn = try transactions.openDir(io, transaction_id, .{ .iterate = true, .follow_symlinks = false });
     defer txn.close(io);
+    const opened = try txn.stat(io);
+    try fs.rejectReparse(opened);
+    if (opened.kind != .directory or opened.inode != named.inode) return error.UnsafeFileType;
+    if (builtin.os.tag != .windows and opened.permissions.toMode() & 0o077 != 0) return error.UnsafePrivateDirectory;
     const has_journal = try fs.inspectEntry(txn, io, "journal.json") != null;
     const committed = try fs.inspectEntry(txn, io, "committed") != null;
     const rolled_back = try fs.inspectEntry(txn, io, "rolled-back") != null;
@@ -508,24 +518,34 @@ fn transactionPending(a: A, io: Io, transactions: Dir, id: []const u8, name: []c
 }
 
 fn scanPending(a: A, io: Io, transactions: Dir, id: []const u8, name: []const u8, pending: ?*std.ArrayList([]const u8)) !void {
-    var count: usize = 0;
+    // History is retained for inspection; only unresolved work consumes pending capacity.
+    // Use an independent scratch arena: `a` may itself be an arena, where free
+    // cannot reclaim per-journal allocations during a long read-only scan.
+    var pending_count: usize = 0;
     var recovery_required = false;
-    var iterator = transactions.iterate();
+    // Own the enumeration cursor independently of all transaction inspection.
+    // Only full ASCII transaction IDs observed here are opened; other names fail closed.
+    const enumeration = try transactions.openDir(io, ".", .{ .iterate = true, .follow_symlinks = false });
+    defer enumeration.close(io);
+    var iterator = enumeration.iterate();
     while (try iterator.next(io)) |entry| {
-        count += 1;
-        if (count > providers.max_items) return error.RecoveryRequired;
+        try io.checkCancel();
         if (!validTransactionId(entry.name)) {
             recovery_required = true;
             continue;
         }
-        const unresolved = transactionPending(a, io, transactions, id, name, entry.name) catch |err| switch (err) {
-            error.OutOfMemory, error.ProtectedPath => return err,
+        var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const unresolved = transactionPending(scratch.allocator(), io, transactions, id, name, entry.name) catch |err| switch (err) {
+            error.OutOfMemory, error.ProtectedPath, error.Canceled => return err,
             else => {
                 recovery_required = true;
                 continue;
             },
         };
         if (unresolved) {
+            pending_count += 1;
+            if (pending_count > providers.max_items) return error.RecoveryRequired;
             if (pending) |list| {
                 try list.append(a, try a.dupe(u8, entry.name));
             } else recovery_required = true;
@@ -536,7 +556,7 @@ fn scanPending(a: A, io: Io, transactions: Dir, id: []const u8, name: []const u8
 
 fn ensureNoPending(a: A, io: Io, transactions: Dir, id: []const u8, name: []const u8) !void {
     scanPending(a, io, transactions, id, name, null) catch |err| switch (err) {
-        error.OutOfMemory, error.ProtectedPath => return err,
+        error.OutOfMemory, error.ProtectedPath, error.Canceled => return err,
         else => return error.RecoveryRequired,
     };
 }
@@ -557,7 +577,7 @@ pub fn listPendingTransactions(a: A, io: Io, paths: *const instances.Paths, inst
     if (try openRecoveryTransactions(io, paths, instance_id, instance_name)) |transactions| {
         defer transactions.close(io);
         scanPending(aa, io, transactions, instance_id, instance_name, &pending) catch |err| switch (err) {
-            error.OutOfMemory, error.ProtectedPath => return err,
+            error.OutOfMemory, error.ProtectedPath, error.Canceled => return err,
             else => return error.RecoveryRequired,
         };
     }
@@ -1192,7 +1212,7 @@ test "journal path preflight bounds precede uninitialized entries" {
     const a = std.testing.allocator;
     const entries = try a.alloc(Entry, providers.max_items + 1);
     defer a.free(entries);
-    const transaction_id = "txn-" ++ "1" ** 32;
+    const transaction_id = "txn-" ++ @as([32]u8, @splat('1'));
     const journal: Journal = .{
         .instance_id = "instance",
         .instance_name = "Test",
@@ -1201,7 +1221,7 @@ test "journal path preflight bounds precede uninitialized entries" {
         .kept_local = 0,
         .entries = entries,
         .manifest_before = null,
-        .manifest_after = .{ .size = 0, .sha1 = .{'0'} ** 40, .sha256 = .{'0'} ** 64, .sha512 = .{'0'} ** 128 },
+        .manifest_after = .{ .size = 0, .sha1 = @as([40]u8, @splat('0')), .sha256 = @as([64]u8, @splat('0')), .sha512 = @as([128]u8, @splat('0')) },
         .manifest_temp = ".content-" ++ transaction_id ++ ".next",
     };
     try std.testing.expectError(error.InvalidJournal, validateJournal(journal, "instance", "Test", transaction_id));

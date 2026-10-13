@@ -12,7 +12,6 @@ const manifest = @import("core/content_manifest.zig");
 const http = @import("core/http_transport.zig");
 const credentials = @import("core/credentials.zig");
 const manager = @import("ui/content_manager.zig");
-const view = @import("ui/content_view.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 const selected: config.Instance = .{ .id = "stable-id", .name = "Display Name", .minecraft_version = "1.20.1" };
@@ -280,7 +279,7 @@ fn selectionAllocations(allocator: std.mem.Allocator) !void {
     if (service.snapshot().failure) |failure| if (failure == error.OutOfMemory) return error.OutOfMemory;
 }
 test "content manager selection request registry allocation failures clean up" {
-    try std.testing.checkAllAllocationFailures(a, selectionAllocations, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, selectionAllocations, .{});
 }
 
 const CrashFixture = struct {
@@ -379,68 +378,9 @@ test "content manager crash pin survives selection cancel failed repair and rest
     try std.testing.expect(restarted.snapshot().report.?.recovered);
 }
 
-test "content UI owned entrypoints" {
-    var ui = try view.Ui.init(a);
-    defer ui.deinit();
-}
-test "content draw semantic declarations" {
-    const callbacks = .{ &view.draw, &view.drawModal, &view.finish };
-    std.mem.doNotOptimizeAway(&callbacks);
-}
-
 fn manualStatus(proposal: *const manager.Proposal, path: []const u8) ?manager.ManualSourceStatus {
     for (proposal.manual_source_status) |status| if (std.mem.eql(u8, status.path, path)) return status;
     return null;
-}
-
-test "content manual presentation uses provenance checked target path and live inclusion" {
-    var file: manifest.InstallFile = .{ .record = .{ .path = "mods/a.jar", .provider = .curseforge, .project_id = "12", .version_id = "34", .hashes = .{} }, .download = .{ .manual_required = .{ .official_page = "https://www.curseforge.com/minecraft/mc-mods/example/files/34", .reason = .missing_url } } };
-    const status: manager.ManualSourceStatus = .{ .path = file.record.path, .source_absolute_path = "/tmp/a.jar", .verified = true };
-    const Presentation = view.ManualSourcePresentation;
-    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, null, "/tmp/a.jar", false));
-    try std.testing.expectEqual(Presentation.external_verified, view.manualSourcePresentation(file, true, status, "  /tmp/a.jar\t", false));
-    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, status, "/tmp/other.jar", false));
-    // Even edit-and-revert must wait for another verification pass.
-    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, status, "/tmp/a.jar", true));
-    var other_status = status;
-    other_status.path = "mods/other.jar";
-    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, other_status, "/tmp/a.jar", false));
-    other_status = status;
-    other_status.verified = false;
-    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, other_status, "/tmp/a.jar", false));
-    other_status = status;
-    other_status.source_absolute_path = null;
-    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, other_status, "/tmp/a.jar", false));
-    try std.testing.expectEqualStrings(file.download.manual_required.official_page, view.manualOfficialPage(file, .external_required).?);
-    try std.testing.expect(view.manualOfficialPage(file, .external_verified) == null);
-    for ([_]providers.ManualReason{ .missing_url, .distribution_disabled }) |reason| {
-        file.download.manual_required.reason = reason;
-        file.download.manual_required.official_page = "";
-        try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, null, "", false));
-        try std.testing.expect(view.manualOfficialPage(file, .external_required) == null);
-    }
-    file.record.role = .override;
-    // Role or an empty page alone is not proof that a file came from an archive.
-    try std.testing.expectEqual(Presentation.external_required, view.manualSourcePresentation(file, true, status, "", false));
-    file.record.identity_provenance = .pack_override;
-    try std.testing.expectEqual(Presentation.archive_verified, view.manualSourcePresentation(file, true, status, "/tmp/a.jar", false));
-    try std.testing.expectEqual(Presentation.archive_unverified, view.manualSourcePresentation(file, true, null, "/tmp/a.jar", false));
-    try std.testing.expectEqual(Presentation.archive_unverified, view.manualSourcePresentation(file, true, status, "/tmp/a.jar", true));
-    try std.testing.expect(view.manualOfficialPage(file, .archive_unverified) == null);
-    file.required = false;
-    file.selected = false;
-    const choices = [_]manager.OptionalChoice{.{ .path = file.record.path, .include = true }};
-    try std.testing.expect(view.manualFileIncluded(file, &choices));
-    try std.testing.expectEqual(Presentation.archive_verified, view.manualSourcePresentation(file, view.manualFileIncluded(file, &choices), status, "/tmp/a.jar", false));
-    file.selected = true;
-    const excluded = [_]manager.OptionalChoice{.{ .path = file.record.path, .include = false }};
-    try std.testing.expectEqual(Presentation.hidden, view.manualSourcePresentation(file, view.manualFileIncluded(file, &excluded), status, "/tmp/a.jar", false));
-    file.selected = null;
-    try std.testing.expect(!view.manualFileIncluded(file, &.{}));
-    file.required = true;
-    try std.testing.expect(view.manualFileIncluded(file, &excluded));
-    file.download = .{ .remote = "https://example.com/a.jar" };
-    try std.testing.expectEqual(Presentation.hidden, view.manualSourcePresentation(file, true, status, "/tmp/a.jar", false));
 }
 
 const ZipEntry = struct { path: []const u8, bytes: []const u8 };
@@ -577,7 +517,6 @@ test "content manager real archive game receipt dependencies asset tamper and co
     try std.testing.expectEqual(@as(usize, 0), staged.missing_manual);
     try std.testing.expect(staged_status.verified);
     try std.testing.expectEqual(manifest.IdentityProvenance.pack_override, staged.files[0].record.identity_provenance);
-    try std.testing.expectEqual(view.ManualSourcePresentation.archive_verified, view.manualSourcePresentation(staged.files[0], true, staged_status, staged.manual_files[0].source_absolute_path, false));
     try std.testing.expectEqualStrings(staged.manual_files[0].source_absolute_path, staged_status.source_absolute_path.?);
     try tmp.dir.createDirPath(io, ".minecraft/libraries/fixture/runtime/1");
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/libraries/fixture/runtime/1/runtime-1.jar", .data = library });
@@ -810,7 +749,7 @@ test "content manager inspects actual native CPU for opaque modern classifier" {
     const archive = try tmp.dir.realPathFileAlloc(io, "fixture.mrpack", a);
     defer a.free(archive);
     for ([_]bool{ false, true }, 0..) |wrong_cpu, iteration| {
-        var elf = [_]u8{0} ** 64;
+        var elf: [64]u8 = @splat(0);
         elf[0] = 0x7f;
         elf[1] = 'E';
         elf[2] = 'L';
@@ -894,7 +833,7 @@ test "content manager verifies legacy 1.7 native sources without touching launch
     defer a.free(archive);
     const Case = enum { valid, wrong_cpu, malformed, missing, wrong_hash, wrong_size, missing_hash, missing_size };
     for (std.enums.values(Case), 0..) |case, iteration| {
-        var elf = [_]u8{0} ** 64;
+        var elf: [64]u8 = @splat(0);
         @memcpy(elf[0..4], "\x7fELF");
         elf[4] = 2;
         elf[5] = 1;
@@ -1230,7 +1169,7 @@ test "content CF explicit authorization gates before fake vault and HTTP" {
         try std.testing.expect(!service.canResolvePackReferences());
         try std.testing.expectError(error.ProviderDisabled, service.resolvePackReferences(&.{}, &.{}, &.{}, &.{}));
     }
-    try std.testing.expectError(error.InvalidReference, service.setCurseForgePolicy(.{ .enabled = true, .terms_approved = true, .credential_ref = [_]u8{'X'} ** 32 }));
+    try std.testing.expectError(error.InvalidReference, service.setCurseForgePolicy(.{ .enabled = true, .terms_approved = true, .credential_ref = @as([32]u8, @splat('X')) }));
     try std.testing.expectEqual(@as(usize, 0), vault.gets);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try service.setCurseForgePolicy(cf_policy);
@@ -1246,7 +1185,6 @@ test "content CF explicit authorization gates before fake vault and HTTP" {
     try std.testing.expect(manualStatus(proposal, "config/pack.cfg").?.verified);
     const remote_manual_status = manualStatus(proposal, "resourcepacks/example.jar").?;
     try std.testing.expect(!remote_manual_status.verified and remote_manual_status.source_absolute_path == null);
-    try std.testing.expectEqual(view.ManualSourcePresentation.external_required, view.manualSourcePresentation(proposal.files[1], true, remote_manual_status, "", false));
     try std.testing.expectEqual(@as(usize, 1), vault.gets);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try std.testing.expectEqualStrings("12", proposal.files[1].record.project_id);
@@ -1517,7 +1455,7 @@ fn inspectionRollbackAllocations(allocator: std.mem.Allocator) !void {
 }
 
 test "content inspected adoption retains caller after every allocation or injected spawn failure" {
-    try std.testing.checkAllAllocationFailures(a, inspectionRollbackAllocations, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, inspectionRollbackAllocations, .{});
 }
 
 test "content inspected adoption uses private bytes and removes owned stages on manager teardown" {
@@ -2074,8 +2012,8 @@ fn drainToggle(service: *manager.Manager, coordinator: *ToggleCoordinator.Coordi
 
 test "owned mod state UI request is local for standalone and pack children with real leases" {
     for ([_]manifest.IdentityProvenance{ .official_file, .pack_archive, .pack_override }) |provenance| {
-        var phase: enum { setup, launch_guard, mutation_guard, ui_request, disable_review, disable_commit, refresh_handoff, enable_review, enable_commit } = .setup;
-        errdefer |err| std.debug.print("mod state fixture {s}/{s}: {s}\n", .{ @tagName(provenance), @tagName(phase), @errorName(err) });
+        var phase: enum { setup, launch_guard, mutation_guard, owned_request, disable_review, disable_commit, refresh_handoff, enable_review, enable_commit } = .setup;
+        errdefer std.debug.print("mod state fixture {s}/{s}\n", .{ @tagName(provenance), @tagName(phase) });
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try tmp.dir.realPathFileAlloc(io, ".", a);
@@ -2108,22 +2046,10 @@ test "owned mod state UI request is local for standalone and pack children with 
         try std.testing.expectError(error.InstanceBusy, service.prepareEnabled(record.path, false));
         competing.release(selected.id);
         coordinator.tick();
-        phase = .ui_request;
-        var store = try config.Store.init(a, io, root);
-        defer store.deinit();
-        try store.update(.{ .instances = &.{selected}, .selected_instance = selected.id });
-        var ui = try view.Ui.init(a);
-        defer ui.deinit();
-        // draw captures this snapshot before the actual row queues an action.
-        ui.policy_generation = service.snapshot().policy_generation;
-        ui.provider = service.snapshot().provider;
+        phase = .owned_request;
         var requested_path = "mods/state.jar".*;
-        try ui.queueEnabled(selected, &requested_path, false);
+        try service.prepareEnabled(&requested_path, false);
         requested_path[5] = 'X';
-        try std.testing.expectEqualStrings(record.path, ui.pending.?.value);
-        view.finish(&ui, &store, &service);
-        if (ui.failure) |err| std.debug.print("mod state UI dispatch: {s}\n", .{@errorName(err)});
-        try std.testing.expect(ui.failure == null and ui.review_requested);
         try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(selected.id));
         phase = .disable_review;
         try drainToggle(&service, &coordinator);
@@ -2170,8 +2096,7 @@ test "owned mod state UI request is local for standalone and pack children with 
         coordinator.releaseLaunch();
         coordinator.tick();
         phase = .enable_review;
-        try ui.queueEnabled(selected, record.path, true);
-        view.finish(&ui, &store, &service);
+        try service.prepareEnabled(record.path, true);
         try drainToggle(&service, &coordinator);
         try std.testing.expect((try expectProposal(&service)).plan.ready);
         phase = .enable_commit;
@@ -2273,7 +2198,7 @@ test "failed mod rename recovery keeps real launch and mutation reservations unt
 test "disabled archive and override pack choices survive same path updates but ambiguous identities block" {
     var phase: enum { setup, pack_prepare, pack_review, identity_setup, identity_prepare, identity_review, commit_guard } = .setup;
     var diagnostic_provenance: manifest.IdentityProvenance = .pack_archive;
-    errdefer |err| std.debug.print("disabled pack choice {s}/{s}: {s}\n", .{ @tagName(diagnostic_provenance), @tagName(phase), @errorName(err) });
+    errdefer std.debug.print("disabled pack choice {s}/{s}\n", .{ @tagName(diagnostic_provenance), @tagName(phase) });
     for ([_]manifest.IdentityProvenance{ .pack_archive, .pack_override }) |provenance| {
         diagnostic_provenance = provenance;
         phase = .setup;
@@ -2366,7 +2291,7 @@ test "disabled archive and override pack choices survive same path updates but a
 
 test "a disabled verified required dependency keeps the proposed root unready" {
     var phase: enum { setup, dependency_prepare, dependency_review, commit_guard, persisted_state } = .setup;
-    errdefer |err| std.debug.print("disabled required dependency {s}: {s}\n", .{ @tagName(phase), @errorName(err) });
+    errdefer std.debug.print("disabled required dependency {s}\n", .{@tagName(phase)});
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
@@ -2557,7 +2482,7 @@ test "canonical vanilla content preflight authenticates the real factory without
     const Mode = enum { complete, metadata_tamper, client_hash, client_size, invalid_receipt, noncanonical, nonvanilla, missing_library, missing_native, missing_index, missing_asset, index_tamper, asset_tamper, late_lease };
     for (std.enums.values(Mode)) |mode| {
         var phase: enum { setup, prepare, review, commit, persisted_state } = .setup;
-        errdefer |err| std.debug.print("vanilla content preflight {s}/{s}: {s}\n", .{ @tagName(mode), @tagName(phase), @errorName(err) });
+        errdefer std.debug.print("vanilla content preflight {s}/{s}\n", .{ @tagName(mode), @tagName(phase) });
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try tmp.dir.realPathFileAlloc(io, ".", a);

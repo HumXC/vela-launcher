@@ -18,6 +18,7 @@ pub const Options = struct {
     root: []const u8,
     java_executable: []const u8,
     identity: Identity,
+    min_memory_mb: ?u32 = null,
     max_memory_mb: ?u32 = null,
     extra_jvm: []const []const u8 = &.{},
     extra_game: []const []const u8 = &.{},
@@ -56,7 +57,8 @@ pub fn build(allocator: std.mem.Allocator, version: m.version.Version, plan: ins
     const a = arena.allocator();
     for (plan.classpath) |path| if (!std.fs.path.isAbsolute(path)) return error.AbsolutePlanPathRequired;
     if (plan.classpath.len == 0) return error.EmptyClasspath;
-    const cp = try std.mem.join(a, if (std.mem.eql(u8, env.os_name, "windows")) ";" else ":", plan.classpath);
+    const separator = if (std.mem.eql(u8, env.os_name, "windows")) ";" else ":";
+    const cp = try std.mem.join(a, separator, plan.classpath);
     const natives = options.natives_directory orelse if (plan.native_extractions.len != 0) plan.native_extractions[0].destination else try std.fs.path.join(a, &.{ options.root, "versions", version.id, "natives" });
     if (!std.fs.path.isAbsolute(natives)) return error.AbsoluteNativePathRequired;
     for (plan.native_extractions) |extraction| if (!std.mem.eql(u8, extraction.destination, natives)) return error.NativeDirectoryMismatch;
@@ -67,12 +69,18 @@ pub fn build(allocator: std.mem.Allocator, version: m.version.Version, plan: ins
     if (!std.fs.path.isAbsolute(game_assets)) return error.AbsoluteAssetPathRequired;
     try tokenValid(game_assets);
     for (plan.native_checks) |check| if (check.suitability == .incompatible) return error.IncompatibleNativeArchitecture;
-    var context: Context = .{ .a = a, .version = version, .options = options, .classpath = cp, .natives = natives, .game_assets = game_assets };
+    var context: Context = .{ .a = a, .version = version, .options = options, .classpath = cp, .classpath_separator = separator, .natives = natives, .game_assets = game_assets };
     var jvm = try command.Builder.init(a, options.java_executable);
     defer jvm.deinit();
-    const jvm_tokens = if (arguments.jvm) |args| try context.arguments(args, env) else if (version.minecraft_arguments != null) try context.expandMany(if (std.mem.eql(u8, env.os_name, "osx")) &.{ "-XstartOnFirstThread", "-Djava.library.path=${natives_directory}", "-Dminecraft.launcher.brand=${launcher_name}", "-Dminecraft.launcher.version=${launcher_version}", "-cp", "${classpath}" } else &.{ "-Djava.library.path=${natives_directory}", "-Dminecraft.launcher.brand=${launcher_name}", "-Dminecraft.launcher.version=${launcher_version}", "-cp", "${classpath}" }) else return error.MissingJvmArguments;
+    // A loader JVM overlay on a legacy parent still needs its launcher defaults.
+    // Keyed JVM options let the overlay replace defaults without a second classpath.
+    const jvm_tokens = if (arguments.jvm) |args| try context.arguments(args, env) else &.{};
     try validateJvm(jvm_tokens);
-    try java.append(&jvm, jvm_tokens);
+    if (arguments.jvm == null or version.minecraft_arguments != null) {
+        const defaults = try context.expandMany(if (std.mem.eql(u8, env.os_name, "osx")) &.{ "-XstartOnFirstThread", "-Djava.library.path=${natives_directory}", "-Dminecraft.launcher.brand=${launcher_name}", "-Dminecraft.launcher.version=${launcher_version}", "-cp", "${classpath}" } else &.{ "-Djava.library.path=${natives_directory}", "-Dminecraft.launcher.brand=${launcher_name}", "-Dminecraft.launcher.version=${launcher_version}", "-cp", "${classpath}" });
+        try appendJvm(&jvm, defaults);
+    }
+    try appendJvm(&jvm, jvm_tokens);
     // Ensure classpath exists even for minimal metadata, preserving explicit metadata setting.
     if (!jvm.has(.{ .namespace = "java.option", .name = "classpath" })) try java.append(&jvm, &.{ "-cp", cp });
     for (version.logging) |logging| {
@@ -90,13 +98,18 @@ pub fn build(allocator: std.mem.Allocator, version: m.version.Version, plan: ins
         try java.append(&jvm, &.{token});
         context.logging_path = null;
     }
+    if (options.min_memory_mb) |mb| {
+        if (mb == 0) return error.InvalidMemory;
+        if (options.max_memory_mb) |maximum| if (mb > maximum) return error.InvalidMemory;
+        try java.append(&jvm, &.{try std.fmt.allocPrint(a, "-Xms{d}M", .{mb})});
+    }
     if (options.max_memory_mb) |mb| {
         if (mb == 0) return error.InvalidMemory;
         try java.append(&jvm, &.{try std.fmt.allocPrint(a, "-Xmx{d}M", .{mb})});
     }
     const extra_jvm = try context.expandMany(options.extra_jvm);
     try validateJvm(extra_jvm);
-    try java.append(&jvm, extra_jvm);
+    try appendJvm(&jvm, extra_jvm);
     var game = try command.Builder.init(a, "game");
     defer game.deinit();
     const game_tokens = if (arguments.game) |args| try context.arguments(args, env) else try context.expandMany(try m.version.tokenizeLegacy(a, version.minecraft_arguments orelse return error.MissingGameArguments));
@@ -120,6 +133,7 @@ const Context = struct {
     version: m.version.Version,
     options: Options,
     classpath: []const u8,
+    classpath_separator: []const u8,
     natives: []const u8,
     game_assets: []const u8,
     logging_path: ?[]const u8 = null,
@@ -164,6 +178,7 @@ const Context = struct {
         };
         inline for (values) |pair| if (std.mem.eql(u8, name, pair[0])) return pair[1];
         if (std.mem.eql(u8, name, "game_assets")) return self.game_assets;
+        if (std.mem.eql(u8, name, "classpath_separator")) return self.classpath_separator;
         if (std.mem.eql(u8, name, "library_directory")) return std.fs.path.join(self.a, &.{ o.root, "libraries" });
         if (std.mem.eql(u8, name, "assets_root")) return std.fs.path.join(self.a, &.{ o.root, "assets" });
         if (std.mem.eql(u8, name, "assets_index_name")) return (self.version.asset_index orelse return error.MissingAssetIndex).id;
@@ -181,6 +196,38 @@ const Context = struct {
 fn tokenValid(token: []const u8) !void {
     if (std.mem.indexOfScalar(u8, token, 0) != null) return error.EmbeddedNul;
 }
+// Java uses one module path (the final alias wins), independently of the classpath.
+// Keep repeatable module directives intact; java.append owns the other JVM keys.
+fn appendJvm(builder: *command.Builder, tokens: []const []const u8) !void {
+    var i: usize = 0;
+    var start: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        const end = std.mem.indexOfScalar(u8, token, '=') orelse token.len;
+        const name = token[0..end];
+        const canonical: ?[]const u8 = if (std.mem.eql(u8, name, "-p") or std.mem.eql(u8, name, "--module-path")) "--module-path" else if (std.mem.eql(u8, name, "--upgrade-module-path")) "--upgrade-module-path" else if (std.mem.eql(u8, name, "--limit-modules")) "--limit-modules" else null;
+        if (canonical) |option| {
+            try java.append(builder, tokens[start..i]);
+            const value = if (end < token.len) token[end + 1 ..] else blk: {
+                i += 1;
+                if (i == tokens.len) return error.MissingValue;
+                break :blk tokens[i];
+            };
+            try builder.add(.{ .key = .{ .namespace = "java.option", .name = option }, .canonical = option, .arity = .value }, value);
+            start = i + 1;
+        } else {
+            // An operand may itself look like a module-path option. Skip it.
+            for ([_][]const u8{ "-cp", "-classpath", "--class-path", "--add-modules", "--add-reads", "--add-exports", "--add-opens", "--patch-module", "--enable-native-access", "--source" }) |option| {
+                if (std.mem.eql(u8, token, option)) {
+                    i += 1;
+                    if (i == tokens.len) return error.MissingValue;
+                    break;
+                }
+            }
+        }
+    }
+    try java.append(builder, tokens[start..]);
+}
 fn validateJvm(tokens: []const []const u8) !void {
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
@@ -197,7 +244,7 @@ fn validateJvm(tokens: []const []const u8) !void {
     }
 }
 fn appendGame(builder: *command.Builder, tokens: []const []const u8) !void {
-    const valued = [_][]const u8{ "--username", "--version", "--gameDir", "--assetsDir", "--assetIndex", "--uuid", "--accessToken", "--clientId", "--xuid", "--userType", "--versionType", "--userProperties", "--profileProperties", "--width", "--height", "--server", "--port", "--quickPlayPath", "--quickPlaySingleplayer", "--quickPlayMultiplayer", "--quickPlayRealms" };
+    const valued = [_][]const u8{ "--username", "--version", "--gameDir", "--assetsDir", "--assetIndex", "--uuid", "--accessToken", "--clientId", "--xuid", "--userType", "--versionType", "--userProperties", "--profileProperties", "--session", "--width", "--height", "--server", "--port", "--quickPlayPath", "--quickPlaySingleplayer", "--quickPlayMultiplayer", "--quickPlayRealms", "--launchTarget", "--fml.forgeVersion", "--fml.mcVersion", "--fml.forgeGroup", "--fml.mcpVersion", "--fml.neoForgeVersion", "--fml.fmlVersion", "--fml.neoFormVersion", "--tweakClass" };
     const flags = [_][]const u8{ "--demo", "--fullscreen", "--disableMultiplayer", "--disableChat" };
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
@@ -210,7 +257,7 @@ fn appendGame(builder: *command.Builder, tokens: []const []const u8) !void {
                 if (i == tokens.len) return error.MissingGameValue;
                 break :blk tokens[i];
             };
-            try builder.add(.{ .key = .{ .namespace = "game", .name = name }, .canonical = name, .arity = .value }, value);
+            try builder.add(.{ .key = .{ .namespace = "game", .name = name }, .canonical = name, .arity = .value, .merge = if (std.mem.eql(u8, name, "--tweakClass")) .append else .replace }, value);
             recognized = true;
             break;
         };
@@ -252,7 +299,7 @@ fn argvIndex(argv: []const []const u8, token: []const u8) ?usize {
 }
 test "legacy launch preserves Forge tweaks and substitutes without retokenizing" {
     const a = std.testing.allocator;
-    try std.testing.checkAllAllocationFailures(a, legacyLaunchAllocationCase, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, legacyLaunchAllocationCase, .{});
     var version = try m.version.parseSlice(a, legacy_launch_fixture);
     defer version.deinit();
     var launched = try build(a, version.value, legacy_launch_plan, .{ .os_name = "linux", .arch = "x86_64" }, legacy_launch_options);

@@ -369,7 +369,7 @@ test "CF transport rejects missing malformed and oversized credentials before HT
         request.credential_header = .{ .name = "x-api-key", .value = key };
         try std.testing.expectError(error.InvalidCredentialScope, transport.get(transport.context, a, request));
     }
-    const oversized = [_]u8{'a'} ** 513;
+    const oversized: [513]u8 = @splat('a');
     request.credential_header = .{ .name = "x-api-key", .value = &oversized };
     try std.testing.expectError(error.InvalidCredentialScope, transport.get(transport.context, a, request));
     request.credential_header = .{ .name = "Authorization", .value = scoped_fixture_key };
@@ -717,7 +717,7 @@ test "fixture CDN status size hash and callback failures cannot fall through or 
         .{ .status = 500, .expected = error.HttpStatus },
         .{ .max = 3, .expected = error.BodyTooLarge },
         .{ .size = 1, .expected = error.SizeMismatch },
-        .{ .sha1 = [_]u8{0} ** 20, .expected = error.Sha1Mismatch },
+        .{ .sha1 = @as([20]u8, @splat(0)), .expected = error.Sha1Mismatch },
         .{ .failure = error.NonPublicAddress, .expected = error.NonPublicAddress },
         .{ .failure = error.OutOfMemory, .expected = error.OutOfMemory },
         .{ .failure = error.Canceled, .expected = error.Canceled },

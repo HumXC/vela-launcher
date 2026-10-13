@@ -945,7 +945,7 @@ fn allocationExercise(a: Allocator) !void {
 }
 test "allocation failures release owned parse mutation reload snapshots and file resources" {
     try testSupported();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
 }
 test "unsupported durability and invalid roots are rejected before native operations" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
@@ -1344,5 +1344,5 @@ fn windowsJournalAllocationScenario(allocator: Allocator) !void {
     try j.reload();
 }
 test "Windows CF allocation failures release owned and reopened roots docs and staging" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, windowsJournalAllocationScenario, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, windowsJournalAllocationScenario, .{});
 }

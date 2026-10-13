@@ -317,7 +317,7 @@ const Linux = struct {
     const Schema = extern struct {
         name: [*:0]const u8 = "org.vela-launcher.auth",
         flags: c_int = 0,
-        attributes: [32]Attribute = [_]Attribute{.{ .name = "reference" }} ++ [_]Attribute{.{}} ** 31,
+        attributes: [32]Attribute = [_]Attribute{.{ .name = "reference" }} ++ @as([31]Attribute, @splat(.{})),
         reserved: c_int = 0,
         reserved1: ?*anyopaque = null,
         reserved2: ?*anyopaque = null,
@@ -371,8 +371,8 @@ const Linux = struct {
         var library = std.DynLib.open("libsecret-1.so.0") catch return error.Unavailable;
         errdefer library.close();
         var api: Api = undefined;
-        inline for (@typeInfo(Api).@"struct".fields) |field| {
-            @field(api, field.name) = library.lookup(field.type, field.name ++ "\x00") orelse return error.Unavailable;
+        inline for (@typeInfo(Api).@"struct".field_names, @typeInfo(Api).@"struct".field_types) |name, field_type| {
+            @field(api, name) = library.lookup(field_type, name ++ "\x00") orelse return error.Unavailable;
         }
         return .{ .library = library, .api = api };
     }

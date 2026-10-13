@@ -297,7 +297,7 @@ fn tokenAllocationCase(a: std.mem.Allocator) !void {
 }
 test "legacy tokenizer allocation cleanup and bounds" {
     const a = std.testing.allocator;
-    try std.testing.checkAllAllocationFailures(a, tokenAllocationCase, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, tokenAllocationCase, .{});
     const excessive = try a.alloc(u8, 8193 * 2);
     defer a.free(excessive);
     for (excessive, 0..) |*c, i| c.* = if (i % 2 == 0) 'x' else ' ';

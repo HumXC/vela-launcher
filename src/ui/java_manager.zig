@@ -124,19 +124,16 @@ fn spawnOwned(a: Allocator, io: std.Io, argv: []const []const u8) !std.process.C
     if (builtin.os.tag == .windows) return std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .pipe, .stderr = .pipe });
     // libc owns its spawn handshake and failure cleanup, unlike std's POSIX exec pipe.
     // Spawn's kernel/libc boundary is not interruptible; the deadline starts before it.
-    const spawn = if (builtin.os.tag == .linux) @cImport({
-        @cDefine("_GNU_SOURCE", "1");
-        @cInclude("spawn.h");
-    }) else std.c;
+    const spawn = if (builtin.os.tag == .linux) @import("linux_c") else std.c;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
     const args = try scratch.allocSentinel(?[*:0]const u8, argv.len, null);
-    for (argv, args) |arg, *out| out.* = (try scratch.dupeZ(u8, arg)).ptr;
+    for (argv, args) |arg, *out| out.* = (try scratch.dupeSentinel(u8, arg, 0)).ptr;
     var env: std.ArrayList(?[*:0]const u8) = .empty;
     var index: usize = 0;
     while (std.c.environ[index]) |entry| : (index += 1) {
-        try env.append(scratch, (try scratch.dupeZ(u8, std.mem.span(entry))).ptr);
+        try env.append(scratch, (try scratch.dupeSentinel(u8, std.mem.span(entry), 0)).ptr);
     }
     try env.append(scratch, null);
     const stdout = try probePipe();
@@ -1016,7 +1013,7 @@ test "empty search path explicitly searches PATH without adding" {
     try fakeJava(tmp.dir, "Zulu JDK/bin/java", zulu25);
     var buffer: [4096]u8 = undefined;
     const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
-    const old = if (std.c.getenv("PATH")) |value| try a.dupeZ(u8, std.mem.span(value)) else null;
+    const old = if (std.c.getenv("PATH")) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (old) |value| a.free(value);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/Open JDK/bin:{s}/Zulu JDK/bin:{s}/Open JDK/bin", .{ root, root, root }, 0);
     defer a.free(path);

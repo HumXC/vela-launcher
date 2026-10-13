@@ -323,6 +323,9 @@ pub const WindowsFake = struct {
     drift_bytes: ?[]const u8 = null,
     disappear_at_load: usize = 0,
     fail_load_at: usize = 0,
+    writer_in_use: bool = false,
+    writer_owned: bool = false,
+    writer_acquires: usize = 0,
 
     pub const TempRecord = struct {
         name: [64]u8 = undefined,
@@ -364,7 +367,7 @@ pub const WindowsFake = struct {
         return self.disk[0..self.disk_len];
     }
     pub fn nativeOps(self: *WindowsFake) fs.NativeOps {
-        return .{ .context = self, .open = open, .close = close, .check_cancel = cancel, .validate_root = validate, .load = load, .ensure_directory = ensure, .random = random, .create_temp = create, .write = write, .flush = flush, .verify_temp = verifyTemp, .move = move, .verify_final = final, .close_file = closeFile, .discard_temp = discard };
+        return .{ .context = self, .open = open, .close = close, .acquire_writer = acquireWriter, .check_cancel = cancel, .validate_root = validate, .load = load, .ensure_directory = ensure, .random = random, .create_temp = create, .write = write, .flush = flush, .verify_temp = verifyTemp, .move = move, .verify_final = final, .close_file = closeFile, .discard_temp = discard };
     }
     pub fn reopen(ctx: *anyopaque, allocator: std.mem.Allocator, root: []const u8) fs.Error!fs.Root {
         return fs.openRootWithOps(allocator, root, .private_journal, cast(ctx).nativeOps());
@@ -376,10 +379,17 @@ pub const WindowsFake = struct {
         try validate(ctx);
         self.opens += 1;
     }
+    fn acquireWriter(ctx: *anyopaque) fs.Error!void {
+        const self = cast(ctx);
+        if (self.writer_in_use) return error.LauncherRootInUse;
+        self.writer_owned = true;
+        self.writer_acquires += 1;
+    }
     fn close(ctx: *anyopaque) void {
         const self = cast(ctx);
         std.debug.assert(!self.temp_open);
         self.closes += 1;
+        self.writer_owned = false;
     }
     fn cancel(ctx: *anyopaque) fs.Error!void {
         if (cast(ctx).cancel_before or cast(ctx).cancelled) return error.Cancelled;
@@ -553,5 +563,5 @@ fn windowsAuthAllocationScenario(allocator: std.mem.Allocator) !void {
     try debt.remove(@splat('0'));
 }
 test "Windows auth owner allocation failures release staged refs bytes and root" {
-    try std.testing.checkAllAllocationFailures(a, windowsAuthAllocationScenario, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, windowsAuthAllocationScenario, .{});
 }

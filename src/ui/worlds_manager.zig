@@ -91,6 +91,8 @@ pub const Worker = *const fn (A, Io, *const instances.Paths, config.Instance, ?R
 pub const Options = struct {
     guard: worlds.Guard = .{},
     scope: ?worlds.WorldScope = null,
+    /// Used exclusively by requestless listing jobs, never by world operations.
+    scan_scope: ?worlds.WorldScope = null,
     limits: worlds.Limits = .{},
     worker: Worker = runBackend,
 };
@@ -227,7 +229,8 @@ const Job = struct {
     fn create(a: A, io: Io, paths: *const instances.Paths, instance: config.Instance, request: ?Request, options: Options) !*Job {
         const self = try a.create(Job);
         errdefer a.destroy(self);
-        self.* = .{ .allocator = a, .arena = .init(a), .io = io, .paths = paths, .instance = undefined, .request = null, .options = .{ .limits = options.limits, .scope = options.scope }, .worker = options.worker };
+        const scope = if (request == null and options.scan_scope != null) options.scan_scope else options.scope;
+        self.* = .{ .allocator = a, .arena = .init(a), .io = io, .paths = paths, .instance = undefined, .request = null, .options = .{ .limits = options.limits, .scope = scope }, .worker = options.worker };
         errdefer self.arena.deinit();
         const owned = self.arena.allocator();
         self.instance = try cloneInstance(owned, instance);
@@ -244,7 +247,10 @@ const Job = struct {
         return .{ .source = self.instance.id, .target = target };
     }
     fn acquireScope(self: *Job) !void {
-        const entry = try worlds.enterScope(self.options, self.scopeIds());
+        const entry = if (self.request == null)
+            try worlds.enterReadScope(self.options, self.scopeIds())
+        else
+            try worlds.enterScope(self.options, self.scopeIds());
         self.options.held_scope = entry.held;
         self.options.scope = null;
     }
@@ -629,7 +635,7 @@ const CountingScope = struct {
     releases: usize = 0,
 
     fn scope(self: *CountingScope) worlds.WorldScope {
-        return .{ .context = self, .probe = probe, .acquire = acquire, .recheck = recheck, .release = release };
+        return .{ .context = self, .read_only = self.inner.read_only, .probe = probe, .acquire = acquire, .recheck = recheck, .release = release };
     }
     fn probe(context: ?*anyopaque, ids: worlds.ScopeIds) anyerror!worlds.ScopeState {
         const self: *CountingScope = @ptrCast(@alignCast(context.?));
@@ -861,7 +867,7 @@ fn allocationScenario(a: A) !void {
     try manager.perform(.{ .backup = "World" });
 }
 test "selection request and title allocation failure rolls back owned resources" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
 }
 test "actual temporary world backup refreshes real recovery listing" {
     const a = std.testing.allocator;
@@ -971,6 +977,47 @@ test "world directory validation is read only and rejects stale selection and sy
             return error.SymlinkAccepted;
         } else |_| {}
     }
+}
+
+test "manager uses read-only scope for scans and mutation scope for operations" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".minecraft/versions/One/saves/World");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buf);
+    var paths = try instances.Paths.init(a, io, buf[0..len]);
+    defer paths.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    var mutation: CountingScope = .{ .inner = coordinator.worldScope(3) };
+    var read: CountingScope = .{ .inner = coordinator.worldReadScope(3) };
+    var manager = try Manager.initOptions(a, io, &paths, &registry, .{ .scope = mutation.scope(), .scan_scope = read.scope(), .guard = .{ .running_ids = &.{"one"} } });
+    defer manager.deinit();
+    const source: config.Instance = .{ .id = "one", .name = "One", .minecraft_version = "1.21" };
+    try coordinator.reserveLaunch(source.id);
+    try manager.select(source);
+    try settle(&manager);
+    try std.testing.expectEqual(@as(?anyerror, null), manager.snapshot().failure);
+    try std.testing.expectEqual(@as(usize, 1), manager.snapshot().worlds.len);
+    try std.testing.expectEqual(worlds.WorldAccess.available, manager.snapshot().worlds[0].access);
+    try std.testing.expectEqual(@as(usize, 1), read.acquired);
+    try std.testing.expectEqual(@as(usize, 1), read.releases);
+    try std.testing.expectEqual(@as(usize, 0), mutation.acquired);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/One/saves/World/session.lock", .{}));
+    try std.testing.expect(manager.isRunning(source.id));
+    try std.testing.expectError(error.InstanceRunning, manager.perform(.{ .backup = "World" }));
+    coordinator.releaseLaunch();
+    manager.options.guard.running_ids = &.{};
+    try manager.perform(.{ .backup = "World" });
+    try settle(&manager);
+    try std.testing.expect(manager.snapshot().outcome.?.state == .committed);
+    try std.testing.expectEqual(@as(usize, 1), mutation.acquired);
+    try std.testing.expectEqual(@as(usize, 1), mutation.releases);
+    try std.testing.expectEqual(@as(usize, 2), read.acquired);
+    try std.testing.expectEqual(@as(usize, 2), read.releases);
 }
 
 test "manager requires scope and rejects dynamic guards before allocation" {

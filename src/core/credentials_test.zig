@@ -57,8 +57,8 @@ const Mock = struct {
 
 test "references require exactly 32 lowercase hexadecimal bytes" {
     try testing.expect(credentials.validateReference(reference));
-    try testing.expect(credentials.validateReference("a" ** 32));
-    const invalid = [_][]const u8{ "", "a" ** 31, "a" ** 33, "A" ** 32, "g" ** 32, "a" ** 31 ++ "\x00", "a" ** 31 ++ " " };
+    try testing.expect(credentials.validateReference(&(comptime @as([32]u8, @splat('a')))));
+    const invalid = [_][]const u8{ "", &(comptime @as([31]u8, @splat('a'))), &(comptime @as([33]u8, @splat('a'))), &(comptime @as([32]u8, @splat('A'))), &(comptime @as([32]u8, @splat('g'))), @as([31]u8, @splat('a')) ++ "\x00", @as([31]u8, @splat('a')) ++ " " };
     var mock: Mock = .{};
     defer mock.deinit();
     for (invalid) |ref| {
@@ -76,7 +76,7 @@ test "invalid secrets and oversized secrets never reach backend" {
     for ([_][]const u8{ "", "abc\x00def", "\xff", "\xc0\xaf", "\xed\xa0\x80" }) |secret| {
         try testing.expectError(error.InvalidSecret, mock.store().put(reference, secret));
     }
-    const oversized = [_]u8{'s'} ** (credentials.max_secret_bytes + 1);
+    const oversized: [credentials.max_secret_bytes + 1]u8 = @splat('s');
     try testing.expectError(error.TooLarge, mock.store().put(reference, &oversized));
     try testing.expectEqual(@as(usize, 0), mock.calls);
 }
@@ -108,7 +108,7 @@ test "mock roundtrip replacement isolation and deletion" {
 test "16 KiB and multibyte UTF8 are accepted by common contract" {
     var mock: Mock = .{};
     defer mock.deinit();
-    const maximum = [_]u8{'s'} ** credentials.max_secret_bytes;
+    const maximum: [credentials.max_secret_bytes]u8 = @splat('s');
     try mock.store().put(reference, &maximum);
     var result = try mock.store().get(testing.allocator, reference);
     defer result.deinit();
@@ -174,7 +174,7 @@ test "Secret deinit wipes bytes before freeing" {
 test "untrusted backend results are validated wiped and freed" {
     var mock: Mock = .{};
     defer mock.deinit();
-    const oversized = [_]u8{'s'} ** (credentials.max_secret_bytes + 1);
+    const oversized: [credentials.max_secret_bytes + 1]u8 = @splat('s');
     const invalid = [_][]const u8{ "bad\x00value", "\xff", &oversized };
     for (invalid, 0..) |bytes, i| {
         mock.invalid_result = bytes;

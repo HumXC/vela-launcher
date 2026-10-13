@@ -396,9 +396,19 @@ const FakeVault = struct {
         var disk = journal.Journal.init(std.testing.allocator, std.testing.io, self.root) catch return error.StorageFailure;
         defer disk.deinit();
         std.debug.assert(disk.snapshot().pending == null);
-        var cfg = config.Store.init(std.testing.allocator, std.testing.io, self.root) catch return error.StorageFailure;
+        // Cleanup runs while the original config owner still holds the root.
+        if (config.Store.init(std.testing.allocator, std.testing.io, self.root)) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.StorageFailure;
+        } else |err| if (err != error.LauncherRootInUse) return error.StorageFailure;
+        const directory = std.Io.Dir.cwd().openDir(std.testing.io, self.root, .{}) catch return error.StorageFailure;
+        defer directory.close(std.testing.io);
+        const bytes = directory.readFileAlloc(std.testing.io, ".vela/config.json", std.testing.allocator, .limited(4 * 1024 * 1024)) catch return error.StorageFailure;
+        defer std.testing.allocator.free(bytes);
+        const cfg = std.json.parseFromSlice(config.Document, std.testing.allocator, bytes, .{}) catch return error.StorageFailure;
         defer cfg.deinit();
-        std.debug.assert(!same(activeReference(cfg.snapshot().settings) catch return error.StorageFailure, ref[0..32].*));
+        std.debug.assert(!same(activeReference(cfg.value.settings) catch return error.StorageFailure, ref[0..32].*));
         self.deletes += 1;
         if (self.cancel_delete) |flag| flag.store(true, .release);
         const existed = self.exists[index(ref)];
@@ -791,7 +801,7 @@ test "CF manager rejects forged foreign mismatched and stale receipts and proofs
     var spy: WipeSpy = .{};
     var secret = spy.secret(test_key);
     const receipt = try manager.prepareSet(prior, test_new, &secret, .{});
-    var forged = [_]Receipt{receipt} ** 5;
+    var forged: [5]Receipt = @splat(receipt);
     forged[0].owner ^= 1;
     forged[1].sequence += 1;
     forged[2].pending.old_ref = test_other;
@@ -894,7 +904,8 @@ fn allocationFailures(a: Allocator, recovery: bool) !void {
     const root = try testRoot(&tmp);
     defer std.testing.allocator.free(root);
     var baseline = try config.Store.init(std.testing.allocator, std.testing.io, root);
-    defer baseline.deinit();
+    var baseline_open = true;
+    defer if (baseline_open) baseline.deinit();
     try initializeConfig(&baseline);
     var vault: FakeVault = .{ .root = root };
     if (recovery) {
@@ -907,6 +918,8 @@ fn allocationFailures(a: Allocator, recovery: bool) !void {
         _ = try publish(&staged, &baseline, initial_receipt, test_policy);
         try std.testing.expect(initial_secret.bytes.len == 0 and initial_spy.frees == 1);
     }
+    baseline.deinit();
+    baseline_open = false;
     var manager = try Manager.init(a, std.testing.io, root, vault.store());
     defer manager.deinit();
     var cfg = try config.Store.init(a, std.testing.io, root);
@@ -934,8 +947,8 @@ fn allocationFailures(a: Allocator, recovery: bool) !void {
 
 test "CF manager allocation failures never leak owned secrets or delete active refs" {
     if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailures, .{false});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailures, .{true});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationFailures, .{false});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationFailures, .{true});
 }
 
 test "CF manager cancellation after staging before put retains debt and never initializes native" {
@@ -1461,5 +1474,5 @@ fn windowsManagerAllocationScenario(allocator: Allocator) !void {
     try manager.acknowledge(publication, .{});
 }
 test "Windows manager allocation failures release consumed journal config and secret ownership" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, windowsManagerAllocationScenario, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, windowsManagerAllocationScenario, .{});
 }

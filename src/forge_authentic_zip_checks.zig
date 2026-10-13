@@ -11,9 +11,9 @@
 //! Parent execution after source freeze:
 //! VELA_FORGE_AUDIT_DIR=/tmp/vela-forge-profile-audit.zPv5snot direnv exec . zig test src/forge_authentic_zip_checks.zig -O ReleaseSafe -lc --test-filter 'authentic Forge embedded ZIP'
 const std = @import("std");
-const l = @import("core/minecraft/loaders.zig");
-const c = @import("core/minecraft/loaders_common.zig");
-const files = @import("core/minecraft/loaders_files.zig");
+const l = @import("core/loaders/root.zig");
+const c = @import("core/loaders/common.zig");
+const files = @import("core/loaders/files.zig");
 const safe = @import("core/safe_archive.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;

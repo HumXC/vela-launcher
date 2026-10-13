@@ -11,9 +11,12 @@ const Allocator = std.mem.Allocator;
 const max_url_bytes = 16 * 1024;
 const max_header_bytes = 64 * 1024;
 const max_body_bytes = 64 * 1024 * 1024;
+pub const max_binary_response_bytes = 512 * 1024 * 1024;
 
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Method = enum { get, post };
+pub const Progress = struct { received: u64 = 0, total: ?u64 = null, bytes_per_second: f64 = 0, complete: bool = false, failure: ?anyerror = null };
+pub const Observer = struct { context: ?*anyopaque = null, report: *const fn (?*anyopaque, Progress) void };
 pub const Request = struct {
     method: Method = .get,
     url: []const u8,
@@ -25,6 +28,8 @@ pub const Request = struct {
     /// Absolute std.Io.Clock.awake monotonic nanoseconds.
     deadline_ns: ?i96 = null,
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// Optional allocation-free observer, called on the execute caller thread.
+    observer: ?Observer = null,
     /// Test-only exception: exact 127.0.0.1 / [::1], not DNS aliases.
     allow_http_loopback: bool = false,
     /// GET metadata only, at most five validated redirects. Disabled for POST,
@@ -42,12 +47,47 @@ pub const Options = struct {
 };
 pub const Response = struct {
     status: u16,
+    /// Borrowed view into owned storage; release through deinit, not allocator.free.
     body: []u8,
     allocator: Allocator,
+    /// Full allocation when body is a shorter view. Null supports exact-sized
+    /// responses constructed by existing callers and test transports.
+    allocation: ?[]u8 = null,
+
+    /// Return bytes owned by a; caller must wipe sensitive bytes before a.free.
+    /// Same-allocator storage transfers directly if exact-sized or resize succeeds.
+    /// Otherwise copy safely; allocation failure preserves this response. On
+    /// success body is empty and deinit remains valid (status is unchanged).
+    pub fn takeBody(self: *Response, a: Allocator) ![]u8 {
+        const storage = self.allocation orelse self.body;
+        const len = self.body.len;
+        if (len == 0) {
+            std.crypto.secureZero(u8, storage);
+            self.allocator.free(storage);
+            self.body = &.{};
+            self.allocation = null;
+            return &.{};
+        }
+        if (a.ptr == self.allocator.ptr and a.vtable == self.allocator.vtable) {
+            std.crypto.secureZero(u8, storage[len..]);
+            if (storage.len == len or self.allocator.resize(storage, len)) {
+                self.body = &.{};
+                self.allocation = null;
+                return storage.ptr[0..len];
+            }
+        }
+        const owned = try a.dupe(u8, self.body);
+        std.crypto.secureZero(u8, storage);
+        self.allocator.free(storage);
+        self.body = &.{};
+        self.allocation = null;
+        return owned;
+    }
 
     pub fn deinit(self: *Response) void {
-        std.crypto.secureZero(u8, self.body);
-        self.allocator.free(self.body);
+        const storage = self.allocation orelse self.body;
+        std.crypto.secureZero(u8, storage);
+        self.allocator.free(storage);
         self.* = undefined;
     }
 };
@@ -65,12 +105,12 @@ pub const Client = struct {
         if (options.ca_bundle) |path| {
             if (path.len == 0 or path.len > max_url_bytes or badControls(path)) return error.InvalidCaBundle;
         }
-        const p = try a.dupeZ(u8, proxy);
+        const p = try a.dupeSentinel(u8, proxy, 0);
         errdefer {
             std.crypto.secureZero(u8, p);
             a.free(p);
         }
-        const ca_path = if (options.ca_bundle) |path| try a.dupeZ(u8, path) else null;
+        const ca_path = if (options.ca_bundle) |path| try a.dupeSentinel(u8, path, 0) else null;
         errdefer if (ca_path) |path| a.free(path);
         var ca_pem: std.ArrayList(u8) = if (ca_path == null) try collectNativeCA(a, io) else .empty;
         errdefer ca_pem.deinit(a);
@@ -89,15 +129,34 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    pub fn execute(self: *const Client, request: Request) !Response {
-        try validateRequest(request);
+    pub fn execute(self: *const Client, request: Request) anyerror!Response {
+        return self.executeBounded(request, max_body_bytes);
+    }
+
+    /// Explicit buffered binary GET. Callers retain responsibility for artifact
+    /// origin and digest verification. Ordinary execute keeps its JSON/auth ceiling.
+    /// Shares URL/header checks, redirects, deadlines, cancellation and observers.
+    pub fn executeBinary(self: *const Client, request: Request) anyerror!Response {
+        if (request.method != .get or request.body != null) return error.InvalidBinaryRequest;
+        return self.executeBounded(request, max_binary_response_bytes);
+    }
+
+    fn executeBounded(self: *const Client, request: Request, response_limit: usize) anyerror!Response {
+        try validateRequestBounded(request, response_limit);
         if (request.require_public_address and self.proxy.len != 0) return error.UnsupportedProxyWithPublicAddressGuard;
         const start = std.Io.Clock.awake.now(self.io).nanoseconds;
         const deadline = @min(request.deadline_ns orelse std.math.maxInt(i96), start + @as(i96, request.timeout_ms) * std.time.ns_per_ms);
-        var state: Transfer = .{ .allocator = self.allocator, .io = self.io, .request = request, .deadline = deadline };
+        var state: Transfer = .{ .allocator = self.allocator, .io = self.io, .request = request, .deadline = deadline, .sample_ns = start };
         defer state.deinit();
+        return self.executeTransfer(request, &state) catch |err| {
+            state.publishTerminal(err);
+            return err;
+        };
+    }
+
+    fn executeTransfer(self: *const Client, request: Request, state: *Transfer) anyerror!Response {
         try state.check();
-        var current = try self.allocator.dupeZ(u8, request.url);
+        var current = try self.allocator.dupeSentinel(u8, request.url, 0);
         defer self.allocator.free(current);
         var headers: ?*c.curl_slist = null;
         defer freeHeaders(headers);
@@ -152,12 +211,12 @@ pub const Client = struct {
             try set(easy, c.CURLOPT_TIMEOUT_MS, remaining);
             try set(easy, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_long, @min(remaining, 30_000)));
             try set(easy, c.CURLOPT_WRITEFUNCTION, &writeCallback);
-            try set(easy, c.CURLOPT_WRITEDATA, &state);
+            try set(easy, c.CURLOPT_WRITEDATA, state);
             try set(easy, c.CURLOPT_HEADERFUNCTION, &headerCallback);
-            try set(easy, c.CURLOPT_HEADERDATA, &state);
+            try set(easy, c.CURLOPT_HEADERDATA, state);
             try set(easy, c.CURLOPT_NOPROGRESS, @as(c_long, 0));
             try set(easy, c.CURLOPT_XFERINFOFUNCTION, &progressCallback);
-            try set(easy, c.CURLOPT_XFERINFODATA, &state);
+            try set(easy, c.CURLOPT_XFERINFODATA, state);
             if (headers) |list| try set(easy, c.CURLOPT_HTTPHEADER, list);
             if (request.method == .post) {
                 const body = request.body orelse "";
@@ -167,9 +226,9 @@ pub const Client = struct {
             } else try set(easy, c.CURLOPT_HTTPGET, @as(c_long, 1));
             try state.check();
             const result = c.curl_easy_perform(easy);
-            if (state.failure) |err| return err;
+            if (state.failure) |err| return @as(anyerror!Response, err);
             try state.check();
-            if (result != c.CURLE_OK) return curlFailure(result);
+            if (result != c.CURLE_OK) return @as(anyerror!Response, curlFailure(result));
             var status: c_long = 0;
             if (c.curl_easy_getinfo(easy, c.CURLINFO_RESPONSE_CODE, &status) != c.CURLE_OK) return error.CurlInfo;
             if (status < 100 or status > 599) return error.InvalidHttpStatus;
@@ -181,8 +240,8 @@ pub const Client = struct {
                 redirects += 1;
                 continue;
             }
-            const owned = try self.allocator.dupe(u8, state.body.bytes());
-            return .{ .status = @intCast(status), .body = owned, .allocator = self.allocator };
+            state.publishTerminal(null);
+            return state.body.takeResponse(self.allocator, @intCast(status));
         }
     }
 };
@@ -219,9 +278,12 @@ fn validateUrl(url: []const u8, allow_http_loopback: bool) !void {
     return error.InsecureUrl;
 }
 fn validateRequest(request: Request) !void {
+    return validateRequestBounded(request, max_body_bytes);
+}
+fn validateRequestBounded(request: Request, response_limit: usize) !void {
     try validateUrl(request.url, request.allow_http_loopback);
     if (request.timeout_ms == 0 or std.math.cast(c_long, request.timeout_ms) == null) return error.InvalidTimeout;
-    if (request.max_response_bytes > max_body_bytes) return error.InvalidLimit;
+    if (request.max_response_bytes > response_limit) return error.InvalidLimit;
     if (request.body) |body| {
         if (request.method != .post or body.len > max_body_bytes) return error.InvalidBody;
     }
@@ -259,7 +321,7 @@ fn resolveRedirect(a: Allocator, base: [:0]const u8, location: []const u8, allow
     const handle = c.curl_url() orelse return error.OutOfMemory;
     defer c.curl_url_cleanup(handle);
     if (c.curl_url_set(handle, c.CURLUPART_URL, base.ptr, 0) != c.CURLUE_OK) return error.InvalidUrl;
-    const relative = try a.dupeZ(u8, location);
+    const relative = try a.dupeSentinel(u8, location, 0);
     defer a.free(relative);
     if (c.curl_url_set(handle, c.CURLUPART_URL, relative.ptr, 0) != c.CURLUE_OK) return error.InvalidUrl;
     var resolved: [*c]u8 = null;
@@ -270,7 +332,7 @@ fn resolveRedirect(a: Allocator, base: [:0]const u8, location: []const u8, allow
     const old_uri = std.Uri.parse(base) catch return error.InvalidUrl;
     const new_uri = std.Uri.parse(url) catch return error.InvalidUrl;
     if (std.ascii.eqlIgnoreCase(old_uri.scheme, "https") and !std.ascii.eqlIgnoreCase(new_uri.scheme, "https")) return error.InsecureRedirect;
-    return a.dupeZ(u8, url);
+    return a.dupeSentinel(u8, url, 0);
 }
 fn freeHeaders(list: ?*c.curl_slist) void {
     var cursor = list;
@@ -316,17 +378,29 @@ const BodyBuffer = struct {
         a.free(self.storage);
         self.* = .{};
     }
+    fn takeResponse(self: *BodyBuffer, a: Allocator, status: u16) Response {
+        const response: Response = .{ .status = status, .body = self.storage[0..self.len], .allocator = a, .allocation = self.storage };
+        self.* = .{};
+        return response;
+    }
     fn append(self: *BodyBuffer, a: Allocator, data: []const u8, limit: usize) !void {
-        if (data.len > limit - self.len) return error.ResponseTooLarge;
+        if (self.len > limit or data.len > limit - self.len) return error.ResponseTooLarge;
         const needed = self.len + data.len;
         if (needed > self.storage.len) {
-            const capacity = @min(limit, @max(needed, @max(4096, self.storage.len * 2)));
-            const storage = try a.alloc(u8, capacity);
-            @memset(storage, 0);
-            @memcpy(storage[0..self.len], self.bytes());
-            std.crypto.secureZero(u8, self.storage);
-            a.free(self.storage);
-            self.storage = storage;
+            const doubled = std.math.mul(usize, self.storage.len, 2) catch limit;
+            const capacity = @min(limit, @max(needed, @max(4096, doubled)));
+            const previous_capacity = self.storage.len;
+            if (a.resize(self.storage, capacity)) {
+                self.storage = self.storage.ptr[0..capacity];
+                @memset(self.storage[previous_capacity..], 0);
+            } else {
+                const storage = try a.alloc(u8, capacity);
+                @memset(storage, 0);
+                @memcpy(storage[0..self.len], self.bytes());
+                std.crypto.secureZero(u8, self.storage);
+                a.free(self.storage);
+                self.storage = storage;
+            }
         }
         @memcpy(self.storage[self.len..needed], data);
         self.len = needed;
@@ -341,6 +415,15 @@ const Transfer = struct {
     location: std.ArrayList(u8) = .empty,
     header_bytes: usize = 0,
     failure: ?anyerror = null,
+    progress: Progress = .{},
+    sample_ns: i96 = 0,
+    sample_received: u64 = 0,
+    fn publishTerminal(self: *Transfer, failure: ?anyerror) void {
+        self.progress.failure = failure;
+        self.progress.complete = failure == null;
+        self.progress.bytes_per_second = 0;
+        if (self.request.observer) |observer| observer.report(observer.context, self.progress);
+    }
     fn deinit(self: *Transfer) void {
         self.body.clear(self.allocator);
         std.crypto.secureZero(u8, self.location.items);
@@ -410,12 +493,25 @@ fn headerCallback(ptr: [*c]u8, size: usize, count: usize, userdata: ?*anyopaque)
     }
     return len;
 }
-fn progressCallback(userdata: ?*anyopaque, _: c.curl_off_t, _: c.curl_off_t, _: c.curl_off_t, _: c.curl_off_t) callconv(.c) c_int {
+fn progressCallback(userdata: ?*anyopaque, total: c.curl_off_t, received: c.curl_off_t, _: c.curl_off_t, _: c.curl_off_t) callconv(.c) c_int {
     const state: *Transfer = @ptrCast(@alignCast(userdata orelse return 1));
     state.check() catch |err| {
         state.fail(err);
         return 1;
     };
+    if (state.request.observer) |observer| {
+        const now = std.Io.Clock.awake.now(state.io).nanoseconds;
+        const bytes: u64 = @intCast(@max(0, received));
+        const elapsed = now - state.sample_ns;
+        if (elapsed > 0 and (elapsed >= 100 * std.time.ns_per_ms or (state.progress.bytes_per_second == 0 and bytes > state.sample_received))) {
+            state.progress.bytes_per_second = @as(f64, @floatFromInt(bytes -| state.sample_received)) * std.time.ns_per_s / @as(f64, @floatFromInt(elapsed));
+            state.sample_ns = now;
+            state.sample_received = bytes;
+        }
+        state.progress.received = bytes;
+        state.progress.total = if (total > 0) @intCast(total) else null;
+        observer.report(observer.context, state.progress);
+    }
     return 0;
 }
 
@@ -442,14 +538,13 @@ fn bufferOom(a: Allocator) !void {
     var buffer: BodyBuffer = .{};
     defer buffer.clear(a);
     try buffer.append(a, "secret", 8192);
-    try buffer.append(a, &([_]u8{42} ** 5000), 8192);
-    const owned = try a.dupe(u8, buffer.bytes());
-    var response: Response = .{ .status = 200, .body = owned, .allocator = a };
+    try buffer.append(a, &@as([5000]u8, @splat(42)), 8192);
+    var response = buffer.takeResponse(a, 200);
     defer response.deinit();
     try std.testing.expectEqual(@as(usize, 5006), response.body.len);
 }
 test "body growth and response ownership are leak-free under OOM" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, bufferOom, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, bufferOom, .{});
 }
 test "body exact limit and callback cancellation, deadline, overflow" {
     var buffer: BodyBuffer = .{};
@@ -478,7 +573,7 @@ fn initOom(a: Allocator) !void {
     try std.testing.expectEqualStrings("fixture.pem", client.ca_path.?);
 }
 test "client option copies have balanced lifetime under OOM" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, initOom, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, initOom, .{});
     try std.testing.expectError(error.InvalidProxy, Client.init(std.testing.allocator, std.testing.io, .{ .proxy = "proxy\x00" }));
     try std.testing.expectError(error.InvalidCaBundle, Client.init(std.testing.allocator, std.testing.io, .{ .ca_bundle = "" }));
 }
@@ -519,7 +614,7 @@ test "loopback GET, POST binary bytes, auth headers, statuses, empty body and ex
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqualStrings("{\"ok\":true}", response.body);
-    try std.testing.checkAllAllocationFailures(a, performOom, .{ &client, get });
+    try @import("test_allocations").checkAllAllocationFailures(a, performOom, .{ &client, get });
     const post = try fixtureUrl(a, base, "/post");
     defer a.free(post);
     var echo = try client.execute(.{ .method = .post, .url = post, .body = "one\x00two", .allow_http_loopback = true, .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }} });
@@ -586,6 +681,93 @@ test "loopback metadata redirects bounded, secret redirects blocked, external HT
     defer a.free(loop);
     try std.testing.expectError(error.TooManyRedirects, client.execute(.{ .url = loop, .allow_http_loopback = true, .follow_redirects = true }));
 }
+test "binary API accepts loader limit while ordinary and auth requests retain their ceiling" {
+    const a = std.testing.allocator;
+    var client = try Client.init(a, std.testing.io, .{});
+    defer client.deinit();
+    var cancel = std.atomic.Value(bool).init(true);
+    const request: Request = .{ .url = "https://example.invalid/installer.jar", .max_response_bytes = max_binary_response_bytes, .cancel = &cancel };
+    try std.testing.expectError(error.InvalidLimit, client.execute(request));
+    try std.testing.expectError(error.Canceled, client.executeBinary(request));
+    var invalid = request;
+    invalid.max_response_bytes += 1;
+    try std.testing.expectError(error.InvalidLimit, client.executeBinary(invalid));
+    invalid = request;
+    invalid.method = .post;
+    try std.testing.expectError(error.InvalidBinaryRequest, client.executeBinary(invalid));
+    invalid = request;
+    invalid.body = "unexpected";
+    try std.testing.expectError(error.InvalidBinaryRequest, client.executeBinary(invalid));
+    invalid = request;
+    invalid.headers = &.{.{ .name = "Authorization", .value = "Bearer fixture-secret" }};
+    try std.testing.expectError(error.InvalidLimit, client.execute(invalid));
+    invalid = request;
+    invalid.url = "http://example.invalid/installer.jar";
+    try std.testing.expectError(error.InsecureUrl, client.executeBinary(invalid));
+    invalid = request;
+    invalid.headers = &.{.{ .name = "Host", .value = "example.invalid" }};
+    try std.testing.expectError(error.InvalidHeader, client.executeBinary(invalid));
+    cancel.store(false, .release);
+    invalid = request;
+    invalid.deadline_ns = 0;
+    try std.testing.expectError(error.TimedOut, client.executeBinary(invalid));
+}
+
+test "loopback binary transfers exceed ordinary ceiling and enforce declared and streaming response bounds" {
+    const Capture = struct {
+        latest: Progress = .{},
+        fn report(raw: ?*anyopaque, progress: Progress) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.latest = progress;
+        }
+    };
+    const a = std.testing.allocator;
+    const base = try fixtureBase(a);
+    defer a.free(base);
+    var client = try Client.init(a, std.testing.io, .{});
+    defer client.deinit();
+    for ([_][]const u8{ "/binary-large", "/binary-large-stream" }) |route| {
+        const url = try fixtureUrl(a, base, route);
+        defer a.free(url);
+        // The actual production API must receive >64MiB, even though the loader
+        // requests a 512MiB upper bound for installations of unknown size.
+        var capture: Capture = .{};
+        var response = try client.executeBinary(.{ .url = url, .allow_http_loopback = true, .max_response_bytes = max_binary_response_bytes, .observer = .{ .context = &capture, .report = Capture.report } });
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        try std.testing.expectEqual(@as(usize, 65 * 1024 * 1024), response.body.len);
+        try std.testing.expect(std.mem.allEqual(u8, response.body, 98));
+        try std.testing.expect(capture.latest.complete);
+        try std.testing.expect(capture.latest.failure == null);
+        try std.testing.expectEqual(@as(u64, response.body.len), capture.latest.received);
+        try std.testing.expectEqual(@as(f64, 0), capture.latest.bytes_per_second);
+        try std.testing.expectError(error.ResponseTooLarge, client.executeBinary(.{ .url = url, .allow_http_loopback = true, .max_response_bytes = max_body_bytes }));
+        try std.testing.expectError(error.ResponseTooLarge, client.execute(.{ .url = url, .allow_http_loopback = true, .max_response_bytes = max_body_bytes }));
+    }
+    const small = try fixtureUrl(a, base, "/get");
+    defer a.free(small);
+    var default = try client.executeBinary(.{ .url = small, .allow_http_loopback = true });
+    defer default.deinit();
+    try std.testing.expectEqualStrings("{\"ok\":true}", default.body);
+}
+
+test "binary requests preserve mid-transfer cancellation deadline and public-address protection" {
+    const a = std.testing.allocator;
+    const base = try fixtureBase(a);
+    defer a.free(base);
+    var client = try Client.init(a, std.testing.io, .{});
+    defer client.deinit();
+    const slow = try fixtureUrl(a, base, "/slow");
+    defer a.free(slow);
+    try std.testing.expectError(error.TimedOut, client.executeBinary(.{ .url = slow, .allow_http_loopback = true, .max_response_bytes = max_binary_response_bytes, .timeout_ms = 80 }));
+    try std.testing.expectError(error.TimedOut, client.executeBinary(.{ .url = slow, .allow_http_loopback = true, .max_response_bytes = max_binary_response_bytes, .deadline_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 80 * std.time.ns_per_ms }));
+    var cancel = std.atomic.Value(bool).init(false);
+    const worker = try std.Thread.spawn(.{}, cancelSoon, .{ std.testing.io, &cancel });
+    defer worker.join();
+    try std.testing.expectError(error.Canceled, client.executeBinary(.{ .url = slow, .allow_http_loopback = true, .max_response_bytes = max_binary_response_bytes, .cancel = &cancel, .timeout_ms = 3000 }));
+    try std.testing.expectError(error.NonPublicAddress, client.executeBinary(.{ .url = slow, .allow_http_loopback = true, .max_response_bytes = max_binary_response_bytes, .require_public_address = true }));
+}
+
 fn cancelSoon(io: std.Io, flag: *std.atomic.Value(bool)) void {
     io.sleep(.fromMilliseconds(40), .awake) catch {};
     flag.store(true, .release);
@@ -729,4 +911,191 @@ test "guarded downloader cannot reuse an unguarded persistent loopback connectio
     var response = try client.execute(.{ .url = stats, .allow_http_loopback = true });
     defer response.deinit();
     try std.testing.expectEqualStrings("0", response.body);
+}
+
+test "short HTTP downloads publish speed through the install task bridge before 100ms" {
+    const tasks = @import("tasks.zig");
+    const telemetry = @import("install/download_details.zig");
+    var registry = tasks.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    const task = try registry.create(.game_install, "Short metadata download");
+    var adapter: telemetry.HttpObserver = .{ .task = task, .path = "34.json", .stage = .downloading };
+    var transfer: Transfer = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .request = .{ .url = "https://example.invalid/34.json", .observer = adapter.observer() },
+        .deadline = std.math.maxInt(i96),
+        .sample_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - 10 * std.time.ns_per_ms,
+    };
+    defer transfer.deinit();
+    const bytes = 583 * 1024;
+    try std.testing.expectEqual(@as(c_int, 0), progressCallback(&transfer, bytes, bytes, 0, 0));
+    const live = task.details();
+    try std.testing.expectEqualStrings("34.json", live.files[0].name());
+    try std.testing.expectEqual(@as(u64, bytes), live.received);
+    try std.testing.expect(live.bytes_per_second > 0);
+    try std.testing.expectEqual(live.bytes_per_second, live.files[0].bytes_per_second);
+    transfer.publishTerminal(null);
+    const complete = task.details();
+    try std.testing.expectEqual(@as(u64, bytes), complete.received);
+    try std.testing.expectEqual(tasks.FileState.complete, complete.files[0].state);
+    try std.testing.expectEqual(@as(f64, 0), complete.bytes_per_second);
+}
+
+test "HTTP observer publishes received bytes before completion and resets terminal speed" {
+    const Capture = struct {
+        latest: Progress = .{},
+        calls: usize = 0,
+        fn report(raw: ?*anyopaque, value: Progress) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.latest = value;
+            self.calls += 1;
+        }
+    };
+    var capture: Capture = .{};
+    var transfer: Transfer = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .request = .{ .url = "https://example.invalid/file.jar", .observer = .{ .context = &capture, .report = Capture.report } },
+        .deadline = std.math.maxInt(i96),
+        .sample_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - std.time.ns_per_s,
+    };
+    defer transfer.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), progressCallback(&transfer, 4096, 1024, 0, 0));
+    try std.testing.expectEqual(@as(u64, 1024), capture.latest.received);
+    try std.testing.expectEqual(@as(?u64, 4096), capture.latest.total);
+    try std.testing.expect(!capture.latest.complete);
+    try std.testing.expect(capture.latest.bytes_per_second > 0 and capture.latest.bytes_per_second <= 1024);
+    try std.testing.expectEqual(@as(c_int, 0), progressCallback(&transfer, 0, 1536, 0, 0));
+    try std.testing.expectEqual(@as(?u64, null), capture.latest.total);
+    transfer.publishTerminal(error.TimedOut);
+    try std.testing.expectEqual(@as(?anyerror, error.TimedOut), capture.latest.failure);
+    try std.testing.expectEqual(@as(f64, 0), capture.latest.bytes_per_second);
+    try std.testing.expectEqual(@as(u64, 1536), capture.latest.received);
+    try std.testing.expectEqual(@as(usize, 3), capture.calls);
+}
+
+// Debug/safe free poisons bytes after secureZero; ReleaseFast observes the wipe.
+const BodyWipeAllocator = struct {
+    allocations: usize = 0,
+    frees: usize = 0,
+    freed_bytes: usize = 0,
+    all_wiped: bool = true,
+
+    fn allocator(self: *BodyWipeAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *BodyWipeAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = std.testing.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.allocations += 1;
+        return ptr;
+    }
+    fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *BodyWipeAllocator = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        self.freed_bytes += bytes.len;
+        const poison: u8 = if (@import("builtin").mode == .debug or @import("builtin").mode == .safe) 0xaa else 0;
+        for (bytes) |byte| if (byte != poison) {
+            self.all_wiped = false;
+        };
+        std.testing.allocator.rawFree(bytes, alignment, ret_addr);
+    }
+};
+
+test "body transfer allocates nothing and wipes full capacity after growth" {
+    var tracking: BodyWipeAllocator = .{};
+    const a = tracking.allocator();
+    var buffer: BodyBuffer = .{};
+    defer buffer.clear(a);
+    try buffer.append(a, "secret", 8192);
+    try buffer.append(a, &@as([5000]u8, @splat(42)), 8192);
+    const ptr = buffer.storage.ptr;
+    const allocations = tracking.allocations;
+    var response = buffer.takeResponse(a, 429);
+    try std.testing.expectEqual(allocations, tracking.allocations);
+    try std.testing.expect(response.body.ptr == ptr);
+    try std.testing.expectEqual(@as(usize, 5006), response.body.len);
+    try std.testing.expectEqual(@as(usize, 8192), response.allocation.?.len);
+    try std.testing.expectEqual(@as(usize, 0), buffer.storage.len);
+    try std.testing.expectEqual(@as(usize, 1), tracking.frees);
+    response.deinit();
+    try std.testing.expectEqual(@as(usize, 2), tracking.frees);
+    try std.testing.expectEqual(@as(usize, 4096 + 8192), tracking.freed_bytes);
+    try std.testing.expect(tracking.all_wiped);
+}
+
+test "body growth and extraction use in-place resizing when available" {
+    var memory: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    const a = fixed.allocator();
+    var buffer: BodyBuffer = .{};
+    defer buffer.clear(a);
+    try buffer.append(a, "secret", 8192);
+    const ptr = buffer.storage.ptr;
+    try buffer.append(a, &@as([5000]u8, @splat(42)), 8192);
+    try std.testing.expect(buffer.storage.ptr == ptr);
+    var response = buffer.takeResponse(a, 200);
+    defer response.deinit();
+    const owned = try response.takeBody(a);
+    defer {
+        std.crypto.secureZero(u8, owned);
+        a.free(owned);
+    }
+    try std.testing.expect(owned.ptr == ptr);
+    try std.testing.expectEqual(@as(usize, 5006), owned.len);
+    try std.testing.expectEqual(@as(usize, 0), response.body.len);
+    try std.testing.expect(response.allocation == null);
+}
+
+test "body extraction preserves ownership on OOM and safely copies across allocators" {
+    var tracking: BodyWipeAllocator = .{};
+    const a = tracking.allocator();
+    var buffer: BodyBuffer = .{};
+    defer buffer.clear(a);
+    try buffer.append(a, "secret", 8192);
+    var response = buffer.takeResponse(a, 201);
+    defer response.deinit();
+    var empty: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&empty);
+    try std.testing.expectError(error.OutOfMemory, response.takeBody(fixed.allocator()));
+    try std.testing.expectEqualStrings("secret", response.body);
+    try std.testing.expectEqual(@as(usize, 0), tracking.frees);
+    const copied = try response.takeBody(std.testing.allocator);
+    defer {
+        std.crypto.secureZero(u8, copied);
+        std.testing.allocator.free(copied);
+    }
+    try std.testing.expectEqualStrings("secret", copied);
+    try std.testing.expectEqual(@as(usize, 0), response.body.len);
+    try std.testing.expectEqual(@as(u16, 201), response.status);
+    try std.testing.expectEqual(@as(usize, 1), tracking.frees);
+    try std.testing.expect(tracking.all_wiped);
+}
+
+test "body extraction supports exact-sized legacy responses and no-resize fallback" {
+    var tracking: BodyWipeAllocator = .{};
+    const a = tracking.allocator();
+    var exact: Response = .{ .status = 200, .body = try a.dupe(u8, "secret"), .allocator = a };
+    defer exact.deinit();
+    const ptr = exact.body.ptr;
+    const owned = try exact.takeBody(a);
+    try std.testing.expect(owned.ptr == ptr);
+    std.crypto.secureZero(u8, owned);
+    a.free(owned);
+    var buffer: BodyBuffer = .{};
+    defer buffer.clear(a);
+    try buffer.append(a, "secret", 8192);
+    var response = buffer.takeResponse(a, 200);
+    defer response.deinit();
+    const copied = try response.takeBody(a);
+    try std.testing.expectEqualStrings("secret", copied);
+    std.crypto.secureZero(u8, copied);
+    a.free(copied);
+    var blank = buffer.takeResponse(a, 204);
+    defer blank.deinit();
+    const empty = try blank.takeBody(a);
+    a.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expect(tracking.all_wiped);
 }

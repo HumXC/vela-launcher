@@ -1,6 +1,6 @@
 const std = @import("std");
-const files = @import("core/minecraft/loaders_files.zig");
-const common = @import("core/minecraft/loaders_common.zig");
+const files = @import("core/loaders/files.zig");
+const common = @import("core/loaders/common.zig");
 fn now(_: ?*anyopaque) u64 {
     return 0;
 }

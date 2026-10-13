@@ -26,6 +26,7 @@ pub const Instance = struct {
     loader: Loader = .vanilla,
     loader_version: ?[]const u8 = null,
     java_path: ?[]const u8 = null,
+    min_memory_mb: ?u32 = null,
     max_memory_mb: ?u32 = null,
     debug_launch: bool = false,
     origin: ?Origin = null,
@@ -139,7 +140,11 @@ fn validate(doc: Document) !void {
             if (!validText(version, 200, false)) return error.InvalidLoaderVersion;
         } else if (instance.loader != .vanilla) return error.InvalidLoaderVersion;
         if (instance.java_path) |path| if (!validText(path, 4096, false)) return error.InvalidJavaPath;
+        if (instance.min_memory_mb) |memory| if (!validMemory(memory)) return error.InvalidMemory;
         if (instance.max_memory_mb) |memory| if (!validMemory(memory)) return error.InvalidMemory;
+        if (instance.min_memory_mb) |minimum| {
+            if (minimum > (instance.max_memory_mb orelse doc.settings.default_memory_mb)) return error.InvalidMemory;
+        }
         if (instance.origin) |origin| {
             if (!validText(origin.project_id, 4096, false) or !validText(origin.version_id, 4096, false)) return error.InvalidOrigin;
         }
@@ -187,7 +192,50 @@ fn parse(a: Allocator, bytes: []const u8) !std.json.Parsed(Document) {
     return parsed;
 }
 
-/// Single-owner store. Calls must be serialized by the caller.
+// Keep the lock inode forever; unlinking it would split cooperating writers.
+// flock is attached to this open description on POSIX and released on crash/close.
+const RootWriter = struct {
+    directory: Dir,
+    file: std.Io.File,
+    const leaf = ".vela-writer.lock";
+
+    fn acquire(io: std.Io, path: []const u8) !RootWriter {
+        const directory = try Dir.cwd().openDir(io, path, .{});
+        errdefer directory.close(io);
+        const file = directory.openFile(io, leaf, .{ .mode = .read_write, .follow_symlinks = false, .allow_directory = false }) catch |err| blk: {
+            if (err != error.FileNotFound) return err;
+            break :blk directory.createFile(io, leaf, .{ .read = true, .exclusive = true }) catch |create_err| {
+                if (create_err != error.PathAlreadyExists) return create_err;
+                break :blk try directory.openFile(io, leaf, .{ .mode = .read_write, .follow_symlinks = false, .allow_directory = false });
+            };
+        };
+        errdefer file.close(io);
+        if ((try file.stat(io)).kind != .file) return error.InvalidRootWriterLock;
+        if (!try file.tryLock(io, .exclusive)) return error.LauncherRootInUse;
+        const writer: RootWriter = .{ .directory = directory, .file = file };
+        try writer.recheckLock(io);
+        return writer;
+    }
+
+    fn recheckLock(self: RootWriter, io: std.Io) !void {
+        const named = try self.directory.statFile(io, leaf, .{ .follow_symlinks = false });
+        if (named.kind != .file or named.inode != (try self.file.stat(io)).inode) return error.RootWriterLockChanged;
+    }
+
+    fn recheck(self: RootWriter, io: std.Io, root: []const u8) !void {
+        try self.recheckLock(io);
+        const named = try Dir.cwd().statFile(io, root, .{ .follow_symlinks = false });
+        if (named.kind != .directory or named.inode != (try self.directory.stat(io)).inode) return error.LauncherRootChanged;
+    }
+
+    fn close(self: RootWriter, io: std.Io) void {
+        self.file.close(io);
+        self.directory.close(io);
+    }
+};
+
+/// Single-owner root writer. Calls must be serialized by the caller.
+/// The lifetime lock also protects reference publication through vault cleanup.
 pub const Store = struct {
     a: Allocator,
     io: std.Io,
@@ -196,25 +244,29 @@ pub const Store = struct {
     state: std.json.Parsed(Document),
     publication_uncertain: bool = false,
     windows_root: ?windows_fs.Root = null,
+    writer: ?RootWriter = null,
 
-    /// Owns an absolute copy of the launcher base path and all parsed data.
+    /// Owns the canonical launcher root, all parsed data, and its exclusive writer.
+    /// Creates/opens only the persistent root lock; never creates or rewrites config.
+    /// A competing Store fails with LauncherRootInUse before reading any references.
     /// Only a missing config gives defaults; all other load errors propagate.
-    /// Init never creates or rewrites a config file.
     pub fn init(a: Allocator, io: std.Io, root: []const u8) !Store {
         if (!validText(root, 4096, false)) return error.InvalidRoot;
         if (builtin.os.tag == .windows) {
             var owned: ?windows_fs.Root = windows_fs.openRoot(a, io, root, .ordinary_config) catch |err| return windowsError(err);
             return initWithOwnedRoot(a, io, &owned);
         }
-        const cwd = try std.process.currentPathAlloc(io, a);
-        defer a.free(cwd);
-        const owned_root = try std.fs.path.resolve(a, &.{ cwd, root });
+        const writer = try RootWriter.acquire(io, root);
+        errdefer writer.close(io);
+        var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const root_len = try writer.directory.realPath(io, &root_buffer);
+        const owned_root = try a.dupe(u8, root_buffer[0..root_len]);
         errdefer a.free(owned_root);
         const file = try std.fs.path.join(a, &.{ owned_root, ".vela", "config.json" });
         errdefer a.free(file);
         const stat = Dir.cwd().statFile(io, file, .{}) catch |err| switch (err) {
             error.FileNotFound => {
-                return .{ .a = a, .io = io, .root = owned_root, .file = file, .state = try parse(a, "{}") };
+                return .{ .a = a, .io = io, .root = owned_root, .file = file, .state = try parse(a, "{}"), .writer = writer };
             },
             else => return err,
         };
@@ -222,7 +274,7 @@ pub const Store = struct {
         if (stat.size > max_json) return error.ConfigTooLarge;
         const bytes = try Dir.cwd().readFileAlloc(io, file, a, .limited(max_json));
         defer a.free(bytes);
-        return .{ .a = a, .io = io, .root = owned_root, .file = file, .state = try parse(a, bytes) };
+        return .{ .a = a, .io = io, .root = owned_root, .file = file, .state = try parse(a, bytes), .writer = writer };
     }
 
     /// Consumes the optional capability immediately, including on every error.
@@ -232,6 +284,7 @@ pub const Store = struct {
         owned.* = null;
         errdefer windows_fs.deinit(&capability);
         if (capability.privacy != .ordinary_config) return error.InvalidRoot;
+        try windows_fs.acquireWriter(&capability);
         const root = try a.dupe(u8, capability.normalized);
         errdefer a.free(root);
         const file = try std.fmt.allocPrint(a, "{s}\\.vela\\config.json", .{root});
@@ -244,6 +297,7 @@ pub const Store = struct {
     /// Separate from read-only init. App calls this before any worker or consumer.
     pub fn prepareStorage(self: *Store) !void {
         if (self.publication_uncertain) return error.ConfigPublicationUncertain;
+        try self.recheckWriter();
         if (self.windows_root) |*root| {
             windows_fs.prepareStorage(root) catch |err| {
                 self.publication_uncertain = true;
@@ -264,6 +318,7 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         self.state.deinit();
+        if (self.writer) |writer| writer.close(self.io);
         if (self.windows_root) |*root| windows_fs.deinit(root);
         self.a.free(self.file);
         self.a.free(self.root);
@@ -303,6 +358,7 @@ pub const Store = struct {
     /// Windows reconciles the exact loaded bytes through the durable adapter.
     pub fn reconcile(self: *Store) !void {
         self.publication_uncertain = true;
+        try self.recheckWriter();
         if (self.windows_root) |*root| {
             root.publication_uncertain = true;
             var loaded = (windows_fs.load(root, self.a, "config.json", max_json) catch |err| return windowsError(err)) orelse return error.FileNotFound;
@@ -329,7 +385,12 @@ pub const Store = struct {
         self.publication_uncertain = false;
     }
 
+    fn recheckWriter(self: *Store) !void {
+        if (self.writer) |writer| try writer.recheck(self.io, self.root);
+    }
+
     fn save(self: *Store, bytes: []const u8) !void {
+        try self.recheckWriter();
         if (self.windows_root) |*root| {
             windows_fs.publish(root, "config.json", bytes, .none) catch |err| return windowsError(err);
             return;
@@ -371,6 +432,7 @@ const sample: Document = .{
         .loader = .fabric,
         .loader_version = "0.16.10",
         .java_path = "/java/bin/java",
+        .min_memory_mb = 1024,
         .max_memory_mb = 4096,
         .debug_launch = true,
         .origin = .{ .kind = .modrinth, .project_id = "project", .version_id = "release" },
@@ -433,8 +495,8 @@ test "save reload and snapshot alias updates own every string and collection" {
     try std.testing.expectEqualStrings("/java/bin/java", store.snapshot().instances[0].java_path.?);
     try std.testing.expectEqualStrings("vault:player", store.snapshot().accounts[0].credential_ref.?);
     try store.update(store.snapshot().*);
-    var reloaded = try Store.init(a, io, root);
-    defer reloaded.deinit();
+    try store.reconcile();
+    const reloaded = &store;
     const expected = try serialize(a, sample);
     defer a.free(expected);
     const actual = try serialize(a, reloaded.snapshot().*);
@@ -453,11 +515,93 @@ test "serialization omits all null optionals but retains non-null values" {
     };
     const bytes = try serialize(a, doc);
     defer a.free(bytes);
-    for ([_][]const u8{ "null", "loader_version", "java_path", "max_memory_mb", "origin", "credential_ref", "selected_instance", "selected_account", "selected_server" }) |key| try std.testing.expect(std.mem.indexOf(u8, bytes, key) == null);
+    for ([_][]const u8{ "null", "loader_version", "java_path", "min_memory_mb", "max_memory_mb", "origin", "credential_ref", "selected_instance", "selected_account", "selected_server" }) |key| try std.testing.expect(std.mem.indexOf(u8, bytes, key) == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "vanilla") != null);
     const parsed = try parse(a, bytes);
     defer parsed.deinit();
     try std.testing.expect(parsed.value.instances[0].origin == null);
+}
+
+test "legacy minimum heap defaults to null and non-null heap roundtrips with schema one" {
+    const a = std.testing.allocator;
+    const legacy = try parse(a, "{\"instances\":[{\"id\":\"world\",\"name\":\"World\",\"minecraft_version\":\"1.21\",\"max_memory_mb\":4096}]}");
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(u32, 1), legacy.value.schema_version);
+    try std.testing.expectEqual(@as(?u32, null), legacy.value.instances[0].min_memory_mb);
+    var instance = legacy.value.instances[0];
+    instance.min_memory_mb = 1024;
+    var doc = legacy.value;
+    doc.instances = (&instance)[0..1];
+    const bytes = try serialize(a, doc);
+    defer a.free(bytes);
+    const decoded = try parse(a, bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), decoded.value.schema_version);
+    try std.testing.expectEqual(@as(?u32, 1024), decoded.value.instances[0].min_memory_mb);
+    try std.testing.expectEqual(@as(?u32, 4096), decoded.value.instances[0].max_memory_mb);
+}
+
+test "instance heap endpoints and effective maximum are validated together" {
+    var instance: Instance = .{ .id = "world", .name = "World", .minecraft_version = "1.21" };
+    var doc: Document = .{ .instances = (&instance)[0..1] };
+    for ([_]u32{ 0, min_memory_mb - 1, max_memory_mb + 1 }) |invalid| {
+        instance.min_memory_mb = invalid;
+        try std.testing.expectError(error.InvalidMemory, validate(doc));
+        instance.min_memory_mb = null;
+        instance.max_memory_mb = invalid;
+        try std.testing.expectError(error.InvalidMemory, validate(doc));
+        instance.max_memory_mb = null;
+    }
+    instance.min_memory_mb = min_memory_mb;
+    instance.max_memory_mb = min_memory_mb;
+    try validate(doc);
+    instance.min_memory_mb = max_memory_mb;
+    instance.max_memory_mb = max_memory_mb;
+    try validate(doc);
+    instance.min_memory_mb = 4096;
+    instance.max_memory_mb = 2048;
+    try std.testing.expectError(error.InvalidMemory, validate(doc));
+    instance.max_memory_mb = null;
+    try std.testing.expectError(error.InvalidMemory, validate(doc));
+    doc.settings.default_memory_mb = 4096;
+    try validate(doc);
+    instance.min_memory_mb = null;
+    doc.settings.default_memory_mb = 2048;
+    try validate(doc);
+}
+
+test "reducing global heap maximum preserves persisted instances when minimum would exceed it" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer a.free(root);
+    var store = try Store.init(a, io, root);
+    defer store.deinit();
+    try store.update(.{
+        .settings = .{ .default_memory_mb = 4096 },
+        .instances = &.{.{ .id = "world", .name = "World", .minecraft_version = "1.21", .min_memory_mb = 3072 }},
+    });
+    const before = try tmp.dir.readFileAlloc(io, ".vela/config.json", a, .limited(max_json));
+    defer a.free(before);
+    var reduced = store.snapshot().*;
+    reduced.settings.default_memory_mb = 2048;
+    try std.testing.expectError(error.InvalidMemory, store.update(reduced));
+    try std.testing.expectEqual(@as(u32, 4096), store.snapshot().settings.default_memory_mb);
+    try std.testing.expectEqual(@as(?u32, 3072), store.snapshot().instances[0].min_memory_mb);
+    const after = try tmp.dir.readFileAlloc(io, ".vela/config.json", a, .limited(max_json));
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    var explicit = reduced.instances[0];
+    explicit.max_memory_mb = 4096;
+    reduced.instances = (&explicit)[0..1];
+    try store.update(reduced);
+    try std.testing.expectEqual(@as(u32, 2048), store.snapshot().settings.default_memory_mb);
+    try store.reconcile();
+    const reloaded = &store;
+    try std.testing.expectEqual(@as(?u32, 3072), reloaded.snapshot().instances[0].min_memory_mb);
+    try std.testing.expectEqual(@as(?u32, 4096), reloaded.snapshot().instances[0].max_memory_mb);
 }
 
 test "validation bounds versions names and namespaces" {
@@ -789,6 +933,7 @@ test "reconcile rejects missing nonregular invalid oversized and unreadable disk
     var store = try Store.init(a, io, root);
     defer store.deinit();
     const old = store.snapshot();
+    fault.reset(); // init may create only the persistent writer lock.
     // Explicit reconciliation is not a defaults initialization path.
     try std.testing.expect(!store.publicationUncertain());
     try std.testing.expectError(error.FileNotFound, store.reconcile());
@@ -859,8 +1004,8 @@ fn configAllocationFailures(a: Allocator, reconcile: bool) !void {
 }
 
 test "update preparation and reconcile allocation failures clean up without publishing" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, configAllocationFailures, .{false});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, configAllocationFailures, .{true});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, configAllocationFailures, .{false});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, configAllocationFailures, .{true});
 }
 
 test "CurseForge reference settings default validate clone and roundtrip" {
@@ -882,8 +1027,8 @@ test "CurseForge reference settings default validate clone and roundtrip" {
     try store.update(.{ .settings = .{ .curseforge_enabled = true, .curseforge_terms_approved = true, .curseforge_credential_ref = &reference } });
     @memset(&reference, 'x');
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", store.snapshot().settings.curseforge_credential_ref.?);
-    var loaded = try Store.init(a, std.testing.io, root);
-    defer loaded.deinit();
+    try store.reconcile();
+    const loaded = &store;
     try std.testing.expect(loaded.snapshot().settings.curseforge_enabled);
     try std.testing.expect(loaded.snapshot().settings.curseforge_terms_approved);
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", loaded.snapshot().settings.curseforge_credential_ref.?);
@@ -1040,5 +1185,102 @@ fn windowsConfigAllocationScenario(allocator: Allocator) !void {
     try store.reconcile();
 }
 test "Windows config allocation failures release roots snapshots and staging" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, windowsConfigAllocationScenario, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, windowsConfigAllocationScenario, .{});
+}
+
+test "root writer excludes aliases and stale credential owners until close" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer a.free(root);
+    var first = try Store.init(a, io, root);
+    var first_open = true;
+    defer if (first_open) first.deinit();
+    const reference = "0123456789abcdef0123456789abcdef";
+    try first.update(.{ .settings = .{ .curseforge_credential_ref = reference } });
+    try std.testing.expectError(error.LauncherRootInUse, Store.init(a, io, root));
+    if (builtin.os.tag == .linux) try testOtherProcessLock(root, first.writer.?.file.handle, true);
+    const alias = try std.fmt.allocPrint(a, "{s}/./", .{root});
+    defer a.free(alias);
+    try std.testing.expectError(error.LauncherRootInUse, Store.init(a, io, alias));
+    var removed = first.snapshot().*;
+    removed.settings.curseforge_credential_ref = null;
+    removed.settings.download_connections = 19;
+    try first.update(removed);
+    // No stale owner exists while cleanup removes this reference from its vault.
+    try std.testing.expectError(error.LauncherRootInUse, Store.init(a, io, root));
+    first.deinit();
+    first_open = false;
+    if (builtin.os.tag == .linux) try testOtherProcessLock(root, null, false);
+    var second = try Store.init(a, io, root);
+    defer second.deinit();
+    try std.testing.expect(second.snapshot().settings.curseforge_credential_ref == null);
+    try std.testing.expectEqual(@as(u16, 19), second.snapshot().settings.download_connections);
+    var unrelated = second.snapshot().*;
+    unrelated.settings.default_memory_mb = 4096;
+    try second.update(unrelated);
+    try second.reconcile();
+    try std.testing.expect(second.snapshot().settings.curseforge_credential_ref == null);
+    try std.testing.expectEqual(@as(u16, 19), second.snapshot().settings.download_connections);
+}
+
+test "Windows config writer contention consumes capability before loading and releases on failure" {
+    var busy: WindowsConfigFake = .{ .writer_in_use = true };
+    try std.testing.expectError(error.LauncherRootInUse, windowsConfig(std.testing.allocator, &busy));
+    try std.testing.expectEqual(@as(usize, 0), busy.load_count);
+    try std.testing.expectEqual(@as(usize, 1), busy.closes);
+    var bad: WindowsConfigFake = .{};
+    bad.seed("invalid-json");
+    if (windowsConfig(std.testing.allocator, &bad)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedLoadFailure;
+    } else |_| {}
+    try std.testing.expectEqual(@as(usize, 1), bad.writer_acquires);
+    try std.testing.expect(!bad.writer_owned and bad.closes == 1);
+}
+
+fn testOtherProcessLock(root: []const u8, inherited: ?std.posix.fd_t, blocked: bool) !void {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/{s}", .{ root, RootWriter.leaf }, 0);
+    defer std.testing.allocator.free(path);
+    const linux = std.os.linux;
+    const pid = std.c.fork();
+    if (pid < 0) return error.ForkFailed;
+    if (pid == 0) {
+        // Only raw syscalls after fork: the testing Io runtime can own threads.
+        if (inherited) |fd| _ = linux.close(fd);
+        const opened = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) linux.exit_group(41);
+        const fd: linux.fd_t = @intCast(opened);
+        const result = linux.errno(linux.flock(fd, 2 | 4)); // LOCK_EX | LOCK_NB
+        _ = linux.close(fd);
+        linux.exit_group(if (result == (if (blocked) linux.E.AGAIN else linux.E.SUCCESS)) 0 else 42);
+    }
+    var status: i32 = 0;
+    while (true) {
+        const waited = linux.waitpid(pid, &status, 0);
+        if (linux.errno(waited) == .INTR) continue;
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(waited));
+        try std.testing.expectEqual(@as(usize, @intCast(pid)), waited);
+        break;
+    }
+    try std.testing.expectEqual(@as(i32, 0), status);
+}
+
+test "root writer lock substitution rejects config writes without changing snapshot" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer std.testing.allocator.free(root);
+    var store = try Store.init(std.testing.allocator, std.testing.io, root);
+    defer store.deinit();
+    try tmp.dir.rename(RootWriter.leaf, tmp.dir, "old-writer-lock", std.testing.io);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = RootWriter.leaf, .data = "" });
+    try std.testing.expectError(error.RootWriterLockChanged, store.update(.{ .settings = .{ .download_connections = 17 } }));
+    try std.testing.expectEqual(@as(u16, 8), store.snapshot().settings.download_connections);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, ".vela/config.json", .{}));
 }

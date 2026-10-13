@@ -18,6 +18,8 @@ pub const Phase = enum { idle, running, complete, canceled, failed };
 pub const Snapshot = struct {
     phase: Phase,
     progress: tasks.Progress,
+    bytes_per_second: f64 = 0,
+    details: tasks.Details = .{},
     request: ?Request,
     installed: ?*const backend.Installed,
     release: ?*const backend.RuntimeRelease,
@@ -112,7 +114,7 @@ const Job = struct {
     installed: ?backend.Installed = null,
     runtime: ?java.Runtime = null,
     registered: bool = false,
-    final_progress: tasks.Progress = .{ .stage = .queued, .completed = 0, .total = null },
+    final_details: tasks.Details = .{},
 
     fn destroy(self: *Job) void {
         std.debug.assert(self.thread == null and self.task == null);
@@ -128,17 +130,54 @@ const Job = struct {
     }
     fn progress(context: ?*anyopaque, value: backend.Progress) void {
         const self: *Job = @ptrCast(@alignCast(context.?));
-        self.task.?.report(switch (value.phase) {
+        const stage: tasks.Stage = switch (value.phase) {
             .metadata => .metadata,
             .downloading => .downloading,
             .verifying => .verifying,
             .extracting => .extracting,
             .publishing, .complete => .finalizing,
-        }, value.received, value.total);
+        };
+        const task = self.task.?;
+        var details = task.details();
+        details.stage = stage;
+        details.completed = value.received;
+        details.total = value.total;
+        details.stop();
+        if (stage == .metadata or stage == .downloading) {
+            details.received = value.received;
+            details.total_bytes = value.total;
+            if (stage == .downloading and !task.canceled()) details.bytes_per_second = value.bytes_per_second;
+        }
+        if (stage == .downloading) {
+            if (self.release) |release| {
+                details.file_count = 0;
+                details.omitted_files = 0;
+                details.addFile(tasks.File.init(release.url, value.received, value.total, details.bytes_per_second, .downloading, null));
+            }
+        } else if (stage != .metadata) {
+            // Keep the last measured archive transfer while hashing and extracting.
+            // Reaching extraction proves that the archive passed verification.
+            for (details.files[0..details.file_count]) |*file| {
+                file.state = if (stage == .verifying) .verifying else .complete;
+            }
+        }
+        task.reportDetails(details);
     }
     fn run(self: *Job) void {
         self.perform() catch |err| {
             self.failure = err;
+            var details = self.task.?.details();
+            for (details.files[0..details.file_count]) |*file| {
+                switch (file.state) {
+                    .queued, .downloading, .verifying => {
+                        file.state = if (err == error.Canceled) .canceled else .failed;
+                        file.failure = err;
+                    },
+                    .complete, .failed, .canceled => {},
+                }
+            }
+            details.stop();
+            self.task.?.reportDetails(details);
         };
         self.done.store(true, .release);
     }
@@ -431,17 +470,23 @@ pub const Controller = struct {
     }
     fn finishTask(self: *Controller, job: *Job) void {
         const task = job.task orelse return;
-        job.final_progress = task.progress();
         self.registry.finish(task, if (job.installed != null) .succeeded else if ((job.failure orelse error.DownloadFailed) == error.Canceled) .canceled else .{ .failed = job.failure orelse error.DownloadFailed });
+        job.final_details = task.details();
         job.task = null;
     }
     pub fn snapshot(self: *const Controller) Snapshot {
         const active = self.active;
         const data = if (active == null) self.published else null;
+        // Progress and telemetry describe one coherent publication, retained after JOIN.
+        var details = if (active) |job| job.task.?.details() else if (data) |job| job.final_details else tasks.Details{};
+        const live_download = self.phase == .running and if (active) |job| !job.task.?.canceled() and details.stage == .downloading else false;
+        if (!live_download) details.stop();
         return .{
             .phase = self.phase,
             .failure = self.failure,
-            .progress = if (active) |job| job.task.?.progress() else if (data) |job| job.final_progress else .{ .stage = .queued, .completed = 0, .total = null },
+            .progress = .{ .stage = details.stage, .completed = details.completed, .total = details.total },
+            .bytes_per_second = details.bytes_per_second,
+            .details = details,
             .request = if (active) |job| job.request else if (data) |job| job.request else null,
             .installed = if (data) |job| if (job.installed != null) &job.installed.? else null else null,
             .release = if (data) |job| if (job.release != null) &job.release.? else null else null,
@@ -470,10 +515,16 @@ test "host platform is typed and publisher identities match only explicit aliase
 }
 
 const Fixture = struct {
-    const Mode = enum { good, unusable, wrong_major, wrong_vendor, wait_metadata, wait_probe };
+    const Mode = enum { good, unusable, wrong_major, wrong_vendor, wait_metadata, wait_probe, wait_download, fail_download };
     mode: Mode = .good,
     entered: std.atomic.Value(bool) = .init(false),
     requests: std.atomic.Value(usize) = .init(0),
+    transfer_entered: std.atomic.Value(bool) = .init(false),
+    continue_download: std.atomic.Value(bool) = .init(false),
+    extract_entered: std.atomic.Value(bool) = .init(false),
+    continue_extract: std.atomic.Value(bool) = .init(false),
+    unknown_total: bool = false,
+    extract_failure: bool = false,
     fn transport(self: *Fixture) backend.Transport {
         return .{ .context = self, .get = get, .download = download };
     }
@@ -509,15 +560,41 @@ const Fixture = struct {
         if (result.len > limit) return error.MetadataTooLarge;
         return result;
     }
-    fn download(_: *anyopaque, io: Io, release: *const backend.RuntimeRelease, path: []const u8, hooks: backend.Hooks) !void {
+    fn download(ctx: *anyopaque, io: Io, release: *const backend.RuntimeRelease, path: []const u8, hooks: backend.Hooks) !void {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
         try hooks.check();
         if (release.major != 21 or !std.mem.startsWith(u8, release.url, "https://aka.ms/download-jdk/microsoft-jdk-21.0.1-")) return error.UnexpectedFixtureArtifact;
+        const received: u64 = if (self.mode == .fail_download) 24482688 else 2;
+        const total: ?u64 = if (self.unknown_total) null else if (self.mode == .fail_download) 106674581 else 3;
+        hooks.progress.?(hooks.context, .{ .phase = .downloading, .received = received, .total = total, .bytes_per_second = 14575206.4 });
+        if (self.mode == .wait_download or self.mode == .fail_download) {
+            self.transfer_entered.store(true, .release);
+            while (!self.continue_download.load(.acquire)) {
+                try hooks.check();
+                try io.sleep(.fromMilliseconds(2), .awake);
+            }
+        }
+        if (self.mode == .fail_download) {
+            // The child transport's terminal sample can advance before it returns an error.
+            hooks.progress.?(hooks.context, .{ .phase = .downloading, .received = received + 3, .total = total });
+            return error.DownloadInterrupted;
+        }
         const file = try Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
         defer file.close(io);
         try file.writeStreamingAll(io, "abc");
+        hooks.progress.?(hooks.context, .{ .phase = .downloading, .received = 3, .total = 3 });
     }
-    fn extract(_: *anyopaque, a: Allocator, io: Io, format: backend.Archive, _: []const u8, dest: []const u8, hooks: backend.Hooks) ![]u8 {
+    fn extract(ctx: *anyopaque, a: Allocator, io: Io, format: backend.Archive, _: []const u8, dest: []const u8, hooks: backend.Hooks) ![]u8 {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
         try hooks.check();
+        if (self.mode == .wait_download) {
+            self.extract_entered.store(true, .release);
+            while (!self.continue_extract.load(.acquire)) {
+                try hooks.check();
+                try io.sleep(.fromMilliseconds(2), .awake);
+            }
+        }
+        if (self.extract_failure) return error.ExtractInterrupted;
         const dir = try Io.Dir.cwd().openDir(io, dest, .{});
         defer dir.close(io);
         try dir.createDir(io, "bin", .default_dir);
@@ -559,6 +636,163 @@ fn awaitFlag(flag: *const std.atomic.Value(bool)) !void {
         try std.testing.io.sleep(.fromMilliseconds(2), .awake);
     }
     return error.FixtureTimedOut;
+}
+
+test "archive transfer details follow child transport through extraction and pruning" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try fixtureRoot(&tmp);
+    defer a.free(root);
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var manager = try java.Manager.init(a, io, root);
+    defer manager.deinit();
+    var fixture: Fixture = .{ .mode = .wait_download };
+    var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+    defer controller.deinit();
+    try controller.start(.{ .vendor = .microsoft, .major = 21 });
+    const task = controller.active.?.task.?;
+    try awaitFlag(&fixture.transfer_entered);
+    const live = controller.snapshot();
+    try std.testing.expectEqual(tasks.Stage.downloading, live.progress.stage);
+    try std.testing.expectEqual(@as(u64, 2), live.progress.completed);
+    try std.testing.expectEqual(@as(?u64, 3), live.progress.total);
+    try std.testing.expectEqual(@as(usize, 1), live.details.file_count);
+    try std.testing.expectEqual(@as(usize, 0), live.details.omitted_files);
+    const entry = live.details.files[0];
+    const platform = try controller.hostPlatform();
+    const os = switch (platform.os) {
+        .linux => "linux",
+        .windows => "windows",
+        .macos => "macOS",
+    };
+    const name = try std.fmt.allocPrint(a, "microsoft-jdk-21.0.1-{s}-{s}.{s}", .{ os, @tagName(platform.arch), if (platform.archive() == .zip) "zip" else "tar.gz" });
+    defer a.free(name);
+    try std.testing.expectEqualStrings(name, entry.name());
+    try std.testing.expect(std.mem.startsWith(u8, entry.path(), "https://aka.ms/download-jdk/"));
+    try std.testing.expectEqual(tasks.FileState.downloading, entry.state);
+    try std.testing.expectEqual(@as(u64, 2), entry.received);
+    try std.testing.expectEqual(@as(?u64, 3), entry.total);
+    try std.testing.expectEqual(live.details.received, entry.received);
+    try std.testing.expectEqual(live.details.total_bytes, entry.total);
+    try std.testing.expectEqual(@as(f64, 14575206.4), entry.bytes_per_second);
+    try std.testing.expectEqual(entry.bytes_per_second, live.bytes_per_second);
+    fixture.continue_download.store(true, .release);
+    try awaitFlag(&fixture.extract_entered);
+    const extracting = controller.snapshot();
+    try std.testing.expectEqual(tasks.Stage.extracting, extracting.progress.stage);
+    try std.testing.expectEqual(@as(u64, 0), extracting.progress.completed);
+    try std.testing.expectEqual(@as(?u64, null), extracting.progress.total);
+    try std.testing.expectEqual(@as(usize, 1), extracting.details.file_count);
+    try std.testing.expectEqual(@as(usize, 0), extracting.details.omitted_files);
+    try std.testing.expectEqualStrings(name, extracting.details.files[0].name());
+    try std.testing.expectEqual(tasks.FileState.complete, extracting.details.files[0].state);
+    try std.testing.expectEqual(@as(u64, 3), extracting.details.files[0].received);
+    try std.testing.expectEqual(@as(?u64, 3), extracting.details.files[0].total);
+    try std.testing.expectEqual(@as(u64, 3), extracting.details.received);
+    try std.testing.expectEqual(@as(?u64, 3), extracting.details.total_bytes);
+    try std.testing.expectEqual(@as(f64, 0), extracting.bytes_per_second);
+    try std.testing.expectEqual(@as(f64, 0), extracting.details.files[0].bytes_per_second);
+    fixture.continue_extract.store(true, .release);
+    try awaitController(&controller, &manager);
+    try std.testing.expectEqual(tasks.State.succeeded, task.state);
+    registry.pruneFinished(0);
+    const final = controller.snapshot();
+    try std.testing.expectEqual(Phase.complete, final.phase);
+    try std.testing.expectEqual(@as(usize, 1), final.details.file_count);
+    try std.testing.expectEqualStrings(name, final.details.files[0].name());
+    try std.testing.expectEqual(tasks.FileState.complete, final.details.files[0].state);
+    try std.testing.expectEqual(@as(u64, 3), final.details.files[0].received);
+    try std.testing.expectEqual(@as(f64, 0), final.bytes_per_second);
+}
+
+test "verified archive transfer stays complete when extraction fails or is canceled" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |cancel| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try fixtureRoot(&tmp);
+        defer a.free(root);
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var manager = try java.Manager.init(a, io, root);
+        defer manager.deinit();
+        var fixture: Fixture = .{ .mode = .wait_download, .extract_failure = !cancel };
+        var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+        defer controller.deinit();
+        try controller.start(.{ .vendor = .microsoft, .major = 21 });
+        try awaitFlag(&fixture.transfer_entered);
+        fixture.continue_download.store(true, .release);
+        try awaitFlag(&fixture.extract_entered);
+        if (cancel) controller.cancel() else fixture.continue_extract.store(true, .release);
+        try awaitController(&controller, &manager);
+        registry.pruneFinished(0);
+        const final = controller.snapshot();
+        try std.testing.expectEqual(if (cancel) Phase.canceled else Phase.failed, final.phase);
+        try std.testing.expectEqual(@as(?anyerror, if (cancel) error.Canceled else error.ExtractInterrupted), final.failure);
+        try std.testing.expectEqual(tasks.Stage.extracting, final.progress.stage);
+        try std.testing.expectEqual(@as(usize, 1), final.details.file_count);
+        const file = final.details.files[0];
+        try std.testing.expect(file.name().len > 0);
+        try std.testing.expectEqual(tasks.FileState.complete, file.state);
+        try std.testing.expectEqual(@as(?anyerror, null), file.failure);
+        try std.testing.expectEqual(@as(u64, 3), file.received);
+        try std.testing.expectEqual(@as(?u64, 3), file.total);
+        try std.testing.expectEqual(@as(f64, 0), file.bytes_per_second);
+        try std.testing.expectEqual(@as(f64, 0), final.bytes_per_second);
+    }
+}
+
+test "archive failure and cancellation retain measured file details after join and pruning" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |cancel| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try fixtureRoot(&tmp);
+        defer a.free(root);
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var manager = try java.Manager.init(a, io, root);
+        defer manager.deinit();
+        var fixture: Fixture = .{ .mode = if (cancel) .wait_download else .fail_download, .unknown_total = cancel };
+        var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+        defer controller.deinit();
+        try controller.start(.{ .vendor = .microsoft, .major = 21 });
+        const task = controller.active.?.task.?;
+        try awaitFlag(&fixture.transfer_entered);
+        const live = controller.snapshot();
+        const total: ?u64 = if (cancel) null else 106674581;
+        try std.testing.expectEqual(@as(usize, 1), live.details.file_count);
+        try std.testing.expectEqual(@as(u64, if (cancel) 2 else 24482688), live.details.received);
+        try std.testing.expectEqual(total, live.details.total_bytes);
+        try std.testing.expectEqual(@as(f64, 14575206.4), live.bytes_per_second);
+        if (cancel) {
+            controller.cancel();
+            try std.testing.expectEqual(@as(f64, 0), controller.snapshot().details.files[0].bytes_per_second);
+        } else fixture.continue_download.store(true, .release);
+        try awaitController(&controller, &manager);
+        try std.testing.expectEqual(if (cancel) tasks.State.canceled else tasks.State.failed, task.state);
+        registry.pruneFinished(0);
+        const final = controller.snapshot();
+        try std.testing.expectEqual(if (cancel) Phase.canceled else Phase.failed, final.phase);
+        try std.testing.expectEqual(@as(?anyerror, if (cancel) error.Canceled else error.DownloadInterrupted), final.failure);
+        try std.testing.expectEqual(tasks.Stage.downloading, final.progress.stage);
+        try std.testing.expectEqual(@as(usize, 1), final.details.file_count);
+        try std.testing.expectEqual(@as(usize, 0), final.details.omitted_files);
+        try std.testing.expectEqualStrings(live.details.files[0].name(), final.details.files[0].name());
+        try std.testing.expectEqual(if (cancel) tasks.FileState.canceled else tasks.FileState.failed, final.details.files[0].state);
+        try std.testing.expectEqual(final.failure, final.details.files[0].failure);
+        try std.testing.expectEqual(@as(u64, if (cancel) 2 else 24482691), final.details.files[0].received);
+        try std.testing.expectEqual(final.details.files[0].received, final.details.received);
+        try std.testing.expectEqual(total, final.details.files[0].total);
+        try std.testing.expectEqual(total, final.details.total_bytes);
+        try std.testing.expectEqual(@as(f64, 0), final.bytes_per_second);
+        try std.testing.expectEqual(@as(f64, 0), final.details.files[0].bytes_per_second);
+    }
 }
 
 test "joined downloaded results register only verified identity and survive registry pruning" {
@@ -618,12 +852,31 @@ test "download cancellation joins worker before registry finish and prune" {
     try controller.start(.{ .vendor = .microsoft, .major = 21 });
     const task = controller.active.?.task.?;
     try awaitFlag(&fixture.entered);
+    Job.progress(controller.active.?, .{ .phase = .downloading, .received = 1024, .total = 2048, .bytes_per_second = 3072 });
+    const transfer = controller.snapshot();
+    try std.testing.expectEqual(@as(u64, 1024), transfer.progress.completed);
+    try std.testing.expectEqual(@as(?u64, 2048), transfer.progress.total);
+    try std.testing.expectEqual(@as(f64, 3072), transfer.bytes_per_second);
+    try std.testing.expectEqual(@as(u64, 1024), transfer.details.received);
+    try std.testing.expectEqual(@as(?u64, 2048), transfer.details.total_bytes);
+    try std.testing.expectEqual(transfer.bytes_per_second, transfer.details.bytes_per_second);
+    try std.testing.expectEqual(@as(usize, 0), transfer.details.file_count);
+    Job.progress(controller.active.?, .{ .phase = .verifying, .received = 1024, .total = 2048, .bytes_per_second = 3072 });
+    try std.testing.expectEqual(@as(f64, 0), controller.snapshot().bytes_per_second);
+    task.reportDetails(.{ .stage = .downloading, .received = 1024, .total_bytes = 2048, .bytes_per_second = 3072 });
     controller.cancel();
+    try std.testing.expectEqual(@as(f64, 0), controller.snapshot().bytes_per_second);
+    try std.testing.expectEqual(@as(f64, 0), controller.snapshot().details.bytes_per_second);
     try std.testing.expectEqual(tasks.State.canceling, task.state);
     try awaitController(&controller, &manager);
     try std.testing.expectEqual(tasks.State.canceled, task.state);
     registry.pruneFinished(0);
     try std.testing.expectEqual(Phase.canceled, controller.snapshot().phase);
+    try std.testing.expectEqual(@as(f64, 0), controller.snapshot().bytes_per_second);
+    try std.testing.expectEqual(@as(u64, 1024), controller.snapshot().details.received);
+    try std.testing.expectEqual(@as(?u64, 2048), controller.snapshot().details.total_bytes);
+    try std.testing.expectEqual(@as(f64, 0), controller.snapshot().details.bytes_per_second);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().details.file_count);
     try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
 }
 

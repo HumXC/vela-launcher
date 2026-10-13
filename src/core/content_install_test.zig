@@ -700,7 +700,7 @@ test "managed mod state round trips standalone official pack archive and overrid
     for ([_]manifest.IdentityProvenance{ .official_file, .pack_archive, .pack_override }) |provenance| {
         for ([_]bool{ true, false }) |standalone| {
             if (standalone and provenance != .official_file) continue;
-            errdefer |err| std.debug.print("mod state disk fixture {s}/standalone={}: {s}\n", .{ @tagName(provenance), standalone, @errorName(err) });
+            errdefer std.debug.print("mod state disk fixture {s}/standalone={}\n", .{ @tagName(provenance), standalone });
             var fixture = try Fixture.init();
             defer fixture.deinit();
             try fixture.seed();
@@ -1091,4 +1091,68 @@ test "installer collection bounds reject uninitialized inputs before conflicts l
         try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
         try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft/versions/Test/.vela-content", .{}));
     }
+}
+
+test "terminal history beyond pending capacity stays launchable with bounded scan memory" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.seed();
+    var plan = try fixture.plan();
+    defer plan.deinit();
+    const files = fixture.files();
+    var report = try install.execute(a, io, fixture.options(plan.value, &files));
+    defer report.deinit();
+    const original = try fs.openAbsolute(io, report.backup_directory);
+    defer original.close(io);
+    const journal = try fs.read(a, original, io, "journal.json", 16 * 1024 * 1024);
+    defer a.free(journal);
+    const before = try fs.read(a, original, io, "manifest-before", providers.max_json_bytes);
+    defer a.free(before);
+    const after = try fs.read(a, original, io, "manifest-after", providers.max_json_bytes);
+    defer a.free(after);
+    const transactions = try fixture.tmp.dir.openDir(io, ".minecraft/versions/Test/.vela-content", .{ .iterate = true });
+    defer transactions.close(io);
+    // Include committed and rolled-back receipts, all with validated journal identity.
+    for (0..providers.max_items + 1) |index| {
+        var buffer: [36]u8 = undefined;
+        const id = try std.fmt.bufPrint(&buffer, "txn-{x:0>32}", .{index});
+        const txn = try fs.child(transactions, io, id, true, true);
+        defer txn.close(io);
+        const renamed = try std.mem.replaceOwned(u8, a, journal, report.transaction_id, id);
+        defer a.free(renamed);
+        try txn.writeFile(io, .{ .sub_path = "journal.json", .data = renamed });
+        try txn.writeFile(io, .{ .sub_path = "manifest-before", .data = before });
+        try txn.writeFile(io, .{ .sub_path = "manifest-after", .data = after });
+        try txn.writeFile(io, .{ .sub_path = if (index % 2 == 0) "committed" else "rolled-back", .data = "1\n" });
+    }
+    // An arena-backed caller must not retain all parsed history. This tiny caller
+    // budget is independent of history size; scanner scratch dies after each entry.
+    var buffer: [8192]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    try install.requireRecoveryClear(bounded.allocator(), io, &fixture.paths, "instance", "Test");
+    var pending = try install.listPendingTransactions(bounded.allocator(), io, &fixture.paths, "instance", "Test");
+    defer pending.deinit();
+    try std.testing.expectEqual(@as(usize, 0), pending.value.len);
+    try std.testing.expect(bounded.end_index < buffer.len);
+    try std.testing.expectEqual(@as(usize, 1), fixture.guard.acquired);
+    try std.testing.expectEqual(@as(usize, 2), fixture.fetches);
+    const first = try fs.child(transactions, io, "txn-00000000000000000000000000000000", false, true);
+    defer first.close(io);
+    try first.deleteFile(io, "committed");
+    try std.testing.expectError(error.RecoveryRequired, install.requireRecoveryClear(a, io, &fixture.paths, "instance", "Test"));
+    var one = try install.listPendingTransactions(a, io, &fixture.paths, "instance", "Test");
+    defer one.deinit();
+    try std.testing.expectEqual(@as(usize, 1), one.value.len);
+    try std.testing.expectEqualStrings("txn-00000000000000000000000000000000", one.value[0]);
+    try first.writeFile(io, .{ .sub_path = "committed", .data = "x\n" });
+    try expectRecoveryBlocked(&fixture);
+    // Pending capacity still bounds owned recovery IDs, even amid retained history.
+    for (0..providers.max_items + 1) |index| {
+        var id_buffer: [36]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "txn-{x:0>32}", .{index});
+        const txn = try fs.child(transactions, io, id, false, true);
+        defer txn.close(io);
+        try txn.deleteFile(io, if (index % 2 == 0) "committed" else "rolled-back");
+    }
+    try expectRecoveryBlocked(&fixture);
 }

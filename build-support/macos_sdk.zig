@@ -4,8 +4,10 @@ const std = @import("std");
 pub fn choose(b: *std.Build, target: std.Target.Os.Tag) ?[]const u8 {
     const supplied = b.option([]const u8, "macos-sdk", "Absolute path to an existing macOS SDK");
     if (target != .macos) return null;
-    const root = supplied orelse b.sysroot orelse
-        @panic("macOS builds require an existing SDK: pass -Dmacos-sdk=/absolute/MacOSX.sdk or --sysroot");
+    const root = supplied orelse
+        @panic("macOS builds require an existing SDK: pass -Dmacos-sdk=/absolute/MacOSX.sdk");
+    // SDK layout is inspected during configuration, outside the package graph.
+    b.graph.poisonCache();
     if (!std.fs.path.isAbsolute(root) or std.mem.indexOfScalar(u8, root, 0) != null)
         @panic("macOS SDK path must be absolute and contain no NUL");
     const io = b.graph.io;
@@ -30,8 +32,6 @@ pub fn choose(b: *std.Build, target: std.Target.Os.Tag) ?[]const u8 {
         };
         file.close(io);
     }
-    // Dependencies inherit this before their C/Objective-C steps are created.
-    b.sysroot = root;
     return root;
 }
 
@@ -44,7 +44,7 @@ pub fn apply(b: *std.Build, root_module: *std.Build.Module, sdk: []const u8) voi
     pending.append(b.allocator, root_module) catch @panic("OOM");
     const include: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) };
     const frameworks: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) };
-    const libraries: std.Build.LazyPath = .{ .cwd_relative = "/usr/lib" };
+    const libraries = b.graph.cwdRelativePath(b.pathJoin(&.{ sdk, "usr/lib" }));
     while (pending.pop()) |module| {
         const entry = seen.getOrPut(b.allocator, module) catch @panic("OOM");
         if (entry.found_existing) continue;
@@ -53,16 +53,33 @@ pub fn apply(b: *std.Build, root_module: *std.Build.Module, sdk: []const u8) voi
                 module.addSystemIncludePath(include);
                 module.addSystemFrameworkPath(frameworks);
                 module.addLibraryPath(libraries);
+                for (module.include_dirs.items) |directory| {
+                    if (directory == .config_header_step) {
+                        const header = directory.config_header_step;
+                        if (std.mem.eql(u8, header.include_path, "SDL_build_config.h")) {
+                            // SDL 3.4.16 removed these CMake keys; its Zig wrapper
+                            // still sets them. Zig 0.17 rejects unused values.
+                            for ([_][]const u8{ "HAVE_CALLOC", "HAVE_REALLOC", "HAVE_FREE", "HAVE_MPROTECT", "HAVE_SYSCTL" }) |key|
+                                _ = header.values.swapRemove(key);
+                        }
+                    }
+                }
             }
         }
         if (module.root_source_file) |source| {
             switch (source) {
                 .generated => |generated| {
-                    if (generated.file.step.cast(std.Build.Step.TranslateC)) |translate| {
+                    const step = b.graph.generated_files.items[@backingInt(generated.index)];
+                    if (step.cast(std.Build.Step.TranslateC)) |translate| {
                         if (translate.target.result.os.tag == .macos) {
                             translate.addSystemIncludePath(include);
                             translate.addSystemFrameworkPath(frameworks);
                         }
+                    } else if (step.cast(std.Build.Step.Run)) |translate| {
+                        translate.addArg("-isystem");
+                        translate.addDirectoryArg(include);
+                        translate.addArg("-iframework");
+                        translate.addDirectoryArg(frameworks);
                     }
                 },
                 else => {},

@@ -1,10 +1,13 @@
 const std = @import("std");
 const module = @import("ui/instances_manager.zig");
+test {
+    _ = @import("ui/metadata_http_cache.zig");
+}
 const config = @import("core/config.zig");
 const instances = @import("core/instances.zig");
 const tasks = @import("core/tasks.zig");
-const loader_install = @import("core/minecraft/loader_install.zig");
-const loaders = @import("core/minecraft/loaders.zig");
+const loader_install = @import("core/loaders/install.zig");
+const loaders = @import("core/loaders/root.zig");
 const metadata = @import("core/minecraft/metadata/root.zig");
 const metadata_loader = @import("core/minecraft/metadata_loader.zig");
 const a = std.testing.allocator;
@@ -17,6 +20,7 @@ const Environment = struct {
     root: [:0]const u8,
     paths: instances.Paths,
     store: config.Store,
+    store_open: bool = true,
     fn init() !Environment {
         return initWithStoreIo(io);
     }
@@ -29,8 +33,14 @@ const Environment = struct {
         errdefer paths.deinit();
         return .{ .tmp = tmp, .root = root, .paths = paths, .store = try config.Store.init(a, store_io, root) };
     }
-    fn deinit(self: *Environment) void {
+    fn reloadStore(self: *Environment) !void {
         self.store.deinit();
+        self.store_open = false;
+        self.store = try config.Store.init(a, io, self.root);
+        self.store_open = true;
+    }
+    fn deinit(self: *Environment) void {
+        if (self.store_open) self.store.deinit();
         self.paths.deinit();
         a.free(self.root);
         self.tmp.cleanup();
@@ -42,6 +52,7 @@ const Fixture = struct {
     blocked: std.atomic.Value(bool) = .init(false),
     releases: usize = 0,
     failure: ?anyerror = null,
+    telemetry: bool = false,
     recheck_failure: ?anyerror = null,
     rechecks: usize = 0,
     observed_java: [64]u8 = @splat(0),
@@ -71,6 +82,13 @@ const Fixture = struct {
         self.observed_prepared = request.prepared;
         self.observed_vanilla_prepared = request.vanilla_prepared;
         self.observed_generation = request.prepared_generation;
+        if (self.telemetry) if (control.task) |task| {
+            var details: tasks.Details = .{ .stage = .downloading, .completed = 0, .total = 2, .received = 64, .total_bytes = 128, .bytes_per_second = 512 };
+            var path = [_]u8{ '/', 't', '/', 'l', 'i', 'b', '.', 'j', 'a', 'r' };
+            details.addFile(tasks.File.init(&path, 64, 128, 512, .downloading, null));
+            @memset(&path, 'z');
+            task.reportDetails(details);
+        };
         self.entered.store(true, .release);
         while (self.blocked.load(.acquire)) {
             try control.check();
@@ -78,7 +96,16 @@ const Fixture = struct {
         }
         try control.check();
         try request.lease.recheck(request.lease.context, request.instance.id);
-        if (self.failure) |err| return err;
+        if (self.failure) |err| {
+            if (self.telemetry) if (control.task) |task| {
+                var details = task.details();
+                details.files[0].state = .failed;
+                details.files[0].failure = err;
+                details.stop();
+                task.reportDetails(details);
+            };
+            return err;
+        }
         if (request.installer_java) |java| @memcpy(self.observed_java[0..@min(java.len, self.observed_java.len)], java[0..@min(java.len, self.observed_java.len)]);
         control.report(.verifying, 1, 1);
         return module.Installed.init(alloc, request.instance);
@@ -90,7 +117,8 @@ const Fixture = struct {
         const g = arena.allocator();
         const entries = try g.alloc(module.LoaderEntry, 1);
         entries[0] = .{ .id = try g.dupe(u8, "0.15.11"), .stable = true };
-        return .{ .arena = arena, .base = try g.dupe(u8, base), .kind = kind, .entries = entries };
+        const owned_base = try g.dupe(u8, base);
+        return .{ .arena = arena, .base = owned_base, .kind = kind, .entries = entries };
     }
     fn installer(self: *Fixture) module.Installer {
         return .{ .context = self, .run = run };
@@ -532,6 +560,7 @@ test "combined rename options publishes one complete config update after JOIN an
         var updated = editable;
         updated.name = "New Play";
         updated.java_path = "/new/java";
+        updated.min_memory_mb = 2048;
         updated.max_memory_mb = 8192;
         updated.debug_launch = true;
         try manager.startRenameWithOptions(editable, updated);
@@ -613,13 +642,75 @@ test "rename publication rejects an external options edit against the original w
     updated.max_memory_mb = 8192;
     try manager.startRenameWithOptions(editable, updated);
     try settle(&manager);
-    @constCast(env.store.state.value.instances)[0].debug_launch = true;
+    @constCast(env.store.state.value.instances)[0].min_memory_mb = 512;
     try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
     try std.testing.expect(manager.pending != null and fixture.releases == 0);
     try std.testing.expectEqualStrings("Play", env.store.snapshot().instances[0].name);
-    try std.testing.expectEqual(@as(?u32, 2048), env.store.snapshot().instances[0].max_memory_mb);
-    try std.testing.expect(env.store.snapshot().instances[0].debug_launch);
+    try std.testing.expectEqual(@as(?u32, 512), env.store.snapshot().instances[0].min_memory_mb);
+    try std.testing.expectEqual(editable.max_memory_mb, env.store.snapshot().instances[0].max_memory_mb);
+    try std.testing.expectEqual(editable.debug_launch, env.store.snapshot().instances[0].debug_launch);
     try std.testing.expectError(error.InstanceNamespaceBusy, @import("core/instance_namespace.zig").acquire(io));
+}
+
+test "minimum heap admission rejects invalid endpoints and reversed explicit pairs without work" {
+    var env = try Environment.init();
+    defer env.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+    defer manager.deinit();
+    manager.setInstaller(fixture.installer());
+    var invalid = example;
+    for ([_]u32{ 0, 255, 1024 * 1024 + 1 }) |minimum| {
+        invalid.min_memory_mb = minimum;
+        try std.testing.expectError(error.InvalidMemory, manager.startCreate(invalid));
+    }
+    invalid.min_memory_mb = 4096;
+    invalid.max_memory_mb = 2048;
+    try std.testing.expectError(error.InvalidMemory, manager.startCreate(invalid));
+    try std.testing.expectEqual(module.Phase.idle, manager.snapshot().phase);
+    try std.testing.expect(manager.pending == null);
+    try std.testing.expect(!fixture.held.load(.acquire));
+    try std.testing.expect(!fixture.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fixture.releases);
+    try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
+    try std.testing.expectEqual(@as(usize, 0), env.store.snapshot().instances.len);
+    var valid = example;
+    valid.min_memory_mb = 256;
+    valid.max_memory_mb = 256;
+    try manager.startCreate(valid);
+    try settle(&manager);
+    try manager.publish(&env.store);
+    try std.testing.expectEqual(@as(?u32, 256), env.store.snapshot().instances[0].min_memory_mb);
+    try std.testing.expectEqual(@as(?u32, 256), env.store.snapshot().instances[0].max_memory_mb);
+}
+
+test "checked options save rejects minimum-only stale baseline and can clear minimum" {
+    var env = try Environment.init();
+    defer env.deinit();
+    try env.store.update(.{ .instances = &.{example}, .selected_instance = example.id });
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+    defer manager.deinit();
+    var stale = example;
+    stale.min_memory_mb = 512;
+    var updated = example;
+    updated.min_memory_mb = 1024;
+    try std.testing.expectError(error.InstanceConfigurationChanged, manager.saveOptionsChecked(&env.store, stale, updated));
+    try std.testing.expect(!fixture.held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fixture.releases);
+    try std.testing.expectEqual(@as(?u32, null), env.store.snapshot().instances[0].min_memory_mb);
+    try manager.saveOptionsChecked(&env.store, example, updated);
+    try std.testing.expectEqual(@as(?u32, 1024), env.store.snapshot().instances[0].min_memory_mb);
+    stale = updated;
+    updated.min_memory_mb = null;
+    try manager.saveOptionsChecked(&env.store, stale, updated);
+    try std.testing.expectEqual(@as(?u32, null), env.store.snapshot().instances[0].min_memory_mb);
+    try env.reloadStore();
+    try std.testing.expectEqual(@as(?u32, null), env.store.snapshot().instances[0].min_memory_mb);
 }
 
 test "instance manager options preserve identity and default Java is cloned into worker" {
@@ -640,10 +731,14 @@ test "instance manager options preserve identity and default Java is cloned into
     try std.testing.expectEqualStrings("/default/java", std.mem.sliceTo(&fixture.observed_java, 0));
     var updated = env.store.snapshot().instances[0];
     updated.java_path = "/override/java";
+    updated.min_memory_mb = 1024;
     updated.max_memory_mb = 4096;
     updated.debug_launch = true;
     try manager.saveOptions(&env.store, updated);
+    try std.testing.expectEqual(@as(?u32, 1024), env.store.snapshot().instances[0].min_memory_mb);
     try std.testing.expectEqual(@as(?u32, 4096), env.store.snapshot().instances[0].max_memory_mb);
+    // saveOptions replaces the snapshot arena; refresh borrowed identity strings.
+    updated = env.store.snapshot().instances[0];
     updated.name = "Different";
     try std.testing.expectError(error.OptionsCannotChangeIdentity, manager.saveOptions(&env.store, updated));
     try manager.select(&env.store, example.id);
@@ -665,7 +760,7 @@ fn allocationFailure(alloc: std.mem.Allocator, paths: *const instances.Paths) !v
 test "instance manager allocation failures release cloned requests and any acquired lease" {
     var env = try Environment.init();
     defer env.deinit();
-    try std.testing.checkAllAllocationFailures(a, allocationFailure, .{&env.paths});
+    try @import("test_allocations").checkAllAllocationFailures(a, allocationFailure, .{&env.paths});
 }
 
 test "instance manager production callbacks honor pre-cancellation without networking" {
@@ -712,12 +807,10 @@ test "instance manager acknowledgment retains ownership on Store worker and leas
     try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
     fault.reset();
     try env.store.reconcile();
-    var alias = try config.Store.init(a, io, env.root);
-    defer alias.deinit();
+    try std.testing.expectError(error.LauncherRootInUse, config.Store.init(a, io, env.root));
     const counts = fault.counts();
-    try std.testing.expectError(error.ConfigurationStoreChanged, manager.acknowledgeReconciledCreation(&alias));
     try std.testing.expectError(error.ConfigurationStoreChanged, manager.acknowledgeReconciledCreation(&foreign.store));
-    try std.testing.expectError(error.ConfigurationStoreChanged, manager.publish(&alias));
+    try std.testing.expectError(error.ConfigurationStoreChanged, manager.publish(&foreign.store));
     {
         const root = env.store.root;
         env.store.root = foreign.root;
@@ -837,7 +930,7 @@ test "instance manager acknowledgment compares all completed row fields and reje
     }
 }
 
-test "instance manager import acknowledgment uses the owned completed value rather than original request" {
+test "instance manager creation acknowledgment uses the owned completed value rather than original request" {
     try requireSyncFaults();
     var fault: PublicationFaultIo = .{};
     const store_io = fault.start();
@@ -859,15 +952,9 @@ test "instance manager import acknowledgment uses the owned completed value rath
     completed.loader = .fabric;
     completed.loader_version = "0.16.10";
     completed.origin = .{ .kind = .modrinth, .project_id = "imported-project", .version_id = "imported-version" };
-    {
-        // Seed a joined fake import result; this does not test filesystem import.
-        var arena: std.heap.ArenaAllocator = .init(a);
-        errdefer arena.deinit();
-        const value = try module.cloneInstance(arena.allocator(), completed);
-        job.result = .{ .arena = arena, .operation = .imported, .instance = value };
-    }
-    job.operation = .importing;
-    manager.operation = .importing;
+    // Preserve the installer-owned completed value after the worker has joined.
+    job.installed.?.deinit();
+    job.installed = try module.Installed.init(a, completed);
     fault.reset();
     fault.fail_sync = 3;
     try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
@@ -882,7 +969,7 @@ test "instance manager import acknowledgment uses the owned completed value rath
     try manager.acknowledgeReconciledCreation(&env.store);
     try std.testing.expectEqualDeep(counts, fault.counts());
     try std.testing.expectEqual(@as(usize, 1), fixture.releases);
-    try std.testing.expectEqual(module.Operation.importing, manager.snapshot().operation);
+    try std.testing.expectEqual(module.Operation.creating, manager.snapshot().operation);
     try std.testing.expectEqualStrings(completed.minecraft_version, manager.snapshot().instance.?.minecraft_version);
     try std.testing.expectEqual(tasks.State.succeeded, registry.tasks()[0].state);
 }
@@ -1555,283 +1642,6 @@ test "instance cancelAndJoin preserves owned publication uncertainty without Sto
     try std.testing.expectEqual(module.Phase.complete, manager.snapshot().phase);
 }
 
-const canonical_import: Instance = .{ .id = "canonical-existing", .name = "26.3", .minecraft_version = "" };
-fn canonicalImportBytes(alloc: std.mem.Allocator) ![]u8 {
-    var client_hash: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash("base", &client_hash, .{});
-    return std.json.Stringify.valueAlloc(alloc, .{ .id = "26.3", .mainClass = "net.minecraft.client.main.Main", .javaVersion = .{ .component = "java-runtime-delta", .majorVersion = 25 }, .downloads = .{ .client = .{ .url = "https://piston-data.mojang.com/v1/objects/fixture/client.jar", .sha1 = &std.fmt.bytesToHex(&client_hash, .lower), .size = 4 } } }, .{});
-}
-fn seedCanonicalImport(dir: std.Io.Dir) !void {
-    const bytes = try canonicalImportBytes(a);
-    defer a.free(bytes);
-    try dir.createDirPath(io, ".minecraft/versions/26.3/mods");
-    try dir.createDirPath(io, ".minecraft/versions/26.3/saves/world");
-    try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.json", .data = bytes });
-    try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.jar", .data = "base" });
-    try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/mods/keep.jar", .data = "mod" });
-    try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/saves/world/level.dat", .data = "world" });
-}
-const CanonicalImportPreparation = struct {
-    entered: std.atomic.Value(bool) = .init(false),
-    blocked: std.atomic.Value(bool) = .init(false),
-    calls: usize = 0,
-    corrupt_pin: bool = false,
-    wrong_generation: bool = false,
-    fn adapter(self: *CanonicalImportPreparation) module.VanillaPreparationAdapter {
-        return .{ .context = self, .prepare = prepare };
-    }
-    fn prepare(raw: ?*anyopaque, alloc: std.mem.Allocator, worker_io: std.Io, requested: metadata_loader.VanillaTarget, control: module.Control) !metadata_loader.PreparedVanilla {
-        const self: *CanonicalImportPreparation = @ptrCast(@alignCast(raw.?));
-        self.calls += 1;
-        self.entered.store(true, .release);
-        while (self.blocked.load(.acquire)) {
-            try control.check();
-            try worker_io.sleep(.fromMilliseconds(1), .awake);
-        }
-        try control.check();
-        const bytes = try canonicalImportBytes(alloc);
-        defer alloc.free(bytes);
-        var metadata_hash: [20]u8 = undefined;
-        std.crypto.hash.Sha1.hash(bytes, &metadata_hash, .{});
-        if (self.corrupt_pin) metadata_hash[0] ^= 1;
-        const entries = [_]metadata.manifest.Entry{.{ .id = "26.3", .kind = "release", .url = "https://piston-meta.mojang.com/v1/packages/fixture/26.3.json", .time = "", .release_time = "", .sha1 = metadata_hash, .compliance_level = null }};
-        const minecraft_root = try std.fs.path.join(alloc, &.{ requested.root, ".minecraft" });
-        defer alloc.free(minecraft_root);
-        var target = requested;
-        if (self.wrong_generation) target.generation += 1;
-        return metadata_loader.prepareVanilla(alloc, worker_io, .{ .target = target, .vanilla = .{ .root = minecraft_root, .version_id = target.version_id, .manifest = .{ .latest = .{ .release = "26.3", .snapshot = "26.3" }, .versions = &entries }, .cancel = control.cancel }, .fetcher = .{} });
-    }
-    fn waitEntered(self: *CanonicalImportPreparation) !void {
-        const started = std.Io.Clock.awake.now(io).nanoseconds;
-        while (!self.entered.load(.acquire)) {
-            if (std.Io.Clock.awake.now(io).nanoseconds - started > 3 * std.time.ns_per_s) return error.FixtureTimeout;
-            try io.sleep(.fromMilliseconds(1), .awake);
-        }
-    }
-};
-fn expectCanonicalData(dir: std.Io.Dir) !void {
-    for ([_]struct { path: []const u8, bytes: []const u8 }{
-        .{ .path = ".minecraft/versions/26.3/26.3.jar", .bytes = "base" },
-        .{ .path = ".minecraft/versions/26.3/mods/keep.jar", .bytes = "mod" },
-        .{ .path = ".minecraft/versions/26.3/saves/world/level.dat", .bytes = "world" },
-    }) |entry| {
-        const bytes = try dir.readFileAlloc(io, entry.path, a, .limited(64));
-        defer a.free(bytes);
-        try std.testing.expectEqualStrings(entry.bytes, bytes);
-    }
-    try std.testing.expectError(error.FileNotFound, dir.statFile(io, ".minecraft/versions/26.3/.vela-instance.json", .{ .follow_symlinks = false }));
-    try std.testing.expectError(error.FileNotFound, dir.statFile(io, ".minecraft/versions/26.3/.vela-loader.json", .{ .follow_symlinks = false }));
-}
-
-test "canonical existing import retains authenticated owner through JOIN and publishes once under lease" {
-    var env = try Environment.init();
-    defer env.deinit();
-    try seedCanonicalImport(env.tmp.dir);
-    var registry = tasks.Registry.init(a);
-    defer registry.deinit();
-    var fixture: Fixture = .{};
-    var preparation: CanonicalImportPreparation = .{};
-    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
-    defer manager.deinit();
-    manager.setVanillaPreparation(preparation.adapter());
-    try manager.startImport(canonical_import);
-    try std.testing.expectError(error.NoPendingPublication, manager.publish(&env.store));
-    try std.testing.expect(!manager.snapshot().local_client_verified);
-    try settle(&manager);
-    try expectRetained(&manager, &fixture, &registry);
-    const job = manager.pending.?;
-    try std.testing.expect(job.import_prepared != null and job.result.?.local_client_verified);
-    try std.testing.expectEqual(@as(u64, 1), job.import_prepared.?.target.generation);
-    try std.testing.expectEqualStrings("26.3", job.result.?.instance.minecraft_version);
-    try std.testing.expectEqual(@as(usize, 0), env.store.snapshot().instances.len);
-    try std.testing.expect(!manager.snapshot().local_client_verified);
-    fixture.recheck_failure = error.LeaseLost;
-    try std.testing.expectError(error.LeaseLost, manager.publish(&env.store));
-    try std.testing.expect(manager.pending.? == job and job.import_prepared != null);
-    fixture.recheck_failure = null;
-    try manager.publish(&env.store);
-    try std.testing.expectEqual(@as(usize, 1), env.store.snapshot().instances.len);
-    try std.testing.expectEqualStrings(canonical_import.id, env.store.snapshot().selected_instance.?);
-    try std.testing.expectEqualStrings("26.3", env.store.snapshot().instances[0].minecraft_version);
-    try std.testing.expect(manager.snapshot().local_client_verified and job.import_prepared == null and job.result.?.publication_proof == null);
-    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
-    try std.testing.expectEqual(@as(usize, 1), preparation.calls);
-    try std.testing.expectError(error.NoPendingPublication, manager.publish(&env.store));
-    try expectCanonicalData(env.tmp.dir);
-}
-
-test "canonical publication rejects modified or replaced sources and retains pending evidence" {
-    for (0..8) |change| {
-        var env = try Environment.init();
-        defer env.deinit();
-        try seedCanonicalImport(env.tmp.dir);
-        var registry = tasks.Registry.init(a);
-        defer registry.deinit();
-        var fixture: Fixture = .{};
-        var preparation: CanonicalImportPreparation = .{};
-        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
-        var live = true;
-        defer if (live) manager.deinit();
-        manager.setVanillaPreparation(preparation.adapter());
-        try manager.startImport(canonical_import);
-        try settle(&manager);
-        const job = manager.pending.?;
-        switch (change) {
-            0 => try env.tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.jar", .data = "changed-client" }),
-            1 => try env.tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.json", .data = "{}" }),
-            2, 3 => {
-                const path = if (change == 2) ".minecraft/versions/26.3/26.3.jar" else ".minecraft/versions/26.3/26.3.json";
-                const bytes = if (change == 2) try a.dupe(u8, "base") else try canonicalImportBytes(a);
-                defer a.free(bytes);
-                try env.tmp.dir.rename(path, env.tmp.dir, ".minecraft/versions/26.3/replaced-original", io);
-                try env.tmp.dir.writeFile(io, .{ .sub_path = path, .data = bytes });
-            },
-            4 => {
-                try env.tmp.dir.rename(".minecraft/versions/26.3", env.tmp.dir, ".minecraft/versions/held-original", io);
-                try env.tmp.dir.createDirPath(io, ".minecraft/versions/26.3");
-            },
-            5 => try env.tmp.dir.hardLink(".minecraft/versions/26.3/26.3.jar", env.tmp.dir, "outside-client-alias", io, .{}),
-            6 => try env.tmp.dir.hardLink(".minecraft/versions/26.3/26.3.json", env.tmp.dir, "outside-metadata-alias", io, .{}),
-            7 => {
-                try env.tmp.dir.rename(".minecraft", env.tmp.dir, "held-minecraft", io);
-                try env.tmp.dir.createDirPath(io, ".minecraft/versions/26.3");
-            },
-            else => unreachable,
-        }
-        const expected = if (change == 5 or change == 6) error.HardLinkAlias else error.TreeChanged;
-        try std.testing.expectError(expected, manager.publish(&env.store));
-        try std.testing.expectEqual(@as(usize, 0), env.store.snapshot().instances.len);
-        try std.testing.expect(env.store.snapshot().selected_instance == null and !manager.snapshot().local_client_verified);
-        try std.testing.expectEqual(@as(anyerror, expected), manager.snapshot().failure orelse return error.ExpectedPublicationFailure);
-        try std.testing.expect(manager.pending.? == job and job.import_prepared != null and job.result.?.publication_proof != null);
-        manager.cancelAndJoin();
-        try expectRetained(&manager, &fixture, &registry);
-        manager.deinit();
-        live = false;
-        try std.testing.expectEqual(@as(usize, 1), fixture.releases);
-        try std.testing.expect(!fixture.held.load(.acquire) and !registry.hasActive());
-    }
-}
-
-test "canonical reconciled publication checks freshness without rewriting authoritative config" {
-    try requireSyncFaults();
-    for ([_]bool{ false, true }) |changed| {
-        var fault: PublicationFaultIo = .{};
-        const store_io = fault.start();
-        defer fault.stop();
-        var env = try Environment.initWithStoreIo(store_io);
-        defer env.deinit();
-        try env.store.update(.{});
-        try seedCanonicalImport(env.tmp.dir);
-        var registry = tasks.Registry.init(a);
-        defer registry.deinit();
-        var fixture: Fixture = .{};
-        var preparation: CanonicalImportPreparation = .{};
-        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
-        defer manager.deinit();
-        manager.setVanillaPreparation(preparation.adapter());
-        try manager.startImport(canonical_import);
-        try settle(&manager);
-        const job = manager.pending.?;
-        job.result.?.publication_proof.?.io = store_io;
-        fault.reset();
-        fault.require_namespace = true;
-        fault.fail_sync = 3;
-        try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
-        try fault.expectPublicationProtected();
-        try std.testing.expect(fault.stats > 0 and fault.writes > 0 and fault.syncs > 0 and fault.renames > 0);
-        try std.testing.expectError(error.InstanceNamespaceBusy, @import("core/instance_namespace.zig").acquire(io));
-        try std.testing.expect(job.uncertain_publication_store == &env.store and job.import_prepared != null);
-        fault.reset();
-        try env.store.reconcile();
-        try fault.expectPublicationProtected();
-        try std.testing.expect(fault.opens > 0);
-        try std.testing.expectEqual(@as(usize, 1), env.store.snapshot().instances.len);
-        const before = try std.json.Stringify.valueAlloc(a, env.store.snapshot().*, .{});
-        defer a.free(before);
-        const counts = fault.counts();
-        if (changed) {
-            try env.tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.jar", .data = "changed-after-rename" });
-            try std.testing.expectError(error.TreeChanged, manager.acknowledgeReconciledCreation(&env.store));
-            try expectRetained(&manager, &fixture, &registry);
-            try std.testing.expect(job.import_prepared != null and !manager.snapshot().local_client_verified);
-            try std.testing.expectEqual(@as(anyerror, error.TreeChanged), manager.snapshot().failure orelse return error.ExpectedPublicationFailure);
-        } else {
-            try manager.acknowledgeReconciledCreation(&env.store);
-            try std.testing.expect(manager.snapshot().local_client_verified and job.import_prepared == null);
-            try std.testing.expectEqual(@as(usize, 1), fixture.releases);
-        }
-        const after = try std.json.Stringify.valueAlloc(a, env.store.snapshot().*, .{});
-        defer a.free(after);
-        try std.testing.expectEqualStrings(before, after);
-        try std.testing.expectEqualDeep(counts, fault.counts());
-        try fault.expectPublicationProtected();
-        if (changed) {
-            try std.testing.expectError(error.InstanceNamespaceBusy, @import("core/instance_namespace.zig").acquire(io));
-        } else {
-            const token = try @import("core/instance_namespace.zig").acquire(io);
-            token.release();
-        }
-    }
-}
-
-test "canonical preparation rejects unauthenticated pins foreign generation and cancellation after start" {
-    for (0..3) |mode| {
-        var env = try Environment.init();
-        defer env.deinit();
-        try seedCanonicalImport(env.tmp.dir);
-        var registry = tasks.Registry.init(a);
-        defer registry.deinit();
-        var fixture: Fixture = .{};
-        var preparation: CanonicalImportPreparation = .{ .corrupt_pin = mode == 0, .wrong_generation = mode == 1 };
-        preparation.blocked.store(mode == 2, .release);
-        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
-        defer manager.deinit();
-        manager.setVanillaPreparation(preparation.adapter());
-        try manager.startImport(canonical_import);
-        if (mode == 2) {
-            try preparation.waitEntered();
-            manager.cancel();
-        }
-        try settle(&manager);
-        const expected = switch (mode) {
-            0 => error.ChecksumMismatch,
-            1 => error.PreparedMetadataGenerationMismatch,
-            2 => error.Canceled,
-            else => unreachable,
-        };
-        try std.testing.expectEqual(@as(anyerror, expected), manager.snapshot().failure orelse return error.ExpectedPreparationFailure);
-        try std.testing.expect(!manager.snapshot().local_client_verified);
-        try std.testing.expect(manager.pending == null and manager.published.?.import_prepared == null);
-        try std.testing.expectEqual(@as(usize, 0), env.store.snapshot().instances.len);
-        try std.testing.expectEqual(@as(usize, 1), fixture.releases);
-        try std.testing.expect(!fixture.held.load(.acquire) and !registry.hasActive());
-        try expectCanonicalData(env.tmp.dir);
-    }
-}
-fn canonicalManagerAllocationFailure(alloc: std.mem.Allocator, paths: *const instances.Paths) !void {
-    var registry = tasks.Registry.init(alloc);
-    defer registry.deinit();
-    var fixture: Fixture = .{};
-    defer std.debug.assert(!fixture.held.load(.acquire));
-    var preparation: CanonicalImportPreparation = .{};
-    var manager = try module.Manager.init(alloc, io, paths, &registry, .{}, fixture.lease());
-    defer manager.deinit();
-    manager.setVanillaPreparation(preparation.adapter());
-    try manager.startImport(canonical_import);
-    try settle(&manager);
-    if (manager.snapshot().failure) |err| return err;
-    try std.testing.expectEqual(module.Phase.awaiting_publication, manager.snapshot().phase);
-    try std.testing.expect(manager.pending.?.import_prepared != null and manager.pending.?.result.?.publication_proof != null);
-}
-test "canonical manager allocation failures release request prepared proof handles and lease after JOIN" {
-    var env = try Environment.init();
-    defer env.deinit();
-    try seedCanonicalImport(env.tmp.dir);
-    try std.testing.checkAllAllocationFailures(a, canonicalManagerAllocationFailure, .{&env.paths});
-    try expectCanonicalData(env.tmp.dir);
-}
-
 fn expectRealPublicationLease(coordinator: *@import("core/instance_leases.zig").Coordinator, id: []const u8) !void {
     try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(id));
     try coordinator.reserveLaunch("unrelated-instance");
@@ -1959,4 +1769,794 @@ test "manager real lease excludes same ID through JOIN uncertain save reconcile 
     coordinator.tick();
     const token = try namespace.acquire(io);
     token.release();
+}
+
+const CatalogueFixture = struct {
+    calls: usize = 0,
+    entered: std.atomic.Value(bool) = .init(false),
+    blocked: std.atomic.Value(bool) = .init(false),
+    ignore_cancel: bool = false,
+    failure: ?anyerror = null,
+    wrong_base: bool = false,
+    wrong_kind: bool = false,
+    empty: bool = false,
+    observed_cache_root: ?[]const u8 = null,
+    fn adapter(self: *CatalogueFixture) module.CatalogueAdapter {
+        return .{ .context = self, .fetch = fetch };
+    }
+    fn fetch(raw: ?*anyopaque, alloc: std.mem.Allocator, worker_io: std.Io, base: []const u8, kind: config.Loader, control: module.Control) !module.LoaderCatalogue {
+        const self: *CatalogueFixture = @ptrCast(@alignCast(raw.?));
+        self.calls += 1;
+        self.observed_cache_root = control.cache_root;
+        self.entered.store(true, .release);
+        while (self.blocked.load(.acquire)) {
+            if (!self.ignore_cancel) try control.check();
+            try worker_io.sleep(.fromMilliseconds(1), .awake);
+        }
+        if (!self.ignore_cancel) try control.check();
+        if (self.failure) |err| return err;
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        const entries = try owned.alloc(module.LoaderEntry, if (self.empty) 0 else 1);
+        if (entries.len != 0) entries[0] = .{ .id = try owned.dupe(u8, "loader-owned"), .stable = false, .release_time = try owned.dupe(u8, "2025-04-03T12:34:56Z") };
+        const owned_base = try owned.dupe(u8, if (self.wrong_base) "wrong-base" else base);
+        return .{ .arena = arena, .base = owned_base, .kind = if (self.wrong_kind) .quilt else kind, .entries = entries };
+    }
+};
+const CatalogueClock = struct {
+    milliseconds: u64 = 10,
+    fn now(raw: ?*anyopaque, _: std.Io) u64 {
+        const self: *CatalogueClock = @ptrCast(@alignCast(raw.?));
+        return self.milliseconds;
+    }
+    fn options(self: *CatalogueClock) module.Options {
+        return .{ .cache_clock = .{ .context = self, .now_ms = now } };
+    }
+};
+fn waitCatalogueEntered(fixture: *CatalogueFixture) !void {
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
+    while (!fixture.entered.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).nanoseconds - start > 3 * std.time.ns_per_s) return error.FixtureTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+fn waitCatalogueDone(manager: *module.Manager) !void {
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
+    while (!manager.active.?.done.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).nanoseconds - start > 3 * std.time.ns_per_s) return error.FixtureTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+test "loader catalogue warm switching uses independent owned snapshots and base-kind keys" {
+    var env = try Environment.init();
+    defer env.deinit();
+    var registry: tasks.Registry = .init(a);
+    defer registry.deinit();
+    var lease: Fixture = .{};
+    var fixture: CatalogueFixture = .{ .blocked = .init(true) };
+    var clock: CatalogueClock = .{};
+    var cache_root = "/owned/cache".*;
+    var options = clock.options();
+    options.cache_root = &cache_root;
+    var manager = try module.Manager.initWithOptions(a, io, &env.paths, &registry, .{}, lease.lease(), options);
+    defer manager.deinit();
+    manager.setLoaderCatalogue(fixture.adapter());
+    var base = "1.20.1".*;
+    try manager.loadLoaders(&base, .fabric);
+    try waitCatalogueEntered(&fixture);
+    @memset(&base, 'x');
+    @memset(&cache_root, 'x');
+    fixture.blocked.store(false, .release);
+    try settle(&manager);
+    try std.testing.expectEqualStrings("/owned/cache", fixture.observed_cache_root.?);
+    const first = manager.loaderSnapshot();
+    try std.testing.expectEqualStrings("1.20.1", first.base.?);
+    try std.testing.expectEqualStrings("loader-owned", first.entries[0].id);
+    try std.testing.expectEqualStrings("2025-04-03T12:34:56Z", first.entries[0].release_time);
+    try std.testing.expect(!first.entries[0].stable);
+    const cached = manager.loader_cache[0].?.catalogue;
+    try std.testing.expect(cached.base.ptr != first.base.?.ptr);
+    try std.testing.expect(cached.entries.ptr != first.entries.ptr);
+    try std.testing.expect(cached.entries[0].id.ptr != first.entries[0].id.ptr);
+    try std.testing.expect(cached.entries[0].release_time.ptr != first.entries[0].release_time.ptr);
+    try manager.loadLoaders("1.20.1", .quilt);
+    try settle(&manager);
+    try manager.loadLoaders("1.21", .fabric);
+    try settle(&manager);
+    const task_count = registry.tasks().len;
+    try manager.loadLoaders("1.20.1", .fabric);
+    try std.testing.expect(!manager.isBusy());
+    try std.testing.expectEqual(module.Phase.complete, manager.loaderSnapshot().phase);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+    try std.testing.expectEqual(task_count, registry.tasks().len);
+    const warm = manager.loaderSnapshot();
+    try std.testing.expectEqualStrings("1.20.1", warm.base.?);
+    try std.testing.expectEqual(config.Loader.fabric, warm.kind);
+    try std.testing.expectEqualStrings("2025-04-03T12:34:56Z", warm.entries[0].release_time);
+    try std.testing.expect(warm.entries[0].id.ptr != cached.entries[0].id.ptr);
+    fixture.empty = true;
+    try manager.loadLoaders("empty-base", .forge);
+    try settle(&manager);
+    try manager.loadLoaders("1.20.1", .quilt);
+    try manager.loadLoaders("empty-base", .forge);
+    try std.testing.expectEqual(@as(usize, 4), fixture.calls);
+    try std.testing.expectEqual(module.Phase.complete, manager.loaderSnapshot().phase);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaderSnapshot().entries.len);
+}
+
+test "loader catalogue monotonic expiry and explicit retry revalidate once" {
+    var env = try Environment.init();
+    defer env.deinit();
+    var registry: tasks.Registry = .init(a);
+    defer registry.deinit();
+    var lease: Fixture = .{};
+    var fixture: CatalogueFixture = .{};
+    var clock: CatalogueClock = .{};
+    var manager = try module.Manager.initWithOptions(a, io, &env.paths, &registry, .{}, lease.lease(), clock.options());
+    defer manager.deinit();
+    manager.setLoaderCatalogue(fixture.adapter());
+    try manager.loadLoaders("1.20.1", .fabric);
+    try settle(&manager);
+    clock.milliseconds += 299_999;
+    try manager.loadLoaders("1.20.1", .fabric);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    clock.milliseconds += 1;
+    try manager.loadLoaders("1.20.1", .fabric);
+    try std.testing.expect(manager.isBusy());
+    try settle(&manager);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try manager.refreshLoaders("1.20.1", .fabric);
+    try std.testing.expect(manager.isBusy());
+    try settle(&manager);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+    try manager.loadLoaders("1.20.1", .fabric);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+}
+
+test "loader catalogue cache stays bounded and adapter replacement invalidates successes" {
+    var env = try Environment.init();
+    defer env.deinit();
+    var registry: tasks.Registry = .init(a);
+    defer registry.deinit();
+    var lease: Fixture = .{};
+    var fixture: CatalogueFixture = .{};
+    var clock: CatalogueClock = .{};
+    var manager = try module.Manager.initWithOptions(a, io, &env.paths, &registry, .{}, lease.lease(), clock.options());
+    defer manager.deinit();
+    manager.setLoaderCatalogue(fixture.adapter());
+    for (0..9) |i| {
+        var buffer: [16]u8 = undefined;
+        const base = try std.fmt.bufPrint(&buffer, "base-{d}", .{i});
+        try manager.loadLoaders(base, .fabric);
+        try settle(&manager);
+    }
+    var occupied: usize = 0;
+    for (manager.loader_cache) |entry| if (entry != null) {
+        occupied += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 8), occupied);
+    try manager.loadLoaders("base-1", .fabric);
+    try std.testing.expectEqual(@as(usize, 9), fixture.calls);
+    try manager.loadLoaders("base-0", .fabric);
+    try settle(&manager);
+    try std.testing.expectEqual(@as(usize, 10), fixture.calls);
+    manager.setLoaderCatalogue(fixture.adapter());
+    try manager.loadLoaders("base-0", .fabric);
+    try settle(&manager);
+    try std.testing.expectEqual(@as(usize, 11), fixture.calls);
+}
+
+test "loader catalogue failure cancellation and mismatched results never enter cache" {
+    var env = try Environment.init();
+    defer env.deinit();
+    var registry: tasks.Registry = .init(a);
+    defer registry.deinit();
+    var lease: Fixture = .{};
+    var fixture: CatalogueFixture = .{ .failure = error.FixtureFetchFailed };
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, lease.lease());
+    defer manager.deinit();
+    manager.setLoaderCatalogue(fixture.adapter());
+    try manager.loadLoaders("1.20.1", .fabric);
+    try settle(&manager);
+    try std.testing.expectEqual(error.FixtureFetchFailed, manager.loaderSnapshot().failure.?);
+    fixture.failure = null;
+    fixture.wrong_base = true;
+    try manager.loadLoaders("1.20.1", .fabric);
+    try settle(&manager);
+    try std.testing.expectEqual(error.LoaderCatalogueMismatch, manager.loaderSnapshot().failure.?);
+    fixture.wrong_base = false;
+    fixture.wrong_kind = true;
+    try manager.loadLoaders("1.20.1", .fabric);
+    try settle(&manager);
+    try std.testing.expectEqual(error.LoaderCatalogueMismatch, manager.loaderSnapshot().failure.?);
+    fixture.wrong_kind = false;
+    fixture.entered.store(false, .release);
+    fixture.blocked.store(true, .release);
+    fixture.ignore_cancel = true;
+    try manager.loadLoaders("1.20.1", .fabric);
+    try waitCatalogueEntered(&fixture);
+    try std.testing.expectError(error.Busy, manager.loadLoaders("another-base", .quilt));
+    manager.cancel();
+    fixture.blocked.store(false, .release);
+    try settle(&manager);
+    try std.testing.expectEqual(module.Phase.canceled, manager.loaderSnapshot().phase);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaderSnapshot().entries.len);
+    for (manager.loader_cache) |entry| try std.testing.expect(entry == null);
+    fixture.ignore_cancel = false;
+    try manager.loadLoaders("1.20.1", .fabric);
+    try settle(&manager);
+    try std.testing.expectEqual(@as(usize, 5), fixture.calls);
+    try std.testing.expectEqual(module.Phase.complete, manager.loaderSnapshot().phase);
+    // Explicit retry retains a valid successful entry until a joined replacement.
+    fixture.failure = error.FixtureFetchFailed;
+    try manager.refreshLoaders("1.20.1", .fabric);
+    try settle(&manager);
+    fixture.failure = null;
+    try manager.loadLoaders("1.20.1", .fabric);
+    try std.testing.expect(!manager.isBusy());
+    try std.testing.expectEqual(@as(usize, 6), fixture.calls);
+    try std.testing.expectEqual(module.Phase.complete, manager.loaderSnapshot().phase);
+    fixture.entered.store(false, .release);
+    fixture.blocked.store(true, .release);
+    try manager.refreshLoaders("1.20.1", .fabric);
+    try waitCatalogueEntered(&fixture);
+    manager.cancel();
+    fixture.blocked.store(false, .release);
+    try settle(&manager);
+    try std.testing.expectEqual(module.Phase.canceled, manager.loaderSnapshot().phase);
+    try manager.loadLoaders("1.20.1", .fabric);
+    try std.testing.expect(!manager.isBusy());
+    try std.testing.expectEqual(@as(usize, 7), fixture.calls);
+    try std.testing.expectEqual(module.Phase.complete, manager.loaderSnapshot().phase);
+}
+
+test "loader catalogue late cancel and obsolete generation reject successful worker results after JOIN" {
+    var env = try Environment.init();
+    defer env.deinit();
+    var registry: tasks.Registry = .init(a);
+    defer registry.deinit();
+    var lease: Fixture = .{};
+    var fixture: CatalogueFixture = .{};
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, lease.lease());
+    defer manager.deinit();
+    manager.setLoaderCatalogue(fixture.adapter());
+    try manager.loadLoaders("1.20.1", .fabric);
+    try waitCatalogueDone(&manager);
+    manager.cancel();
+    manager.tick();
+    try std.testing.expectEqual(module.Phase.canceled, manager.loaderSnapshot().phase);
+    for (manager.loader_cache) |entry| try std.testing.expect(entry == null);
+    try manager.loadLoaders("1.20.1", .fabric);
+    try waitCatalogueDone(&manager);
+    // Replacing even an equal adapter deliberately invalidates its old generation.
+    manager.setLoaderCatalogue(fixture.adapter());
+    manager.tick();
+    try std.testing.expectEqual(module.Phase.canceled, manager.loaderSnapshot().phase);
+    for (manager.loader_cache) |entry| try std.testing.expect(entry == null);
+    try manager.loadLoaders("1.20.1", .fabric);
+    try settle(&manager);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+    try std.testing.expectEqual(module.Phase.complete, manager.loaderSnapshot().phase);
+}
+
+const delete_other: Instance = .{ .id = "delete-other", .name = "Other", .minecraft_version = "1.21" };
+fn seedDeleteConfiguration(env: *Environment) !void {
+    try editableFixture(env.tmp.dir);
+    try env.store.update(.{
+        .instances = &.{ editable, delete_other },
+        .servers = &.{
+            .{ .id = "bound-one", .name = "First", .address = "localhost", .instance_id = editable.id },
+            .{ .id = "bound-two", .name = "Second", .address = "localhost", .instance_id = editable.id },
+            .{ .id = "unrelated", .name = "Other", .address = "localhost", .instance_id = delete_other.id },
+        },
+        .selected_instance = editable.id,
+        .selected_server = "bound-two",
+    });
+}
+fn expectDeletedConfiguration(store: *const config.Store) !void {
+    try std.testing.expectEqual(@as(usize, 1), store.snapshot().instances.len);
+    try std.testing.expect(module.sameInstance(delete_other, store.snapshot().instances[0]));
+    try std.testing.expectEqual(@as(usize, 1), store.snapshot().servers.len);
+    try std.testing.expectEqualStrings("unrelated", store.snapshot().servers[0].id);
+}
+
+test "permanent deletion publishes complete removal of bound servers after JOIN only" {
+    for ([_]bool{ false, true }) |select_other| {
+        var env = try Environment.init();
+        defer env.deinit();
+        try seedDeleteConfiguration(&env);
+        if (select_other) {
+            var latest = env.store.snapshot().*;
+            latest.selected_instance = delete_other.id;
+            latest.selected_server = "unrelated";
+            try env.store.update(latest);
+        }
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var fixture: Fixture = .{};
+        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+        defer manager.deinit();
+        try manager.startDelete(editable);
+        try settle(&manager);
+        const job = manager.pending.?;
+        try std.testing.expectEqual(module.Phase.awaiting_publication, manager.snapshot().phase);
+        try std.testing.expectEqual(@import("core/instance_transactions.zig").Operation.deleted, job.result.?.operation);
+        try std.testing.expect(manager.snapshot().recovery_directory == null);
+        try std.testing.expect(module.sameInstance(editable, job.result.?.instance));
+        try std.testing.expectError(error.FileNotFound, env.tmp.dir.access(io, ".minecraft/versions/Play", .{}));
+        try env.tmp.dir.access(io, ".minecraft/versions/1.21/1.21.json", .{});
+        try std.testing.expectEqual(@as(usize, 2), env.store.snapshot().instances.len);
+        try std.testing.expectEqual(@as(usize, 3), env.store.snapshot().servers.len);
+        try expectRetained(&manager, &fixture, &registry);
+        try manager.publish(&env.store);
+        try expectDeletedConfiguration(&env.store);
+        if (select_other) {
+            try std.testing.expectEqualStrings(delete_other.id, env.store.snapshot().selected_instance.?);
+            try std.testing.expectEqualStrings("unrelated", env.store.snapshot().selected_server.?);
+        } else {
+            try std.testing.expect(env.store.snapshot().selected_instance == null);
+            try std.testing.expect(env.store.snapshot().selected_server == null);
+        }
+        try std.testing.expectEqual(module.Phase.complete, manager.snapshot().phase);
+        try std.testing.expect(manager.pending == null and !registry.hasActive());
+        try std.testing.expectEqual(tasks.State.succeeded, registry.tasks()[0].state);
+        try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+    }
+}
+
+test "permanent deletion stale whole row retains the owned result and never removes config" {
+    try requireSyncFaults();
+    var env = try Environment.init();
+    defer env.deinit();
+    try seedDeleteConfiguration(&env);
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+    defer manager.deinit();
+    try manager.startDelete(editable);
+    try settle(&manager);
+    const job = manager.pending.?;
+    var fault: PublicationFaultIo = .{ .require_namespace = true };
+    env.store.io = fault.start();
+    defer fault.stop();
+    const counts = fault.counts();
+    for (0..5) |field| {
+        const row = &@constCast(env.store.state.value.instances)[0];
+        row.* = editable;
+        switch (field) {
+            0 => row.java_path = "/external/java",
+            1 => row.min_memory_mb = 512,
+            2 => row.max_memory_mb = 8192,
+            3 => row.debug_launch = true,
+            4 => row.origin = .{ .kind = .modrinth, .project_id = "external", .version_id = "release" },
+            else => unreachable,
+        }
+        try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
+        try std.testing.expectEqualDeep(counts, fault.counts());
+        try std.testing.expect(manager.pending.? == job);
+        try std.testing.expectEqual(@as(usize, 3), env.store.snapshot().servers.len);
+        try expectRetained(&manager, &fixture, &registry);
+    }
+    @constCast(env.store.state.value.instances)[0] = editable;
+    try manager.publish(&env.store);
+    try expectDeletedConfiguration(&env.store);
+    try std.testing.expectEqual(@as(usize, 1), fault.renames);
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+}
+
+test "permanent deletion precommit config fault retries the same joined result" {
+    try requireSyncFaults();
+    var env = try Environment.init();
+    defer env.deinit();
+    try seedDeleteConfiguration(&env);
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+    defer manager.deinit();
+    try manager.startDelete(editable);
+    try settle(&manager);
+    const job = manager.pending.?;
+    var fault: PublicationFaultIo = .{ .require_namespace = true, .fail_sync = 1 };
+    env.store.io = fault.start();
+    defer fault.stop();
+    try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
+    try std.testing.expect(job.uncertain_publication_store == &env.store);
+    try std.testing.expectEqual(@as(usize, 2), job.deleted_server_ids.?.len);
+    try std.testing.expectEqual(@as(usize, 0), fault.renames);
+    try fault.expectPublicationProtected();
+    const blocked = fault.counts();
+    try std.testing.expectError(error.ConfigPublicationUncertain, manager.publish(&env.store));
+    try std.testing.expectEqualDeep(blocked, fault.counts());
+    try expectRetained(&manager, &fixture, &registry);
+    fault.reset();
+    try env.store.reconcile();
+    try std.testing.expectEqual(@as(usize, 2), env.store.snapshot().instances.len);
+    try std.testing.expectEqual(@as(usize, 3), env.store.snapshot().servers.len);
+    try std.testing.expect(manager.pending.? == job);
+    fault.reset();
+    try manager.publish(&env.store);
+    try expectDeletedConfiguration(&env.store);
+    try std.testing.expectEqual(@as(usize, 1), fault.renames);
+    try fault.expectPublicationProtected();
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+}
+
+test "permanent deletion reconciled committed save acknowledges without overwriting latest edits" {
+    try requireSyncFaults();
+    var env = try Environment.init();
+    defer env.deinit();
+    try seedDeleteConfiguration(&env);
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+    defer manager.deinit();
+    try manager.startDelete(editable);
+    try settle(&manager);
+    const job = manager.pending.?;
+    var fault: PublicationFaultIo = .{ .require_namespace = true, .fail_sync = 3 };
+    env.store.io = fault.start();
+    defer fault.stop();
+    try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
+    try std.testing.expectEqual(@as(usize, 1), fault.renames);
+    try expectRetained(&manager, &fixture, &registry);
+    fault.reset();
+    fault.fail_sync = 1;
+    try std.testing.expectError(error.InputOutput, env.store.reconcile());
+    const blocked = fault.counts();
+    try std.testing.expectError(error.ConfigPublicationUncertain, manager.publish(&env.store));
+    try std.testing.expectEqualDeep(blocked, fault.counts());
+    try expectRetained(&manager, &fixture, &registry);
+    fault.reset();
+    try env.store.reconcile();
+    try expectDeletedConfiguration(&env.store);
+    try std.testing.expectError(error.LauncherRootInUse, config.Store.init(a, io, env.root));
+    var foreign = try Environment.init();
+    defer foreign.deinit();
+    try std.testing.expectError(error.ConfigurationStoreChanged, manager.publish(&foreign.store));
+    var latest = env.store.snapshot().*;
+    latest.settings.default_memory_mb = 8192;
+    latest.selected_instance = delete_other.id;
+    latest.selected_server = "unrelated";
+    try env.store.update(latest);
+    const counts = fault.counts();
+    fixture.recheck_failure = error.LeaseLost;
+    try std.testing.expectError(error.LeaseLost, manager.publish(&env.store));
+    fixture.recheck_failure = null;
+    const deleted = job.result.?.instance;
+    job.result.?.instance.java_path = "/wrong/result";
+    try std.testing.expectError(error.InvalidCompletedPublication, manager.publish(&env.store));
+    job.result.?.instance = deleted;
+    {
+        job.done.store(false, .release);
+        defer job.done.store(true, .release);
+        try std.testing.expectError(error.PublicationWorkerNotJoined, manager.publish(&env.store));
+    }
+    {
+        const operation = job.result.?.operation;
+        job.result.?.operation = .renamed;
+        defer job.result.?.operation = operation;
+        try std.testing.expectError(error.InvalidCompletedPublication, manager.publish(&env.store));
+    }
+    {
+        const id = job.result.?.instance.id;
+        job.result.?.instance.id = delete_other.id;
+        defer job.result.?.instance.id = id;
+        try std.testing.expectError(error.InvalidCompletedPublication, manager.publish(&env.store));
+    }
+    {
+        const snapshot = @constCast(env.store.snapshot());
+        const saved = snapshot.servers;
+        defer snapshot.servers = saved;
+        const rebound = [_]config.Server{.{ .id = "bound-one", .name = "Rebound", .address = "localhost", .instance_id = delete_other.id }};
+        snapshot.servers = &rebound;
+        try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
+    }
+    {
+        const selected = env.store.state.value.selected_instance;
+        env.store.state.value.selected_instance = editable.id;
+        defer env.store.state.value.selected_instance = selected;
+        try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
+    }
+    {
+        const selected = env.store.state.value.selected_server;
+        env.store.state.value.selected_server = "bound-two";
+        defer env.store.state.value.selected_server = selected;
+        try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
+    }
+    {
+        const snapshot = @constCast(env.store.snapshot());
+        const saved = snapshot.servers;
+        defer snapshot.servers = saved;
+        const still_bound = [_]config.Server{.{ .id = "new-bound", .name = "Bound", .address = "localhost", .instance_id = editable.id }};
+        snapshot.servers = &still_bound;
+        try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
+    }
+    try std.testing.expectEqualDeep(counts, fault.counts());
+    try std.testing.expect(manager.pending.? == job);
+    try expectRetained(&manager, &fixture, &registry);
+    manager.cancelAndJoin();
+    try manager.publish(&env.store);
+    try std.testing.expectEqualDeep(counts, fault.counts());
+    try expectDeletedConfiguration(&env.store);
+    try std.testing.expectEqual(@as(u32, 8192), env.store.snapshot().settings.default_memory_mb);
+    try std.testing.expectEqualStrings(delete_other.id, env.store.snapshot().selected_instance.?);
+    try std.testing.expectEqualStrings("unrelated", env.store.snapshot().selected_server.?);
+    try std.testing.expectEqual(module.Phase.complete, manager.snapshot().phase);
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+    try std.testing.expectError(error.NoPendingPublication, manager.publish(&env.store));
+    try std.testing.expectEqualDeep(counts, fault.counts());
+}
+
+test "permanent deletion external config absence cannot forge owned publication evidence" {
+    for ([_]bool{ false, true }) |preexisting_uncertainty| {
+        var env = try Environment.init();
+        defer env.deinit();
+        try seedDeleteConfiguration(&env);
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var fixture: Fixture = .{};
+        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+        defer manager.deinit();
+        try manager.startDelete(editable);
+        try settle(&manager);
+        const job = manager.pending.?;
+        try env.store.update(.{ .instances = &.{delete_other} });
+        if (preexisting_uncertainty) {
+            env.store.publication_uncertain = true;
+            try std.testing.expectError(error.ConfigPublicationUncertain, manager.publish(&env.store));
+            env.store.publication_uncertain = false;
+        }
+        try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
+        try std.testing.expect(job.uncertain_publication_store == null and job.deleted_server_ids == null);
+        try std.testing.expect(manager.pending.? == job);
+        try expectRetained(&manager, &fixture, &registry);
+    }
+}
+
+test "permanent deletion partial worker debt stays leased and cannot retry by starting again" {
+    for ([_]anyerror{ error.PermanentDeletionIncomplete, error.InputOutput, error.Canceled }) |failure| {
+        var env = try Environment.init();
+        defer env.deinit();
+        try seedDeleteConfiguration(&env);
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        // Inject a worker-side error before filesystem mutation; this test audits
+        // manager classification without needing a destructive filesystem fault.
+        var fixture: Fixture = .{ .recheck_failure = failure };
+        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+        var live = true;
+        defer if (live) manager.deinit();
+        try manager.startDelete(editable);
+        try settle(&manager);
+        try std.testing.expectEqual(failure, manager.snapshot().failure.?);
+        try std.testing.expectEqual(@as(usize, 2), env.store.snapshot().instances.len);
+        try std.testing.expectEqual(@as(usize, 3), env.store.snapshot().servers.len);
+        try env.tmp.dir.access(io, ".minecraft/versions/Play/saves/World/level.dat", .{});
+        try std.testing.expect(!registry.hasActive());
+        if (failure == error.PermanentDeletionIncomplete) {
+            const job = manager.pending.?;
+            try std.testing.expect(manager.isBusy() and job.leased and fixture.held.load(.acquire));
+            try std.testing.expect(job.future == null and job.done.load(.acquire) and job.task == null);
+            try std.testing.expect(manager.snapshot().recovery_directory == null);
+            try std.testing.expectError(error.PermanentDeletionIncomplete, manager.publish(&env.store));
+            try std.testing.expectError(error.Busy, manager.startDelete(editable));
+            manager.cancel();
+            manager.cancelAndJoin();
+            manager.tick();
+            try std.testing.expect(manager.pending.? == job and fixture.releases == 0);
+            try std.testing.expectError(error.InstanceNamespaceBusy, @import("core/instance_namespace.zig").acquire(io));
+        } else {
+            try std.testing.expect(!manager.isBusy() and !fixture.held.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+        }
+        manager.deinit();
+        live = false;
+        try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+    }
+}
+
+test "permanent deletion late cancelAndJoin preserves committed removal and publication" {
+    var env = try Environment.init();
+    defer env.deinit();
+    try seedDeleteConfiguration(&env);
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+    defer manager.deinit();
+    try manager.startDelete(editable);
+    try waitWorkerDone(&manager);
+    const job = manager.active.?;
+    manager.cancelAndJoin();
+    manager.cancelAndJoin();
+    manager.tick();
+    try std.testing.expect(manager.active == null and manager.pending.? == job);
+    try std.testing.expectEqual(module.Phase.awaiting_publication, manager.snapshot().phase);
+    try std.testing.expect(manager.snapshot().recovery_directory == null);
+    try expectRetained(&manager, &fixture, &registry);
+    try manager.publish(&env.store);
+    try expectDeletedConfiguration(&env.store);
+    try std.testing.expectEqual(tasks.State.succeeded, registry.tasks()[0].state);
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+}
+
+fn deletionProofPublicationFixture(reconciled_save: bool) !void {
+    try requireSyncFaults();
+    for ([_]bool{ false, true }) |replace_versions| {
+        var env = try Environment.init();
+        defer env.deinit();
+        try seedDeleteConfiguration(&env);
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var fixture: Fixture = .{};
+        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+        defer manager.deinit();
+        try manager.startDelete(editable);
+        try settle(&manager);
+        const job = manager.pending.?;
+        try std.testing.expect(job.result.?.deletion_proof != null);
+        try std.testing.expect(manager.snapshot().recovery_directory == null);
+        try std.testing.expectError(error.FileNotFound, env.tmp.dir.access(io, ".minecraft/versions/Play", .{}));
+        var fault: PublicationFaultIo = .{ .require_namespace = true };
+        env.store.io = fault.start();
+        defer fault.stop();
+        if (reconciled_save) {
+            fault.fail_sync = 3;
+            try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
+            try std.testing.expect(job.uncertain_publication_store == &env.store);
+            fault.reset();
+            try env.store.reconcile();
+            try expectDeletedConfiguration(&env.store);
+        }
+        // Substitute only directories in this fixture's isolated temporary root.
+        // Keep the original versions directory alive so restoring it preserves
+        // its identity and permits retry against the original deletion proof.
+        if (replace_versions) {
+            try env.tmp.dir.renamePreserve(".minecraft/versions", env.tmp.dir, ".minecraft/versions-held", io);
+            try env.tmp.dir.createDirPath(io, ".minecraft/versions");
+        } else {
+            try env.tmp.dir.createDirPath(io, ".minecraft/versions/Play");
+        }
+        const before = try std.json.Stringify.valueAlloc(a, env.store.snapshot().*, .{ .emit_null_optional_fields = false });
+        defer a.free(before);
+        const counts = fault.counts();
+        if (manager.publish(&env.store)) |_| return error.ExpectedDeletionPublicationProofFailure else |_| {}
+        try std.testing.expectEqualDeep(counts, fault.counts());
+        try std.testing.expectEqual(module.Phase.awaiting_publication, manager.snapshot().phase);
+        try std.testing.expect(manager.pending.? == job and job.result.?.deletion_proof != null);
+        try expectRetained(&manager, &fixture, &registry);
+        const after = try std.json.Stringify.valueAlloc(a, env.store.snapshot().*, .{ .emit_null_optional_fields = false });
+        defer a.free(after);
+        try std.testing.expectEqualStrings(before, after);
+        if (replace_versions) {
+            try env.tmp.dir.access(io, ".minecraft/versions", .{});
+            try env.tmp.dir.access(io, ".minecraft/versions-held/1.21/1.21.json", .{});
+            // Remove only the externally substituted empty directory, then put
+            // back the original pinned directory without changing its identity.
+            try env.tmp.dir.deleteDir(io, ".minecraft/versions");
+            try env.tmp.dir.renamePreserve(".minecraft/versions-held", env.tmp.dir, ".minecraft/versions", io);
+        } else {
+            try env.tmp.dir.access(io, ".minecraft/versions/Play", .{});
+            // The manager rejected publication and did not erase this new tree.
+            // The fixture removes its own empty external recreation explicitly.
+            try env.tmp.dir.deleteDir(io, ".minecraft/versions/Play");
+        }
+        fault.reset();
+        try manager.publish(&env.store);
+        if (reconciled_save) {
+            try std.testing.expectEqual(@as(usize, 0), fault.writes);
+            try std.testing.expectEqual(@as(usize, 0), fault.syncs);
+            try std.testing.expectEqual(@as(usize, 0), fault.renames);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), fault.renames);
+            try fault.expectPublicationProtected();
+        }
+        try expectDeletedConfiguration(&env.store);
+        try env.tmp.dir.access(io, ".minecraft/versions/1.21/1.21.json", .{});
+        try std.testing.expectEqual(module.Phase.complete, manager.snapshot().phase);
+        try std.testing.expect(manager.pending == null and !registry.hasActive());
+        try std.testing.expect(job.result.?.deletion_proof == null);
+        try std.testing.expectEqual(tasks.State.succeeded, registry.tasks()[0].state);
+        try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+    }
+}
+
+test "permanent deletion pending publication rejects recreated target and substituted versions" {
+    try deletionProofPublicationFixture(false);
+}
+
+test "permanent deletion reconciled acknowledgment rejects recreated target and substituted versions" {
+    try deletionProofPublicationFixture(true);
+}
+
+test "manager retains copied live and terminal file details after task dismissal and pruning" {
+    for ([_]enum { success, failure, canceled }{ .success, .failure, .canceled }) |outcome| {
+        var env = try Environment.init();
+        defer env.deinit();
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var fixture: Fixture = .{ .telemetry = true, .failure = if (outcome == .failure) error.ChecksumMismatch else null };
+        fixture.blocked.store(true, .release);
+        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+        defer manager.deinit();
+        manager.setInstaller(fixture.installer());
+        try manager.startCreate(example);
+        try waitEntered(&fixture);
+        const live = manager.snapshot();
+        const id = live.task_id.?;
+        try std.testing.expectEqual(module.Phase.working, live.phase);
+        try std.testing.expectEqual(@as(u64, 0), live.details.completed);
+        try std.testing.expectEqual(@as(u64, 64), live.details.received);
+        try std.testing.expectEqual(@as(?u64, 128), live.details.total_bytes);
+        try std.testing.expectEqual(@as(f64, 512), live.details.bytes_per_second);
+        try std.testing.expectEqualStrings("lib.jar", live.details.files[0].name());
+        try std.testing.expectEqualStrings("/t/lib.jar", live.details.files[0].path());
+        try std.testing.expect(!registry.dismiss(id));
+        if (outcome == .canceled) manager.cancel();
+        fixture.blocked.store(false, .release);
+        try settle(&manager);
+        if (outcome == .success) {
+            try std.testing.expectEqual(module.Phase.awaiting_publication, manager.snapshot().phase);
+            try manager.publish(&env.store);
+        }
+        const terminal_snapshot = manager.snapshot();
+        try std.testing.expectEqual(@as(?u64, id), terminal_snapshot.task_id);
+        try std.testing.expectEqual(@as(f64, 0), terminal_snapshot.details.bytes_per_second);
+        try std.testing.expectEqual(@as(f64, 0), terminal_snapshot.details.files[0].bytes_per_second);
+        try std.testing.expectEqual(switch (outcome) {
+            .success => tasks.FileState.complete,
+            .failure => .failed,
+            .canceled => .canceled,
+        }, terminal_snapshot.details.files[0].state);
+        if (outcome == .failure) {
+            try std.testing.expectEqual(@as(?anyerror, error.ChecksumMismatch), terminal_snapshot.failure);
+            try std.testing.expectEqual(@as(?anyerror, error.ChecksumMismatch), terminal_snapshot.details.files[0].failure);
+        }
+        if (outcome == .success) try std.testing.expectEqual(@as(usize, 1), terminal_snapshot.completed);
+        if (outcome == .failure) try std.testing.expect(registry.dismiss(id)) else registry.pruneFinished(0);
+        try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
+        const after_prune = manager.snapshot();
+        try std.testing.expectEqual(@as(?u64, id), after_prune.task_id);
+        try std.testing.expectEqualDeep(terminal_snapshot.details, after_prune.details);
+        try std.testing.expectEqualStrings("lib.jar", after_prune.details.files[0].name());
+    }
+}
+
+const StageFault = @import("core/loaders/tests/stage_owner.zig").FaultIo;
+
+test "instance manager production stage rolls back cancellation open and sync acquisition faults" {
+    for ([_]StageFault.Mode{ .cancel_create, .fail_open, .fail_sync }) |mode| {
+        if (mode == .fail_sync and !@import("core/worlds_tree.zig").directory_sync_supported) continue;
+        var env = try Environment.init();
+        defer env.deinit();
+        var lease_fixture: Fixture = .{};
+        const lease = lease_fixture.lease();
+        try lease.acquire(lease.context, example.id);
+        defer lease.release(lease.context, example.id);
+        var fault: StageFault = .{ .mode = mode, .prefix = ".vela-instance-" };
+        const fault_io = fault.start();
+        defer fault.stop();
+        var canceled: std.atomic.Value(bool) = .init(false);
+        const installer = module.productionInstaller();
+        const expected = switch (mode) {
+            .cancel_create => error.Canceled,
+            .fail_open => error.AccessDenied,
+            .fail_sync => error.InputOutput,
+            else => unreachable,
+        };
+        try std.testing.expectError(expected, installer.run(installer.context, a, fault_io, .{ .root = env.root, .instance = example, .lease = lease }, .{ .cancel = &canceled }));
+        try std.testing.expect(fault.created and fault.removed);
+        const versions_path = try std.fs.path.join(a, &.{ env.root, ".minecraft", "versions" });
+        defer a.free(versions_path);
+        var versions = try std.Io.Dir.cwd().openDir(io, versions_path, .{ .iterate = true });
+        defer versions.close(io);
+        var iterator = versions.iterate();
+        while (try iterator.next(io)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".vela-instance-"));
+        try std.testing.expectError(error.FileNotFound, versions.statFile(io, example.name, .{ .follow_symlinks = false }));
+    }
 }

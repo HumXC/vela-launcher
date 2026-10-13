@@ -1,3 +1,4 @@
 test {
-    _ = @import("core/minecraft/loader_install_tests.zig");
+    _ = @import("core/loaders/tests/publication.zig");
+    _ = @import("core/loaders/tests/stage_owner.zig");
 }

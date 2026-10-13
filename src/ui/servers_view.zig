@@ -5,6 +5,7 @@ const servers = @import("../core/servers.zig");
 const server_manager = @import("server_manager.zig");
 const theme = @import("theme.zig");
 const components = @import("components.zig");
+const server_card = @import("server_card.zig");
 const R = dvui.Rect;
 const Allocator = std.mem.Allocator;
 
@@ -52,6 +53,9 @@ pub const Ui = struct {
     allocator: Allocator,
     draft: Draft = .{},
     editor_open: bool = false,
+    adding: bool = false,
+    dirty: bool = false,
+    save_timer: ?dvui.Id = null,
     deleting_id: ?[]u8 = null,
     pending: ?Pending = null,
     failure: ?anyerror = null,
@@ -96,10 +100,7 @@ const HomeChoices = struct {
     }
 };
 fn homeChoices(a: Allocator, doc: *const config.Document) !HomeChoices {
-    var count: usize = 1;
-    for (doc.servers) |server| if (server.show_on_home) {
-        count += 1;
-    };
+    const count = doc.servers.len + 1;
     const labels = try a.alloc([]const u8, count);
     errdefer a.free(labels);
     const ids = try a.alloc(?[]const u8, count);
@@ -107,12 +108,12 @@ fn homeChoices(a: Allocator, doc: *const config.Document) !HomeChoices {
     ids[0] = null;
     var choice: ?usize = if (doc.selected_server == null) 0 else null;
     var index: usize = 1;
-    for (doc.servers) |server| if (server.show_on_home) {
+    for (doc.servers) |server| {
         labels[index] = server.name;
         ids[index] = server.id;
         if (sameId(doc.selected_server, server.id)) choice = index;
         index += 1;
-    };
+    }
     return .{ .labels = labels, .ids = ids, .choice = choice };
 }
 pub fn drawHome(ui: *Ui, doc: *const config.Document) void {
@@ -120,22 +121,28 @@ pub fn drawHome(ui: *Ui, doc: *const config.Document) void {
 }
 
 pub fn drawHomeWithOptions(ui: *Ui, doc: *const config.Document, compact: bool) void {
-    const font = if (compact) dvui.themeGet().font_body.withSize(14) else dvui.themeGet().font_body;
     const choices = homeChoices(ui.allocator, doc) catch |err| {
         ui.failure = err;
         return;
     };
     defer choices.deinit(ui.allocator);
     var choice = choices.choice;
-    if (dvui.dropdown(@src(), choices.labels, .{ .choice_nullable = &choice }, .{ .placeholder = "当前服务器未显示在首页", .null_selectable = false }, .{ .tag = "home-server-target", .font = font, .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .h = 24 }, .padding = R.all(8), .margin = R.all(0), .corners = .all(4), .label = .{ .text = "启动目标" } })) {
+    if (components.dropdownTagged(@src(), "启动目标", choices.labels, .{ .choice_nullable = &choice }, .{ .placeholder = "当前服务器不可用", .null_selectable = false }, "home-server-target")) {
         if (choice) |index| {
             if (choices.ids[index]) |id| ui.queue(.select, id) else ui.queue(.clear_server, null);
         }
     }
+    drawHomeSummary(ui, doc, compact);
+}
+
+pub fn drawHomeSummary(ui: *Ui, doc: *const config.Document, compact: bool) void {
+    _ = ui;
+    const font = theme.headingFont();
     if (doc.selected_server) |id| {
         if (findServer(doc, id)) |server| {
-            const detail_font = if (compact) font.withSize(12) else font;
-            const detail_options: dvui.Options = .{ .font = detail_font, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .y = 2, .h = if (compact) 0 else 6 }, .color_text = .{ .color = theme.accent } };
+            const detail_font = theme.captionFont();
+            dvui.labelNoFmt(@src(), server.name, .{}, .{ .tag = "home-server-target", .font = font, .padding = R.all(0), .margin = R.all(0), .expand = .horizontal, .max_size_content = .width(0) });
+            const detail_options: dvui.Options = .{ .font = detail_font, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .y = theme.spacing.detail_gap, .h = if (compact) 0 else theme.spacing.row_gap }, .color_text = .{ .color = theme.accent } };
             const address = dvui.textLayout(@src(), .{}, detail_options.override(.{ .tag = "home-server-address" }));
             address.addText(fmt("{s}:{d}", .{ server.address, server.port }), .{});
             address.deinit();
@@ -148,188 +155,165 @@ pub fn drawHomeWithOptions(ui: *Ui, doc: *const config.Document, compact: bool) 
         }
     }
 }
-fn wrapped(src: std.builtin.SourceLocation, value: []const u8, color: dvui.Color) void {
-    components.text(src, value, color);
-}
 fn fmt(comptime format: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), format, args) catch "";
 }
-fn iconButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{}, .{ .label = .{ .text = name }, .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .padding = R.all(8), .margin = .{ .x = 4 }, .corners = .all(4) });
-    button.processEvents();
-    button.drawBackground();
-    dvui.icon(@src(), name, asset, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0), .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .role = .none }));
-    button.drawFocus();
-    const clicked = button.clicked();
-    const control_id = button.data().id;
-    const rect = button.data().borderRectScale().r;
-    button.deinit();
-    components.tooltip(src, control_id, rect, name);
-    return clicked;
+fn gap(src: std.builtin.SourceLocation, height: f32) void {
+    _ = dvui.spacer(src, .{ .min_size_content = .{ .h = height } });
 }
-fn entry(src: std.builtin.SourceLocation, name: []const u8, buffer: []u8, numeric: bool) void {
-    dvui.labelNoFmt(src, name, .{}, .{ .padding = R.all(0), .margin = .{ .y = 8, .h = 4 } });
-    const height = (dvui.Options{}).fontGet().sizeM(0, 1).h;
-    const input = dvui.textEntry(src, .{ .text = .{ .buffer = buffer } }, .{ .id_extra = 1, .label = .{ .text = name }, .expand = .horizontal, .min_size_content = .{ .h = height }, .max_size_content = .height(height), .padding = R.all(8), .corners = .all(4), .margin = .{ .h = 6 } });
-    if (numeric) input.filterIn("0123456789");
-    input.deinit();
+
+fn changed(ui: *Ui) void {
+    ui.dirty = true;
+    ui.failure = null;
+    if (!ui.adding) {
+        const id = dvui.parentGet().data().id.update("server-autosave");
+        ui.save_timer = id;
+        dvui.timer(id, 500_000);
+    }
 }
+
 fn drawEditor(ui: *Ui, doc: *const config.Document) void {
-    const editor = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .{ .y = 12 }, .margin = R.all(0), .border = .{ .y = 1 } });
-    defer editor.deinit();
-    dvui.labelNoFmt(@src(), if (ui.draft.id == null) "添加服务器" else "编辑服务器", .{}, .{ .padding = R.all(0), .margin = .{ .h = 6 } });
-    switch (components.formActions(@src(), .{})) {
+    components.title(@src(), if (ui.adding) "添加服务器" else text(&ui.draft.name));
+    if (ui.adding) switch (components.formActions(@src(), .{ .save_label = "完成" })) {
         .save => ui.queue(.save, null),
         .cancel => ui.queue(.cancel_edit, null),
         .none => {},
-    }
-    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .background = false, .padding = R.all(0), .margin = R.all(0), .border = R.all(0) });
-    defer scroll.deinit();
-    if (ui.failure) |err| wrapped(@src(), fmt("操作失败：{s}", .{@errorName(err)}), dvui.Color.fromHex("F0A6A1"));
-    entry(@src(), "名称", &ui.draft.name, false);
-    entry(@src(), "地址", &ui.draft.address, false);
-    entry(@src(), "端口", &ui.draft.port, true);
-    dvui.labelNoFmt(@src(), "绑定实例", .{}, .{ .padding = R.all(0), .margin = .{ .y = 8, .h = 4 } });
-    const labels = dvui.currentWindow().arena().alloc([]const u8, doc.instances.len) catch {
-        ui.failure = error.OutOfMemory;
-        return;
     };
-    var choice: ?usize = null;
-    for (doc.instances, 0..) |instance, index| {
-        labels[index] = instance.name;
-        if (sameId(ui.draft.instance_id, instance.id)) choice = index;
+    gap(@src(), theme.spacing.page_title_gap);
+    const scroll = components.scrollBody(@src());
+    defer scroll.deinit();
+    if (ui.failure) |err| {
+        components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), theme.danger);
+        if (ui.dirty and !ui.adding and components.button(@src(), "重试", .{})) ui.queue(.save, null);
     }
-    if (labels.len > 0) {
-        if (dvui.dropdown(@src(), labels, .{ .choice_nullable = &choice }, .{ .placeholder = "选择实例", .null_selectable = false }, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(8), .corners = .all(4) })) {
-            if (choice) |index| {
-                const owned = ui.allocator.dupe(u8, doc.instances[index].id) catch |err| {
-                    ui.failure = err;
-                    return;
-                };
-                if (ui.draft.instance_id) |old| ui.allocator.free(old);
-                ui.draft.instance_id = owned;
-            }
+    {
+        const panel = components.formPanel(@src(), .{ .tag = "server-editor" });
+        defer panel.deinit();
+        if (components.field(@src(), "名称", &ui.draft.name, .{ .gap_after = 0 })) changed(ui);
+    }
+    {
+        const panel = components.formPanel(@src(), .{ .tag = "server-address" });
+        defer panel.deinit();
+        if (components.field(@src(), "地址", &ui.draft.address, .{ .gap_after = 0 })) changed(ui);
+    }
+    {
+        const panel = components.formPanel(@src(), .{ .tag = "server-connection" });
+        defer panel.deinit();
+        const fields = components.formRow(@src());
+        defer fields.deinit();
+        {
+            const cell = fields.cell(@src(), 0);
+            defer cell.deinit();
+            if (components.field(@src(), "端口", &ui.draft.port, .{ .gap_after = 0, .digits_only = true })) changed(ui);
         }
-    } else wrapped(@src(), "暂无实例", theme.muted);
-    _ = dvui.checkbox(@src(), &ui.draft.show_on_home, "显示在首页", .{ .margin = .{ .y = 8, .h = 8 } });
+        const cell = fields.cell(@src(), 1);
+        defer cell.deinit();
+        components.fieldLabel(@src(), "绑定实例");
+        const labels = dvui.currentWindow().arena().alloc([]const u8, doc.instances.len) catch {
+            ui.failure = error.OutOfMemory;
+            return;
+        };
+        var choice: ?usize = null;
+        for (doc.instances, 0..) |instance, index| {
+            labels[index] = instance.name;
+            if (sameId(ui.draft.instance_id, instance.id)) choice = index;
+        }
+        if (labels.len > 0) {
+            if (components.dropdownStyled(@src(), "绑定实例", labels, .{ .choice_nullable = &choice }, .{ .placeholder = "选择实例", .null_selectable = false }, .{ .margin = R.all(0) })) {
+                if (choice) |index| {
+                    const owned = ui.allocator.dupe(u8, doc.instances[index].id) catch |err| {
+                        ui.failure = err;
+                        return;
+                    };
+                    if (ui.draft.instance_id) |old| ui.allocator.free(old);
+                    ui.draft.instance_id = owned;
+                    changed(ui);
+                }
+            }
+        } else components.emptyState(@src(), "暂无实例");
+    }
+    if (!ui.adding) {
+        if (ui.draft.id) |id| if (components.button(@src(), "删除", .{ .tag = "server-delete", .destructive = true, .expand = true, .enabled = ui.deleting_id == null })) ui.queue(.ask_delete, id);
+    }
 }
 
 /// The caller owns the utility menu shell and footer; actions remain deferred.
 pub fn drawSidebar(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) void {
-    _ = manager;
     const doc = store.snapshot();
-    if (components.sidebarItem(@src(), "add-server", "添加服务器", .{ .icon = dvui.entypo.plus, .selected = ui.editor_open and ui.draft.id == null })) ui.queue(.add, null);
-    components.section(@src(), "已配置");
-    const list = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .background = false, .label = .{ .text = "已配置服务器" } });
+    const enabled = ui.deleting_id == null;
+    if (components.sidebarAction(@src(), "add-server", "添加服务器", .{ .icon = dvui.entypo.plus, .selected = ui.editor_open and ui.draft.id == null, .enabled = enabled, .gap_after = 0 })) ui.queue(.add, null);
+    const list = components.scrollBody(@src());
     defer list.deinit();
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .h = theme.spacing.sidebar_action_gap } });
     if (doc.servers.len == 0) components.emptyState(@src(), "暂无服务器");
-    for (doc.servers) |server| {
-        if (components.sidebarItem(@src(), server.id, server.name, .{ .selected = sameId(doc.selected_server, server.id) })) ui.queue(.select_sidebar, server.id);
+    for (doc.servers, 0..) |server, index| {
+        const row = dvui.box(@src(), .{}, .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, server.id))), .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = if (index + 1 == doc.servers.len) 0 else theme.spacing.card_gap } });
+        defer row.deinit();
+        const selected = if (ui.editor_open) sameId(ui.draft.id, server.id) else sameId(doc.selected_server, server.id);
+        if (server_card.draw(@src(), server, doc, manager.pickerSnapshot(server.id), .{ .selected = selected, .enabled = enabled, .require_instance = false, .width = row.data().contentRect().w, .tag = fmt("server-option-{s}", .{server.id}) })) ui.queue(.select_sidebar, server.id);
     }
 }
 
 /// Right-hand content. Store and manager snapshots stay borrowed until finish.
 pub fn draw(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) void {
+    _ = manager;
     const doc = store.snapshot();
     const page = dvui.box(@src(), .{}, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
     defer page.deinit();
-    if (!ui.editor_open) {
-        if (ui.failure) |err| wrapped(@src(), fmt("操作失败：{s}", .{@errorName(err)}), dvui.Color.fromHex("F0A6A1"));
-    }
-    if (ui.deleting_id) |id| {
-        if (findServer(doc, id)) |server| wrapped(@src(), fmt("删除服务器「{s}」？", .{server.name}), theme.accent);
-        const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 8 } });
-        if (iconButton(@src(), "确认删除", dvui.entypo.trash)) ui.queue(.delete, id);
-        if (iconButton(@src(), "取消删除", dvui.entypo.cross)) ui.queue(.cancel_delete, null);
-        actions.deinit();
-    }
     if (ui.editor_open) {
         drawEditor(ui, doc);
-        return;
-    }
-    const scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false, .padding = R.all(0), .border = R.all(0) });
-    defer scroll.deinit();
-    const column = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0) });
-    defer column.deinit();
-    const selected_id = doc.selected_server orelse {
-        wrapped(@src(), if (doc.servers.len == 0) "暂无服务器，请从左侧添加服务器" else "从左侧选择服务器", theme.muted);
-        return;
-    };
-    const server = findServer(doc, selected_id) orelse {
-        wrapped(@src(), "所选服务器不存在，请从左侧重新选择", theme.muted);
-        return;
-    };
-    dvui.labelNoFmt(@src(), server.name, .{}, .{ .font = dvui.themeGet().font_title, .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 12 } });
-    const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 12 } });
-    if (iconButton(@src(), "刷新状态", dvui.entypo.cw)) ui.queue(.refresh, server.id);
-    if (iconButton(@src(), "编辑服务器", dvui.entypo.pencil)) ui.queue(.edit, server.id);
-    if (iconButton(@src(), "删除服务器", dvui.entypo.trash)) ui.queue(.ask_delete, server.id);
-    actions.deinit();
-    wrapped(@src(), fmt("{s}:{d}", .{ server.address, server.port }), theme.muted);
-    var instance_name: []const u8 = "实例不存在";
-    for (doc.instances) |instance| if (std.mem.eql(u8, instance.id, server.instance_id)) {
-        instance_name = instance.name;
-        break;
-    };
-    wrapped(@src(), fmt("绑定实例：{s}", .{instance_name}), theme.muted);
-    wrapped(@src(), if (server.show_on_home) "显示在首页 · 启动时自动连接" else "未显示在首页 · 启动时自动连接", theme.muted);
-    const snapshot = manager.snapshot();
-    if (snapshot.server) |requested| {
-        if (std.mem.eql(u8, requested.id, server.id)) {
-            drawStatus(manager);
-            if (snapshot.state == .querying and iconButton(@src(), "取消查询", dvui.entypo.cross)) ui.queue(.cancel_query, null);
-            return;
-        }
-    }
-    wrapped(@src(), "尚未查询", theme.muted);
+    } else if (doc.selected_server) |id| {
+        if (findServer(doc, id) != null) ui.queue(.edit, id);
+    } else components.emptyState(@src(), if (doc.servers.len == 0) "暂无服务器" else "从左侧选择服务器");
 }
 
-/// Inline and read-only. Untrusted PNGs must pass both backend checks and stb.
-pub fn drawStatus(manager: *server_manager.Manager) void {
-    const snapshot = manager.snapshot();
-    const band = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .y = 4 } });
-    defer band.deinit();
-    switch (snapshot.state) {
-        .idle => wrapped(@src(), "尚未查询", theme.muted),
-        .querying => wrapped(@src(), "查询中…", theme.muted),
-        .canceled => wrapped(@src(), "已取消", theme.muted),
-        .offline => {
-            const reason: []const u8 = if (snapshot.failure) |err| switch (servers.classifyFailure(err)) {
-                .timeout => "查询超时",
-                .canceled => "已取消",
-                .invalid_response => "服务器响应无效",
-                .invalid_configuration => "服务器配置无效",
-                .resource => "查询资源不足",
-                .offline => "无法连接",
-            } else "无法连接";
-            wrapped(@src(), reason, dvui.Color.fromHex("F0A6A1"));
-        },
-        .online => if (snapshot.status) |status| {
-            if (status.icon_png) |png| {
-                const decoded = dvui.Color.PMAImage.fromImageFile("server-icon", dvui.currentWindow().arena(), png) catch null;
-                if (decoded) |image| {
-                    if (image.width == 64 and image.height == 64) _ = dvui.image(@src(), .{ .source = .{ .pixelsPMA = .{ .rgba = image.pma, .width = image.width, .height = image.height, .invalidation = .bytes } } }, .{ .label = .{ .text = "服务器图标" }, .min_size_content = .{ .w = 32, .h = 32 }, .max_size_content = .{ .w = 32, .h = 32 }, .margin = .{ .h = 6 }, .padding = R.all(0) });
-                }
-            }
-            wrapped(@src(), fmt("在线 · {s} · {d} ms", .{ status.version, status.latency_ms }), theme.accent);
-            if (status.players_online) |online| {
-                if (status.players_max) |max| wrapped(@src(), fmt("玩家 {d} / {d}", .{ online, max }), theme.muted) else wrapped(@src(), fmt("玩家 {d}", .{online}), theme.muted);
-            }
-            if (status.motd.len > 0) wrapped(@src(), status.motd, theme.muted);
-        },
+pub fn drawModal(ui: *Ui, doc: *const config.Document) void {
+    const id = ui.deleting_id orelse return;
+    const server = findServer(doc, id) orelse return;
+    const window = components.modal(@src(), "删除服务器", theme.style.dialogs.server_delete_height);
+    defer window.deinit();
+    {
+        const actions = components.modalActions(@src(), 2);
+        defer actions.deinit();
+        if (components.button(@src(), "取消", .{ .placement = .footer, .min_width = 120 })) ui.queue(.cancel_delete, null);
+        if (components.button(@src(), "确认删除", .{ .placement = .footer, .min_width = 152, .gravity_x = 1, .primary = true })) ui.queue(.delete, id);
     }
+    const body = components.scrollBody(@src());
+    defer body.deinit();
+    components.text(@src(), fmt("删除服务器「{s}」？", .{server.name}), theme.foreground);
+    if (ui.failure) |err| components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), theme.danger);
 }
 
-fn select(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, id: []const u8) !void {
-    _ = ui;
+pub fn selectLaunchTarget(store: *config.Store, manager: *server_manager.Manager, id: []const u8) !void {
+    try selectTarget(store, id, true);
+    try syncSelectedTarget(store, manager);
+}
+
+fn selectTarget(store: *config.Store, id: []const u8, validate_launch: bool) !void {
     var document = store.snapshot().*;
     const server = findServer(&document, id) orelse return error.ServerNotFound;
-    _ = try servers.selectLaunch(server, document.instances);
+    // Management must remain accessible when a stored endpoint needs repair.
+    if (validate_launch) _ = try servers.selectLaunch(server, document.instances);
+    if (sameId(document.selected_server, server.id) and sameId(document.selected_instance, server.instance_id)) return;
     document.selected_server = server.id;
     document.selected_instance = server.instance_id;
     try store.update(document);
-    manager.refreshConfigured(findServer(store.snapshot(), id).?) catch |err| {
+}
+
+fn syncSelectedTarget(store: *config.Store, manager: *server_manager.Manager) !void {
+    const document = store.snapshot();
+    const server = findServer(document, document.selected_server.?).?;
+    // Management selection must report invalid stored endpoints synchronously.
+    _ = servers.validateAddress(server.address, server.port) catch |err| {
+        manager.clear();
+        return err;
+    };
+    try manager.selectConfigured(server);
+}
+
+fn refreshSelectedTarget(store: *config.Store, manager: *server_manager.Manager) !void {
+    const selected_document = store.snapshot();
+    manager.refreshConfigured(findServer(selected_document, selected_document.selected_server.?).?) catch |err| {
         manager.clear();
         return err;
     };
@@ -360,8 +344,13 @@ fn save(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) !void {
     if (selected) document.selected_instance = server.instance_id;
     try store.update(document);
     if (selected) manager.clear();
-    ui.editor_open = false;
-    ui.draft.deinit(ui.allocator);
+    ui.dirty = false;
+    ui.save_timer = null;
+    if (ui.adding) {
+        ui.editor_open = false;
+        ui.adding = false;
+        ui.draft.deinit(ui.allocator);
+    }
 }
 fn delete(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, id: []const u8) !void {
     var document = store.snapshot().*;
@@ -381,6 +370,9 @@ fn delete(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, id: [
     };
     if (sameId(ui.draft.id, id)) {
         ui.editor_open = false;
+        ui.adding = false;
+        ui.dirty = false;
+        ui.save_timer = null;
         ui.draft.deinit(ui.allocator);
     }
     if (ui.deleting_id) |owned| ui.allocator.free(owned);
@@ -389,7 +381,19 @@ fn delete(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, id: [
 
 /// Must run after ALL parent/root/floating widgets have been closed.
 pub fn finish(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) void {
-    const pending = ui.pending orelse return;
+    const pending = ui.pending orelse {
+        if (ui.dirty and !ui.adding) {
+            if (ui.save_timer) |id| if (dvui.timerDone(id)) {
+                ui.save_timer = null;
+                save(ui, store, manager) catch |err| {
+                    ui.failure = err;
+                    return;
+                };
+                ui.failure = null;
+            };
+        }
+        return;
+    };
     ui.pending = null;
     defer if (pending.id) |id| ui.allocator.free(id);
     ui.failure = null;
@@ -398,10 +402,18 @@ pub fn finish(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) v
     };
 }
 fn apply(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, pending: Pending) !void {
+    // Persist an existing draft before navigation; on failure keep it editable.
+    switch (pending.action) {
+        .add, .edit, .select_sidebar => if (ui.dirty and !ui.adding) try save(ui, store, manager),
+        else => {},
+    }
     switch (pending.action) {
         .add => {
             ui.draft.deinit(ui.allocator);
             ui.editor_open = true;
+            ui.adding = true;
+            ui.dirty = false;
+            ui.save_timer = null;
         },
         .edit => {
             const server = findServer(store.snapshot(), pending.id.?) orelse return error.ServerNotFound;
@@ -409,12 +421,29 @@ fn apply(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, pendin
             ui.draft.deinit(ui.allocator);
             ui.draft = draft;
             ui.editor_open = true;
+            ui.adding = false;
+            ui.dirty = false;
+            ui.save_timer = null;
         },
-        .select, .refresh => try select(ui, store, manager, pending.id.?),
+        .select => try selectLaunchTarget(store, manager, pending.id.?),
+        .refresh => {
+            try selectTarget(store, pending.id.?, true);
+            try refreshSelectedTarget(store, manager);
+        },
         .select_sidebar => {
-            try select(ui, store, manager, pending.id.?);
+            // Select first, so even a failed query leaves Edit/Delete reachable.
+            try selectTarget(store, pending.id.?, false);
+            syncSelectedTarget(store, manager) catch |err| {
+                ui.failure = err;
+            };
+            const server = findServer(store.snapshot(), pending.id.?) orelse return error.ServerNotFound;
+            const draft = try Draft.fromServer(ui.allocator, server);
             ui.draft.deinit(ui.allocator);
-            ui.editor_open = false;
+            ui.draft = draft;
+            ui.editor_open = true;
+            ui.adding = false;
+            ui.dirty = false;
+            ui.save_timer = null;
             if (ui.deleting_id) |id| ui.allocator.free(id);
             ui.deleting_id = null;
         },
@@ -424,11 +453,14 @@ fn apply(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, pendin
             try store.update(document);
             manager.clear();
         },
-        .cancel_query => manager.cancel(),
+        .cancel_query => manager.cancelSelected(),
         .save => try save(ui, store, manager),
         .cancel_edit => {
             ui.draft.deinit(ui.allocator);
             ui.editor_open = false;
+            ui.adding = false;
+            ui.dirty = false;
+            ui.save_timer = null;
         },
         .ask_delete => {
             const owned = try ui.allocator.dupe(u8, pending.id.?);
@@ -480,7 +512,7 @@ const fixtureInstances: []const config.Instance = &.{
     .{ .id = "One", .name = "One", .minecraft_version = "1.21" },
     .{ .id = "Two", .name = "Two", .minecraft_version = "1.20" },
 };
-test "home choices filter visibility and instance mode clears only server selection" {
+test "home choices include every server and instance mode clears only server selection" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -493,10 +525,11 @@ test "home choices filter visibility and instance mode clears only server select
         .{ .id = "hidden", .name = "Hidden", .address = "127.0.0.1", .instance_id = "Two", .show_on_home = false },
     }, .selected_server = "hidden", .selected_instance = "Two" });
     var choices = try homeChoices(a, store.snapshot());
-    try std.testing.expectEqual(@as(usize, 2), choices.labels.len);
+    try std.testing.expectEqual(@as(usize, 3), choices.labels.len);
     try std.testing.expect(choices.ids[0] == null);
     try std.testing.expectEqualStrings("visible", choices.ids[1].?);
-    try std.testing.expect(choices.choice == null);
+    try std.testing.expectEqualStrings("hidden", choices.ids[2].?);
+    try std.testing.expectEqual(@as(?usize, 2), choices.choice);
     choices.deinit(a);
     var manager = server_manager.Manager.initWithQuery(a, std.testing.io, offlineFixture);
     defer manager.deinit();
@@ -513,8 +546,8 @@ test "home choices filter visibility and instance mode clears only server select
     choices = try homeChoices(a, store.snapshot());
     defer choices.deinit(a);
     try std.testing.expectEqual(@as(?usize, 0), choices.choice);
-    var persisted = try config.Store.init(a, std.testing.io, root);
-    defer persisted.deinit();
+    try store.reconcile();
+    const persisted = &store;
     try std.testing.expect(persisted.snapshot().selected_server == null);
     try std.testing.expectEqualStrings("Two", persisted.snapshot().selected_instance.?);
 }
@@ -629,10 +662,50 @@ test "draft remains owned and retryable after validation or atomic persistence f
     try std.testing.expect(!ui.editor_open);
     try std.testing.expectEqualStrings(id, store.snapshot().servers[0].id);
 }
+test "existing server edits persist before navigation and preserve invalid drafts" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try fixtureRoot(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    try store.update(.{ .instances = fixtureInstances, .servers = &.{.{ .id = "existing", .name = "Before", .address = "127.0.0.1", .instance_id = "One" }} });
+    var manager = server_manager.Manager.initWithQuery(a, std.testing.io, offlineFixture);
+    defer manager.deinit();
+    var ui = Ui.init(a);
+    defer ui.deinit();
+    ui.queue(.edit, "existing");
+    finish(&ui, &store, &manager);
+    @memset(&ui.draft.name, 0);
+    @memcpy(ui.draft.name[0..5], "After");
+    ui.dirty = true;
+    ui.queue(.save, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.failure == null and ui.editor_open and !ui.adding and !ui.dirty);
+    try std.testing.expectEqualStrings("After", store.snapshot().servers[0].name);
+    try std.testing.expectEqualStrings("existing", ui.draft.id.?);
+    @memset(&ui.draft.port, 0);
+    @memcpy(ui.draft.port[0..3], "bad");
+    ui.dirty = true;
+    ui.queue(.add, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.InvalidServerPort, ui.failure.?);
+    try std.testing.expect(ui.editor_open and !ui.adding and ui.dirty);
+    try std.testing.expectEqualStrings("bad", text(&ui.draft.port));
+    @memset(&ui.draft.port, 0);
+    @memcpy(ui.draft.port[0..5], "25566");
+    ui.queue(.add, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.failure == null and ui.editor_open and ui.adding and !ui.dirty);
+    try std.testing.expectEqual(@as(u16, 25566), store.snapshot().servers[0].port);
+    try std.testing.expect(ui.draft.id == null);
+}
+
 fn oomDraft(a: Allocator) !void {
     var draft = try Draft.fromServer(a, .{ .id = "server", .name = "Example", .address = "127.0.0.1", .instance_id = "One" });
     defer draft.deinit(a);
 }
 test "server editor cloning frees allocations at every failure point" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, oomDraft, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, oomDraft, .{});
 }

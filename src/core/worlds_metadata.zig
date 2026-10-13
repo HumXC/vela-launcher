@@ -15,7 +15,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !worlds.Metadata {
     defer transient.free(plain);
     // std.flate exposes but does not verify gzip's footer checksum/size.
     const footer = bytes[bytes.len - 8 ..];
-    if (std.mem.readInt(u32, footer[0..4], .little) != std.hash.crc.Crc32.hash(plain) or std.mem.readInt(u32, footer[4..8], .little) != plain.len) return error.InvalidGzipChecksum;
+    if (std.mem.readInt(u32, footer[0..4], .little) != std.hash.crc.@"CRC-32/ISO-HDLC".hash(plain) or std.mem.readInt(u32, footer[4..8], .little) != plain.len) return error.InvalidGzipChecksum;
     if (bytes[3] & 0xe0 != 0) return error.InvalidGzipHeader;
     if (bytes[3] & 2 != 0) {
         var header_end: usize = 10;
@@ -24,7 +24,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !worlds.Metadata {
         }
         if (bytes[3] & 8 != 0) header_end = (std.mem.indexOfScalarPos(u8, bytes, header_end, 0) orelse return error.InvalidGzipHeader) + 1;
         if (bytes[3] & 16 != 0) header_end = (std.mem.indexOfScalarPos(u8, bytes, header_end, 0) orelse return error.InvalidGzipHeader) + 1;
-        if (header_end > bytes.len - 2 or std.mem.readInt(u16, bytes[header_end..][0..2], .little) != @as(u16, @truncate(std.hash.crc.Crc32.hash(bytes[0..header_end])))) return error.InvalidGzipHeader;
+        if (header_end > bytes.len - 2 or std.mem.readInt(u16, bytes[header_end..][0..2], .little) != @as(u16, @truncate(std.hash.crc.@"CRC-32/ISO-HDLC".hash(bytes[0..header_end])))) return error.InvalidGzipHeader;
     }
     var options: nbt.Options = .java;
     options.reject_trailing_bytes = true;

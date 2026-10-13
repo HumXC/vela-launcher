@@ -264,7 +264,11 @@ pub fn beforeFrame(launcher: anytype, manager: *world_manager.Manager, configura
         .none => return error.InvalidLifecycleCommand,
         .arm_world => {
             if (s.armed.swap(true, .acq_rel)) return error.LifecycleAlreadyArmed;
-            try manager.refresh();
+            if (manager.snapshot().instance == null) {
+                const selected_id = configuration.snapshot().selected_instance orelse return error.InvalidLifecycleProfile;
+                const selected = instances.findById(configuration.snapshot(), selected_id) orelse return error.InvalidLifecycleProfile;
+                try manager.select(selected.*);
+            } else try manager.refresh();
         },
         .start => {
             if (s.launched or (s.armed.load(.acquire) and !s.entered.load(.acquire))) return error.InvalidLifecycleStart;
@@ -374,9 +378,9 @@ pub fn destroy() void {
 }
 
 test "nonce and case admit only finite owned protocol values" {
-    try std.testing.expect(validNonce("a" ** 64));
-    try std.testing.expect(!validNonce("a" ** 63));
-    try std.testing.expect(!validNonce("g" ** 64));
+    try std.testing.expect(validNonce(&(comptime @as([64]u8, @splat('a')))));
+    try std.testing.expect(!validNonce(&(comptime @as([63]u8, @splat('a')))));
+    try std.testing.expect(!validNonce(&(comptime @as([64]u8, @splat('g')))));
     try std.testing.expect(std.meta.stringToEnum(Case, "close_running") != null);
     try std.testing.expect(std.meta.stringToEnum(Case, "force_quit") == null);
 }

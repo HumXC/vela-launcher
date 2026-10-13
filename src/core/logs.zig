@@ -88,7 +88,7 @@ pub const Redactor = struct {
 
     pub fn feed(self: *Redactor, source: Source, bytes: []const u8, writer: anytype) !void {
         if (self.secrets.len == 0) return writer.writeAll(bytes);
-        const pending = &self.pending[@intFromEnum(source)];
+        const pending = &self.pending[@backingInt(source)];
         for (bytes) |byte| {
             pending.appendAssumeCapacity(byte);
             try self.drain(pending, false, writer);
@@ -96,7 +96,7 @@ pub const Redactor = struct {
     }
 
     pub fn finish(self: *Redactor, source: Source, writer: anytype) !void {
-        try self.drain(&self.pending[@intFromEnum(source)], true, writer);
+        try self.drain(&self.pending[@backingInt(source)], true, writer);
     }
 
     fn drain(self: *Redactor, pending: *std.ArrayList(u8), eof: bool, writer: anytype) !void {
@@ -219,7 +219,7 @@ pub const Buffer = struct {
         return if (self.len == 0) null else self.storage[self.head].id;
     }
     pub fn severityCount(self: *const Buffer, severity: Severity) usize {
-        return self.counts[@intFromEnum(severity)];
+        return self.counts[@backingInt(severity)];
     }
     /// Error/fatal IDs in arrival order; position(id) is the current virtual row.
     pub fn errorIds(self: *const Buffer) []const u64 {
@@ -246,7 +246,7 @@ pub const Buffer = struct {
     /// EOF flush; repeated finish is harmless. Feeding again afterwards is legal.
     pub fn finish(self: *Buffer, source: Source) !void {
         try self.redactor.finish(source, Sink{ .buffer = self, .source = source });
-        const partial = &self.partial[@intFromEnum(source)];
+        const partial = &self.partial[@backingInt(source)];
         self.flushInvalid(partial);
         if (partial.text.items.len != 0 or partial.truncated) try self.publish(source);
         partial.skip_lf = false;
@@ -261,7 +261,7 @@ pub const Buffer = struct {
     };
 
     fn accept(self: *Buffer, source: Source, byte: u8) !void {
-        const partial = &self.partial[@intFromEnum(source)];
+        const partial = &self.partial[@backingInt(source)];
         if (partial.skip_lf) {
             partial.skip_lf = false;
             if (byte == '\n') return;
@@ -328,7 +328,7 @@ pub const Buffer = struct {
 
     fn publish(self: *Buffer, source: Source) !void {
         if (self.next_id == std.math.maxInt(u64)) return error.IdExhausted;
-        const partial = &self.partial[@intFromEnum(source)];
+        const partial = &self.partial[@backingInt(source)];
         const text = try self.allocator.dupe(u8, partial.text.items);
         const severity = classify(text, source);
         if (self.head + self.len == self.storage.len) {
@@ -342,7 +342,7 @@ pub const Buffer = struct {
         self.storage[self.head + self.len] = .{ .id = self.next_id, .generation = self.generation, .source = source, .severity = severity, .text = text, .truncated = partial.truncated, .invalid_utf8 = partial.invalid_utf8 };
         self.len += 1;
         self.retained_bytes += text.len;
-        self.counts[@intFromEnum(severity)] += 1;
+        self.counts[@backingInt(severity)] += 1;
         if (severity == .@"error" or severity == .fatal) {
             self.errors[self.error_head + self.error_len] = self.next_id;
             self.error_len += 1;
@@ -357,7 +357,7 @@ pub const Buffer = struct {
         while (self.len > self.limits.max_lines or self.retained_bytes > self.limits.max_bytes) {
             const line = self.storage[self.head];
             self.retained_bytes -= line.text.len;
-            self.counts[@intFromEnum(line.severity)] -= 1;
+            self.counts[@backingInt(line.severity)] -= 1;
             if (line.severity == .@"error" or line.severity == .fatal) {
                 self.error_head += 1;
                 self.error_len -= 1;
@@ -644,7 +644,7 @@ fn allocationScenario(allocator: Allocator) !void {
 }
 
 test "every allocation failure is leak free" {
-    try testing.checkAllAllocationFailures(testing.allocator, allocationScenario, .{});
+    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, allocationScenario, .{});
 }
 
 test "std Io writer redacts longest match once and masks incomplete longer match" {
@@ -660,7 +660,7 @@ test "std Io writer redacts longest match once and masks incomplete longer match
 test "huge partial chunks stay bounded, clear discards lookahead, empty rows" {
     var buffer = try Buffer.init(testing.allocator, .{ .max_lines = 2, .max_bytes = 64, .max_line_bytes = 32 }, &.{"fake-token"});
     defer buffer.deinit();
-    const huge = [_]u8{'x'} ** 100_000;
+    const huge: [100_000]u8 = @splat('x');
     try buffer.feed(.stdout, &huge);
     try testing.expectEqual(@as(usize, 0), buffer.lineCount());
     try testing.expect(buffer.partial[0].text.items.len <= 32);

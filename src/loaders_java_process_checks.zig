@@ -1,3 +1,3 @@
 test {
-    _ = @import("core/minecraft/loaders_java_process_tests.zig");
+    _ = @import("core/loaders/tests/java_process.zig");
 }

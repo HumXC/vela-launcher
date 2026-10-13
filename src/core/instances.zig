@@ -170,5 +170,5 @@ fn checkPathsAllocations(a: Allocator) !void {
 }
 
 test "path construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPathsAllocations, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, checkPathsAllocations, .{});
 }

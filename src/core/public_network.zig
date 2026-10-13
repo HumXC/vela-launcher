@@ -78,8 +78,8 @@ test "public IPv4 guard excludes private, shared, loopback, special-use and mult
 
 test "public IPv6 guard excludes local, mapped-private, transition and documentation endpoints" {
     for ([_][16]u8{
-        [_]u8{0} ** 16,
-        [_]u8{0} ** 15 ++ .{1},
+        @as([16]u8, @splat(0)),
+        @as([15]u8, @splat(0)) ++ [_]u8{1},
         .{ 0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
         .{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
         .{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },

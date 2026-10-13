@@ -71,13 +71,16 @@ pub const Coordinator = struct {
     pub fn worldScope(self: *Coordinator, slot: usize) worlds.WorldScope {
         return self.mutation(slot).worldScope();
     }
+    pub fn worldReadScope(self: *Coordinator, slot: usize) worlds.WorldScope {
+        return self.mutation(slot).worldReadScope();
+    }
     pub fn reserveLaunch(self: *Coordinator, id: []const u8) !void {
         if (!config.validId(id)) return error.InvalidInstanceId;
         if (!worlds.transaction_gate.tryLock()) return error.InstanceBusy;
         defer worlds.transaction_gate.unlock(self.io);
         self.drainReleasesLocked();
         if (self.launch.matches(id)) return error.InstanceRunning;
-        if (self.launch.len != 0 or self.busy(id, null)) return error.InstanceBusy;
+        if (self.launch.len != 0 or self.mutationsBusy(id, null, true)) return error.InstanceBusy;
         try self.launch.reserve(id);
     }
     /// Publish only after the launch worker/process has joined. Admission or tick clears it.
@@ -103,9 +106,12 @@ pub const Coordinator = struct {
         return .{ .context = self, .is_running = guardCallback };
     }
     fn busy(self: *Coordinator, id: []const u8, excluding: ?*Mutation) bool {
-        if (self.launch.matches(id)) return true;
+        return self.launch.matches(id) or self.mutationsBusy(id, excluding, false);
+    }
+    fn mutationsBusy(self: *Coordinator, id: []const u8, excluding: ?*Mutation, allow_reads: bool) bool {
         for (&self.mutations) |*item| {
             if (item == excluding) continue;
+            if (allow_reads and item.pair_active and item.pair_read_only) continue;
             if (item.reservation.matches(id) or item.secondary.matches(id)) return true;
         }
         return false;
@@ -121,6 +127,7 @@ pub const Mutation = struct {
     reservation: Reservation = .{},
     secondary: Reservation = .{},
     pair_active: bool = false,
+    pair_read_only: bool = false,
     pair_release: Atomic(u64) = .init(0),
 
     pub fn acquire(self: *Mutation, id: []const u8) !void {
@@ -185,6 +192,7 @@ pub const Mutation = struct {
             self.secondary.epoch.store(0, .release);
             self.secondary.len = 0;
             self.pair_active = false;
+            self.pair_read_only = false;
             return;
         }
         self.reservation.applyRelease();
@@ -196,35 +204,55 @@ pub const Mutation = struct {
         if (ids.target) |target| if (!config.validId(target)) return error.InvalidInstanceId;
         return ids;
     }
-    fn worldStateLocked(self: *Mutation, ids: worlds.ScopeIds, excluding: ?*Mutation) worlds.ScopeState {
+    fn worldStateLocked(self: *Mutation, ids: worlds.ScopeIds, excluding: ?*Mutation, read_only: bool) worlds.ScopeState {
         const owner = self.owner.?;
-        if (owner.launch.matches(ids.source)) return .running;
-        if (ids.target) |target| if (owner.launch.matches(target)) return .running;
-        if (owner.busy(ids.source, excluding)) return .busy;
-        if (ids.target) |target| if (owner.busy(target, excluding)) return .busy;
+        if (!read_only) {
+            if (owner.launch.matches(ids.source)) return .running;
+            if (ids.target) |target| if (owner.launch.matches(target)) return .running;
+        }
+        if (owner.mutationsBusy(ids.source, excluding, false)) return .busy;
+        if (ids.target) |target| if (owner.mutationsBusy(target, excluding, false)) return .busy;
         return .available;
     }
     pub fn worldScope(self: *Mutation) worlds.WorldScope {
         std.debug.assert(self.owner != null);
         return .{ .context = self, .probe = worldProbe, .acquire = worldAcquire, .recheck = worldRecheck, .release = worldRelease };
     }
+    pub fn worldReadScope(self: *Mutation) worlds.WorldScope {
+        std.debug.assert(self.owner != null);
+        return .{ .context = self, .read_only = true, .probe = worldReadProbe, .acquire = worldReadAcquire, .recheck = worldReadRecheck, .release = worldRelease };
+    }
     fn worldProbe(context: ?*anyopaque, requested: worlds.ScopeIds) anyerror!worlds.ScopeState {
         const self: *Mutation = @ptrCast(@alignCast(context.?));
+        return self.worldProbeMode(requested, false);
+    }
+    fn worldReadProbe(context: ?*anyopaque, requested: worlds.ScopeIds) anyerror!worlds.ScopeState {
+        const self: *Mutation = @ptrCast(@alignCast(context.?));
+        return self.worldProbeMode(requested, true);
+    }
+    fn worldProbeMode(self: *Mutation, requested: worlds.ScopeIds, read_only: bool) !worlds.ScopeState {
         const ids = try validateWorldIds(requested);
         const owner = self.owner.?;
         if (!worlds.transaction_gate.tryLock()) return .busy;
         defer worlds.transaction_gate.unlock(owner.io);
         owner.drainReleasesLocked();
-        return self.worldStateLocked(ids, null);
+        return self.worldStateLocked(ids, null, read_only);
     }
     fn worldAcquire(context: ?*anyopaque, requested: worlds.ScopeIds) anyerror!worlds.ScopeStamp {
         const self: *Mutation = @ptrCast(@alignCast(context.?));
+        return self.worldAcquireMode(requested, false);
+    }
+    fn worldReadAcquire(context: ?*anyopaque, requested: worlds.ScopeIds) anyerror!worlds.ScopeStamp {
+        const self: *Mutation = @ptrCast(@alignCast(context.?));
+        return self.worldAcquireMode(requested, true);
+    }
+    fn worldAcquireMode(self: *Mutation, requested: worlds.ScopeIds, read_only: bool) !worlds.ScopeStamp {
         const ids = try validateWorldIds(requested);
         const owner = self.owner.?;
         if (!worlds.transaction_gate.tryLock()) return error.InstanceBusy;
         defer worlds.transaction_gate.unlock(owner.io);
         owner.drainReleasesLocked();
-        switch (self.worldStateLocked(ids, null)) {
+        switch (self.worldStateLocked(ids, null, read_only)) {
             .running => return error.InstanceRunning,
             .busy => return error.InstanceBusy,
             .available => {},
@@ -236,21 +264,29 @@ pub const Mutation = struct {
         self.reservation.reserve(ids.source) catch unreachable;
         if (ids.target) |target| self.secondary.reserve(target) catch unreachable;
         self.pair_active = true;
+        self.pair_read_only = read_only;
         return .{ .source_generation = self.reservation.generation, .target_generation = if (ids.target != null) self.secondary.generation else null };
     }
     fn worldRecheck(context: ?*anyopaque, requested: worlds.ScopeIds, stamp: worlds.ScopeStamp) anyerror!void {
         const self: *Mutation = @ptrCast(@alignCast(context.?));
+        return self.worldRecheckMode(requested, stamp, false);
+    }
+    fn worldReadRecheck(context: ?*anyopaque, requested: worlds.ScopeIds, stamp: worlds.ScopeStamp) anyerror!void {
+        const self: *Mutation = @ptrCast(@alignCast(context.?));
+        return self.worldRecheckMode(requested, stamp, true);
+    }
+    fn worldRecheckMode(self: *Mutation, requested: worlds.ScopeIds, stamp: worlds.ScopeStamp, read_only: bool) !void {
         const ids = try validateWorldIds(requested);
         const owner = self.owner.?;
         // Workers may wait for a short state section; this gate never covers I/O.
         try worlds.transaction_gate.lock(owner.io);
         defer worlds.transaction_gate.unlock(owner.io);
-        if (!self.pair_active or !self.reservation.matches(ids.source) or self.reservation.epoch.load(.acquire) != stamp.source_generation or self.pair_release.load(.acquire) == stamp.source_generation) return error.LeaseNotHeld;
+        if (!self.pair_active or self.pair_read_only != read_only or !self.reservation.matches(ids.source) or self.reservation.epoch.load(.acquire) != stamp.source_generation or self.pair_release.load(.acquire) == stamp.source_generation) return error.LeaseNotHeld;
         if (ids.target) |target| {
             const generation = stamp.target_generation orelse return error.LeaseNotHeld;
             if (!self.secondary.matches(target) or self.secondary.epoch.load(.acquire) != generation) return error.LeaseNotHeld;
         } else if (stamp.target_generation != null or self.secondary.len != 0) return error.LeaseNotHeld;
-        switch (self.worldStateLocked(ids, self)) {
+        switch (self.worldStateLocked(ids, self, read_only)) {
             .running => return error.InstanceRunning,
             .busy => return error.InstanceBusy,
             .available => {},
@@ -440,7 +476,7 @@ test "instance lease portable bounded owned IDs and exact callback signatures" {
         try std.testing.expectError(error.InvalidInstanceId, acquire(lease, id));
         try std.testing.expectError(error.InvalidInstanceId, recheck(lease, id));
     }
-    const oversized = [_]u8{'a'} ** 201;
+    const oversized: [201]u8 = @splat('a');
     try std.testing.expectError(error.InvalidInstanceId, acquire(lease, &oversized));
     try acquire(lease, oversized[0..200]);
     try recheck(lease, oversized[0..200]);
@@ -844,4 +880,107 @@ test "worker lease and namespace checks coexist with concurrent owner ticks" {
     coordinator.tick();
     try std.testing.expectError(error.InstanceNamespaceBusy, ns.acquireWaiting(test_io));
     try std.testing.expectError(error.InvalidInstanceId, mutation.workerRecheck("../bad"));
+}
+
+test "world read scope coexists with launch in both admission orders and excludes writes" {
+    var coordinator = Coordinator.init(test_io);
+    const read = coordinator.worldReadScope(3);
+    const write = coordinator.worldScope(2);
+    const content = coordinator.mutation(1);
+    try std.testing.expect(read.read_only);
+    try std.testing.expect(!write.read_only);
+
+    try coordinator.reserveLaunch("alpha");
+    try std.testing.expectEqual(worlds.ScopeState.available, try read.probe(read.context, .{ .source = "alpha" }));
+    const during_launch = try read.hold(.{ .source = "alpha" });
+    try during_launch.recheck();
+    try std.testing.expectError(error.InstanceRunning, write.hold(.{ .source = "alpha" }));
+    coordinator.releaseLaunch();
+    coordinator.tick();
+    try during_launch.recheck();
+    try std.testing.expectError(error.InstanceBusy, content.acquire("alpha"));
+    try std.testing.expectError(error.InstanceBusy, write.hold(.{ .source = "alpha" }));
+    try std.testing.expectError(error.ReadOnlyWorldScope, worlds.enterScope(.{ .held_scope = during_launch }, .{ .source = "alpha" }));
+    try std.testing.expectError(error.ReadOnlyWorldScope, worlds.enterScope(.{ .scope = read }, .{ .source = "beta" }));
+    during_launch.release();
+
+    const before_launch = try read.hold(.{ .source = "alpha", .target = "beta" });
+    try coordinator.reserveLaunch("beta");
+    try before_launch.recheck();
+    try std.testing.expectError(error.InstanceBusy, content.acquire("alpha"));
+    try std.testing.expectError(error.InstanceRunning, content.acquire("beta"));
+    try std.testing.expectError(error.InstanceBusy, write.hold(.{ .source = "alpha" }));
+    try content.acquire("gamma");
+    try content.recheck("gamma");
+    content.release("gamma");
+    before_launch.release();
+    coordinator.releaseLaunch();
+    coordinator.tick();
+
+    const writable = try write.hold(.{ .source = "alpha" });
+    try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch("alpha"));
+    writable.release();
+    try content.acquire("alpha");
+    content.release("alpha");
+    coordinator.tick();
+}
+
+test "world read scope refuses mutation conflicts and preserves atomic admission" {
+    var coordinator = Coordinator.init(test_io);
+    const read = coordinator.worldReadScope(3);
+    const content = coordinator.mutation(1);
+    try content.acquire("beta");
+    try std.testing.expectEqual(worlds.ScopeState.busy, try read.probe(read.context, .{ .source = "alpha", .target = "beta" }));
+    try std.testing.expectError(error.InstanceBusy, read.hold(.{ .source = "alpha", .target = "beta" }));
+    try std.testing.expectEqual(@as(u64, 0), coordinator.mutation(3).reservation.generation);
+    try coordinator.reserveLaunch("alpha");
+    try std.testing.expectError(error.InstanceBusy, read.hold(.{ .source = "alpha", .target = "beta" }));
+    content.release("beta");
+    const held = try read.hold(.{ .source = "alpha", .target = "beta" });
+    try held.recheck();
+    try std.testing.expectEqual(worlds.ScopeState.busy, try read.probe(read.context, .{ .source = "beta" }));
+    try std.testing.expectError(error.InstanceBusy, content.acquire("beta"));
+    try worlds.transaction_gate.lock(test_io);
+    {
+        defer worlds.transaction_gate.unlock(test_io);
+        try std.testing.expectEqual(worlds.ScopeState.busy, try read.probe(read.context, .{ .source = "gamma" }));
+        held.release();
+        coordinator.tick();
+        try std.testing.expect(guardBusy(coordinator.guard(null), "beta"));
+        try std.testing.expectError(error.InstanceBusy, content.acquire("beta"));
+    }
+    try std.testing.expectError(error.LeaseNotHeld, held.recheck());
+    try content.acquire("beta");
+    content.release("beta");
+    coordinator.releaseLaunch();
+    coordinator.tick();
+    try std.testing.expectError(error.InvalidInstanceId, read.hold(.{ .source = "../invalid" }));
+}
+
+test "world read stamped release cannot clear a renewed write or change held mode" {
+    var coordinator = Coordinator.init(test_io);
+    const read = coordinator.worldReadScope(3);
+    const write = coordinator.worldScope(3);
+    const ids: worlds.ScopeIds = .{ .source = "alpha", .target = "beta" };
+    const old = try read.hold(ids);
+    try std.testing.expectError(error.LeaseNotHeld, write.recheck(write.context, old.ids, old.stamp));
+    old.release();
+    coordinator.tick();
+    const current = try write.hold(ids);
+    old.release();
+    coordinator.tick();
+    try current.recheck();
+    try std.testing.expectError(error.LeaseNotHeld, old.recheck());
+    try std.testing.expectError(error.LeaseNotHeld, read.recheck(read.context, current.ids, current.stamp));
+    try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch("alpha"));
+    try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch("beta"));
+    current.release();
+    old.release();
+    coordinator.tick();
+    const renewed = try read.hold(ids);
+    try coordinator.reserveLaunch("alpha");
+    try renewed.recheck();
+    renewed.release();
+    coordinator.releaseLaunch();
+    coordinator.tick();
 }

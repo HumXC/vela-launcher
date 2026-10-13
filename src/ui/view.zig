@@ -2,7 +2,9 @@ const std = @import("std");
 const dvui = @import("dvui");
 const state = @import("model.zig");
 const theme = @import("theme.zig");
+const components = @import("components.zig");
 const games = @import("game_library.zig");
+const game_selection_view = @import("game_selection_view.zig");
 const tools = @import("tools_view.zig");
 const java = @import("java_manager.zig");
 const java_view = @import("java_view.zig");
@@ -10,11 +12,12 @@ const launch = @import("game_launch.zig");
 const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
 const task_registry = @import("../core/tasks.zig");
-const tasks_view = @import("tasks_view.zig");
 const settings_view = @import("settings_view.zig");
 const cf_credentials_controller = @import("curseforge_credentials_controller.zig");
 const java_download_controller = @import("java_download_controller.zig");
 const java_download_view = @import("java_download_view.zig");
+const avatar_manager = @import("avatar_manager.zig");
+const avatar_image = @import("avatar_image.zig");
 const server_manager = @import("server_manager.zig");
 const servers_view = @import("servers_view.zig");
 const logs_view = @import("logs_view.zig");
@@ -25,14 +28,26 @@ const accounts_view = @import("accounts_view.zig");
 const instances_manager = @import("instances_manager.zig");
 const instances_view = @import("instances_view.zig");
 const content_manager = @import("content_manager.zig");
-const content_view = @import("content_view.zig");
-const pack_import_controller = @import("pack_import_controller.zig");
-const pack_import_view = @import("pack_import_view.zig");
+const instance_creation_controller = @import("instance_creation_controller.zig");
 
 pub fn boundedSidebarWidth(requested: f32, available: f32) f32 {
     const upper = @max(1, @min(500, available - 280));
     const lower = @min(260, upper);
     return std.math.clamp(if (std.math.isFinite(requested)) requested else 276, lower, upper);
+}
+
+/// Keep the five standard log actions inside the main pane's content padding.
+pub fn boundedLogsSidebarWidth(requested: f32, available: f32) f32 {
+    const minimum_main = 2 * theme.spacing.page_padding + 5 * theme.sizing.icon_button;
+    const upper = @max(1, @min(500, available - minimum_main));
+    const lower = @min(260, upper);
+    return std.math.clamp(if (std.math.isFinite(requested)) requested else 276, lower, upper);
+}
+
+pub fn boundedInstanceSidebarWidth(requested: f32, available: f32) f32 {
+    const upper = @max(1, @min(400, available - 280));
+    const lower = @min(260, upper);
+    return std.math.clamp(if (std.math.isFinite(requested)) requested else 280, lower, upper);
 }
 
 fn guardInstanceLeave(model: *state.Model, ui: *instances_view.Ui, pending: *?state.Msg) void {
@@ -49,7 +64,7 @@ fn guardInstanceLeave(model: *state.Model, ui: *instances_view.Ui, pending: *?st
     }
     if (pending.*) |destination| {
         const leaving = (model.panel == .instances or model.panel == .library) and switch (destination) {
-            .back, .utility_back => true,
+            .back, .utility_back, .library_back => true,
             else => false,
         };
         if (leaving and !consumed_leave) {
@@ -63,7 +78,7 @@ fn guardInstanceLeave(model: *state.Model, ui: *instances_view.Ui, pending: *?st
 }
 
 test "instance exits remain deferred during save and failed publication and consume only once" {
-    var model: state.Model = .{ .panel = .instances };
+    var model: state.Model = .{ .panel = .instances, .instance_parent = .home };
     var ui = instances_view.Ui.init(std.testing.allocator);
     defer ui.deinit();
     var pending: ?state.Msg = .back;
@@ -116,6 +131,39 @@ test "instance exits remain deferred during save and failed publication and cons
     try std.testing.expect(pending == null);
     try std.testing.expectEqual(state.Msg.utility_back, model.instance_leave.?);
     try std.testing.expectEqual(instances_view.Action.leave, ui.pending.?.action);
+    ui.pending = null;
+    ui.exit_requested = true;
+    guardInstanceLeave(&model, &ui, &pending);
+    state.transition(&model, pending.?);
+    try std.testing.expectEqual(state.Panel.home, model.panel);
+}
+
+test "library back defers dirty instance exit until navigation acknowledges the destination" {
+    var model: state.Model = .{ .panel = .home };
+    state.transition(&model, .open_instances);
+    try std.testing.expectEqual(state.Panel.instances, model.panel);
+    try std.testing.expectEqual(state.Panel.home, model.parentPanel());
+    var ui = instances_view.Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    var pending: ?state.Msg = model.parentMessage();
+    guardInstanceLeave(&model, &ui, &pending);
+    try std.testing.expect(pending == null);
+    try std.testing.expectEqual(state.Msg.library_back, model.instance_leave.?);
+    try std.testing.expectEqual(instances_view.Action.leave, ui.pending.?.action);
+    ui.pending = null;
+    ui.navigation = .{ .action = .leave, .text = null };
+    ui.navigation_prompt = true;
+    guardInstanceLeave(&model, &ui, &pending);
+    try std.testing.expectEqual(state.Panel.instances, model.panel);
+    try std.testing.expect(model.instance_leave != null and pending == null);
+    ui.navigation = null;
+    ui.navigation_prompt = false;
+    ui.exit_requested = true;
+    guardInstanceLeave(&model, &ui, &pending);
+    try std.testing.expectEqual(state.Msg.library_back, pending.?);
+    try std.testing.expect(model.instance_leave == null and !ui.exit_requested);
+    state.transition(&model, pending.?);
+    try std.testing.expectEqual(state.Panel.home, model.panel);
 }
 
 pub const Services = struct {
@@ -131,55 +179,48 @@ pub const Services = struct {
     logs: *logs_view.View,
     worlds: *worlds_manager.Manager,
     worlds_ui: *worlds_view.Ui,
+    avatars: ?*avatar_manager.Manager = null,
     accounts: ?*accounts_manager.Manager = null,
     accounts_ui: ?*accounts_view.Ui = null,
     task_viewport_height: ?f32 = null,
     instances: ?*instances_manager.Manager = null,
     instances_ui: ?*instances_view.Ui = null,
     content: ?*content_manager.Manager = null,
-    content_ui: ?*content_view.Ui = null,
-    pack_import: ?*pack_import_controller.Controller = null,
-    pack_import_ui: ?*pack_import_view.Ui = null,
+    ordinary_creation: ?*instance_creation_controller.Controller = null,
     allow_mutations: bool = true,
 };
 var launch_error: ?anyerror = null;
 const R = dvui.Rect;
 
-fn phasePinned(phase: ?pack_import_controller.Phase) bool {
+fn phasePinned(phase: ?instance_creation_controller.Phase) bool {
     return switch (phase orelse return false) {
-        .idle, .review_required, .failed, .canceled => false,
+        .idle, .complete, .failed, .canceled => false,
         else => true,
     };
 }
 
-pub fn packWorkflowPinned(controller: ?*const pack_import_controller.Controller) bool {
+pub fn ordinaryCreationPinned(controller: ?*const instance_creation_controller.Controller) bool {
     return phasePinned(if (controller) |value| value.snapshot().phase else null);
 }
 
 const DispatchGates = struct { java: bool, instances: bool, content: bool, worlds: bool };
 
-fn dispatchGates(phase: ?pack_import_controller.Phase, owns_instances: bool, owns_java: bool, allow_mutations: bool) DispatchGates {
+fn dispatchGates(phase: ?instance_creation_controller.Phase, owns_instances: bool, owns_java: bool, allow_mutations: bool) DispatchGates {
     const pinned = phasePinned(phase) or !allow_mutations;
     return .{ .java = pinned or owns_java, .instances = pinned or owns_instances, .content = pinned, .worlds = pinned };
 }
 
 fn serviceGates(services: Services) DispatchGates {
-    const controller = services.pack_import;
+    const controller = services.ordinary_creation;
     return dispatchGates(if (controller) |value| value.snapshot().phase else null, if (controller) |value| value.ownsInstancesPublication() else false, if (controller) |value| value.ownsJavaDiscovery() or value.ownsJavaDownload() else false, services.allow_mutations);
 }
 
-const ManualIntents = struct {
-    content: bool = false,
-    instances: bool = false,
-    java: bool = false,
-    worlds: bool = false,
-    credentials: bool = false,
-    uncertain: bool = false,
-    stopping: bool = false,
-};
-
-fn admissionBlocked(intents: ManualIntents) bool {
-    return intents.content or intents.instances or intents.java or intents.worlds or intents.credentials or intents.uncertain or intents.stopping;
+fn gatedTaskActionAllowed(action: ?instances_view.Action, allow_mutations: bool) bool {
+    if (!allow_mutations) return false;
+    return switch (action orelse return false) {
+        .cancel, .close_task => true,
+        else => false,
+    };
 }
 
 fn launchPinsJava(phase: launch.Phase) bool {
@@ -192,6 +233,7 @@ fn javaIntents(ui: *const java_view.Ui, download_ui: *const java_download_view.U
 }
 
 fn discardJavaIntents(ui: *java_view.Ui, download_ui: *java_download_view.Ui) void {
+    java_view.discardPicker(ui);
     java_view.discardCommands(ui);
     ui.download_requested = false;
     download_ui.pending = null;
@@ -199,73 +241,59 @@ fn discardJavaIntents(ui: *java_view.Ui, download_ui: *java_download_view.Ui) vo
     download_ui.cancel_requested = false;
 }
 
-fn packBlocked(services: Services, manager: *const java.Manager, java_ui: *const java_view.Ui) bool {
-    var intents: ManualIntents = .{
-        .java = manager.isSearching() or services.java_download.isBusy() or javaIntents(java_ui, services.java_download_ui),
-        .worlds = services.worlds.snapshot().worker_active or services.worlds_ui.draft != null or services.worlds_ui.select_queued or
-            services.worlds_ui.pending_select != null or services.worlds_ui.requests.items.len != 0 or services.worlds_ui.directory_open != null or
-            services.worlds_ui.refresh_queued or services.worlds_ui.cancel_queued,
-        .credentials = services.settings.pending != null or services.settings.key_pending != null,
-        .uncertain = services.configuration.publicationUncertain(),
-        .stopping = !services.allow_mutations,
-    };
-    if (services.cf_credentials) |controller| intents.credentials = intents.credentials or controller.isBusy() or controller.lease();
-    if (services.instances) |instance_manager| {
-        const snapshot = instance_manager.snapshot();
-        intents.instances = instance_manager.isBusy() or snapshot.phase == .awaiting_publication or snapshot.durability_uncertain or (snapshot.failure != null and snapshot.failure.? == error.RecoveryRequired);
-    }
-    if (services.instances_ui) |ui| intents.instances = intents.instances or ui.blocksPackWorkflow();
-    if (services.content) |content_manager_| {
-        const snapshot = content_manager_.snapshot();
-        intents.content = content_manager_.isBusy() or snapshot.recovery_required or snapshot.proposal != null;
-    }
-    if (services.content_ui) |ui| intents.content = intents.content or ui.picker != null or ui.picker_queued or ui.picker_manual != null or
-        ui.draft != null or ui.review_requested or ui.review_refresh or ui.pending != null or ui.update_selection != null or ui.select_queued or
-        ui.pending_select != null or ui.cancel_queued;
-    return admissionBlocked(intents);
+fn creationServices(services: Services, manager: *java.Manager) ?instance_creation_controller.Services {
+    return .{ .store = services.configuration, .java = manager, .java_download = services.java_download, .instances = services.instances orelse return null };
 }
 
-fn packServices(services: Services, manager: *java.Manager) ?pack_import_controller.Services {
-    return .{ .store = services.configuration, .java = manager, .java_download = services.java_download, .instances = services.instances orelse return null, .content = services.content orelse return null };
-}
-
-fn consumePackRequest(services: Services, manager: *const java.Manager, java_ui: *const java_view.Ui, pending: *?state.Msg) void {
-    const instance_ui = services.instances_ui orelse return;
-    if (!instance_ui.pack_requested) return;
-    instance_ui.pack_requested = false;
-    if (services.pack_import == null or services.pack_import_ui == null or services.instances == null or services.content == null) {
-        instance_ui.failure = error.PackImportUnavailable;
-        return;
-    }
-    if (packBlocked(services, manager, java_ui)) {
-        instance_ui.failure = error.Busy;
-        return;
-    }
-    pack_import_view.open(services.pack_import_ui.?);
-    pending.* = .open_instances;
+fn discardInactivePickers(model: *const state.Model, java_ui: *java_view.Ui, services: Services) void {
+    if (model.panel != .java or !services.allow_mutations) java_view.discardPicker(java_ui);
 }
 
 pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Manager, java_ui: *java_view.Ui, launcher: *launch.Controller, services: Services) !void {
+    theme.applyTypography();
+    discardInactivePickers(model, java_ui, services);
     // Old callers may still restore the directory route; it is only an alias.
     if (model.panel == .library) model.panel = .instances;
+    if (services.allow_mutations) services.worlds_ui.setPageActive(model.panel == .worlds);
     const snapshot = library.snapshot();
+    if (services.instances_ui) |ui| {
+        ui.java_preview = library.previewSnapshot();
+        if (ui.java_preview.phase == .loading) dvui.timer(dvui.parentGet().data().id.update("instance-java-preview-poll"), 100_000);
+    }
+    if (services.avatars) |avatars| {
+        avatars.beginPicker(model.panel == .players);
+        const delay_ms = avatars.retryDelayMilliseconds();
+        if (delay_ms != std.math.maxInt(u32)) dvui.timer(dvui.parentGet().data().id.update("player-avatar-poll"), @intCast(@min(@as(u64, delay_ms) * 1000, std.math.maxInt(i32))));
+    }
+    try services.servers.updateSelected(services.configuration.snapshot(), services.allow_mutations);
+    const server_cards_open = model.panel == .versions or model.panel == .servers;
+    try services.servers.updatePicker(services.configuration.snapshot().servers, server_cards_open and services.allow_mutations);
+    if (services.allow_mutations and services.configuration.snapshot().selected_server != null) {
+        const delay_ms = services.servers.selectedRefreshDelay();
+        dvui.timer(dvui.parentGet().data().id.update("selected-server-poll"), @intCast(@min(@as(u64, delay_ms) * 1000, std.math.maxInt(i32))));
+    }
+    if (server_cards_open and services.allow_mutations) {
+        const delay_ms = services.servers.pickerRefreshDelay();
+        dvui.timer(dvui.parentGet().data().id.update("server-picker-poll"), @intCast(@min(@as(u64, delay_ms) * 1000, std.math.maxInt(i32))));
+    }
     var gates = serviceGates(services);
     gates.java = gates.java or launchPinsJava(launcher.snapshot().phase) or if (services.instances) |instance_manager| instance_manager.isBusy() else false;
     java_view.setDownloadController(java_ui, services.java_download);
     java_download_view.beginFrame(services.java_download_ui);
     if (gates.java) discardJavaIntents(java_ui, services.java_download_ui);
-    if (model.active_game.len != 0 and !tools.hasInstalled(snapshot, model.active_game.get())) model.active_game.len = 0;
     var pending: ?state.Msg = null;
     var command: ?tools.Command = null;
     {
         const available = @max(1, dvui.windowRect().w - 8);
-        const initial_width = boundedSidebarWidth(model.sidebar_width, available);
+        const instance_panel = model.panel == .instances or model.panel == .library;
+        const sidebar_width = if (instance_panel) &model.instance_sidebar_width else &model.sidebar_width;
+        const initial_width = if (instance_panel) boundedInstanceSidebarWidth(sidebar_width.*, available) else if (model.panel == .logs) boundedLogsSidebarWidth(sidebar_width.*, available) else boundedSidebarWidth(sidebar_width.*, available);
         var split = initial_width / available;
         const root = dvui.paned(@src(), .{ .direction = .horizontal, .collapsed_size = 0, .split_ratio = &split, .handle_size = 8 }, .{ .expand = .both, .background = true, .color_fill = .{ .color = theme.background }, .margin = R.all(0), .padding = R.all(0), .label = .{ .text = "调整侧栏宽度" } });
         defer root.deinit();
-        const resized_width = boundedSidebarWidth(split * available, available);
+        const resized_width = if (instance_panel) boundedInstanceSidebarWidth(split * available, available) else if (model.panel == .logs) boundedLogsSidebarWidth(split * available, available) else boundedSidebarWidth(split * available, available);
         split = resized_width / available;
-        if (@abs(resized_width - initial_width) > 0.1) model.sidebar_width = resized_width;
+        if (@abs(resized_width - initial_width) > 0.1) sidebar_width.* = resized_width;
         if (root.showFirst()) {
             switch (model.panel) {
                 .more => tools.moreMenu(model, &pending),
@@ -284,14 +312,15 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
                 .logs => {
                     const side = tools.beginUtilityMenu("游戏日志");
                     defer side.deinit();
-                    tools.utilityMenuFooter(model, &pending);
+                    if (services.logs.drawNavigationFooter(launcher)) pending = .back;
                     try services.logs.drawSidebar(launcher);
                 },
                 .instances, .library => {
-                    const side = tools.beginUtilityMenu("实例管理");
+                    const side = instances_view.sidebarPanel(@src());
                     defer side.deinit();
-                    tools.utilityMenuFooter(model, &pending);
-                    if (services.instances) |instance_manager| if (services.instances_ui) |ui| instances_view.drawSidebar(ui, services.configuration, instance_manager, !gates.instances and !(if (services.pack_import_ui) |pack_ui| pack_ui.isBusy() or pack_ui.pending != null else false));
+                    instances_view.sidebarHeading(@src());
+                    if (instances_view.sidebarFooter(@src(), model.parentLabel())) pending = model.parentMessage();
+                    if (services.instances) |instance_manager| if (services.instances_ui) |ui| instances_view.drawSidebar(ui, services.configuration, instance_manager, !gates.instances);
                 },
                 .worlds => {
                     const side = tools.beginUtilityMenu("存档");
@@ -299,44 +328,62 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
                     tools.utilityMenuFooter(model, &pending);
                     worlds_view.drawSidebar(services.worlds_ui, services.configuration.snapshot(), services.worlds, !gates.worlds);
                 },
-                .content => {
-                    const side = tools.beginUtilityMenu("模组与整合包");
-                    defer side.deinit();
-                    tools.utilityMenuFooter(model, &pending);
-                    if (!gates.content) if (services.content) |content_manager_| if (services.content_ui) |ui| try content_view.drawSidebar(ui, services.configuration.snapshot(), content_manager_);
-                },
-                else => sidebar(model, &pending, services.configuration.snapshot()),
+                else => sidebar(model, &pending, services.configuration.snapshot(), services.servers, services.avatars),
             }
         }
+        if (services.instances_ui) |ui| if (services.instances) |manager_| {
+            ui.creation_presented = if (services.ordinary_creation) |controller| controller.presentsCreation(manager_) else false;
+        };
         if (root.showSecond()) try content(model, snapshot, &pending, &command, manager, java_ui, launcher, services);
     }
-    if (services.instances_ui) |ui| instances_view.drawModal(ui, !gates.instances);
-    consumePackRequest(services, manager, java_ui, &pending);
+    if (!gates.instances) servers_view.drawModal(services.servers_ui, services.configuration.snapshot());
+    if (services.instances_ui) |ui| {
+        if (services.instances) |manager_| {
+            ui.creation_presented = if (services.ordinary_creation) |controller| controller.presentsCreation(manager_) else false;
+            instances_view.syncTaskSnapshot(ui, if (ui.creation_presented) services.ordinary_creation.?.creationSnapshot() else manager_.snapshot());
+        }
+        instances_view.drawModal(ui, !gates.instances);
+    }
     if (!gates.java) {
         java_view.drawModal(java_ui);
         if (java_ui.download_requested) {
             java_ui.download_requested = false;
             java_ui.acquisition_open = true;
+            java_ui.acquisition_mode = .download;
             if (services.java_download.snapshot().phase != .running) java_download_view.suggestMajor(services.java_download_ui, java_ui.requested_major);
             pending = .open_java;
         }
     } else discardJavaIntents(java_ui, services.java_download_ui);
     if (!gates.worlds) try worlds_view.drawModal(services.worlds_ui, services.configuration.snapshot(), services.worlds);
-    if (!gates.content) {
-        if (services.content) |manager_| if (services.content_ui) |ui| try content_view.drawModal(ui, services.configuration.snapshot(), manager_);
-    }
     if (services.instances_ui) |ui| guardInstanceLeave(model, ui, &pending);
     if (pending) |msg| {
         const selection_allowed = !gates.instances and model.panel == .versions;
         const transition_allowed = switch (msg) {
-            .use_game => selection_allowed,
+            .use_game, .select_instance, .select_server => selection_allowed,
             .start => !gates.instances and !gates.content and !services.java_download.isDeleting(),
             else => true,
         };
         if (transition_allowed) state.transition(model, msg);
         switch (msg) {
             .open_library, .get_game => {},
-            .start => if (!gates.instances and !gates.content and !services.java_download.isDeleting()) startGame(model, snapshot, manager, launcher, services),
+            .start => if (!gates.instances and !gates.content and !services.java_download.isDeleting()) {
+                startGame(snapshot, manager, launcher, services);
+                if (launch_error) |err| components.alert(@src(), "无法启动游戏", launchFailureMessage(err));
+            },
+            .select_instance => |id| if (selection_allowed) {
+                launch_error = null;
+                game_selection_view.selectInstance(services.configuration, services.servers, id) catch |err| {
+                    launch_error = err;
+                };
+                syncSelectedGame(model, services.configuration.snapshot());
+            },
+            .select_server => |id| if (selection_allowed) {
+                launch_error = null;
+                game_selection_view.selectServer(services.configuration, services.servers, id) catch |err| {
+                    launch_error = err;
+                };
+                syncSelectedGame(model, services.configuration.snapshot());
+            },
             .use_game => |name| if (selection_allowed) {
                 const current = services.configuration.snapshot();
                 if (instances.findByName(current, name)) |instance| {
@@ -373,6 +420,9 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
             }
         }
     }
+    // Navigation invalidates picker receipts before any consumer can apply them.
+    discardInactivePickers(model, java_ui, services);
+    if (model.panel == .java and !gates.java) java_view.syncPicker(java_ui);
     // A start intent above can acquire the launch lease in this same frame.
     const java_blocked = gates.java or launchPinsJava(launcher.snapshot().phase) or if (services.instances) |instance_manager| instance_manager.isBusy() else false;
     if (!java_blocked) java_view.finish(java_ui, manager) else discardJavaIntents(java_ui, services.java_download_ui);
@@ -396,6 +446,7 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
     if (!java_blocked) java_download_view.finish(services.java_download_ui, services.java_download);
     if (!gates.instances) servers_view.finish(services.servers_ui, services.configuration, services.servers);
     services.logs.finish(launcher);
+    if (services.allow_mutations) services.worlds_ui.setPageActive(model.panel == .worlds);
     if (!gates.worlds) worlds_view.finish(services.worlds_ui, services.configuration, services.worlds);
     if (!gates.instances) {
         if (services.accounts) |accounts| if (services.accounts_ui) |ui| accounts_view.finish(ui, services.configuration, accounts);
@@ -404,29 +455,24 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
         if (services.instances) |manager_| {
             if (services.instances_ui) |ui| {
                 if (manager_.setDefaultJava(defaultInstallerJava(manager.entries()))) |_| {
-                    const before_navigation = ui.navigation_serial;
-                    instances_view.finish(ui, services.configuration, manager_);
-                    if (ui.navigation_serial != before_navigation) {
-                        if (services.pack_import_ui) |pack_ui| if (services.pack_import) |controller| {
-                            if (pack_ui.modal_open and !pack_ui.pinned and pack_ui.pending == null) pack_ui.queueOwned(.close, controller) catch |err| {
-                                pack_ui.failure = err;
-                            };
-                        };
-                    }
+                    const before_submitted = ui.submitted;
+                    if (services.ordinary_creation) |controller| {
+                        if (creationServices(services, manager)) |bound| {
+                            instances_view.finishWithPreflight(ui, services.configuration, manager_, controller, bound, services.allow_mutations);
+                        } else instances_view.finish(ui, services.configuration, manager_);
+                    } else instances_view.finish(ui, services.configuration, manager_);
+                    if (ui.submitted != before_submitted) dvui.refresh(null, @src(), null);
                 } else |err| {
                     ui.failure = err;
                 }
             }
         }
-    }
-    if (!gates.content) {
-        if (services.content) |manager_| if (services.content_ui) |ui| content_view.finish(ui, services.configuration, manager_);
-    }
-    // Generic finishes may have admitted work; recheck before pack admission.
-    if (services.pack_import) |controller| {
-        if (services.pack_import_ui) |ui| {
-            if (packServices(services, manager)) |bound| {
-                pack_import_view.finish(ui, services.configuration, controller, bound, packBlocked(services, manager, java_ui));
+    } else if (services.instances) |manager_| {
+        if (services.instances_ui) |ui| {
+            if (ui.creation_active and services.ordinary_creation != null) {
+                if (creationServices(services, manager)) |bound| instances_view.finishWithPreflight(ui, services.configuration, manager_, services.ordinary_creation.?, bound, services.allow_mutations);
+            } else if (gatedTaskActionAllowed(if (ui.pending) |action| action.action else null, services.allow_mutations)) {
+                instances_view.finish(ui, services.configuration, manager_);
             }
         }
     }
@@ -441,12 +487,20 @@ fn defaultInstallerJava(runtimes: []const java.Runtime) ?[]const u8 {
     return if (best) |runtime| runtime.path else null;
 }
 
-fn requiredJava(snapshot: games.Snapshot, id: []const u8) ?u32 {
-    for (snapshot.installed) |entry| if (std.mem.eql(u8, entry.id, id)) return entry.java_major;
-    return null;
+fn launchFailureMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InstanceNotSelected, error.InstanceNotConfigured => "请先选择一个游戏实例。",
+        error.NoAccountSelected => "请先选择一个账户。",
+        error.LoginRequired, error.AuthorizationExpired => "账户需要重新登录，请在账户页面完成登录后再试。",
+        error.JavaDeleteBusy => "Java 正在删除，请稍后重试。",
+        error.InstallInProgress => "游戏正在安装，请等待安装完成后再启动。",
+        error.Busy => "所选账户或游戏正在处理其他操作，请稍后重试。",
+        error.ServerInstanceMismatch => "所选服务器与游戏实例不匹配，请重新选择。",
+        else => std.fmt.allocPrint(dvui.currentWindow().arena(), "无法启动游戏：{s}", .{@errorName(err)}) catch "无法启动游戏，请重试。",
+    };
 }
 
-fn startGame(model: *const state.Model, snapshot: games.Snapshot, manager: *java.Manager, launcher: *launch.Controller, services: Services) void {
+fn startGame(snapshot: games.Snapshot, manager: *java.Manager, launcher: *launch.Controller, services: Services) void {
     const document = services.configuration.snapshot();
     launch_error = null;
     if (services.java_download.isDeleting()) {
@@ -457,23 +511,15 @@ fn startGame(model: *const state.Model, snapshot: games.Snapshot, manager: *java
         launch_error = error.InstallInProgress;
         return;
     }
-    const required = requiredJava(snapshot, model.active_game.get()) orelse {
-        launch_error = error.VersionNotInstalled;
+    const selected_id = document.selected_instance orelse {
+        launch_error = error.InstanceNotSelected;
         return;
     };
-    const instance = instances.findByName(document, model.active_game.get()) orelse {
+    const instance = instances.findById(document, selected_id) orelse {
         launch_error = error.InstanceNotConfigured;
         return;
     };
-    if (document.selected_instance == null or !std.mem.eql(u8, document.selected_instance.?, instance.id)) {
-        launch_error = error.InstanceNotSelected;
-        return;
-    }
-    const runtime = manager.resolve(model.active_game.get(), required);
-    const java_path = instance.java_path orelse if (runtime) |value| value.path else {
-        launch_error = error.NoCompatibleJava;
-        return;
-    };
+    const java_path = instance.java_path orelse manager.selectedPath(instance.name) orelse "";
     const accounts = services.accounts orelse {
         launch_error = error.NoAccountSelected;
         return;
@@ -502,12 +548,15 @@ fn startGame(model: *const state.Model, snapshot: games.Snapshot, manager: *java
         };
     }
     launcher.startWithOptions(.{
-        .version = model.active_game.get(),
+        .version = instance.name,
         .java_path = java_path,
-        .java_major = required,
+        .java_major = 0,
         .username = session.username,
+        .min_memory_mb = instance.min_memory_mb,
         .max_memory_mb = instance.max_memory_mb orelse document.settings.default_memory_mb,
     }, .{
+        .resolve_java_from_metadata = true,
+        .java_candidates = manager.entries(),
         .debug = instance.debug_launch,
         .instance_directory = game_directory,
         .instance_id = instance.id,
@@ -519,37 +568,32 @@ fn startGame(model: *const state.Model, snapshot: games.Snapshot, manager: *java
     };
 }
 
-fn title(src: std.builtin.SourceLocation, text: []const u8) void {
-    dvui.labelNoFmt(src, text, .{}, .{ .font = dvui.themeGet().font_title, .margin = R.all(0), .padding = R.all(0) });
-}
-
-fn muted(src: std.builtin.SourceLocation, text: []const u8) void {
-    dvui.labelNoFmt(src, text, .{}, .{ .color_text = .{ .color = theme.muted }, .font = dvui.themeGet().font_body.withSize(14), .margin = R.all(0), .padding = R.all(0) });
-}
-
 fn gap(src: std.builtin.SourceLocation, height: f32) void {
     _ = dvui.spacer(src, .{ .min_size_content = .{ .h = height } });
 }
 
-fn action(src: std.builtin.SourceLocation, text: []const u8, opts: dvui.Options) bool {
-    return dvui.button(src, text, .{}, (dvui.Options{ .margin = R.all(0), .padding = R.all(10), .min_size_content = .{ .h = 20 }, .border = R.all(1) }).override(opts));
-}
-
-fn sidebar(model: *const state.Model, pending: *?state.Msg, document: *const config.Document) void {
+fn sidebar(model: *const state.Model, pending: *?state.Msg, document: *const config.Document, manager: *server_manager.Manager, avatars: ?*avatar_manager.Manager) void {
     const account = selectedAccount(document);
     const name = if (account) |value| value.name else model.labels.choosePlayer;
-    const kind = if (account) |value| (if (value.kind == .microsoft) "Microsoft" else "离线玩家") else "未选择账号";
-    const side = dvui.box(@src(), .{}, .{ .expand = .both, .padding = R.all(24), .margin = .{ .x = 16, .y = 16, .h = 16 }, .corners = .all(8), .background = true, .color_fill = .{ .color = theme.surface } });
+    const kind = if (account) |value| (if (value.kind == .microsoft) "Microsoft" else "离线账户") else "未选择账号";
+    const side = components.sidebarPanel(@src());
     defer side.deinit();
-    title(@src(), "Vela Launcher");
-    gap(@src(), 24);
+    if (model.panel == .players or model.panel == .versions) {
+        if (components.sidebarFooter(@src(), model.parentLabel(), true)) pending.* = model.parentMessage();
+    } else {
+        if (components.sidebarFooter(@src(), model.labels.more, true)) pending.* = .open_more;
+    }
+    const compact = side.data().contentRect().h < 440;
+    const spacing: f32 = if (compact) theme.spacing.card_gap else 32;
+    components.sidebarTitle(@src(), "Vela Launcher", compact);
+    gap(@src(), spacing);
     {
-        const name_font = dvui.themeGet().font_body;
-        const kind_font = name_font.withSize(14);
-        const text_height = name_font.textSize(name).h + 4 + kind_font.textSize(kind).h;
-        const row_height = @max(48, text_height);
+        const name_font = theme.headingFont();
+        const kind_font = theme.captionFont();
+        const text_height = name_font.textSize(name).h + theme.style.cards.sidebar_account_text_gap + kind_font.textSize(kind).h;
+        const row_height = @max(theme.style.cards.sidebar_account_height - 2 * theme.style.cards.sidebar_account_padding_y, text_height);
         var player: dvui.ButtonWidget = undefined;
-        player.init(@src(), .{}, .{ .expand = .horizontal, .min_size_content = .{ .h = row_height }, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .color_fill = .{ .color = theme.surface }, .label = .{ .text = model.labels.choosePlayer } });
+        player.init(@src(), .{}, .{ .tag = "sidebar-player", .expand = .horizontal, .min_size_content = .{ .h = row_height }, .max_size_content = .width(0), .padding = .{ .x = theme.style.cards.sidebar_account_padding_x - 1, .w = theme.style.cards.sidebar_account_padding_x - 1, .y = theme.style.cards.sidebar_account_padding_y - 1, .h = theme.style.cards.sidebar_account_padding_y - 1 }, .margin = R.all(0), .border = R.all(1), .corners = .all(theme.sizing.card_radius), .color_fill = .{ .color = theme.sidebar }, .color_border = .{ .color = theme.outline }, .label = .{ .text = model.labels.choosePlayer } });
         defer player.deinit();
         player.processEvents();
         player.drawBackground();
@@ -557,34 +601,61 @@ fn sidebar(model: *const state.Model, pending: *?state.Msg, document: *const con
             const identity = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .min_size_content = .{ .h = row_height }, .padding = R.all(0), .margin = R.all(0) });
             defer identity.deinit();
             {
-                const avatar = dvui.box(@src(), .{}, .{ .min_size_content = .{ .w = 48, .h = 48 }, .max_size_content = .{ .w = 48, .h = 48 }, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .background = true, .color_fill = .{ .color = theme.accent } });
+                const avatar = dvui.box(@src(), .{}, .{ .min_size_content = dvui.Size.all(theme.style.cards.avatar), .max_size_content = .size(dvui.Size.all(theme.style.cards.avatar)), .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .background = false });
                 defer avatar.deinit();
-                dvui.labelNoFmt(@src(), accountInitial(account), .{ .align_x = 0.5, .align_y = 0.5 }, .{ .gravity_x = 0.5, .gravity_y = 0.5, .font = dvui.themeGet().font_body.withSize(20), .color_text = .{ .color = .fromHex("182318") }, .padding = R.all(0), .margin = R.all(0) });
+                drawAccountAvatar(account, avatars);
             }
-            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 12 } });
-            const details = dvui.box(@src(), .{}, .{ .expand = .horizontal, .min_size_content = .{ .h = text_height }, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0) });
+            _ = dvui.spacer(@src(), .{ .min_size_content = .width(theme.style.cards.sidebar_account_gap) });
+            const details = dvui.box(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .h = text_height }, .padding = R.all(0), .margin = R.all(0) });
             defer details.deinit();
-            dvui.labelNoFmt(@src(), name, .{}, .{ .padding = R.all(0), .margin = R.all(0) });
-            gap(@src(), 4);
-            muted(@src(), kind);
+            dvui.labelNoFmt(@src(), name, .{ .ellipsize = true }, .{ .font = name_font, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0) });
+            gap(@src(), theme.spacing.detail_gap);
+            components.hint(@src(), kind);
         }
         player.drawFocus();
-        if (player.clicked()) pending.* = .open_players;
+        if (player.clicked()) pending.* = if (model.panel == .players) .back else .open_players;
     }
-    gap(@src(), 24);
-    _ = dvui.separator(@src(), .{ .expand = .horizontal, .margin = R.all(0) });
-    gap(@src(), 24);
-    muted(@src(), model.labels.gameVersion);
-    gap(@src(), 12);
-    if (action(@src(), model.versionName(), .{ .expand = .horizontal, .style = .control, .color_border = if (model.panel == .instances) .{ .color = theme.accent } else null, .label = .{ .text = model.labels.chooseVersion } })) pending.* = .open_instances;
-    _ = dvui.spacer(@src(), .{ .expand = .vertical });
-    if (action(@src(), model.labels.more, .{ .expand = .horizontal, .corners = .all(8), .border = R.all(0) })) pending.* = .open_more;
+    gap(@src(), theme.style.cards.sidebar_identity_gap);
+    const body = components.scrollBody(@src());
+    defer body.deinit();
+    const width = dvui.parentGet().data().contentRect().w;
+    const game_action: state.Msg = if (model.panel == .versions) .back else .open_versions;
+    if (document.selected_server) |id| {
+        for (document.servers) |server| {
+            if (!std.mem.eql(u8, server.id, id)) continue;
+            const query = if (model.panel == .versions) manager.pickerSnapshot(id) else manager.snapshot();
+            if (game_selection_view.serverCard(@src(), server, document, query, false, true, width, "sidebar-game-target")) pending.* = game_action;
+            return;
+        }
+    }
+    if (document.selected_instance) |id| {
+        if (instances.findById(document, id)) |instance| {
+            if (components.selectionCard(@src(), instance.id, instance.name, .{ .width = width, .description = game_selection_view.instanceDescription(instance), .tag = "sidebar-game-target" })) pending.* = game_action;
+            return;
+        }
+    }
+    if (components.selectionCard(@src(), "choose-game", configuredGameName(model, document), .{ .width = width, .tag = "sidebar-game-target" })) pending.* = game_action;
 }
 
 fn selectedAccount(document: *const config.Document) ?config.Account {
     const id = document.selected_account orelse return null;
     for (document.accounts) |account| if (std.mem.eql(u8, account.id, id)) return account;
     return null;
+}
+
+fn drawAccountAvatar(account: ?config.Account, avatars: ?*avatar_manager.Manager) void {
+    if (account) |value| {
+        if (avatars) |manager| {
+            avatar_image.draw(@src(), manager.face(value));
+            return;
+        }
+        if (avatar_image.defaultFace(dvui.currentWindow().arena(), value.uuid)) |default| {
+            var face = default;
+            avatar_image.draw(@src(), &face);
+            return;
+        } else |_| {}
+    }
+    dvui.labelNoFmt(@src(), accountInitial(account), .{ .align_x = 0.5, .align_y = 0.5 }, .{ .gravity_x = 0.5, .gravity_y = 0.5, .font = theme.fontSized(theme.typography.avatar), .color_text = .{ .color = theme.style.colors.on_accent }, .padding = R.all(0), .margin = R.all(0) });
 }
 
 fn accountInitial(account: ?config.Account) []const u8 {
@@ -599,8 +670,8 @@ fn content(model: *state.Model, snapshot: games.Snapshot, pending: *?state.Msg, 
     var gates = serviceGates(services);
     gates.java = gates.java or launchPinsJava(launcher.snapshot().phase);
     const parent_id = dvui.parentGet().data().id;
-    var key: u64 = @intFromEnum(model.panel);
-    key = key * 16 + @intFromEnum(model.category);
+    var key: u64 = @backingInt(model.panel);
+    key = key * 16 + @backingInt(model.category);
 
     const previous = dvui.dataGet(null, parent_id, "content_panel", u64);
     if (previous == null or previous.? != key) {
@@ -610,8 +681,9 @@ fn content(model: *state.Model, snapshot: games.Snapshot, pending: *?state.Msg, 
     const progress = if (dvui.animationGet(parent_id, "content_enter")) |a| a.value() else 1;
     const offset = 8 * (1 - progress);
     const compact_home = model.panel == .home and (services.task_viewport_height orelse dvui.windowRect().h) < 520;
-    const padding: f32 = if (compact_home) 12 else 32;
-    const pane = dvui.box(@src(), .{}, .{ .id_extra = @intFromEnum(model.panel), .expand = .both, .padding = .{ .x = padding + offset, .w = padding - offset, .y = padding, .h = padding } });
+    const compact_instances = (model.panel == .instances or model.panel == .library) and (dvui.windowRect().w < theme.style.layout.compact_page_width or dvui.windowRect().h < theme.style.layout.compact_page_height);
+    const padding: f32 = if (compact_home) theme.spacing.panel_compact_padding else if (compact_instances) theme.spacing.sidebar_padding else theme.spacing.page_padding;
+    const pane = dvui.box(@src(), .{}, .{ .id_extra = @backingInt(model.panel), .expand = .both, .padding = .{ .x = padding + offset, .w = padding - offset, .y = padding, .h = padding } });
     defer pane.deinit();
     const previous_clip = dvui.clip(pane.data().contentRectScale().r);
     defer dvui.clipSet(previous_clip);
@@ -619,11 +691,8 @@ fn content(model: *state.Model, snapshot: games.Snapshot, pending: *?state.Msg, 
     defer dvui.alphaSet(previous_alpha);
     switch (model.panel) {
         .home => try drawHome(model, snapshot, manager, launcher.snapshot(), pending, services),
-        .players => if (services.accounts) |accounts| {
-            if (action(@src(), model.labels.back, .{ .margin = .{ .h = 12 } })) pending.* = .back;
-            if (services.accounts_ui) |ui| accounts_view.draw(ui, services.configuration, accounts);
-        } else players(model, pending),
-        .versions => versions(model, snapshot, pending),
+        .players => drawAccountSelection(model, snapshot, launcher.snapshot(), pending, services),
+        .versions => drawGameSelection(model, snapshot, launcher.snapshot(), pending, services),
         .more => switch (model.category) {
             .settings => if (services.cf_credentials) |controller|
                 try settings_view.drawWithCredentials(services.settings, controller, services.configuration.snapshot().settings, gates.content or if (services.content) |content_service| content_service.isBusy() else false, services.configuration.publicationUncertain())
@@ -634,120 +703,99 @@ fn content(model: *state.Model, snapshot: games.Snapshot, pending: *?state.Msg, 
             .game => tools.moreContent(model, pending),
         },
 
-        .java => if (!gates.java) java_view.drawPage(java_ui, manager, services.java_download_ui, services.java_download) else muted(@src(), "游戏或整合包任务进行中，Java 配置暂不可更改"),
+        .java => if (!gates.java) java_view.drawPage(java_ui, manager, services.java_download_ui, services.java_download) else components.hint(@src(), "游戏或实例创建任务进行中，Java 配置暂不可更改"),
         .servers => servers_view.draw(services.servers_ui, services.configuration, services.servers),
         .worlds => try worlds_view.drawWithEnabled(services.worlds_ui, services.configuration.snapshot(), services.worlds, !gates.worlds),
         .logs => try services.logs.draw(launcher),
         .instances, .library => if (services.instances) |manager_| {
-            if (services.pack_import_ui) |ui| {
-                if (ui.modal_open) {
-                    if (services.pack_import) |controller| try pack_import_view.drawInline(ui, services.configuration, controller, packBlocked(services, manager, java_ui));
-                } else if (services.instances_ui) |instance_ui| instances_view.drawWithEnabled(instance_ui, services.configuration, manager_, snapshot, manager.entries(), !gates.instances);
-            } else if (services.instances_ui) |ui| instances_view.drawWithEnabled(ui, services.configuration, manager_, snapshot, manager.entries(), !gates.instances);
-        },
-        .content => if (!gates.content) {
-            if (services.content) |manager_| {
-                if (services.content_ui) |ui| try content_view.draw(ui, services.configuration.snapshot(), manager_);
-            }
+            if (services.instances_ui) |ui| instances_view.drawWithEnabled(ui, services.configuration, manager_, snapshot, manager.entries(), !gates.instances);
         },
     }
 }
 
 pub fn drawHome(model: *const state.Model, snapshot: games.Snapshot, manager: *java.Manager, process: launch.Snapshot, pending: *?state.Msg, services: Services) !void {
-    const compact = (services.task_viewport_height orelse dvui.windowRect().h) < 520;
-    const body = dvui.themeGet().font_body;
-    const font = if (compact) body.withSize(14) else body;
-    const required = requiredJava(snapshot, model.active_game.get());
-    const runtime = if (required) |major| manager.resolve(model.active_game.get(), major) else null;
-    const configured_instance = instances.findByName(services.configuration.snapshot(), model.active_game.get());
-    const override_path = if (configured_instance) |instance| instance.java_path else null;
-    const failure: ?anyerror = if (launch_error != null) launch_error else process.failure;
-    const running = process.phase == .preparing or process.phase == .running;
-    const now_ms: u64 = if (dvui.App.main_init) |main_init| @intCast(@max(0, std.Io.Clock.awake.now(main_init.io).toMilliseconds())) else 0;
-    const account_ready = if (services.accounts) |accounts| accounts.canLaunch(now_ms) else false;
-    const configured = configured_instance != null;
-    const gates = serviceGates(services);
-    const disabled = gates.instances or gates.content or services.java_download.isDeleting() or !account_ready or !configured or required == null or (runtime == null and override_path == null) or running or snapshot.phase == .installing;
-    const selection_required = !account_ready or !configured or required == null;
-    const status = if (failure) |err| try std.fmt.allocPrint(dvui.currentWindow().arena(), "启动失败：{s}", .{@errorName(err)}) else switch (process.phase) {
-        .preparing => "正在准备启动",
-        .running => "游戏正在运行",
-        .exited => try std.fmt.allocPrint(dvui.currentWindow().arena(), "游戏已退出（{d}）", .{process.exit_code orelse 0}),
-        else => null,
-    };
-    const options: tasks_view.Options = .{ .max_visible_rows = if (compact) 1 else 2, .compact = compact };
-    const task_height = tasks_view.sectionHeight(services.tasks, options);
-    const notice_font = body.withSize(14);
-    const footer_height = 48 + (if (status != null) notice_font.textHeight() else 0) + (if (selection_required) notice_font.textHeight() else 0) + (if (snapshot.phase == .installing) notice_font.textHeight() else 0);
+    _ = manager;
     const frame = dvui.box(@src(), .{}, .{ .tag = "home-layout", .expand = .both, .padding = R.all(0), .margin = R.all(0) });
     defer frame.deinit();
+    drawStartFooter(model, snapshot, process, pending, services, frame.data().contentRect(), "home-footer", "home-start");
+}
+
+pub fn drawGameSelection(model: *state.Model, snapshot: games.Snapshot, process: launch.Snapshot, pending: *?state.Msg, services: Services) void {
+    drawLaunchSelection(model, snapshot, process, pending, services, .game);
+}
+
+pub fn drawAccountSelection(model: *state.Model, snapshot: games.Snapshot, process: launch.Snapshot, pending: *?state.Msg, services: Services) void {
+    drawLaunchSelection(model, snapshot, process, pending, services, .account);
+}
+
+fn drawLaunchSelection(model: *state.Model, snapshot: games.Snapshot, process: launch.Snapshot, pending: *?state.Msg, services: Services, page: enum { game, account }) void {
+    const game_page = page == .game;
+    const frame = dvui.box(@src(), .{}, .{ .tag = if (game_page) "game-selection-layout" else "account-selection-layout", .id_extra = @backingInt(page), .expand = .both, .padding = R.all(0), .margin = R.all(0) });
+    defer frame.deinit();
     const bounds = frame.data().contentRect();
-    // Header overflow is isolated; task rows and the launch footer retain their own space.
-    const header_budget = @max(0, bounds.h - task_height - footer_height);
-    {
-        const header = dvui.scrollArea(@src(), .{}, .{ .tag = "home-header", .expand = .horizontal, .max_size_content = .height(header_budget), .background = false, .padding = R.all(0), .margin = R.all(0), .border = R.all(0) });
-        defer header.deinit();
-        dvui.labelNoFmt(@src(), model.labels.ready, .{}, .{ .font = if (compact) body.withSize(18) else dvui.themeGet().font_title, .padding = R.all(0), .margin = R.all(0) });
-        gap(@src(), if (compact) 4 else 12);
-        dvui.label(@src(), "{s}{s}", .{ model.labels.currentVersion, model.versionName() }, .{ .font = font, .padding = R.all(0), .margin = R.all(0), .expand = .horizontal, .max_size_content = .width(0) });
-        gap(@src(), if (compact) 4 else 12);
-        if (runtime == null and override_path == null and required != null) {
-            muted(@src(), "请先添加可用的 Java");
-            if (dvui.button(@src(), "Java 管理", .{}, .{ .font = font, .padding = R.all(if (compact) 8 else 10), .margin = R.all(0), .corners = .all(8) })) pending.* = .open_java;
+    drawStartFooter(model, snapshot, process, pending, services, bounds, if (game_page) "game-selection-footer" else "account-selection-footer", if (game_page) "game-selection-start" else "account-selection-start");
+    const body = dvui.box(@src(), .{}, .{ .tag = if (game_page) "game-selection-body" else "account-selection-body", .rect = .{ .x = 0, .y = 0, .w = bounds.w, .h = @max(0, bounds.h - theme.sizing.control_height - theme.spacing.footer_gap) }, .padding = R.all(0), .margin = R.all(0) });
+    defer body.deinit();
+    if (game_page) {
+        game_selection_view.draw(model, pending, services.configuration.snapshot(), services.servers, !serviceGates(services).instances, launch_error);
+    } else if (services.accounts) |accounts| {
+        if (services.accounts_ui) |ui| accounts_view.draw(ui, services.configuration, accounts, services.avatars);
+    } else players(model, pending);
+}
+
+fn drawStartFooter(model: *const state.Model, snapshot: games.Snapshot, process: launch.Snapshot, pending: *?state.Msg, services: Services, bounds: R, footer_tag: []const u8, start_tag: []const u8) void {
+    const font = theme.bodyFont();
+    const running = process.phase == .preparing or process.phase == .running;
+    const start_label = if (process.phase == .preparing) "正在启动" else model.labels.start;
+    const gates = serviceGates(services);
+    // Readiness is checked for the selected instance only after a launch intent.
+    const disabled = gates.instances or gates.content or services.java_download.isDeleting() or running or snapshot.phase == .installing;
+    const footer_height = theme.sizing.control_height;
+    const footer = dvui.box(@src(), .{}, .{ .tag = footer_tag, .rect = .{ .x = 0, .y = @max(0, bounds.h - footer_height), .w = bounds.w, .h = footer_height }, .padding = R.all(0), .margin = R.all(0) });
+    defer footer.deinit();
+    var start: dvui.ButtonWidget = undefined;
+    const launch_width = @min(theme.sizing.home_launch_width, bounds.w);
+    const geometry = theme.controlGeometry(@max(font.lineHeight(), font.textSize(start_label).h), footer_height, launch_width, theme.sizing.control_padding_x, theme.sizing.control_border);
+    start.init(@src(), .{ .grayed = disabled }, theme.controlOptions(@max(font.lineHeight(), font.textSize(start_label).h)).override(.{ .tag = start_tag, .label = .{ .text = start_label }, .font = font, .rect = .{ .x = @max(0, bounds.w - launch_width), .y = 0, .w = launch_width, .h = footer_height }, .style = .highlight, .color_fill = if (disabled) .{ .color = theme.surface } else null, .min_size_content = geometry.content, .padding = geometry.padding, .margin = R.all(0), .tab_index = if (disabled) 0 else null }));
+    defer start.deinit();
+    if (disabled) {
+        if (start.data().accesskit_node()) |node| {
+            dvui.AccessKit.nodeSetDisabled(node);
+            dvui.AccessKit.nodeRemoveAction(node, .focus);
+            dvui.AccessKit.nodeRemoveAction(node, .click);
         }
-        servers_view.drawHomeWithOptions(services.servers_ui, services.configuration.snapshot(), compact);
     }
-    try tasks_view.drawWithOptions(services.tasks, options);
-    {
-        const footer = dvui.box(@src(), .{}, .{ .tag = "home-footer", .rect = .{ .x = 0, .y = @max(0, bounds.h - footer_height), .w = bounds.w, .h = footer_height }, .padding = R.all(0), .margin = R.all(0) });
-        defer footer.deinit();
-        if (status) |text| dvui.labelNoFmt(@src(), text, .{}, .{ .font = notice_font, .color_text = .{ .color = if (failure != null) theme.accent else theme.muted }, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0) });
-        if (selection_required) muted(@src(), model.labels.selectionRequired);
-        if (snapshot.phase == .installing) muted(@src(), "正在安装游戏");
-        var start: dvui.ButtonWidget = undefined;
-        start.init(@src(), .{ .grayed = disabled }, .{ .tag = "home-start", .font = font, .rect = .{ .x = @max(0, bounds.w - 176), .y = footer_height - 48, .w = 176, .h = 48 }, .style = .highlight, .color_fill = if (disabled) .{ .color = theme.surface } else null, .min_size_content = .{ .w = 152, .h = 24 }, .padding = R.all(12), .margin = R.all(0), .corners = .all(8), .tab_index = if (disabled) 0 else null });
-        defer start.deinit();
-        if (disabled) {
-            if (start.data().accesskit_node()) |node| {
-                dvui.AccessKit.nodeSetDisabled(node);
-                dvui.AccessKit.nodeRemoveAction(node, .focus);
-                dvui.AccessKit.nodeRemoveAction(node, .click);
-            }
-        }
-        if (!disabled) start.processEvents();
-        start.drawBackground();
-        // Keep the disabled label legible instead of using ButtonWidget's averaged text color.
-        dvui.labelNoFmt(@src(), if (running) "启动中" else model.labels.start, .{ .align_x = 0.5, .align_y = 0.5 }, start.style().override(.{ .color_text = if (disabled) .{ .color = theme.muted } else null, .gravity_x = 0.5, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0) }));
-        if (!disabled) start.drawFocus();
-        if (!disabled and start.clicked()) pending.* = .start;
-    }
+    if (!disabled) start.processEvents();
+    start.drawBackground();
+    // Keep the disabled label legible instead of using ButtonWidget's averaged text color.
+    dvui.labelNoFmt(@src(), start_label, .{ .align_x = 0.5, .align_y = 0.5 }, start.style().override(.{ .color_text = if (disabled) .{ .color = theme.muted } else null, .gravity_x = 0.5, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0) }));
+    if (!disabled) start.drawFocus();
+    if (!disabled and start.clicked()) pending.* = .start;
 }
 
 fn pickerHeader(src: std.builtin.SourceLocation, name: []const u8, back: []const u8, pending: *?state.Msg) void {
-    const header_height = @max(40, dvui.themeGet().font_title.textSize(name).h);
-    const row = dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal, .min_size_content = .{ .h = header_height } });
-    defer row.deinit();
-    if (action(@src(), back, .{ .gravity_x = 1, .gravity_y = 0.5 })) pending.* = .back;
-    title(@src(), name);
+    _ = back;
+    _ = pending;
+    components.title(src, name);
 }
 
 fn choice(src: std.builtin.SourceLocation, id: u32, name: []const u8, detail: []const u8, current: bool, current_label: []const u8) bool {
     var item: dvui.ButtonWidget = undefined;
-    const item_height = dvui.themeGet().font_body.textSize(name).h + dvui.themeGet().font_body.withSize(14).textSize(detail).h + 4;
-    item.init(src, .{}, .{ .id_extra = id, .expand = .horizontal, .min_size_content = .{ .h = item_height }, .padding = R.all(16), .margin = .{ .h = 12 }, .border = R.all(1), .style = .control, .color_border = if (current) .{ .color = theme.accent } else null, .label = .{ .text = name } });
+    const item_height = dvui.themeGet().font_body.textSize(name).h + theme.captionFont().textSize(detail).h + theme.spacing.detail_gap;
+    item.init(src, .{}, .{ .id_extra = id, .expand = .horizontal, .min_size_content = .{ .h = item_height }, .padding = R.all(theme.spacing.panel_padding), .margin = .{ .h = theme.spacing.card_gap }, .border = R.all(1), .style = .control, .color_border = if (current) .{ .color = theme.accent } else null, .label = .{ .text = name } });
     defer item.deinit();
     item.processEvents();
     item.drawBackground();
     {
         const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .min_size_content = .{ .h = item_height } });
         defer row.deinit();
-        if (current) dvui.labelNoFmt(@src(), current_label, .{}, .{ .gravity_x = 1, .gravity_y = 0.5, .color_text = .{ .color = theme.accent }, .padding = R.all(0), .margin = .{ .x = 12 }, .background = false });
+        if (current) dvui.labelNoFmt(@src(), current_label, .{}, .{ .gravity_x = 1, .gravity_y = 0.5, .color_text = .{ .color = theme.accent }, .padding = R.all(0), .margin = .{ .x = theme.spacing.card_gap }, .background = false });
         {
             const text = dvui.box(@src(), .{}, .{ .expand = .horizontal, .min_size_content = .{ .h = item_height } });
             defer text.deinit();
             dvui.labelNoFmt(@src(), name, .{}, item.style().override(.{ .padding = R.all(0), .margin = R.all(0), .background = false }));
-            gap(@src(), 4);
-            dvui.labelNoFmt(@src(), detail, .{}, item.style().override(.{ .font = dvui.themeGet().font_body.withSize(14), .padding = R.all(0), .margin = R.all(0), .background = false }));
+            gap(@src(), theme.spacing.detail_gap);
+            dvui.labelNoFmt(@src(), detail, .{}, item.style().override(.{ .font = theme.captionFont(), .padding = R.all(0), .margin = R.all(0), .background = false }));
         }
     }
     item.drawFocus();
@@ -756,67 +804,35 @@ fn choice(src: std.builtin.SourceLocation, id: u32, name: []const u8, detail: []
 
 fn players(model: *const state.Model, pending: *?state.Msg) void {
     pickerHeader(@src(), model.labels.choosePlayer, model.labels.back, pending);
-    gap(@src(), 24);
+    gap(@src(), theme.spacing.page_title_gap);
     const scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false, .padding = R.all(0), .border = R.all(0), .label = .{ .text = model.labels.playerList } });
     defer scroll.deinit();
-    if (!model.hasPlayers()) muted(@src(), model.labels.noPlayers);
+    if (!model.hasPlayers()) components.emptyState(@src(), model.labels.noPlayers);
     for (model.players) |p| {
         if (choice(@src(), p.id, p.name, p.kind, p.id == model.selected_player, model.labels.current)) pending.* = .{ .select_player = p.id };
     }
 }
 
-fn versions(model: *const state.Model, snapshot: games.Snapshot, pending: *?state.Msg) void {
-    pickerHeader(@src(), model.labels.chooseVersion, model.labels.back, pending);
-    gap(@src(), 24);
-    if (action(@src(), "获取游戏", .{ .expand = .horizontal, .corners = .all(8), .margin = .{ .h = 16 } })) pending.* = .open_library;
-    const scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false, .padding = R.all(0), .border = R.all(0), .label = .{ .text = model.labels.versionList } });
-    defer scroll.deinit();
-    if (snapshot.installed.len == 0) muted(@src(), model.labels.noVersions);
-    for (snapshot.installed, 0..) |v, i| {
-        if (choice(@src(), @intCast(i), v.id, "原版 · 已安装", std.mem.eql(u8, model.active_game.get(), v.id), model.labels.current)) pending.* = .{ .use_game = v.id };
+fn configuredGameName(model: *const state.Model, document: *const config.Document) []const u8 {
+    if (document.selected_instance) |id| {
+        if (instances.findById(document, id)) |instance| return instance.name;
     }
+    return model.versionName();
 }
 
-const DispatchProbe = struct {
-    publications: usize = 0,
-    policies: usize = 0,
-    selections: usize = 0,
-    java_commands: usize = 0,
-    pack_finishes: usize = 0,
-    pack_blocked: bool = false,
-
-    fn finish(self: *DispatchProbe, gates: DispatchGates, blocked: bool) void {
-        if (!gates.instances) self.publications += 1;
-        if (!gates.content) self.policies += 1;
-        if (!gates.worlds) self.selections += 1;
-        if (!gates.java) self.java_commands += 1;
-        self.pack_finishes += 1;
-        self.pack_blocked = blocked;
-    }
-};
-
-test "whole pack phase pins generic publication policy selection and Java dispatch" {
-    try std.testing.expect(!packWorkflowPinned(null));
-    for ([_]pack_import_controller.Phase{ .preparing, .discovering_java, .probing_java, .downloading_java, .creating, .awaiting_publication, .awaiting_reconciliation, .selecting_content, .awaiting_adoption, .reviewing_content, .cleaning }) |phase| {
-        const gates = dispatchGates(phase, false, false, true);
-        var probe: DispatchProbe = .{};
-        probe.finish(gates, false);
-        try std.testing.expect(gates.java and gates.instances and gates.content and gates.worlds);
-        try std.testing.expectEqual(@as(usize, 0), probe.publications + probe.policies + probe.selections + probe.java_commands);
-        try std.testing.expectEqual(@as(usize, 1), probe.pack_finishes);
-    }
+fn syncSelectedGame(model: *state.Model, document: *const config.Document) void {
+    const id = document.selected_instance orelse return;
+    const instance = instances.findById(document, id) orelse return;
+    _ = model.active_game.set(instance.name);
 }
 
-test "review releases whole pin while residual dependency ownership remains gated" {
-    for ([_]pack_import_controller.Phase{ .idle, .review_required, .failed, .canceled }) |phase| {
-        try std.testing.expect(!phasePinned(phase));
-        const released = dispatchGates(phase, false, false, true);
-        try std.testing.expect(!released.java and !released.instances and !released.content and !released.worlds);
-        const retained = dispatchGates(phase, true, true, true);
-        try std.testing.expect(retained.java and retained.instances);
-        try std.testing.expect(!retained.content and !retained.worlds);
+test "foreground task cancellation and acknowledgement bypass only page gates" {
+    inline for (@typeInfo(instances_view.Action).@"enum".field_values) |value| {
+        const action: instances_view.Action = @fromBackingInt(@intCast(value));
+        try std.testing.expectEqual(action == .cancel or action == .close_task, gatedTaskActionAllowed(action, true));
+        try std.testing.expect(!gatedTaskActionAllowed(action, false));
     }
-    try std.testing.expect(admissionBlocked(.{ .content = true }));
+    try std.testing.expect(!gatedTaskActionAllowed(null, true));
 }
 
 test "queued foreign Java commands and cancellation are discarded without replay" {
@@ -841,30 +857,13 @@ test "queued foreign Java commands and cancellation are discarded without replay
     download_ui.start_admitted = true;
     download_ui.cancel_requested = true;
     try std.testing.expect(javaIntents(&ui, &download_ui));
-    try std.testing.expect(admissionBlocked(.{ .java = javaIntents(&ui, &download_ui) }));
     discardJavaIntents(&ui, &download_ui);
     discardJavaIntents(&ui, &download_ui);
     try std.testing.expect(!javaIntents(&ui, &download_ui));
     try std.testing.expect(!download_ui.start_admitted);
     try std.testing.expect(ui.acquisition_open and ui.search_started);
-    const released = dispatchGates(.review_required, false, false, true);
+    const released = dispatchGates(.idle, false, false, true);
     try std.testing.expect(!released.java and ui.commands.items.len == 0 and download_ui.pending == null);
-}
-
-test "each manual admission barrier blocks new pack work but shutdown still dispatches owned finish" {
-    try std.testing.expect(!admissionBlocked(.{}));
-    inline for (std.meta.fields(ManualIntents)) |field| {
-        var intents: ManualIntents = .{};
-        @field(intents, field.name) = true;
-        try std.testing.expect(admissionBlocked(intents));
-    }
-    const gates = dispatchGates(.awaiting_adoption, true, true, false);
-    const blocked = admissionBlocked(.{ .stopping = true, .uncertain = true });
-    var probe: DispatchProbe = .{};
-    probe.finish(gates, blocked);
-    try std.testing.expectEqual(@as(usize, 0), probe.publications + probe.policies + probe.selections + probe.java_commands);
-    try std.testing.expectEqual(@as(usize, 1), probe.pack_finishes);
-    try std.testing.expect(probe.pack_blocked);
 }
 
 test "Java mutation admission is pinned for preparation and the running process" {

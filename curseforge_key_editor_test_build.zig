@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     module.addImport("dvui", dvui.module("dvui_testing"));
+    module.addImport("test_allocations", b.createModule(.{ .root_source_file = b.path("src/test_allocations.zig") }));
     const tests = b.addTest(.{ .root_module = module, .filters = &.{"CF key editor"} });
     const run = b.addRunArtifact(tests);
     b.default_step.dependOn(&run.step);

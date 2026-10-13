@@ -113,12 +113,12 @@ fn clone(comptime T: type, a: A, value: T) anyerror!T {
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
             var result: T = undefined;
-            inline for (info.fields) |field| @field(result, field.name) = try clone(field.type, a, @field(value, field.name));
+            inline for (info.field_names, info.field_types) |field_name, field_type| @field(result, field_name) = try clone(field_type, a, @field(value, field_name));
             return result;
         },
         .@"union" => |info| {
             const tag = std.meta.activeTag(value);
-            inline for (info.fields) |field| if (tag == @field(info.tag_type.?, field.name)) return @unionInit(T, field.name, try clone(field.type, a, @field(value, field.name)));
+            inline for (info.field_names, info.field_types) |field_name, field_type| if (tag == @field(info.tag_type.?, field_name)) return @unionInit(T, field_name, try clone(field_type, a, @field(value, field_name)));
             unreachable;
         },
         .optional => |info| {
@@ -986,7 +986,7 @@ fn gameReady(job: *Job) !bool {
         else => return error.UnsupportedGamePlatform,
     };
     const game_path = try job.paths.instanceDirectory(job.instance.name);
-    var plan = try game_plan.build(a, version.value, assets.value, .{ .os_name = os_name, .arch = @tagName(builtin.cpu.arch) }, .{
+    var plan = try game_plan.buildInstalled(a, version.value, assets.value, .{ .os_name = os_name, .arch = @tagName(builtin.cpu.arch) }, .{
         .root = job.paths.minecraft,
         .instance_name = job.instance.name,
         .game_directory = game_path,
@@ -1002,7 +1002,7 @@ fn gameReady(job: *Job) !bool {
     }
     for (plan.value.native_checks) |check| {
         if (check.suitability == .incompatible) return error.NativePrerequisiteUnsupported;
-        try verifyNativeArchive(job, minecraft, check.archive_path, plan.value.files, bindings);
+        try verifyNativeArchive(job, minecraft, check.archive_path, plan.value.files, bindings, check.classic_family);
     }
     // Launch extracts legacy natives; content readiness only verifies each source.
     for (plan.value.native_extractions) |extraction| {
@@ -1011,7 +1011,7 @@ fn gameReady(job: *Job) !bool {
             checked = true;
             break;
         };
-        if (!checked) try verifyNativeArchive(job, minecraft, extraction.archive_path, plan.value.files, bindings);
+        if (!checked) try verifyNativeArchive(job, minecraft, extraction.archive_path, plan.value.files, bindings, extraction.classic_family);
     }
     for (plan.value.asset_materializations) |file| if (!try plannedFileReady(job, minecraft, file.destination, file.sha1, file.size)) return false;
     try Job.nestedAcquire(job, job.instance.id);
@@ -1074,8 +1074,8 @@ test "content manager native baseline rejects wrong CPU ABA with identical trust
             return result;
         }
         fn archive(machine: u16) [188]u8 {
-            var bytes = [_]u8{0} ** 188;
-            var elf = [_]u8{0} ** 64;
+            var bytes: [188]u8 = @splat(0);
+            var elf: [64]u8 = @splat(0);
             @memcpy(elf[0..4], "\x7fELF");
             elf[4] = 2;
             elf[5] = 1;
@@ -1157,7 +1157,7 @@ test "content manager native baseline rejects wrong CPU ABA with identical trust
     try final.verify(expected.hashes, expected.size);
 }
 
-fn verifyNativeArchive(job: *Job, minecraft: std.Io.Dir, path: []const u8, files: []const game_plan.File, bindings: []const ArtifactBinding) !void {
+fn verifyNativeArchive(job: *Job, minecraft: std.Io.Dir, path: []const u8, files: []const game_plan.File, bindings: []const ArtifactBinding, family: ?native_verify.ClassicFamily) !void {
     var expected: ?GameFileExpected = null;
     for (files) |file| if (std.mem.eql(u8, file.path, path)) {
         expected = try gameFileExpected(job, file, bindings);
@@ -1169,15 +1169,18 @@ fn verifyNativeArchive(job: *Job, minecraft: std.Io.Dir, path: []const u8, files
     defer leaf.deinit(job.io);
     const source = try fs.openRegular(leaf.dir, job.io, leaf.name);
     defer source.close(job.io);
-    try verifyNativeSource(job.result.arena.allocator(), job.io, source, verified, @tagName(builtin.cpu.arch), job.cancelToken());
+    try verifyNativeSourceWithFamily(job.result.arena.allocator(), job.io, source, verified, @tagName(builtin.cpu.arch), job.cancelToken(), family);
 }
 fn verifyNativeSource(a: A, io: std.Io, source: std.Io.File, expected: GameFileExpected, cpu: []const u8, cancel: ?*const std.atomic.Value(bool)) !void {
+    return verifyNativeSourceWithFamily(a, io, source, expected, cpu, cancel, null);
+}
+fn verifyNativeSourceWithFamily(a: A, io: std.Io, source: std.Io.File, expected: GameFileExpected, cpu: []const u8, cancel: ?*const std.atomic.Value(bool), family: ?native_verify.ClassicFamily) !void {
     const baseline = try source.stat(io);
     try checkNativeSourceStat(baseline, baseline);
     const before = try fs.stream(source, null, io, providers.max_file_bytes, cancel, null);
     try before.verify(expected.hashes, expected.size);
     try checkNativeSourceStat(baseline, try source.stat(io));
-    try native_verify.inspectFile(a, io, source, cpu, cancel);
+    try native_verify.inspectFileWithFamily(a, io, source, cpu, cancel, family);
     try checkNativeSourceStat(baseline, try source.stat(io));
     const after = try fs.stream(source, null, io, providers.max_file_bytes, cancel, null);
     try after.verify(expected.hashes, expected.size);
@@ -1985,6 +1988,15 @@ fn prepareState(job: *Job, path: []const u8, enabled: bool) !void {
     defer plan.deinit();
     job.result.proposal = .{ .plan = try clone(manifest.UpdatePlan, a, plan.value), .desired = try clone(manifest.Manifest, a, plan.value.next_manifest), .ready = plan.value.ready, .dependencies_ready = true };
 }
+fn removalManifest(a: A, previous: manifest.Manifest, removed_path: []const u8, records: []const manifest.ManagedFile) !manifest.Manifest {
+    var membership = previous.pack_membership;
+    if (membership) |prior| {
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (prior.paths) |path| if (!std.mem.eql(u8, path, removed_path)) try paths.append(a, path);
+        membership = if (paths.items.len == 0) null else .{ .identity = prior.identity, .paths = try paths.toOwnedSlice(a) };
+    }
+    return .{ .schema_version = previous.schema_version, .instance_id = previous.instance_id, .pack_version = previous.pack_version, .files = records, .pack_membership = membership };
+}
 fn prepareRemoval(job: *Job, adapter: *transport.Adapter, path: []const u8) !void {
     const a = job.result.arena.allocator();
     const previous = try readManifest(job, a);
@@ -2003,7 +2015,7 @@ fn prepareRemoval(job: *Job, adapter: *transport.Adapter, path: []const u8) !voi
             for (found[0].dependencies) |dep| if (dep.kind == .required and ((dep.project_id != null and std.mem.eql(u8, dep.project_id.?, target.project_id)) or (dep.version_id != null and std.mem.eql(u8, dep.version_id.?, target.version_id)))) return error.RequiredByInstalledContent;
         }
     }
-    const desired: manifest.Manifest = .{ .instance_id = previous.instance_id, .pack_version = previous.pack_version, .files = try records.toOwnedSlice(a) };
+    const desired = try removalManifest(a, previous, path, try records.toOwnedSlice(a));
     const observed = try observe(job, a, previous, desired);
     var plan = try manifest.buildUpdatePlan(a, previous, desired, observed, &.{}, .{ .instance_id = job.instance.id, .instance_name = job.instance.name, .running = false });
     defer plan.deinit();
@@ -2311,4 +2323,33 @@ test "content shutdown drain joins bounded fakes and preserves late publication 
         try std.testing.expectEqual(expected_failure, service.snapshot().failure);
         try std.testing.expectEqual(@as(usize, 1), registry.tasks().len);
     }
+}
+
+test "removal retains unrelated pack ownership and filters only the removed member" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const pack_file: manifest.ManagedFile = .{ .path = "mods/owned.jar", .provider = .modrinth, .project_id = "child", .version_id = "v1", .hashes = .{ .sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .size = 3, .identity_provenance = .official_file, .standalone = false };
+    var addon = pack_file;
+    addon.path = "mods/addon.jar";
+    addon.standalone = true;
+    const previous: manifest.Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "pack-v1", .files = &.{ pack_file, addon }, .pack_membership = .{ .identity = .{ .provider = .modrinth, .project_id = "pack", .version_id = "pack-v1" }, .paths = &.{pack_file.path} } };
+    const desired = try removalManifest(arena.allocator(), previous, addon.path, &.{pack_file});
+    try manifest.validate(desired);
+    try std.testing.expectEqual(@as(u32, 2), desired.schema_version);
+    try std.testing.expectEqualStrings("pack-v1", desired.pack_version);
+    try std.testing.expectEqualStrings("pack", desired.pack_membership.?.identity.project_id);
+    try std.testing.expectEqualStrings(pack_file.path, desired.pack_membership.?.paths[0]);
+    const observed = [_]manifest.ObservedFile{ .{ .path = pack_file.path, .hashes = pack_file.hashes, .size = 3 }, .{ .path = addon.path, .hashes = addon.hashes, .size = 3 } };
+    var plan = try manifest.buildUpdatePlan(std.testing.allocator, previous, desired, &observed, &.{}, .{ .instance_id = "instance", .instance_name = "Test", .running = false });
+    defer plan.deinit();
+    try std.testing.expect(plan.value.ready and plan.value.fully_applied);
+    try std.testing.expectEqualStrings(pack_file.path, plan.value.next_manifest.pack_membership.?.paths[0]);
+    const removed_member = try removalManifest(arena.allocator(), previous, pack_file.path, &.{addon});
+    try manifest.validate(removed_member);
+    try std.testing.expect(removed_member.pack_membership == null);
+    var legacy = previous;
+    legacy.schema_version = 1;
+    legacy.pack_membership = null;
+    const old = try removalManifest(arena.allocator(), legacy, addon.path, &.{pack_file});
+    try std.testing.expectEqual(@as(u32, 1), old.schema_version);
 }

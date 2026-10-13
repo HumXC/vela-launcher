@@ -26,6 +26,7 @@ pub const Actions = struct {
     hide: bool = false,
     restore: bool = false,
     show_logs: bool = false,
+    show_home: bool = false,
     prompt_background: bool = false,
     cancel_background: bool = false,
     quit: bool = false,
@@ -64,8 +65,15 @@ pub const Policy = struct {
     /// A late failure still overrides a pending normal-exit shutdown.
     pub fn gameEnded(self: *Policy, reason: EndReason, active_background: usize) Actions {
         const was_active = self.game != .idle;
+        const closed_logs = self.options.debug_launch and self.hidden_by_close;
         self.game = .idle;
         self.hidden_by_close = false;
+        // Closing debug output dismisses that page for this launch, including
+        // abnormal exits. Restore Home after the child has finished.
+        if (was_active and closed_logs) {
+            self.shutdown = .none;
+            return .{ .restore = true, .show_home = true };
+        }
         if (reason.abnormal()) {
             self.shutdown = .none;
             return .{ .restore = true, .show_logs = true };
@@ -199,7 +207,28 @@ test "window close while preparing or running only hides and keeps game alive" {
                 try std.testing.expectEqual(Actions{ .show_logs = true }, policy.gameRunning());
             }
             if (debug) {
-                try std.testing.expectEqual(Actions{ .restore = true, .show_logs = true }, policy.gameEnded(.stopped, 0));
+                try std.testing.expectEqual(Actions{ .restore = true, .show_home = true }, policy.gameEnded(.stopped, 0));
+            }
+        }
+    }
+}
+
+test "dismissed debug logs restore Home for every end reason and reset per launch" {
+    const reasons = [_]EndReason{ .{ .exited = 0 }, .{ .exited = 1 }, .stopped, .failed, .terminated };
+    for (reasons) |reason| {
+        for ([_]bool{ false, true }) |running| {
+            for ([_]ExitBehavior{ .restore_launcher, .exit_launcher }) |after_game| {
+                var policy: Policy = .{};
+                _ = policy.launchStarted(.{ .debug_launch = true, .after_game = after_game });
+                if (running) _ = policy.gameRunning();
+                _ = policy.closeRequested(3);
+                try std.testing.expectEqual(Actions{ .restore = true, .show_home = true }, policy.gameEnded(reason, 3));
+                try std.testing.expectEqual(Shutdown.none, policy.shutdown);
+                try std.testing.expect(!policy.hidden_by_close);
+                try std.testing.expect(policy.canLaunch());
+                try std.testing.expectEqual(Actions{}, policy.backgroundChanged(0));
+                try std.testing.expectEqual(Actions{ .restore = true, .show_logs = true }, policy.launchStarted(.{ .debug_launch = true }));
+                try std.testing.expectEqual(Actions{ .restore = true, .show_logs = true }, policy.gameEnded(.{ .exited = 0 }, 0));
             }
         }
     }

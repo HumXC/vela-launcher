@@ -45,7 +45,9 @@ pub const Request = struct {
     /// use expected_sha1 instead; combining file and cache_path is rejected.
     /// Cache paths must not be shared by simultaneous Service instances.
     cache_path: ?[]const u8 = null,
+    /// Null or empty disables ALL environment proxies; explicit proxies ignore NO_PROXY.
     proxy: ?[]const u8 = null,
+    /// PEM trust for both the origin and HTTPS proxy. Null loads native trust.
     ca_bundle: ?[]const u8 = null,
     timeout_ms: u32 = 120_000,
     /// Prevent initial or redirected requests from using plaintext HTTP.
@@ -189,7 +191,7 @@ pub const Service = struct {
         const a = self.allocator;
         const t = try a.create(Task);
         errdefer a.destroy(t);
-        t.* = .{ .service = self, .request = request, .url = try a.dupeZ(u8, request.url), .temp = undefined };
+        t.* = .{ .service = self, .request = request, .url = try a.dupeSentinel(u8, request.url, 0), .temp = undefined };
         errdefer a.free(t.url);
         t.destination = switch (request.output) {
             .file => |p| try a.dupe(u8, p),
@@ -200,9 +202,9 @@ pub const Service = struct {
         errdefer if (t.cache_path) |p| a.free(p);
         t.meta_path = if (request.cache_path) |p| try std.fmt.allocPrint(a, "{s}.meta.json", .{p}) else null;
         errdefer if (t.meta_path) |p| a.free(p);
-        t.proxy = if (request.proxy) |p| try a.dupeZ(u8, p) else null;
+        t.proxy = if (request.proxy) |p| try a.dupeSentinel(u8, p, 0) else null;
         errdefer if (t.proxy) |p| a.free(p);
-        t.ca = if (request.ca_bundle) |p| try a.dupeZ(u8, p) else null;
+        t.ca = if (request.ca_bundle) |p| try a.dupeSentinel(u8, p, 0) else null;
         errdefer if (t.ca) |p| a.free(p);
         t.temp = try std.fmt.allocPrint(a, "{s}.vela-{x}.part", .{ t.destination orelse t.cache_path orelse "download", @intFromPtr(t) });
         self.tasks[index] = t;
@@ -427,13 +429,20 @@ pub const Service = struct {
             try set(e, c.CURLOPT_FRESH_CONNECT, @as(c_long, 1));
             try set(e, c.CURLOPT_FORBID_REUSE, @as(c_long, 1));
             try set(e, c.CURLOPT_OPENSOCKETDATA, &t.callback_error);
-            try set(e, c.CURLOPT_PROXY, @as([*:0]const u8, ""));
-        } else if (t.proxy) |p| try set(e, c.CURLOPT_PROXY, p.ptr);
+        }
+        try set(e, c.CURLOPT_PROXY, if (t.proxy) |p| p.ptr else @as([*:0]const u8, ""));
+        try set(e, c.CURLOPT_NOPROXY, @as([*:0]const u8, ""));
+        try set(e, c.CURLOPT_SSL_VERIFYPEER, @as(c_long, 1));
+        try set(e, c.CURLOPT_SSL_VERIFYHOST, @as(c_long, 2));
+        try set(e, c.CURLOPT_PROXY_SSL_VERIFYPEER, @as(c_long, 1));
+        try set(e, c.CURLOPT_PROXY_SSL_VERIFYHOST, @as(c_long, 2));
         if (t.ca) |p| {
             try set(e, c.CURLOPT_CAINFO, p.ptr);
+            try set(e, c.CURLOPT_PROXY_CAINFO, p.ptr);
         } else {
             const blob: c.curl_blob = .{ .data = self.ca_bundle.items.ptr, .len = self.ca_bundle.items.len, .flags = c.CURL_BLOB_NOCOPY };
             try set(e, c.CURLOPT_CAINFO_BLOB, &blob);
+            try set(e, c.CURLOPT_PROXY_CAINFO_BLOB, &blob);
         }
         if (!t.retry_unconditional) if (t.cache_meta) |meta| {
             const value = if (meta.value.etag.len > 0) meta.value.etag else meta.value.modified;
@@ -634,7 +643,9 @@ fn progressCallback(userdata: ?*anyopaque, total: c.curl_off_t, now: c.curl_off_
     t.progress.received = @intCast(@max(now, 0));
     t.progress.total = if (total > 0) @intCast(total) else null;
     const dt = time - t.last_time;
-    if (dt >= 100_000_000) {
+    // Small artifacts can finish before the regular 100 ms sampling interval.
+    // Publish their first measured byte delta immediately.
+    if (dt > 0 and (dt >= 100_000_000 or (t.progress.bytes_per_second == 0 and t.progress.received > t.last_count))) {
         const speed = @as(f64, @floatFromInt(t.progress.received -| t.last_count)) * 1e9 / @as(f64, @floatFromInt(dt));
         t.progress.bytes_per_second = if (t.progress.bytes_per_second == 0) speed else 0.3 * speed + 0.7 * t.progress.bytes_per_second;
         t.last_time = time;
@@ -642,4 +653,17 @@ fn progressCallback(userdata: ?*anyopaque, total: c.curl_off_t, now: c.curl_off_
     }
     t.progress.eta_seconds = if (t.progress.total != null and t.progress.bytes_per_second > 0) @as(f64, @floatFromInt(t.progress.total.? -| t.progress.received)) / t.progress.bytes_per_second else null;
     return 0;
+}
+
+test "first download bytes produce speed before the regular sampling interval" {
+    var service: Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1 };
+    var url = "https://example.invalid/small.jar".*;
+    var task: Task = .{ .service = &service, .request = .{ .url = &url }, .url = &url, .temp = &.{}, .progress = .{ .phase = .downloading }, .last_time = std.Io.Clock.awake.now(std.testing.io).nanoseconds - 10 * std.time.ns_per_ms };
+    try std.testing.expectEqual(@as(c_int, 0), progressCallback(&task, 100, 50, 0, 0));
+    try std.testing.expect(task.progress.bytes_per_second > 0);
+    try std.testing.expectEqual(@as(u64, 50), task.progress.received);
+    try std.testing.expect(task.progress.eta_seconds.? > 0);
+    const speed = task.progress.bytes_per_second;
+    _ = progressCallback(&task, 100, 50, 0, 0);
+    try std.testing.expectEqual(speed, task.progress.bytes_per_second);
 }

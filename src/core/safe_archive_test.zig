@@ -124,7 +124,7 @@ fn allocationScenario(allocator: std.mem.Allocator, path: []const u8) !void {
 test "all metadata allocation failures release owned memory and remain staged" {
     const path = try fixture("good.zip");
     defer a.free(path);
-    try std.testing.checkAllAllocationFailures(a, allocationScenario, .{path});
+    try @import("test_allocations").checkAllAllocationFailures(a, allocationScenario, .{path});
 }
 
 const Fault = struct {
@@ -251,7 +251,7 @@ test "link CRC and copied bytes quota are enforced" {
 test "link graph allocation failures release all metadata" {
     const path = try fixture("links.zip");
     defer a.free(path);
-    try std.testing.checkAllAllocationFailures(a, allocationScenario, .{path});
+    try @import("test_allocations").checkAllAllocationFailures(a, allocationScenario, .{path});
 }
 
 test "cancellation during link materialization stops partial copy" {
@@ -329,4 +329,188 @@ test "native filesystem Unicode aliases cannot overwrite existing extracted data
         try checkFile(dirs.dir, "é/a", "first", false);
         try checkFile(dirs.dir, "e\u{301}/b", "second", false);
     }
+}
+
+const directory_limits: archive.Limits = .{ .materialize_directory_links = true };
+
+test "opt-in JDK directory aliases copy implicit trees chains and empty directories" {
+    for ([_][]const u8{ "jdk-directories.zip", "jdk-directories.tgz" }) |name| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try fixture(name);
+        defer a.free(path);
+        var result = try archive.extract(a, io, path, tmp.dir, format(name), directory_limits, null);
+        defer result.deinit(a);
+        try eq(@as(u64, 66), result.total_bytes);
+        try eq(@as(usize, 20), result.entries.len);
+        for ([_][]const u8{ "java.base", "java.desktop", "chain" }) |part| {
+            const license = try std.fmt.allocPrint(a, "jdk/legal/{s}/LICENSE", .{part});
+            defer a.free(license);
+            const copy = try std.fmt.allocPrint(a, "jdk/legal/{s}/COPY", .{part});
+            defer a.free(copy);
+            const notice = try std.fmt.allocPrint(a, "jdk/legal/{s}/nested/NOTICE", .{part});
+            defer a.free(notice);
+            try checkFile(tmp.dir, license, "license", false);
+            try checkFile(tmp.dir, copy, "license", false);
+            try checkFile(tmp.dir, notice, "notice", false);
+        }
+        try checkFile(tmp.dir, "jdk/legal/notice", "notice", false);
+        var empty = try tmp.dir.openDir(io, "jdk/legal/empty-copy", .{ .follow_symlinks = false, .iterate = true });
+        defer empty.close(io);
+        var it = empty.iterate();
+        try expect(try it.next(io) == null);
+        try tmp.dir.writeFile(io, .{ .sub_path = "jdk/legal/java.base/LICENSE", .data = "changed" });
+        try checkFile(tmp.dir, "jdk/legal/java.desktop/LICENSE", "license", false);
+    }
+}
+
+test "directory copy policy rejects unsafe graphs and directory hardlinks" {
+    for ([_][]const u8{ "zip", "tgz" }) |extension| {
+        for ([_][]const u8{ "directory-ancestor", "directory-indirect-cycle", "directory-self-descendant", "cycle", "self-link" }) |label| {
+            const name = try std.fmt.allocPrint(a, "{s}.{s}", .{ label, extension });
+            defer a.free(name);
+            try failure(name, error.ArchiveLinkCycle, directory_limits);
+        }
+        for ([_][]const u8{ "missing-link", "directory-case" }) |label| {
+            const name = try std.fmt.allocPrint(a, "{s}.{s}", .{ label, extension });
+            defer a.free(name);
+            try failure(name, error.MissingArchiveLinkTarget, directory_limits);
+        }
+        const root = try std.fmt.allocPrint(a, "directory-root.{s}", .{extension});
+        defer a.free(root);
+        try failure(root, error.UnsupportedDirectoryLink, directory_limits);
+        const conflict = try std.fmt.allocPrint(a, "directory-conflict.{s}", .{extension});
+        defer a.free(conflict);
+        try failure(conflict, error.ArchivePathConflict, directory_limits);
+        for ([_][]const u8{ "absolute-link", "escape-link", "drive-link" }) |label| {
+            const name = try std.fmt.allocPrint(a, "{s}.{s}", .{ label, extension });
+            defer a.free(name);
+            try failure(name, error.UnsafeArchiveLinkTarget, directory_limits);
+        }
+    }
+    try failure("directory-hardlink.tgz", error.UnsupportedDirectoryLink, directory_limits);
+    try failure("directory-hardchain.tgz", error.UnsupportedDirectoryLink, directory_limits);
+    try failure("directory-crc.zip", error.ArchiveChecksumMismatch, directory_limits);
+}
+
+test "directory copies enforce byte path count path bytes depth and link limits" {
+    var limits = directory_limits;
+    limits.max_total_bytes = 65;
+    try failure("jdk-directories.zip", error.ArchiveSizeLimitExceeded, limits);
+    limits = directory_limits;
+    limits.max_paths = 19;
+    try failure("jdk-directories.zip", error.ArchivePathLimitExceeded, limits);
+    limits = directory_limits;
+    limits.max_total_path_bytes = 23; // Original paths plus target fit; copied child exceeds it.
+    try failure("directory-quota.zip", error.ArchivePathLimitExceeded, limits);
+    limits = directory_limits;
+    limits.max_path_bytes = 13; // Original longest name is 12; copied child is 14.
+    try failure("directory-quota.zip", error.UnsafeArchivePath, limits);
+    limits = directory_limits;
+    limits.max_path_depth = 2; // Only the copied extra/alias/a reaches depth three.
+    try failure("directory-depth.zip", error.ArchivePathLimitExceeded, limits);
+    limits = directory_limits;
+    limits.max_link_depth = 2;
+    try failure("jdk-directories.zip", error.ArchiveLinkDepthExceeded, limits);
+}
+
+fn directoryAllocationScenario(allocator: std.mem.Allocator, path: []const u8) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var result = try archive.extract(allocator, io, path, tmp.dir, .zip, directory_limits, null);
+    defer result.deinit(allocator);
+}
+
+test "directory graph allocation failures release all metadata" {
+    const path = try fixture("jdk-directories.zip");
+    defer a.free(path);
+    try @import("test_allocations").checkAllAllocationFailures(a, directoryAllocationScenario, .{path});
+}
+
+test "cancellation during directory materialization stops partial copy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try fixture("large-directory.zip");
+    defer a.free(path);
+    var cancel: archive.Cancel = .init(false);
+    Fault.count = 0;
+    Fault.fail_at = 10;
+    Fault.cancel = &cancel;
+    defer {
+        Fault.cancel = null;
+        Fault.fail_at = 2;
+    }
+    var vtable = io.vtable.*;
+    vtable.operate = Fault.operate;
+    const fault_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    try std.testing.expectError(error.Canceled, archive.extract(a, fault_io, path, tmp.dir, .zip, directory_limits, &cancel));
+    try eq(@as(usize, 10), Fault.count);
+    const file = try tmp.dir.openFile(io, "copy/large", .{ .follow_symlinks = false });
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
+    try expect(size > 0 and size < 262144);
+}
+
+test "production Java adapter accepts JDK license directory links and executable Java" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try fixture("jdk-install.tgz");
+    defer a.free(path);
+    const destination = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(destination);
+    var adapter: @import("java_archive.zig").Adapter = .{};
+    const extractor = adapter.extractor();
+    const java = try extractor.extract(extractor.context, a, io, .tar_gz, path, destination, .{});
+    defer a.free(java);
+    try std.testing.expectEqualStrings("jdk/bin/java", java);
+    try checkFile(tmp.dir, java, "java executable", true);
+    try checkFile(tmp.dir, "jdk/legal/java.desktop/LICENSE", "license", false);
+    try checkFile(tmp.dir, "jdk/legal/chain/nested/NOTICE", "notice", false);
+}
+
+test "directory copies refuse native Unicode aliases without overwriting sources" {
+    var probe = std.testing.tmpDir(.{});
+    defer probe.cleanup();
+    try probe.dir.createDir(io, "é", .default_dir);
+    const aliases = if (probe.dir.createDir(io, "e\u{301}", .default_dir)) false else |err| switch (err) {
+        error.PathAlreadyExists => true,
+        else => return err,
+    };
+    for ([_][]const u8{ "directory-alias-collision.zip", "directory-alias-collision.tgz" }) |name| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try fixture(name);
+        defer a.free(path);
+        if (aliases) {
+            try std.testing.expectError(error.AliasCollision, archive.extract(a, io, path, tmp.dir, format(name), directory_limits, null));
+        } else {
+            var result = try archive.extract(a, io, path, tmp.dir, format(name), directory_limits, null);
+            defer result.deinit(a);
+            try checkFile(tmp.dir, "e\u{301}/a", "first", false);
+        }
+        try checkFile(tmp.dir, "é/a", "first", false);
+    }
+}
+
+test "directory copies conservatively refuse reentrant aliases even for finite file references" {
+    for ([_][]const u8{ "directory-reentrant-file.zip", "directory-reentrant-file.tgz" }) |name| {
+        try failure(name, error.ArchiveLinkCycle, directory_limits);
+    }
+}
+
+test "production Java adapter selects JDK launcher over embedded JRE after tar extraction" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try fixture("jdk8-install.tgz");
+    defer a.free(path);
+    const destination = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(destination);
+    var adapter: @import("java_archive.zig").Adapter = .{};
+    const extractor = adapter.extractor();
+    const java = try extractor.extract(extractor.context, a, io, .tar_gz, path, destination, .{});
+    defer a.free(java);
+    try std.testing.expectEqualStrings("jdk/bin/java", java);
+    try checkFile(tmp.dir, java, "java executable", true);
+    try checkFile(tmp.dir, "jdk/jre/bin/java", "embedded java", true);
+    try checkFile(tmp.dir, "jdk/legal/java.desktop/LICENSE", "license", false);
 }

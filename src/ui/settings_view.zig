@@ -111,24 +111,6 @@ pub const Ui = struct {
     }
 };
 
-fn fieldLabel(src: std.builtin.SourceLocation, text: []const u8) void {
-    dvui.labelNoFmt(src, text, .{}, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 6 } });
-}
-
-fn numericEntry(src: std.builtin.SourceLocation, name: []const u8, buffer: []u8) bool {
-    const height = dvui.themeGet().font_body.textHeight();
-    const entry = dvui.textEntry(src, .{ .text = .{ .buffer = buffer } }, .{ .tag = name, .label = .{ .text = name }, .expand = .horizontal, .min_size_content = .{ .h = height }, .max_size_content = .{ .w = 240, .h = height }, .padding = R.all(8), .margin = .{ .h = 16 }, .corners = .all(4) });
-    if (@import("builtin").is_test) {
-        const border_tag = std.fmt.allocPrint(dvui.currentWindow().arena(), "{s}-border", .{name}) catch name;
-        dvui.tag(border_tag, .{ .id = entry.data().id, .rect = entry.data().borderRectScale().r, .visible = entry.data().visible() });
-        const caret_tag = std.fmt.allocPrint(dvui.currentWindow().arena(), "{s}-caret", .{name}) catch name;
-        dvui.tag(caret_tag, .{ .id = entry.textLayout.data().id, .rect = entry.textLayout.screenRectScale(entry.textLayout.cursor_rect).r, .visible = entry.data().visible() });
-    }
-    const changed = entry.text_changed;
-    entry.deinit();
-    return changed;
-}
-
 fn failureText(failure: anyerror) []const u8 {
     return switch (failure) {
         error.InvalidMemory => "内存必须为 256 至 1048576 MiB 的整数",
@@ -136,10 +118,6 @@ fn failureText(failure: anyerror) []const u8 {
         error.InvalidClientId => "Microsoft 客户端 ID 含无效字符或超过 4096 字节",
         else => "保存失败",
     };
-}
-
-fn segment(src: std.builtin.SourceLocation, label: []const u8, selected: bool) bool {
-    return dvui.button(src, label, .{}, .{ .label = .{ .text = label }, .style = if (selected) .highlight else .control, .expand = .horizontal, .min_size_content = .{ .h = 20 }, .padding = R.all(8), .margin = R.all(0), .border = R.all(1), .corners = .all(4) });
 }
 
 fn requireKeyCommand(command: KeyCommand, snapshot: credential_controller.Snapshot, content_busy: bool, store_uncertain: bool) !void {
@@ -160,99 +138,66 @@ fn keyAllowed(command: KeyCommand, snapshot: credential_controller.Snapshot, con
     return true;
 }
 
-fn policyCheckbox(src: std.builtin.SourceLocation, value: *bool, label: []const u8, enabled: bool) bool {
-    const opts = dvui.checkbox_defaults.override(.{ .padding = R.all(0), .margin = .{ .h = 16 } });
-    if (enabled) return dvui.checkbox(src, value, label, opts);
-    const row = dvui.box(src, .{ .dir = .horizontal }, opts.override(.{ .expand = .horizontal, .color_text = .{ .color = theme.muted } }));
-    defer row.deinit();
-    const size = opts.fontGet().textHeight();
-    const mark = dvui.spacer(@src(), .{ .min_size_content = dvui.Size.all(size), .gravity_y = 0.5 });
-    dvui.checkmark(value.*, false, mark.borderRectScale(), false, 0, opts);
-    dvui.labelNoFmt(@src(), label, .{}, .{ .color_text = .{ .color = theme.muted }, .gravity_y = 0.5, .padding = .{ .x = 6 } });
-    return false;
-}
-
-fn keyIcon(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8, enabled: bool) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, .{ .label = .{ .text = name }, .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .padding = R.all(8), .margin = .{ .x = 4 }, .corners = .all(4) });
-    if (enabled) button.processEvents() else button.processHover();
-    button.drawBackground();
-    dvui.icon(@src(), name, asset, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0), .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .role = .none }));
-    button.drawFocus();
-    const clicked = enabled and button.clicked();
-    const control_id = button.data().id;
-    const rect = button.data().borderRectScale().r;
-    button.deinit();
-    components.tooltip(src, control_id, rect, name);
-    return clicked;
-}
-
-fn keyStatus(src: std.builtin.SourceLocation, value: []const u8, warning: bool) void {
-    const message = dvui.textLayout(src, .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = 6 }, .color_text = .{ .color = if (warning) dvui.Color.fromHex("F0A6A1") else theme.muted } });
-    message.addText(value, .{});
-    message.deinit();
-}
-
 fn drawCredentials(ui: *Ui, snapshot: credential_controller.Snapshot, settings: config.Settings, content_busy: bool, store_uncertain: bool) void {
     const configured = settings.curseforge_credential_ref != null;
     if (!configured) ui.confirm_remove = false;
     const editor = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0) });
     defer editor.deinit();
-    fieldLabel(@src(), "CurseForge API 密钥");
+    components.fieldLabel(@src(), "CurseForge API 密钥");
     const action = components.formActions(@src(), .{ .save_label = "保存密钥", .save_enabled = ui.key_pending == null and keyAllowed(.save_key, snapshot, content_busy, store_uncertain) and ui.key_editor.readyForSave() });
     if (action == .cancel) ui.key_discard_queued = true;
-    keyStatus(@src(), if (configured) "已配置" else "未配置", false);
-    const height = (dvui.Options{}).fontGet().sizeM(0, 1).h;
-    const result = ui.key_editor.draw(@src(), .{ .expand = .horizontal, .min_size_content = .{ .h = height }, .max_size_content = .height(height), .padding = R.all(8), .margin = .{ .h = 8 }, .corners = .all(4) });
+    components.text(@src(), if (configured) "已配置" else "未配置", theme.muted);
+    const result = ui.key_editor.draw(@src(), components.entryOptions("CurseForge API 密钥", .{}));
     if (result.edited) ui.key_failure = null;
     if (result.cancel) ui.key_discard_queued = true;
     if (!ui.key_discard_queued and (action == .save or result.submit)) ui.requestKey(.save_key, snapshot, content_busy, store_uncertain) catch |err| {
         ui.key_failure = err;
     };
     switch (result.status) {
-        .invalid_input => keyStatus(@src(), "密钥含无效字符", true),
-        .too_long => keyStatus(@src(), "密钥超过 512 字节", true),
+        .invalid_input => components.text(@src(), "密钥含无效字符", theme.danger),
+        .too_long => components.text(@src(), "密钥超过 512 字节", theme.danger),
         else => {},
     }
     {
-        const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 8 } });
+        const actions = components.toolbar(@src());
         defer actions.deinit();
         const remove_allowed = configured and ui.key_pending == null and keyAllowed(.remove_key, snapshot, content_busy, store_uncertain);
-        if (keyIcon(@src(), "移除 API 密钥", dvui.entypo.trash, remove_allowed)) {
+        if (components.iconButton(@src(), "移除 API 密钥", dvui.entypo.trash, .{ .enabled = remove_allowed })) {
             ui.clearKey();
             ui.confirm_remove = true;
         }
-        if (keyIcon(@src(), "恢复凭据状态", dvui.entypo.cw, ui.key_pending == null and keyAllowed(.recover_key, snapshot, content_busy, store_uncertain))) ui.requestKey(.recover_key, snapshot, content_busy, store_uncertain) catch |err| {
+        if (components.iconButton(@src(), "恢复凭据状态", dvui.entypo.cw, .{ .enabled = ui.key_pending == null and keyAllowed(.recover_key, snapshot, content_busy, store_uncertain) })) ui.requestKey(.recover_key, snapshot, content_busy, store_uncertain) catch |err| {
             ui.key_failure = err;
         };
     }
     if (ui.confirm_remove) {
-        keyStatus(@src(), "确认移除 CurseForge API 密钥？", true);
-        const confirmation = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 8 } });
-        defer confirmation.deinit();
-        if (keyIcon(@src(), "确认移除 API 密钥", dvui.entypo.check, configured and ui.key_pending == null and keyAllowed(.remove_key, snapshot, content_busy, store_uncertain))) ui.requestKey(.remove_key, snapshot, content_busy, store_uncertain) catch |err| {
-            ui.key_failure = err;
-        };
-        if (keyIcon(@src(), "取消移除", dvui.entypo.cross, true)) ui.clearKey();
+        components.text(@src(), "确认移除 CurseForge API 密钥？", theme.danger);
+        switch (components.formActions(@src(), .{ .save_label = "确认移除 API 密钥", .cancel_label = "取消移除", .save_enabled = configured and ui.key_pending == null and keyAllowed(.remove_key, snapshot, content_busy, store_uncertain) })) {
+            .save => ui.requestKey(.remove_key, snapshot, content_busy, store_uncertain) catch |err| {
+                ui.key_failure = err;
+            },
+            .cancel => ui.clearKey(),
+            .none => {},
+        }
     }
     if (store_uncertain or snapshot.commit_uncertain) {
-        keyStatus(@src(), "配置持久化状态待确认", true);
+        components.text(@src(), "配置持久化状态待确认", theme.danger);
     } else if (snapshot.cleanup_pending) {
-        keyStatus(@src(), "凭据变更已保存，清理尚未完成", true);
+        components.text(@src(), "凭据变更已保存，清理尚未完成", theme.danger);
     } else if (snapshot.recovery_required) {
-        keyStatus(@src(), "凭据状态需要恢复", true);
+        components.text(@src(), "凭据状态需要恢复", theme.danger);
     } else if (snapshot.publication_pending) {
-        keyStatus(@src(), "正在保存凭据配置", false);
+        components.text(@src(), "正在保存凭据配置", theme.muted);
     } else if (snapshot.busy) {
-        keyStatus(@src(), "正在处理凭据", false);
+        components.text(@src(), "正在处理凭据", theme.muted);
     } else if (snapshot.committed) {
-        keyStatus(@src(), if (configured) "密钥配置已保存" else "密钥已移除", false);
+        components.text(@src(), if (configured) "密钥配置已保存" else "密钥已移除", theme.muted);
     }
     const failure: ?anyerror = if (ui.key_failure) |err| err else snapshot.failure;
     if (failure) |err| {
         var buffer: [256]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, "凭据操作失败（{s}）", .{@errorName(err)}) catch "凭据操作失败";
-        keyStatus(@src(), message, true);
+        components.text(@src(), message, theme.danger);
     }
 }
 
@@ -275,56 +220,73 @@ pub fn drawUnavailable(ui: *Ui, settings: config.Settings, failure: anyerror) !v
 fn drawPage(ui: *Ui, controller: ?*credential_controller.Controller, settings: config.Settings, content_busy: bool, store_uncertain: bool, credential_failure: ?anyerror) !void {
     const page = dvui.box(@src(), .{}, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
     defer page.deinit();
-    dvui.labelNoFmt(@src(), "设置", .{}, .{ .font = dvui.themeGet().font_title, .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 16 } });
+    components.title(@src(), "设置");
     switch (components.formActions(@src(), .{})) {
         .save => ui.pending = .save,
         .cancel => ui.pending = .cancel,
         .none => {},
     }
     {
-        const scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false, .border = R.all(0), .padding = R.all(0), .margin = R.all(0) });
+        const scroll = components.scrollBody(@src());
         defer scroll.deinit();
-        fieldLabel(@src(), "默认游戏内存（MiB）");
-        if (numericEntry(@src(), "默认游戏内存", &ui.memory_buffer)) ui.edited();
-        fieldLabel(@src(), "下载连接数");
-        if (numericEntry(@src(), "下载连接数", &ui.connections_buffer)) ui.edited();
-        fieldLabel(@src(), "游戏结束后");
         {
-            const modes = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .max_size_content = .width(360), .padding = R.all(0), .margin = .{ .h = 16 } });
+            const panel = components.formPanel(@src(), .{ .tag = "settings-resources" });
+            defer panel.deinit();
+            const fields = components.formRow(@src());
+            defer fields.deinit();
+            {
+                const cell = fields.cell(@src(), 0);
+                defer cell.deinit();
+                if (components.field(@src(), "默认游戏内存（MiB）", &ui.memory_buffer, .{ .gap_after = 0, .digits_only = true, .tag = "默认游戏内存" })) ui.edited();
+            }
+            {
+                const cell = fields.cell(@src(), 1);
+                defer cell.deinit();
+                if (components.field(@src(), "下载连接数", &ui.connections_buffer, .{ .gap_after = 0, .digits_only = true, .tag = "下载连接数" })) ui.edited();
+            }
+        }
+        {
+            const panel = components.formPanel(@src(), .{ .tag = "settings-game-exit" });
+            defer panel.deinit();
+            components.fieldLabel(@src(), "游戏结束后");
+            const modes = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .max_size_content = .width(360), .padding = R.all(0), .margin = R.all(0) });
             defer modes.deinit();
-            if (segment(@src(), "显示启动器", ui.game_exit_behavior == .restore_launcher)) {
+            if (components.button(@src(), "显示启动器", .{ .primary = ui.game_exit_behavior == .restore_launcher })) {
                 ui.game_exit_behavior = .restore_launcher;
                 ui.edited();
             }
-            if (segment(@src(), "退出启动器", ui.game_exit_behavior == .exit_launcher)) {
+            if (components.button(@src(), "退出启动器", .{ .primary = ui.game_exit_behavior == .exit_launcher })) {
                 ui.game_exit_behavior = .exit_launcher;
                 ui.edited();
             }
         }
-        fieldLabel(@src(), "Microsoft 客户端 ID");
         {
-            const height = dvui.themeGet().font_body.textHeight();
-            const entry = dvui.textEntry(@src(), .{ .text = .{ .array_list = .{ .backing = &ui.client_id, .allocator = ui.a, .limit = 4096 } } }, .{ .label = .{ .text = "Microsoft 客户端 ID" }, .expand = .horizontal, .min_size_content = .{ .h = height }, .max_size_content = .height(height), .padding = R.all(8), .margin = .{ .h = 16 }, .corners = .all(4) });
+            const panel = components.formPanel(@src(), .{ .tag = "settings-microsoft" });
+            defer panel.deinit();
+            components.fieldLabel(@src(), "Microsoft 客户端 ID");
+            const entry = dvui.textEntry(@src(), .{ .text = .{ .array_list = .{ .backing = &ui.client_id, .allocator = ui.a, .limit = 4096 } } }, components.entryOptions("Microsoft 客户端 ID", .{ .gap_after = 0 }));
             if (entry.text_changed) ui.edited();
             entry.deinit();
         }
-        const policy_enabled = credential_failure == null and (if (controller) |active| !active.lease() and !content_busy else true);
-        if (policyCheckbox(@src(), &ui.curseforge_enabled, "CurseForge", policy_enabled)) ui.edited();
-        if (policyCheckbox(@src(), &ui.curseforge_terms_approved, "已确认 CurseForge 接入条款", policy_enabled)) ui.edited();
-        if (controller) |active| drawCredentials(ui, active.snapshot(), settings, content_busy, store_uncertain);
-        if (credential_failure) |err| {
-            fieldLabel(@src(), "CurseForge API 密钥");
-            var buffer: [256]u8 = undefined;
-            const message = std.fmt.bufPrint(&buffer, "密钥不可用（{s}）", .{@errorName(err)}) catch "密钥不可用";
-            keyStatus(@src(), message, true);
+        {
+            const panel = components.formPanel(@src(), .{ .tag = "settings-curseforge" });
+            defer panel.deinit();
+            const policy_enabled = credential_failure == null and (if (controller) |active| !active.lease() and !content_busy else true);
+            if (components.toggle(@src(), &ui.curseforge_enabled, "CurseForge", policy_enabled)) ui.edited();
+            if (components.checkbox(@src(), &ui.curseforge_terms_approved, "已确认 CurseForge 接入条款", policy_enabled)) ui.edited();
+            if (controller) |active| drawCredentials(ui, active.snapshot(), settings, content_busy, store_uncertain);
+            if (credential_failure) |err| {
+                components.fieldLabel(@src(), "CurseForge API 密钥");
+                var buffer: [256]u8 = undefined;
+                const message = std.fmt.bufPrint(&buffer, "密钥不可用（{s}）", .{@errorName(err)}) catch "密钥不可用";
+                components.text(@src(), message, theme.danger);
+            }
         }
         if (ui.failure) |failure| {
             const text = try std.fmt.allocPrint(dvui.currentWindow().arena(), "{s}（{s}）", .{ failureText(failure), @errorName(failure) });
-            const message = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0), .color_text = .{ .color = dvui.Color.fromHex("F0A6A1") } });
-            message.addText(text, .{});
-            message.deinit();
+            components.text(@src(), text, theme.danger);
         } else if (ui.saved) {
-            dvui.labelNoFmt(@src(), "已保存", .{}, .{ .expand = .horizontal, .color_text = .{ .color = theme.accent }, .padding = R.all(0), .margin = R.all(0) });
+            components.text(@src(), "已保存", theme.accent);
         }
     }
 }
@@ -530,8 +492,8 @@ test "settings save and cancel are deferred and preserve unrelated current recor
     try std.testing.expect(ui.failure == null);
     try std.testing.expectEqual(@as(u32, 4096), (try ui.settings()).default_memory_mb);
     try std.testing.expectEqualStrings("public-client", ui.client_id.items);
-    var reopened = try config.Store.init(a, std.testing.io, root);
-    defer reopened.deinit();
+    try store.reconcile();
+    const reopened = &store;
     try std.testing.expectEqual(@as(u32, 4096), reopened.snapshot().settings.default_memory_mb);
 }
 
@@ -575,7 +537,7 @@ test "settings disk failure retains draft and old store then permits retry" {
 }
 
 test "settings init rolls back allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(a: std.mem.Allocator) !void {
             var ui = try Ui.init(a, .{ .microsoft_client_id = "public-client" });
             defer ui.deinit();
@@ -693,8 +655,8 @@ test "settings explicit Save reconciles committed disk account references and Ca
     try std.testing.expect(latest.settings.curseforge_terms_approved);
     try std.testing.expectEqualStrings(reference, latest.settings.curseforge_credential_ref.?);
     try std.testing.expectEqualStrings("edited-public-client", latest.settings.microsoft_client_id);
-    var reloaded = try config.Store.init(a, std.testing.io, root);
-    defer reloaded.deinit();
+    try store.reconcile();
+    const reloaded = &store;
     try std.testing.expectEqualStrings(reference, reloaded.snapshot().accounts[0].credential_ref.?);
     try std.testing.expectEqualStrings(reference, reloaded.snapshot().settings.curseforge_credential_ref.?);
     try std.testing.expect(reloaded.snapshot().settings.curseforge_terms_approved);

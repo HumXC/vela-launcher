@@ -9,15 +9,7 @@ const cf = @import("core/curseforge_credentials_manager.zig");
 const cleanup = @import("core/auth_cleanup.zig");
 const auth = @import("core/auth.zig");
 const accounts = @import("ui/accounts_manager.zig");
-const c = @cImport({
-    // Translate libc declarations directly; glibc's fortified inline open wrappers fail C translation.
-    @cUndef("_FORTIFY_SOURCE");
-    @cDefine("_FORTIFY_SOURCE", "0");
-    @cInclude("unistd.h");
-    @cInclude("sys/stat.h");
-    @cInclude("fcntl.h");
-    @cInclude("stdlib.h");
-});
+const c = @import("linux_c");
 const A = std.mem.Allocator;
 var wipe_regions: usize = 0; // This driver observes buffers on its coordinator thread only.
 var isolation_rejected = std.atomic.Value(bool).init(false);
@@ -172,7 +164,7 @@ fn procFileBytes(name: []const u8, max: usize) ![]u8 {
     };
 }
 fn statNoLink(name: []const u8) !c.struct_stat {
-    const z = try a.dupeZ(u8, name);
+    const z = try a.dupeSentinel(u8, name, 0);
     defer a.free(z);
     var s: c.struct_stat = undefined;
     if (c.lstat(z.ptr, &s) != 0) return error.OwnedPathUnavailable;
@@ -308,7 +300,7 @@ fn gate(g: *const Grant, input: []const u8, progress: *PreGateStage) !void {
     }) |entry| {
         const value = try path(&.{ g.root, entry[1] });
         defer a.free(value);
-        const name = try a.dupeZ(u8, entry[0]);
+        const name = try a.dupeSentinel(u8, entry[0], 0);
         defer a.free(name);
         try require(std.mem.eql(u8, try env(name), value));
         try privatePath(value, g.uid, true);
@@ -482,7 +474,7 @@ fn validAndInvalidCF(g: *const Grant, guard: *Guard) !void {
     const receipt = try manager.prepareSet(try cf.prepareConfig(&manager, &cfg), reference(g, 9), &good, .{});
     const publication = try cf.publish(&manager, &cfg, receipt, .{ .enabled = true, .terms_approved = true });
     try manager.acknowledge(publication, .{});
-    const too_long = [_]u8{'k'} ** 513;
+    const too_long: [513]u8 = @splat('k');
     for ([_][]const u8{ "", "has space", "bad\nkey", &too_long }) |bad| {
         const prior = try cf.prepareConfig(&manager, &cfg);
         var observer: Observer = .{};
@@ -616,13 +608,13 @@ fn recoverAuth(g: *const Grant, guard: *Guard) !void {
     try equal(guard.store(), g.refs[7], "owned-refresh-fixture");
     try absent(guard.store(), g.refs[8]);
 }
-// Called ONLY by the post-gate errdefer. Never includes error text or secret data.
+// Called ONLY by the post-gate catch. Never includes error text or secret data.
 fn reportFailure(g: *const Grant, stage: FailureStage, err: anyerror) !void {
     const name = try std.fmt.allocPrint(a, "failure-{s}.json", .{@tagName(g.phase)});
     defer a.free(name);
     const full = try path(&.{ g.root, name });
     defer a.free(full);
-    const z = try a.dupeZ(u8, full);
+    const z = try a.dupeSentinel(u8, full, 0);
     defer a.free(z);
     const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u8, 1), .phase = @tagName(g.phase), .stage = @tagName(stage), .class = @tagName(failureClass(err)), .passed = false }, .{});
     defer a.free(bytes);
@@ -653,11 +645,15 @@ fn runOwnedAcceptance() anyerror!void {
     defer diagnostic.deinit();
     var progress: PreGateStage = .opt_in;
     var gate_complete = false;
-    errdefer |err| {
+    runOwnedAcceptanceInner(&diagnostic, &progress, &gate_complete) catch |err| {
         if (!gate_complete) diagnostic.emit(.pregate_failure, .{ .pregate = progress }, failureClass(err), null);
-    }
+        return err;
+    };
+}
+
+fn runOwnedAcceptanceInner(diagnostic: *Diagnostic, progress: *PreGateStage, gate_complete: *bool) anyerror!void {
     try require(std.mem.eql(u8, try env("VELA_NATIVE_VAULT_ACCEPTANCE"), "owned-only"));
-    progress = .input;
+    progress.* = .input;
     var input: [16384]u8 = undefined;
     var used: usize = 0;
     while (used < input.len) {
@@ -667,65 +663,69 @@ fn runOwnedAcceptance() anyerror!void {
         used += @intCast(n);
     }
     try require(used > 0 and used < input.len);
-    progress = .json;
+    progress.* = .json;
     const parsed = try std.json.parseFromSlice(Grant, a, input[0..used], .{ .allocate = .alloc_always });
     defer parsed.deinit();
     const g = &parsed.value;
-    try gate(g, input[0..used], &progress); // ALL native initialization stays below this boundary.
-    gate_complete = true;
+    try gate(g, input[0..used], progress); // ALL native initialization stays below this boundary.
+    gate_complete.* = true;
     var stage: FailureStage = .native_init;
     // Reporting remains best effort; the channel preserves the original failure.
-    errdefer |err| {
+    runNativeAcceptance(g, &stage) catch |err| {
         var secondary: ?FailureClass = null;
         reportFailure(g, stage, err) catch |write_error| {
             secondary = failureClass(write_error);
         };
         diagnostic.emit(if (secondary == null) .native_failure else .report_write_failure, .{ .native = stage }, failureClass(err), secondary);
-    }
+        return err;
+    };
+}
+
+fn runNativeAcceptance(g: *const Grant, stage: *FailureStage) anyerror!void {
     var native = try credentials.Native.init();
     defer native.deinit();
     var guard: Guard = .{ .grant = g, .native = native.store() };
     switch (g.phase) {
         .seed => {
-            stage = .crud;
+            stage.* = .crud;
             try guard.store().put(g.refs[0], "owned-crud-first-fixture");
             try equal(guard.store(), g.refs[0], "owned-crud-first-fixture");
             try guard.store().put(g.refs[0], "owned-crud-replacement-fixture");
             try equal(guard.store(), g.refs[0], "owned-crud-replacement-fixture");
-            stage = .cf_rollback;
+            stage.* = .cf_rollback;
             try seedCF(g, &guard, "rollback", 1, 2, false, false);
-            stage = .cf_commit;
+            stage.* = .cf_commit;
             try seedCF(g, &guard, "commit", 3, 4, true, false);
-            stage = .cf_ambiguous;
+            stage.* = .cf_ambiguous;
             try seedCF(g, &guard, "ambiguous", 5, 6, false, true);
-            stage = .auth_seed;
+            stage.* = .auth_seed;
             try seedAuth(g, &guard);
         },
         .recover => {
-            stage = .crud;
+            stage.* = .crud;
             try equal(guard.store(), g.refs[0], "owned-crud-replacement-fixture");
             try guard.store().delete(g.refs[0]);
             try absent(guard.store(), g.refs[0]);
-            stage = .cf_rollback;
+            stage.* = .cf_rollback;
             try recoverCF(g, &guard, "rollback", 1, 2, false);
-            stage = .cf_commit;
+            stage.* = .cf_commit;
             try recoverCF(g, &guard, "commit", 3, 4, true);
-            stage = .cf_ambiguous;
+            stage.* = .cf_ambiguous;
             try recoverCF(g, &guard, "ambiguous", 5, 6, false);
-            stage = .cf_valid_invalid;
+            stage.* = .cf_valid_invalid;
             try validAndInvalidCF(g, &guard);
-            stage = .auth_cleanup;
+            stage.* = .auth_cleanup;
             try recoverAuth(g, &guard);
         },
         .cleanup => for (g.refs) |ref| {
-            stage = .vault_cleanup;
+            stage.* = .vault_cleanup;
             guard.store().delete(ref) catch |err| {
                 if (err != error.NotFound) return @as(anyerror!void, err);
             };
             try absent(guard.store(), ref);
         },
     }
-    stage = .report;
+    stage.* = .report;
     try report(g, &guard);
 }
 

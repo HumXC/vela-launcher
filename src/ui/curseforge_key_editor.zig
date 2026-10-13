@@ -213,7 +213,7 @@ const unsupported_actions = [_][]const u8{
 };
 
 fn lockExports(entry: *dvui.TextEntryWidget) void {
-    entry.textLayout.te_show_context_menu = false;
+    entry.textLayout.state.te_show_context_menu = false;
     entry.textLayout.process_events_in_deinit = false;
 }
 
@@ -427,12 +427,12 @@ test "CF key editor first repeated touch and handled release persist export lock
     for (0..4) |frame| {
         var entry: dvui.TextEntryWidget = undefined;
         editor.initEntry(&entry, .{});
-        try std.testing.expectEqual(frame != 0, entry.textLayout.touch_editing);
-        try std.testing.expect(!entry.textLayout.te_show_context_menu);
+        try std.testing.expectEqual(frame != 0, entry.textLayout.state.touch_editing);
+        try std.testing.expect(!entry.textLayout.state.te_show_context_menu);
         try std.testing.expect(!entry.textLayout.process_events_in_deinit);
         try std.testing.expectEqualStrings("PublicClipboard", fixture.backend.clipboard.?);
         if (frame == 0) editor.insert(&entry, "TouchCanary!", false);
-        entry.textLayout.touch_editing = true;
+        entry.textLayout.state.touch_editing = true;
         var release: dvui.Event = .{ .handled = true, .evt = .{ .mouse = .{
             .action = .release,
             .button = .touch0,
@@ -442,15 +442,15 @@ test "CF key editor first repeated touch and handled release persist export lock
         } } };
         // Prove the dependency regression trigger, then enforce wrapper reset.
         _ = entry.matchEvent(&release);
-        try std.testing.expect(entry.textLayout.te_show_context_menu);
+        try std.testing.expect(entry.textLayout.state.te_show_context_menu);
         lockExports(&entry);
         entry.draw();
         // Leave a handled release in the real queue: default deinit would set
         // context true again while doing its cursor-only event traversal.
         try fixture.window.events.insert(fixture.window.arena(), fixture.window.events.items.len - 1, release);
-        const layout_id = entry.textLayout.data().id;
+        const layout_state = entry.textLayout.state;
         editor.finishEntry(&entry);
-        try std.testing.expect(!dvui.dataGet(null, layout_id, "_te_show_context_menu", bool).?);
+        try std.testing.expect(!layout_state.te_show_context_menu);
         try std.testing.expectEqualStrings("TouchCanary!", try editor.borrowForSave());
         try std.testing.expectEqualStrings("PublicClipboard", fixture.backend.clipboard.?);
         try testAdvance(&fixture);

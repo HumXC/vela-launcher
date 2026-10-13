@@ -164,6 +164,14 @@ pub const Manager = struct {
         try self.syncSelection(store);
     }
     pub fn addOffline(self: *Manager, store: *config.Store, name: []const u8) !void {
+        return self.createOffline(store, name, false);
+    }
+    /// Publish the new account and its selection together for explicit offline login.
+    pub fn loginOffline(self: *Manager, store: *config.Store, name: []const u8) !void {
+        if (self.active != null or self.publication != null) return error.Busy;
+        return self.createOffline(store, name, true);
+    }
+    fn createOffline(self: *Manager, store: *config.Store, name: []const u8, select_new: bool) !void {
         const uuid = try offlineUuid(name);
         var doc = store.snapshot().*;
         if (duplicateUuid(&doc, &uuid, null)) return error.DuplicateUuid;
@@ -178,8 +186,18 @@ pub const Manager = struct {
         @memcpy(items[0..doc.accounts.len], doc.accounts);
         items[items.len - 1] = .{ .id = id, .name = name, .uuid = &uuid, .kind = .offline };
         doc.accounts = items;
+        var new_selection: ?OwnedLaunchSession = null;
+        errdefer if (new_selection) |*selection| selection.deinit();
+        if (select_new) {
+            doc.selected_account = id;
+            // Prepare all owned metadata before committing so allocation failure is retryable.
+            new_selection = try OwnedLaunchSession.clone(self.allocator, .{ .id = id, .username = name, .uuid = &uuid, .kind = .offline, .access_token = null }, 0);
+        }
         try store.update(doc);
-        try self.syncSelection(store);
+        if (new_selection) |selection| {
+            self.clearSelection();
+            self.selection = selection;
+        } else try self.syncSelection(store);
     }
     pub fn editOffline(self: *Manager, store: *config.Store, id: []const u8, name: []const u8) !void {
         const uuid = try offlineUuid(name);
@@ -596,8 +614,20 @@ test "accounts profile guard bounds body depth and token count" {
     defer std.testing.allocator.free(oversized);
     @memset(oversized, ' ');
     try std.testing.expectError(error.BodyTooLarge, profileMatches(std.testing.allocator, oversized, expected));
-    try std.testing.expectError(error.ResourceLimit, profileMatches(std.testing.allocator, "[" ** 33 ++ "0" ++ "]" ** 33, expected));
-    try std.testing.expectError(error.ResourceLimit, profileMatches(std.testing.allocator, "[" ++ "0," ** 8192 ++ "0]", expected));
+    const deep = comptime blk: {
+        var bytes: [67]u8 = @splat('[');
+        bytes[33] = '0';
+        @memset(bytes[34..], ']');
+        break :blk bytes;
+    };
+    try std.testing.expectError(error.ResourceLimit, profileMatches(std.testing.allocator, &deep, expected));
+    const many_tokens = comptime blk: {
+        @setEvalBranchQuota(20_000);
+        var repeated: [2 * 8192]u8 = undefined;
+        for (0..8192) |i| @memcpy(repeated[i * 2 ..][0..2], "0,");
+        break :blk "[" ++ repeated ++ "0]";
+    };
+    try std.testing.expectError(error.ResourceLimit, profileMatches(std.testing.allocator, many_tokens, expected));
 }
 const Worker = struct {
     io: Io,

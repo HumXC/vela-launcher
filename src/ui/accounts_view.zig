@@ -3,14 +3,16 @@ const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("../core/config.zig");
 const accounts_manager = @import("accounts_manager.zig");
+const avatar_manager = @import("avatar_manager.zig");
+const avatar_image = @import("avatar_image.zig");
 const theme = @import("theme.zig");
 const components = @import("components.zig");
 const Allocator = std.mem.Allocator;
 const Manager = accounts_manager.Manager;
 const R = dvui.Rect;
-const danger = dvui.Color.fromHex("F0A6A1");
+const danger = theme.danger;
 
-const Action = enum { add, edit, save, close_editor, select, ask_delete, ask_sign_out, confirm, close_confirm, start, cancel, close_login, copy_code, open_uri, probe_remember, forget_remember, retry_cleanup, retry_publication, refresh };
+const Action = enum { add, edit, save, close_editor, select, ask_delete, ask_sign_out, confirm, close_confirm, start, cancel, close_login, copy_code, open_verification, open_uri, probe_remember, forget_remember, retry_cleanup, retry_publication, refresh };
 const Pending = struct {
     action: Action,
     id: ?[]u8 = null,
@@ -23,7 +25,7 @@ const Pending = struct {
 };
 const Draft = struct {
     id: ?[]u8 = null,
-    name: [65]u8 = @splat(0),
+    name: [255]u8 = @splat(0),
     fn deinit(self: *Draft, a: Allocator) void {
         if (self.id) |v| a.free(v);
         self.* = .{};
@@ -41,6 +43,7 @@ pub const Ui = struct {
     editor_open: bool = false,
     confirmation: ?Confirmation = null,
     login_open: bool = false,
+    verification_open: bool = false,
     remember: bool = false,
     remember_probe: bool = false,
     failure: ?anyerror = null,
@@ -104,47 +107,6 @@ fn validVerificationUri(uri: []const u8) bool {
 fn fmt(comptime format: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), format, args) catch "";
 }
-fn wrapped(src: std.builtin.SourceLocation, value: []const u8, color: dvui.Color) void {
-    const layout = dvui.textLayout(src, .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = 6 }, .color_text = .{ .color = color } });
-    layout.addText(value, .{});
-    layout.deinit();
-}
-fn iconButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8, enabled: bool) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, .{ .label = .{ .text = name }, .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .padding = R.all(8), .margin = .{ .x = 4 }, .corners = .all(4) });
-    if (enabled) button.processEvents() else button.processHover();
-    button.drawBackground();
-    dvui.icon(@src(), name, asset, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0), .min_size_content = .{ .w = 18, .h = 18 }, .max_size_content = .{ .w = 18, .h = 18 }, .role = .none }));
-    button.drawFocus();
-    const clicked = enabled and button.clicked();
-    const control_id = button.data().id;
-    const rect = button.data().borderRectScale().r;
-    button.deinit();
-    components.tooltip(src, control_id, rect, name);
-    return clicked;
-}
-fn command(src: std.builtin.SourceLocation, text: []const u8, enabled: bool) bool {
-    var button: dvui.ButtonWidget = undefined;
-    button.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, .{ .label = .{ .text = text }, .padding = R.all(8), .margin = .{ .x = 4, .y = 4 }, .corners = .all(4) });
-    if (enabled) button.processEvents() else button.processHover();
-    button.drawBackground();
-    dvui.labelNoFmt(@src(), text, .{}, button.style().override(.{ .padding = R.all(0), .margin = R.all(0), .role = .none }));
-    button.drawFocus();
-    const clicked = enabled and button.clicked();
-    button.deinit();
-    return clicked;
-}
-fn rememberCheckbox(src: std.builtin.SourceLocation, target: *bool, enabled: bool) bool {
-    const opts = dvui.checkbox_defaults.override(.{ .margin = .{ .y = 6 }, .padding = R.all(0) });
-    if (enabled) return dvui.checkbox(src, target, "记住登录", opts);
-    const row = dvui.box(src, .{ .dir = .horizontal }, opts.override(.{ .color_text = .{ .color = theme.muted } }));
-    defer row.deinit();
-    const size = opts.fontGet().textHeight();
-    const mark = dvui.spacer(@src(), .{ .min_size_content = dvui.Size.all(size), .gravity_y = 0.5 });
-    dvui.checkmark(target.*, false, mark.borderRectScale(), false, 0, opts);
-    dvui.labelNoFmt(@src(), "记住登录", .{}, .{ .color_text = .{ .color = theme.muted }, .gravity_y = 0.5, .padding = .{ .x = 6 } });
-    return false;
-}
 fn phaseText(phase: accounts_manager.Phase) []const u8 {
     return switch (phase) {
         .idle => "未登录",
@@ -161,144 +123,198 @@ fn phaseText(phase: accounts_manager.Phase) []const u8 {
     };
 }
 fn errorText(failure: anyerror) []const u8 {
-    return fmt("操作失败：{s}", .{@errorName(failure)});
-}
-fn modal(src: std.builtin.SourceLocation, title: []const u8, height: f32) *dvui.FloatingWindowWidget {
-    const window = dvui.windowRect();
-    const width = @max(0, @min(460, window.w - 24));
-    const h = @max(0, @min(height, window.h - 24));
-    const result = dvui.floatingWindow(src, .{ .modal = true, .resize = .none, .window_avoid = .none }, .{ .rect = .{ .x = window.x + (window.w - width) / 2, .y = window.y + (window.h - h) / 2, .w = width, .h = h }, .min_size_content = .{ .w = @max(0, width - 26), .h = @max(0, h - 26) }, .max_size_content = .{ .w = @max(0, width - 26), .h = @max(0, h - 26) }, .padding = R.all(12), .margin = R.all(0), .border = R.all(1), .corners = .all(8), .label = .{ .text = title } });
-    result.dragAreaSet(dvui.windowHeader(title, "", null));
-    return result;
+    return switch (failure) {
+        error.SelectionChanged => "所选账户已更改，请关闭后重新编辑",
+        error.EditorRequired => "请先打开所选账户的编辑窗口",
+        error.Busy => "账户操作尚未完成，请稍后重试",
+        error.InvalidAccountName => "用户名须为 3–16 位字母、数字或下划线",
+        error.DuplicateUuid => "此账户已存在，请直接选择已有账户",
+        error.AccountNotFound => "账户不存在，请重新选择",
+        else => fmt("操作失败：{s}", .{@errorName(failure)}),
+    };
 }
 
-pub fn draw(ui: *Ui, store: *config.Store, manager: *Manager) void {
+pub fn draw(ui: *Ui, store: *config.Store, manager: *Manager, avatars: ?*avatar_manager.Manager) void {
     const doc = store.snapshot();
     const snapshot = manager.snapshot();
-    const configured = doc.settings.microsoft_client_id.len != 0;
+    const controls_busy = snapshot.busy or snapshot.publication_pending;
     {
-        const header = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = 10 } });
+        const header = components.toolbar(@src());
         defer header.deinit();
-        dvui.labelNoFmt(@src(), "账户", .{}, .{ .expand = .horizontal, .padding = R.all(0) });
-        if (iconButton(@src(), "添加离线账户", dvui.entypo.plus, !snapshot.busy)) ui.queue(.add, null, null);
-    }
-    if (ui.failure) |err| wrapped(@src(), errorText(err), danger);
-    if (snapshot.failure) |err| wrapped(@src(), errorText(err), danger);
-    if (snapshot.busy and !ui.login_open and !ui.remember_probe) {
-        wrapped(@src(), phaseText(snapshot.phase), theme.accent);
-        if (command(@src(), "取消登录", true)) ui.queue(.cancel, null, null);
-    }
-    if (doc.accounts.len == 0) wrapped(@src(), "暂无账户", theme.muted);
-    for (doc.accounts, 0..) |account, index| {
-        const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = index, .expand = .horizontal, .padding = .{ .y = 8 }, .margin = R.all(0), .border = .{ .h = 1 } });
-        {
-            const metadata = dvui.box(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0) });
-            wrapped(@src(), account.name, if (selected(doc, account.id)) theme.accent else dvui.Color.fromHex("EDF1EA"));
-            wrapped(@src(), if (account.kind == .offline) "离线" else "Microsoft", theme.muted);
-            wrapped(@src(), account.uuid, theme.muted);
-            metadata.deinit();
-        }
-        if (selected(doc, account.id)) {
-            dvui.labelNoFmt(@src(), "已选择", .{}, .{ .color_text = .{ .color = theme.accent }, .padding = R.all(8) });
-        } else if (command(@src(), "选择", !snapshot.busy)) ui.queue(.select, account.id, null);
-        if (account.kind == .offline) {
-            if (iconButton(@src(), "编辑账户", dvui.entypo.edit, !snapshot.busy)) ui.queue(.edit, account.id, null);
-            if (iconButton(@src(), "删除账户", dvui.entypo.trash, !snapshot.busy)) ui.queue(.ask_delete, account.id, null);
-        } else {
-            if (selected(doc, account.id) and canRefresh(account, manager)) {
-                if (iconButton(@src(), "刷新登录", dvui.entypo.cw, !snapshot.busy and configured)) ui.queue(.refresh, account.id, null);
+        components.title(@src(), "选择账户");
+        if (doc.selected_account) |id| {
+            if (findAccount(doc, id)) |account| {
+                if (components.iconButton(@src(), "编辑账户", dvui.entypo.edit, .{ .enabled = !controls_busy, .tag = "account-edit" })) ui.queue(.edit, account.id, null);
             }
-            if (iconButton(@src(), "退出登录", dvui.entypo.log_out, !snapshot.busy)) ui.queue(.ask_sign_out, account.id, null);
         }
-        row.deinit();
+        if (components.iconButton(@src(), "添加账户", dvui.entypo.plus, .{ .enabled = !controls_busy, .tag = "account-add" })) ui.queue(.add, null, null);
     }
-    if (!configured) wrapped(@src(), "Microsoft 客户端 ID 未配置", theme.muted);
-    if (command(@src(), "Microsoft 登录", configured and !snapshot.busy and !snapshot.publication_pending)) ui.queue(.start, null, null);
     {
-        var remember = ui.remember;
-        if (rememberCheckbox(@src(), &remember, !snapshot.busy and snapshot.device == null and !snapshot.publication_pending and !ui.remember_probe)) {
-            ui.queue(if (remember) .probe_remember else .forget_remember, null, null);
+        const scroll = components.scrollBody(@src());
+        defer scroll.deinit();
+        if (!ui.editor_open and !ui.login_open and ui.confirmation == null) {
+            if (ui.failure) |err| components.text(@src(), errorText(err), danger);
+            if (snapshot.failure) |err| components.text(@src(), errorText(err), danger);
         }
-        if (ui.remember_probe) wrapped(@src(), "正在检查安全存储", theme.muted);
+        if (snapshot.busy) {
+            components.text(@src(), phaseText(snapshot.phase), theme.accent);
+            if (components.button(@src(), "取消操作", .{})) ui.queue(.cancel, null, null);
+        }
+        if (doc.accounts.len == 0) components.emptyState(@src(), "暂无账户，点击右上角 ＋ 添加");
+        var cards = @import("card_grid.zig").init(@src(), doc.accounts.len, .{ .min_width = theme.style.layout.account_min_width, .max_columns = theme.style.layout.account_columns, .tag = "account-cards" });
+        for (doc.accounts, 0..) |account, index| {
+            const cell = cards.cell(@src(), index, account.id);
+            defer cell.deinit();
+            const initial = account.name[0..@min(account.name.len, std.unicode.utf8ByteSequenceLength(if (account.name.len > 0) account.name[0] else ' ') catch 1)];
+            var fallback: ?avatar_image.Face = if (avatars == null) avatar_image.defaultFace(dvui.currentWindow().arena(), account.uuid) catch null else null;
+            const face = if (avatars) |cache| cache.face(account) else if (fallback) |*local| local else null;
+            var visible = false;
+            if (components.selectionCard(@src(), account.id, account.name, .{
+                .selected = selected(doc, account.id),
+                .enabled = !snapshot.busy,
+                .width = cards.cardWidth(index),
+                .height = theme.style.cards.account_height,
+                .compact = true,
+                .stretch = true,
+                .bounded_text = true,
+                .description = if (account.kind == .offline) "离线账户" else "微软账户",
+                .avatar_text = initial,
+                .avatar_size = theme.style.cards.avatar,
+                .avatar_source = if (face) |pixels| avatar_image.source(pixels) else null,
+                .avatar_tag = fmt("account-avatar-{s}", .{account.id}),
+                .visible = &visible,
+                .tag = fmt("account-card-{s}", .{account.id}),
+            })) ui.queue(.select, account.id, null);
+            if (visible) if (avatars) |cache| cache.request(account) catch {};
+        }
+        cards.deinit();
+        if (snapshot.cleanup_count != 0) {
+            components.text(@src(), fmt("待清理凭据：{d}", .{snapshot.cleanup_count}), theme.muted);
+            if (components.button(@src(), "重试清理", .{ .enabled = !snapshot.busy })) ui.queue(.retry_cleanup, null, null);
+        }
+        if (snapshot.publication_pending) {
+            components.text(@src(), "账户保存未完成", danger);
+            if (components.button(@src(), "重试保存", .{ .enabled = !snapshot.busy })) ui.queue(.retry_publication, null, null);
+        }
     }
-    if (snapshot.cleanup_count != 0) {
-        wrapped(@src(), fmt("待清理凭据：{d}", .{snapshot.cleanup_count}), theme.muted);
-        if (command(@src(), "重试清理", !snapshot.busy)) ui.queue(.retry_cleanup, null, null);
+    if (avatars) |cache| {
+        const delay_ms = cache.retryDelayMilliseconds();
+        if (delay_ms != std.math.maxInt(u32)) dvui.timer(dvui.parentGet().data().id.update("account-avatar-poll"), @intCast(@min(@as(u64, delay_ms) * 1000, std.math.maxInt(i32))));
     }
-    if (snapshot.publication_pending) {
-        wrapped(@src(), "账户保存未完成", danger);
-        if (command(@src(), "重试保存", !snapshot.busy)) ui.queue(.retry_publication, null, null);
-    }
-    if (ui.editor_open) drawEditor(ui, snapshot.busy);
-    if (ui.confirmation != null) drawConfirmation(ui, doc, snapshot.busy);
-    if (ui.login_open) drawLogin(ui, doc, manager, snapshot, configured);
+    drawDialogs(ui, doc, controls_busy);
 }
 
-fn drawEditor(ui: *Ui, busy: bool) void {
-    const font = (dvui.Options{}).fontGet();
-    // Budget the title, field, wrapped validation and footer using actual font
-    // metrics. The modal clamps to the viewport; excess body text remains scrollable.
-    const height = @max(@as(f32, 320), 120 + 7 * font.lineHeight());
-    const window = modal(@src(), if (ui.draft.id == null) "添加离线账户" else "编辑离线账户", height);
+/// Presentation only: queues user intent; callers decide whether to execute it.
+pub fn drawDialogs(ui: *Ui, doc: *const config.Document, busy: bool) void {
+    if (ui.editor_open) drawEditor(ui, doc, busy);
+    if (ui.confirmation != null) drawConfirmation(ui, doc, busy);
+    if (ui.login_open) drawLogin(ui);
+}
+
+fn drawEditor(ui: *Ui, doc: *const config.Document, busy: bool) void {
+    const adding = ui.draft.id == null;
+    const account = if (ui.draft.id) |id| findAccount(doc, id) else null;
+    const current = if (account) |value| selected(doc, value.id) else false;
+    const microsoft = if (account) |value| value.kind == .microsoft else false;
+    const enabled = !busy and current;
+    const height = (if (microsoft) theme.style.dialogs.microsoft_account_height else theme.style.dialogs.account_height) +
+        (if (ui.failure != null) theme.style.dialogs.error_height else @as(f32, 0));
+    const window = components.modal(@src(), if (adding) "添加账户" else if (microsoft) "编辑微软账户" else "编辑离线账户", height);
     defer window.deinit();
-    const action = components.formActions(@src(), .{ .save_enabled = validName(std.mem.sliceTo(&ui.draft.name, 0)) and !busy });
-    if (action == .cancel) ui.queue(.close_editor, null, null);
-    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
-    defer scroll.deinit();
-    dvui.labelNoFmt(@src(), "玩家名称", .{}, .{ .padding = R.all(0), .margin = .{ .h = 6 } });
-    const input = dvui.textEntry(@src(), .{ .text = .{ .buffer = &ui.draft.name } }, .{ .label = .{ .text = "玩家名称" }, .expand = .horizontal, .min_size_content = .{ .h = font.textHeight() }, .max_size_content = .height(font.textHeight()), .padding = R.all(8), .corners = .all(4) });
-    input.deinit();
     const name = std.mem.sliceTo(&ui.draft.name, 0);
-    if (!validName(name)) wrapped(@src(), "名称须为 3–16 位字母、数字或下划线", danger);
-    if (ui.failure) |err| wrapped(@src(), errorText(err), danger);
-    if (action == .save and validName(name) and !busy) ui.queue(.save, ui.draft.id, name);
+    {
+        const actions = components.modalActions(@src(), 3);
+        defer actions.deinit();
+        if (actions.action(@src(), 0, "取消", .{ .tag = "account-cancel" })) ui.queue(.close_editor, null, null);
+        if (!adding) {
+            if (actions.action(@src(), 1, "删除", .{ .enabled = enabled, .destructive = true, .tag = "account-delete" })) ui.queue(if (microsoft) .ask_sign_out else .ask_delete, ui.draft.id, null);
+        }
+        if (microsoft) {
+            if (actions.action(@src(), 2, "退出登录", .{ .enabled = enabled, .tag = "account-sign-out" })) ui.queue(.ask_sign_out, ui.draft.id, null);
+        } else {
+            if (actions.action(@src(), if (adding) 1 else 2, if (adding) "离线登录" else "保存", .{ .enabled = !busy and (adding or current), .primary = !adding, .tag = "account-offline-login" })) ui.queue(.save, ui.draft.id, name);
+        }
+        if (adding) {
+            if (actions.action(@src(), 2, "微软登录", .{ .enabled = !busy, .primary = true, .tag = "account-microsoft-login" })) ui.queue(.start, null, null);
+        }
+    }
+    const scroll = components.scrollBody(@src());
+    defer scroll.deinit();
+    if (adding) {
+        const panel = components.formPanel(@src(), .{ .compact = true, .tag = "account-form-panel", .options = .{ .corners = .all(theme.sizing.card_radius), .margin = R.all(0), .min_size_content = .height(80) } });
+        defer panel.deinit();
+        _ = components.field(@src(), "用户名或者邮箱", &ui.draft.name, .{ .tag = "account-name", .gap_after = 0 });
+    } else if (account) |value| {
+        if (microsoft) {
+            const information = components.modalSection(@src(), .{ .min_height = 248, .gap_after = 0, .tag = "account-microsoft-details" });
+            defer information.deinit();
+            components.text(@src(), "用户名", theme.muted);
+            _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
+            dvui.labelNoFmt(@src(), value.name, .{ .ellipsize = true }, .{ .font = theme.headingFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = theme.spacing.card_gap } });
+            components.text(@src(), "UUID", theme.muted);
+            _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
+            components.hint(@src(), value.uuid);
+            _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
+            components.text(@src(), "微软账户信息由登录同步。删除账户或退出登录将移除此账户，并清理已保存的登录凭据。", theme.muted);
+        } else {
+            const panel = components.formPanel(@src(), .{ .compact = true, .tag = "account-form-panel", .options = .{ .corners = .all(theme.sizing.card_radius), .margin = R.all(0), .min_size_content = .height(80) } });
+            defer panel.deinit();
+            _ = components.field(@src(), "用户名", &ui.draft.name, .{ .tag = "account-name", .gap_after = 0 });
+        }
+        if (!current) components.text(@src(), "所选账户已更改，请关闭后重新编辑", danger);
+    } else components.text(@src(), "账户不存在，请关闭后重新选择", danger);
+    if (ui.failure) |err| {
+        _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
+        components.text(@src(), errorText(err), danger);
+    }
 }
 fn drawConfirmation(ui: *Ui, doc: *const config.Document, busy: bool) void {
     const confirmation = ui.confirmation.?;
-    const window = modal(@src(), if (confirmation.sign_out) "退出登录" else "删除账户", 230);
+    const window = components.modal(@src(), if (confirmation.sign_out) "微软账户退出登录确认" else "删除离线账户确认", if (confirmation.sign_out) theme.style.dialogs.sign_out_height else theme.style.dialogs.account_confirm_height);
     defer window.deinit();
-    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
+    const account = findAccount(doc, confirmation.id);
+    switch (components.modalFormActions(@src(), .{ .save_label = "确认", .save_enabled = !busy and account != null and selected(doc, confirmation.id) })) {
+        .save => ui.queue(.confirm, confirmation.id, null),
+        .cancel => ui.queue(.close_confirm, null, null),
+        .none => {},
+    }
+    const scroll = components.scrollBody(@src());
     defer scroll.deinit();
-    if (findAccount(doc, confirmation.id)) |account| {
-        wrapped(@src(), if (confirmation.sign_out) fmt("退出「{s}」的登录？", .{account.name}) else fmt("删除账户「{s}」？", .{account.name}), dvui.Color.fromHex("EDF1EA"));
-        if (command(@src(), "确认", !busy)) ui.queue(.confirm, confirmation.id, null);
-    } else wrapped(@src(), "账户不存在", danger);
-    if (ui.failure) |err| wrapped(@src(), errorText(err), danger);
-    if (command(@src(), "取消", true)) ui.queue(.close_confirm, null, null);
+    const information = components.modalSection(@src(), .{ .min_height = if (confirmation.sign_out) 112 else 72, .gap_after = 0, .tag = "account-confirm-information" });
+    defer information.deinit();
+    if (account) |value| {
+        dvui.labelNoFmt(@src(), if (confirmation.sign_out) fmt("退出「{s}」的登录？", .{value.name}) else fmt("删除账户「{s}」？", .{value.name}), .{ .ellipsize = true }, .{ .font = theme.headingFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = if (value.kind == .microsoft) theme.spacing.card_gap else 0 } });
+        if (value.kind == .microsoft) components.text(@src(), "此操作将移除账户，并清理已保存的登录凭据。", theme.muted);
+    } else components.text(@src(), "账户不存在", danger);
+    if (ui.failure) |err| components.text(@src(), errorText(err), danger);
 }
-fn drawLogin(ui: *Ui, doc: *const config.Document, manager: *Manager, snapshot: accounts_manager.Snapshot, configured: bool) void {
-    const window = modal(@src(), "Microsoft 登录", 360);
+fn drawLogin(ui: *Ui) void {
+    const window = components.modal(@src(), if (ui.verification_open) "微软登录 · 等待授权" else "微软登录 · 验证码", if (ui.verification_open) theme.style.dialogs.device_wait_height else theme.style.dialogs.device_code_height);
     defer window.deinit();
-    const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
+    switch (components.modalFormActions(@src(), .{ .cancel_label = "返回", .save_label = "关闭" })) {
+        .cancel => ui.queue(.close_login, null, null),
+        .save => ui.queue(.close_editor, null, null),
+        .none => {},
+    }
+    const scroll = components.scrollBody(@src());
     defer scroll.deinit();
-    wrapped(@src(), phaseText(snapshot.phase), theme.accent);
-    if (snapshot.phase == .authenticated) {
-        if (doc.selected_account) |id| {
-            if (findAccount(doc, id)) |account| {
-                wrapped(@src(), account.name, dvui.Color.fromHex("EDF1EA"));
-                wrapped(@src(), account.uuid, theme.muted);
-            }
-        }
+    components.text(@src(), "在浏览器中登录微软账户，并输入下方验证码。授权完成后将自动登录。", theme.muted);
+    _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
+    const information = components.modalSection(@src(), .{ .min_height = if (ui.verification_open) 248 else 200, .gap_after = 0, .tag = "account-device-information" });
+    defer information.deinit();
+    components.text(@src(), "验证码", theme.muted);
+    _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
+    dvui.labelNoFmt(@src(), "ABCD-EFGH", .{}, .{ .font = theme.fontSized(24), .min_size_content = .{ .w = 184, .h = 36 }, .padding = .{ .x = 12, .y = 10, .w = 12, .h = 10 }, .border = R.all(0), .margin = .{ .h = 18 }, .background = true, .color_fill = .{ .color = theme.background } });
+    {
+        const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0), .background = false });
+        defer actions.deinit();
+        if (components.button(@src(), "复制验证码", .{ .placement = .footer, .tag = "account-copy-code" })) ui.queue(.copy_code, null, "ABCD-EFGH");
+        _ = dvui.spacer(@src(), .{ .min_size_content = .width(theme.style.dialogs.action_gap) });
+        if (components.button(@src(), if (ui.verification_open) "重新打开验证页" else "打开验证页", .{ .primary = true, .placement = .footer, .min_width = if (ui.verification_open) 184 else 144, .tag = "account-open-verification" })) ui.queue(.open_verification, null, null);
     }
-    if (snapshot.device) |device| {
-        if (snapshot.phase == .device_pending or snapshot.phase == .slow_down) {
-            wrapped(@src(), device.userCode(), dvui.Color.fromHex("EDF1EA"));
-            wrapped(@src(), device.verificationUri(), theme.muted);
-            const now_ms: u64 = @intCast(@max(0, @divFloor(std.Io.Clock.awake.now(manager.io).nanoseconds, 1_000_000)));
-            const remaining = device.expires_at_ms -| now_ms;
-            wrapped(@src(), fmt("有效期：{d} 秒", .{(remaining +| 999) / 1000}), theme.muted);
-            wrapped(@src(), fmt("下次验证：{d} 秒", .{((device.next_poll_ms -| now_ms) +| 999) / 1000}), theme.muted);
-            if (iconButton(@src(), "复制验证码", dvui.entypo.copy, remaining != 0 and device.userCode().len != 0)) ui.queue(.copy_code, null, device.userCode());
-            if (command(@src(), "打开验证页", remaining != 0 and validVerificationUri(device.verificationUri()))) ui.queue(.open_uri, null, device.verificationUri());
-        }
-    }
-    if (snapshot.failure) |err| wrapped(@src(), errorText(err), danger);
-    if (ui.failure) |err| wrapped(@src(), errorText(err), danger);
-    if (snapshot.busy) {
-        if (command(@src(), "取消登录", true)) ui.queue(.cancel, null, null);
-    } else {
-        if (snapshot.phase != .authenticated and command(@src(), "重新登录", configured and !snapshot.publication_pending)) ui.queue(.start, null, null);
-        if (command(@src(), "关闭", true)) ui.queue(.close_login, null, null);
+    if (ui.verification_open) {
+        _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
+        components.text(@src(), "等待授权完成", theme.muted);
     }
 }
 
@@ -325,11 +341,13 @@ fn apply(ui: *Ui, store: *config.Store, manager: *Manager, pending: Pending) !vo
     switch (pending.action) {
         .add => {
             ui.draft.deinit(ui.allocator);
+            ui.login_open = false;
+            ui.verification_open = false;
             ui.editor_open = true;
         },
         .edit => {
             const account = findAccount(store.snapshot(), pending.id.?) orelse return error.AccountNotFound;
-            if (account.kind != .offline) return error.NotOfflineAccount;
+            if (!selected(store.snapshot(), account.id)) return error.SelectionChanged;
             var draft: Draft = .{};
             draft.id = try ui.allocator.dupe(u8, account.id);
             const count = @min(account.name.len, draft.name.len - 1);
@@ -341,34 +359,59 @@ fn apply(ui: *Ui, store: *config.Store, manager: *Manager, pending: Pending) !vo
         .save => {
             const name = pending.text.?;
             if (!validName(name)) return error.InvalidAccountName;
-            if (pending.id) |id| try manager.editOffline(store, id, name) else try manager.addOffline(store, name);
+            if (pending.id) |id| {
+                const account = findAccount(store.snapshot(), id) orelse return error.AccountNotFound;
+                if (!selected(store.snapshot(), id)) return error.SelectionChanged;
+                if (account.kind != .offline) return error.NotOfflineAccount;
+                const snapshot = manager.snapshot();
+                if (snapshot.busy or snapshot.publication_pending) return error.Busy;
+                try manager.editOffline(store, id, name);
+            } else try manager.loginOffline(store, name);
             ui.editor_open = false;
             ui.draft.deinit(ui.allocator);
         },
         .close_editor => {
             ui.editor_open = false;
+            ui.login_open = false;
+            ui.verification_open = false;
             ui.draft.deinit(ui.allocator);
         },
         .select => try manager.select(store, pending.id.?),
         .ask_delete, .ask_sign_out => {
-            const id = try ui.allocator.dupe(u8, pending.id.?);
+            const account = findAccount(store.snapshot(), pending.id.?) orelse return error.AccountNotFound;
+            if (!selected(store.snapshot(), account.id)) return error.SelectionChanged;
+            if (!ui.editor_open or ui.draft.id == null or !std.mem.eql(u8, ui.draft.id.?, account.id)) return error.EditorRequired;
+            if (pending.action == .ask_sign_out and account.kind != .microsoft) return error.NotMicrosoftAccount;
+            if (pending.action == .ask_delete and account.kind != .offline) return error.NotOfflineAccount;
+            const id = try ui.allocator.dupe(u8, account.id);
             ui.closeConfirmation();
             ui.confirmation = .{ .id = id, .sign_out = pending.action == .ask_sign_out };
         },
         .confirm => {
             const c = ui.confirmation orelse return error.ConfirmationRequired;
             if (!std.mem.eql(u8, c.id, pending.id.?)) return error.SelectionChanged;
-            if (c.sign_out) try manager.signOut(store, pending.id.?) else try manager.removeOffline(store, pending.id.?);
+            _ = findAccount(store.snapshot(), c.id) orelse return error.AccountNotFound;
+            if (!selected(store.snapshot(), c.id)) return error.SelectionChanged;
+            const snapshot = manager.snapshot();
+            if (snapshot.busy or snapshot.publication_pending) return error.Busy;
+            if (c.sign_out) try manager.signOut(store, c.id) else try manager.removeOffline(store, c.id);
             ui.closeConfirmation();
+            ui.editor_open = false;
+            ui.draft.deinit(ui.allocator);
         },
         .close_confirm => ui.closeConfirmation(),
         .start => {
-            if (store.snapshot().settings.microsoft_client_id.len == 0) return error.ClientIdRequired;
+            // Deliberately UI-only until Microsoft credentials are available.
+            ui.editor_open = false;
             ui.login_open = true;
-            try manager.startDeviceRemember(store, pending.remember);
+            ui.verification_open = false;
         },
+        .open_verification => ui.verification_open = true,
         .cancel => manager.cancel(),
-        .close_login => ui.login_open = false,
+        .close_login => {
+            ui.login_open = false;
+            ui.editor_open = true;
+        },
         .copy_code => dvui.clipboardTextSet(pending.text.?),
         .open_uri => {
             if (!validVerificationUri(pending.text.?)) return error.InvalidVerificationUri;
@@ -416,14 +459,14 @@ test "pending strings survive borrowed frame and Store buffers" {
     try std.testing.expect(!ui.remember);
 }
 
-test "editor and confirmation remain deferred and own metadata" {
+test "accounts view editor and confirmation remain deferred and own metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path: [std.fs.max_path_bytes]u8 = undefined;
     const len = try tmp.dir.realPath(std.testing.io, &path);
     var store = try config.Store.init(std.testing.allocator, std.testing.io, path[0..len]);
     defer store.deinit();
-    try store.update(.{ .accounts = &.{.{ .id = "account-a", .name = "Player_A", .uuid = "00000000000000000000000000000000" }} });
+    try store.update(.{ .accounts = &.{.{ .id = "account-a", .name = "Player_A", .uuid = "00000000000000000000000000000000" }}, .selected_account = "account-a" });
     var ui = try Ui.init(std.testing.allocator);
     defer ui.deinit();
     // These UI-only commands must not inspect or call the manager.
@@ -451,4 +494,142 @@ test "editor and confirmation remain deferred and own metadata" {
     finish(&ui, &store, &manager);
     try std.testing.expect(!ui.editor_open);
     try std.testing.expect(ui.draft.id == null);
+}
+
+test "accounts view mock Microsoft preview is local and preserves the input" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &path);
+    var store = try config.Store.init(std.testing.allocator, std.testing.io, path[0..len]);
+    defer store.deinit();
+    var ui = try Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    // An undefined manager ensures preview navigation cannot touch real auth.
+    var manager: Manager = undefined;
+    ui.queue(.add, null, null);
+    finish(&ui, &store, &manager);
+    @memcpy(ui.draft.name[0..18], "player@example.com");
+    ui.queue(.start, null, null);
+    try std.testing.expect(!ui.login_open);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.login_open and !ui.editor_open);
+    try std.testing.expect(ui.failure == null);
+    try std.testing.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
+    try std.testing.expect(store.snapshot().selected_account == null);
+    ui.queue(.open_verification, null, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.verification_open);
+    try std.testing.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
+    ui.queue(.start, null, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(!ui.verification_open);
+    ui.queue(.close_login, null, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(!ui.login_open and ui.editor_open);
+    try std.testing.expectEqualStrings("player@example.com", std.mem.sliceTo(&ui.draft.name, 0));
+    ui.queue(.close_editor, null, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(!ui.editor_open and !ui.login_open);
+    try std.testing.expectEqualStrings("", std.mem.sliceTo(&ui.draft.name, 0));
+    try std.testing.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
+}
+
+test "accounts view selected Microsoft editor keeps identity read-only and signout deferred" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &path);
+    var store = try config.Store.init(std.testing.allocator, std.testing.io, path[0..len]);
+    defer store.deinit();
+    const account: config.Account = .{ .id = "microsoft-fixture", .name = "FixturePlayer", .uuid = "00112233445566778899aabbccddeeff", .kind = .microsoft };
+    try store.update(.{ .accounts = &.{account}, .selected_account = account.id });
+    var ui = try Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    // No authentication, native credentials, or manager mutation is needed to edit details.
+    var manager: Manager = undefined;
+    ui.queue(.edit, account.id, null);
+    try std.testing.expect(!ui.editor_open);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.editor_open and ui.failure == null);
+    try std.testing.expectEqualStrings(account.id, ui.draft.id.?);
+    ui.queue(.save, ui.draft.id, "ChangedName");
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.NotOfflineAccount, ui.failure.?);
+    try std.testing.expect(ui.editor_open);
+    ui.queue(.ask_sign_out, ui.draft.id, null);
+    try std.testing.expect(ui.confirmation == null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.confirmation.?.sign_out);
+    try std.testing.expectEqualStrings(account.id, ui.confirmation.?.id);
+    try std.testing.expectEqualStrings(account.name, store.snapshot().accounts[0].name);
+    try std.testing.expectEqualStrings(account.uuid, store.snapshot().accounts[0].uuid);
+    try std.testing.expectEqualStrings(account.id, store.snapshot().selected_account.?);
+    ui.queue(.close_confirm, null, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.editor_open and ui.confirmation == null);
+    ui.queue(.close_editor, null, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(!ui.editor_open and ui.draft.id == null);
+    try std.testing.expectEqual(@as(usize, 1), store.snapshot().accounts.len);
+}
+
+test "accounts view removal requires selected editor and blocks stale or busy confirmation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &path);
+    var store = try config.Store.init(std.testing.allocator, std.testing.io, path[0..len]);
+    defer store.deinit();
+    const accounts = [_]config.Account{
+        .{ .id = "offline-a", .name = "Player_A", .uuid = "00000000000000000000000000000000" },
+        .{ .id = "offline-b", .name = "Player_B", .uuid = "11111111111111111111111111111111" },
+    };
+    try store.update(.{ .accounts = &accounts, .selected_account = "offline-a" });
+    var ui = try Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, path[0..len]);
+    defer manager.deinit();
+    ui.queue(.add, null, null);
+    finish(&ui, &store, &manager);
+    ui.queue(.ask_delete, "offline-a", null);
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.EditorRequired, ui.failure.?);
+    try std.testing.expect(ui.confirmation == null);
+    ui.queue(.edit, "offline-b", null);
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.SelectionChanged, ui.failure.?);
+    try std.testing.expect(ui.draft.id == null);
+    ui.queue(.edit, "offline-a", null);
+    finish(&ui, &store, &manager);
+    ui.queue(.ask_delete, ui.draft.id, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.confirmation != null and !ui.confirmation.?.sign_out);
+    ui.queue(.confirm, "offline-b", null);
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.SelectionChanged, ui.failure.?);
+    try store.update(.{ .accounts = &accounts, .selected_account = "offline-b" });
+    ui.queue(.confirm, "offline-a", null);
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.SelectionChanged, ui.failure.?);
+    try std.testing.expect(ui.confirmation != null and ui.editor_open);
+    try std.testing.expectEqual(@as(usize, 2), store.snapshot().accounts.len);
+    try store.update(.{ .accounts = &accounts, .selected_account = "offline-a" });
+    manager.reset_needed = true;
+    ui.queue(.confirm, "offline-a", null);
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.Busy, ui.failure.?);
+    try std.testing.expect(ui.confirmation != null and ui.editor_open);
+    ui.queue(.save, "offline-a", "ChangedName");
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.Busy, ui.failure.?);
+    try std.testing.expectEqualStrings("Player_A", store.snapshot().accounts[0].name);
+    manager.reset_needed = false;
+    ui.queue(.confirm, "offline-a", null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.failure == null and ui.confirmation == null and !ui.editor_open);
+    try std.testing.expect(ui.draft.id == null);
+    try std.testing.expectEqual(@as(usize, 1), store.snapshot().accounts.len);
+    try std.testing.expectEqualStrings("offline-b", store.snapshot().accounts[0].id);
+    try std.testing.expect(store.snapshot().selected_account == null);
 }

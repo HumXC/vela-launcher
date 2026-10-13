@@ -1,18 +1,19 @@
 //! Synchronous installation orchestration. Run outside the UI thread.
 const std = @import("std");
 const dl = @import("../downloader.zig");
+const telemetry = @import("../install/download_details.zig");
+const task_registry = @import("../tasks.zig");
 const m = @import("metadata/root.zig");
 const planner = @import("install_plan.zig");
 const native = @import("native_extract.zig");
 const loader = @import("metadata_loader.zig");
-const loader_install = @import("loader_install.zig");
-const loaders = @import("loaders.zig");
+const installation = @import("../install/root.zig");
 const instances = @import("../instances.zig");
 const namespace = @import("../instance_namespace.zig");
-const fs = @import("safe_fs.zig");
+const fs = @import("../install/safe_fs.zig");
 const builtin = @import("builtin");
 const A = std.mem.Allocator;
-pub const Progress = struct { completed: usize, total: usize, downloaded: usize, reused: usize };
+pub const Progress = installation.Progress;
 pub const Config = struct {
     version_id: []const u8,
     root: []const u8 = ".minecraft",
@@ -41,6 +42,8 @@ pub const Config = struct {
     window: usize = 16,
     cancel: ?*const std.atomic.Value(bool) = null,
     progress: ?*const fn (Progress) void = null,
+    /// Borrowed until synchronous installation and downloader drain complete.
+    task: ?*task_registry.Task = null,
 };
 pub const Installed = struct {
     version: m.Owned(m.version.Version),
@@ -67,29 +70,7 @@ pub fn run(a: A, io: std.Io, service: *dl.Service, config: Config) !Installed {
     defer manifest.deinit();
     var fetch_context: FetchContext = .{ .service = service, .config = config };
     const loaded = try loader.load(a, io, .{ .root = config.root, .version_id = config.version_id, .manifest = manifest.value, .metadata_path = config.metadata_path, .cancel = config.cancel, .limits = config.metadata_limits }, .{ .context = &fetch_context, .fetch = fetchMetadata });
-    return installLoaded(a, io, service, reserved_config, loaded, null);
-}
-
-/// Replays an independently owned base without refetching version/loader metadata.
-/// The caller retains prepared through subsequent loader installation and join.
-pub fn runPrepared(a: A, io: std.Io, service: *dl.Service, config: Config, prepared: *const loader_install.PreparedMetadata, target: loader_install.MetadataTarget, control: loaders.Control) !Installed {
-    try validateConfig(config);
-    const token = try reserveNamespace(io, config.namespace_token, config.worker_checks);
-    defer if (config.namespace_token == null) token.release();
-    var reserved_config = config;
-    reserved_config.namespace_token = token;
-    try control.check();
-    if (!std.mem.eql(u8, config.version_id, target.selection.base_id)) return error.PreparedMetadataMismatch;
-    var expected_paths = try instances.Paths.init(a, io, target.root);
-    defer expected_paths.deinit();
-    var actual_paths = try instances.Paths.init(a, io, config.root);
-    defer actual_paths.deinit();
-    if (!std.mem.eql(u8, actual_paths.root, expected_paths.minecraft)) return error.PreparedMetadataMismatch;
-    // Validate the real planner environment, not a stale caller target snapshot.
-    var bound_target = target;
-    bound_target.environment = config.environment;
-    const loaded = try prepared.replayBase(a, io, bound_target, control);
-    return installLoaded(a, io, service, reserved_config, loaded, control);
+    return runLoaded(a, io, service, reserved_config, loaded, null);
 }
 
 /// Replays a sealed vanilla base without manifest or version metadata refetch.
@@ -108,26 +89,26 @@ pub fn runVanillaPrepared(a: A, io: std.Io, service: *dl.Service, config: Config
     var bound_target = target;
     bound_target.environment = config.environment;
     const loaded = try prepared.replayBase(a, io, bound_target, config.cancel);
-    return installLoaded(a, io, service, reserved_config, loaded, null);
+    return runLoaded(a, io, service, reserved_config, loaded, null);
 }
 
-fn reserveNamespace(io: std.Io, borrowed: ?namespace.Token, worker: bool) !namespace.Token {
-    if (borrowed) |token| {
-        if (worker) try token.recheckWaiting() else try token.recheck();
-        return token;
-    }
-    return if (worker) namespace.acquireWaiting(io) else namespace.acquire(io);
-}
+const reserveNamespace = @import("../install/namespace.zig").reserve;
 
-fn validateConfig(config: Config) !void {
+pub fn validateConfig(config: Config) !void {
     if (config.window == 0 or config.window > 128) return error.InvalidWindow;
     try m.version.validateId(config.version_id);
     if (config.instance_name) |name| try m.version.validateId(name);
     try canceled(config.cancel);
 }
 
-// Consumes both loaded owners: sources always release; version moves on success.
-fn installLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_loaded: loader.Loaded, loader_control: ?loaders.Control) !Installed {
+/// Consumes both loaded owners on every path; version and plan move to the result.
+/// The optional external control shares cancellation and deadline semantics with adapters.
+pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_loaded: loader.Loaded, external_control: ?installation.Control) !Installed {
+    validateConfig(config) catch |err| {
+        var failed_loaded = owned_loaded;
+        failed_loaded.deinit();
+        return err;
+    };
     const token = reserveNamespace(io, config.namespace_token, config.worker_checks) catch |err| {
         var failed_loaded = owned_loaded;
         failed_loaded.deinit();
@@ -139,7 +120,7 @@ fn installLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
     defer loaded.sources.deinit();
     var version = loaded.version;
     errdefer version.deinit();
-    const control: InstallControl = .{ .cancel = config.cancel, .loader = loader_control };
+    const control: InstallControl = .{ .cancel = config.cancel, .external = external_control };
     try control.check();
     const index = version.value.asset_index orelse return error.MissingAssetIndex;
     try component(index.id);
@@ -168,10 +149,19 @@ fn installLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
     };
     var downloaded: usize = 0;
     var reused: usize = 0;
-    var tasks: std.ArrayList(*dl.Task) = .empty;
+    var tasks: std.ArrayList(PendingDownload) = .empty;
+    var received_done: u64 = 0;
+    var total_bytes_done: ?u64 = 0;
+    var recent: task_registry.Details = .{};
+    var download_rate: DownloadRate = .{ .io = io, .last_time = std.Io.Clock.awake.now(io).nanoseconds };
     defer tasks.deinit(a);
     // Every task handle is terminal before release, including all failure paths.
-    defer drain(io, tasks.items);
+    defer if (tasks.items.len != 0) {
+        for (tasks.items) |pending| pending.task.cancel();
+        for (tasks.items) |pending| telemetry.join(io, pending.task);
+        reportDownloads(config.task, tasks.items, reused + downloaded, plan.value.files.len, received_done, total_bytes_done, null, &recent);
+        for (tasks.items) |pending| pending.task.release() catch unreachable;
+    };
     try tasks.ensureTotalCapacity(a, config.window);
     var cursor: usize = 0;
     while (cursor < plan.value.files.len or tasks.items.len != 0) {
@@ -181,8 +171,11 @@ fn installLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
             try control.check();
             try ensureParents(io, file.path);
             try control.check();
+            reportChecking(config.task, tasks.items, &recent, file, reused + downloaded, plan.value.files.len, received_done, total_bytes_done, &download_rate);
             if (file.kind == .asset_index or try verifiedControlled(io, file, control)) {
                 reused += 1;
+                rememberFile(&recent, task_registry.File.init(file.path, file.size orelse 0, file.size, 0, .complete, null));
+                reportDownloads(config.task, tasks.items, reused + downloaded, plan.value.files.len, received_done, total_bytes_done, &download_rate, &recent);
                 if (config.progress) |report| report(.{ .completed = reused + downloaded, .total = plan.value.files.len, .downloaded = downloaded, .reused = reused });
                 try control.check();
                 cursor += 1;
@@ -194,25 +187,37 @@ fn installLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
                 if (err == error.QueueFull and tasks.items.len != 0) break;
                 return err;
             };
-            tasks.appendAssumeCapacity(task);
+            tasks.appendAssumeCapacity(.{ .task = task, .path = file.path });
             try control.check();
             cursor += 1;
         }
+        reportDownloads(config.task, tasks.items, reused + downloaded, plan.value.files.len, received_done, total_bytes_done, &download_rate, &recent);
         var i: usize = 0;
         while (i < tasks.items.len) {
             try control.check();
-            const task = tasks.items[i];
+            const task = tasks.items[i].task;
             const snapshot = task.snapshot();
             if (!dl.terminal(snapshot.progress.phase)) {
                 i += 1;
                 continue;
             }
+            // Publish this terminal sample while the label and handle are alive.
+            reportDownloads(config.task, tasks.items, reused + downloaded, plan.value.files.len, received_done, total_bytes_done, &download_rate, &recent);
+            // Keep failed handles in the cleanup batch so final cancellation samples
+            // cannot replace the offending file. Preserve control-error precedence.
+            if (snapshot.failure != null or snapshot.progress.phase != .complete) {
+                try control.check();
+                if (snapshot.failure) |err| return err;
+                return error.DownloadFailed;
+            }
+            rememberFile(&recent, telemetry.file(tasks.items[i].path, snapshot));
+            received_done +|= snapshot.progress.received;
+            total_bytes_done = if (total_bytes_done) |sum| if (snapshot.progress.total) |n| sum +| n else null else null;
             _ = tasks.swapRemove(i);
             try task.release();
             try control.check();
-            if (snapshot.failure) |err| return err;
-            if (snapshot.progress.phase != .complete) return error.DownloadFailed;
             downloaded += 1;
+            reportDownloads(config.task, tasks.items, reused + downloaded, plan.value.files.len, received_done, total_bytes_done, &download_rate, &recent);
             if (config.progress) |report| report(.{ .completed = reused + downloaded, .total = plan.value.files.len, .downloaded = downloaded, .reused = reused });
             try control.check();
         }
@@ -222,13 +227,15 @@ fn installLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
             try control.check();
         }
     }
+    if (config.task) |task_owner| task_owner.report(.verifying, reused + downloaded, plan.value.files.len);
     for (plan.value.native_checks) |check| {
         try control.check();
-        try native.inspect(a, io, check.archive_path, cpu_arch, config.cancel);
+        try native.inspectWithFamily(a, io, check.archive_path, cpu_arch, config.cancel, check.classic_family);
         try control.check();
     }
     // Shared destinations must remain one native merge transaction.
     try control.check();
+    if (config.task) |task_owner| task_owner.report(.extracting, reused + downloaded, plan.value.files.len);
     try native.extractChecked(a, io, plan.value.native_extractions, cpu_arch, config.cancel);
     try control.check();
     for (plan.value.asset_materializations) |alias| {
@@ -239,23 +246,83 @@ fn installLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
     if (descriptor) |value| try publishMetadataControlled(a, io, publication_config, loaded.sources.value, value, control) else try control.check();
     return .{ .version = version, .plan = plan, .downloaded = downloaded, .reused = reused };
 }
+const PendingDownload = struct { task: *dl.Task, path: []const u8 };
+
+/// Measured aggregate throughput across the entire artifact-download stage.
+const DownloadRate = struct {
+    io: std.Io,
+    last_time: i96,
+    last_received: u64 = 0,
+    last_change: i96 = 0,
+    speed: f64 = 0,
+
+    fn update(self: *DownloadRate, now: i96, received: u64) f64 {
+        const elapsed = now - self.last_time;
+        const delta = received -| self.last_received;
+        if (delta > 0) self.last_change = now;
+        if (elapsed > 0 and (elapsed >= 100 * std.time.ns_per_ms or (self.speed == 0 and delta > 0))) {
+            const measured = @as(f64, @floatFromInt(delta)) * std.time.ns_per_s / @as(f64, @floatFromInt(elapsed));
+            self.speed = if (self.speed == 0) measured else 0.3 * measured + 0.7 * self.speed;
+            self.last_time = now;
+            self.last_received = received;
+        }
+        if (now - self.last_change >= std.time.ns_per_s) self.speed = 0;
+        return self.speed;
+    }
+};
+/// Bounded newest-first history. Active transfers take precedence at publication.
+fn rememberFile(recent: *task_registry.Details, value: task_registry.File) void {
+    var index: usize = 0;
+    while (index < recent.file_count and !std.mem.eql(u8, recent.files[index].path(), value.path())) index += 1;
+    const is_new = index == recent.file_count;
+    index = @min(index, recent.files.len - 1);
+    while (index > 0) : (index -= 1) recent.files[index] = recent.files[index - 1];
+    recent.files[0] = value;
+    if (is_new) recent.file_count = @min(recent.file_count + 1, recent.files.len);
+}
+
+fn reportChecking(target: ?*task_registry.Task, pending: []const PendingDownload, recent: *task_registry.Details, file: planner.File, completed: usize, total: usize, received_done: u64, total_done: ?u64, rate: *DownloadRate) void {
+    if (target == null) return;
+    rememberFile(recent, task_registry.File.init(file.path, 0, file.size, 0, .verifying, null));
+    reportDownloads(target, pending, completed, total, received_done, total_done, rate, recent);
+}
+
+fn reportDownloads(target: ?*task_registry.Task, pending: []const PendingDownload, completed: usize, total: usize, received_done: u64, total_done: ?u64, rate: ?*DownloadRate, recent: ?*const task_registry.Details) void {
+    const task = target orelse return;
+    var details: task_registry.Details = .{ .stage = if (pending.len == 0) .verifying else .downloading, .completed = completed, .total = total, .received = received_done, .total_bytes = total_done };
+    for (pending) |item| {
+        const value = telemetry.file(item.path, item.task.snapshot());
+        details.received +|= value.received;
+        details.total_bytes = if (details.total_bytes) |sum| if (value.total) |n| sum +| n else null else null;
+        details.bytes_per_second += value.bytes_per_second;
+        details.addFile(value);
+    }
+    // Completed handles contribute to received_done, so the batch rate survives
+    // short-file completion and replacement instead of summing only live handles.
+    if (pending.len != 0) {
+        if (rate) |sample| details.bytes_per_second = sample.update(std.Io.Clock.awake.now(sample.io).nanoseconds, details.received);
+    }
+    if (recent) |history| for (history.files[0..history.file_count]) |entry| {
+        var active = false;
+        for (pending) |item| if (std.mem.eql(u8, item.path, entry.path())) {
+            active = true;
+            break;
+        };
+        if (!active) details.addFile(entry);
+    };
+    task.reportDetails(details);
+}
+
 const InstallControl = struct {
     cancel: fs.Cancel = null,
-    loader: ?loaders.Control = null,
+    external: ?installation.Control = null,
     fn check(self: InstallControl) !void {
         try canceled(self.cancel);
-        if (self.loader) |control| try control.check();
+        if (self.external) |control| try control.check();
     }
 };
 fn canceled(cancel: ?*const std.atomic.Value(bool)) !void {
     if (cancel) |flag| if (flag.load(.acquire)) return error.Canceled;
-}
-fn drain(io: std.Io, tasks: []const *dl.Task) void {
-    for (tasks) |task| task.cancel();
-    for (tasks) |task| {
-        while (!dl.terminal(task.snapshot().progress.phase)) io.sleep(.fromMilliseconds(10), .awake) catch {};
-        task.release() catch unreachable;
-    }
 }
 const FetchContext = struct { service: *dl.Service, config: Config };
 fn fetchMetadata(context: ?*anyopaque, a: A, io: std.Io, request: loader.Request) anyerror![]u8 {
@@ -286,11 +353,16 @@ fn fetchBoundedControlled(a: A, io: std.Io, service: *dl.Service, config: Config
     defer if (cache_path) |path| a.free(path);
     try control.check();
     const task = try service.submit(.{ .url = url, .output = .bytes, .expected_sha1 = sha1, .expected_size = size, .max_bytes = max_bytes, .proxy = config.proxy, .ca_bundle = config.ca_bundle, .cache_path = cache_path });
-    defer drain(io, &.{task});
+    defer {
+        telemetry.join(io, task);
+        telemetry.single(config.task, .metadata, url, task.snapshot());
+        task.release() catch unreachable;
+    }
     try control.check();
     while (true) {
         try control.check();
         const state = task.snapshot();
+        telemetry.single(config.task, .metadata, url, state);
         if (dl.terminal(state.progress.phase)) {
             if (state.failure) |err| return err;
             if (state.progress.phase != .complete) return error.DownloadFailed;
@@ -614,206 +686,12 @@ test "asset materialization verifies repairs and preserves prior bytes on failur
     try std.testing.expectEqualStrings(body, repaired);
 }
 
-fn preparedRunNow(_: ?*anyopaque) u64 {
-    return 0;
-}
-const prepared_run_control: loaders.Control = .{ .deadline_ms = 1, .now_ms = preparedRunNow };
-// Missing assetIndex deliberately stops the shared executor before service/files IO.
+// Missing assetIndex stops prepared vanilla fixtures before artifact IO.
 const prepared_run_base =
     \\{"id":"1.20.1","mainClass":"vanilla.Main","libraries":[],"javaVersion":{"component":"java-runtime-gamma","majorVersion":17},"downloads":{"client":{"url":"https://piston-data.mojang.com/client.jar","sha1":"0000000000000000000000000000000000000000","size":8}}}
 ;
-const prepared_run_profile =
-    \\{"id":"fabric-fixture","inheritsFrom":"1.20.1","mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient","libraries":[{"name":"net.fabricmc:fabric-loader:0.16.0","url":"https://maven.fabricmc.net/"}]}
-;
-const PreparedRunFixture = struct {
-    entries: [1]m.manifest.Entry = undefined,
-    vanilla_calls: usize = 0,
-    loader_calls: usize = 0,
-
-    fn prepare(self: *PreparedRunFixture, a: A, io: std.Io, root: []const u8) !loader_install.PreparedMetadata {
-        var checksum: m.Sha1 = undefined;
-        std.crypto.hash.Sha1.hash(prepared_run_base, &checksum, .{});
-        self.entries = .{.{ .id = "1.20.1", .kind = "release", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.20.1.json", .time = "", .release_time = "", .sha1 = checksum, .compliance_level = null }};
-        const metadata_root = try std.fs.path.join(a, &.{ root, ".minecraft" });
-        defer a.free(metadata_root);
-        return loader_install.prepareMetadata(a, io, .{
-            .root = root,
-            .instance_id = "pack-fixture",
-            .instance_name = "Final Pack",
-            .generation = 7,
-            .selection = .{ .kind = .fabric, .base_id = "1.20.1", .loader_id = "0.16.0" },
-            .environment = .{ .os_name = "linux", .arch = "x86_64" },
-            .vanilla = .{ .root = metadata_root, .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
-            .fetcher = .{ .context = self, .fetch = vanilla },
-            .transport = .{ .context = self, .get = get },
-        }, prepared_run_control);
-    }
-    fn vanilla(raw: ?*anyopaque, a: A, _: std.Io, request: loader.Request) ![]u8 {
-        const self: *PreparedRunFixture = @ptrCast(@alignCast(raw.?));
-        self.vanilla_calls += 1;
-        try std.testing.expect(request.sha1 != null);
-        return a.dupe(u8, prepared_run_base);
-    }
-    fn get(raw: ?*anyopaque, a: A, url: []const u8, _: usize, control: loaders.Control) !loaders.Response {
-        try control.check();
-        const self: *PreparedRunFixture = @ptrCast(@alignCast(raw.?));
-        self.loader_calls += 1;
-        const body = if (std.mem.endsWith(u8, url, "/v2/versions/loader/1.20.1"))
-            try a.dupe(u8, "[{\"loader\":{\"version\":\"0.16.0\",\"stable\":true}}]")
-        else if (std.mem.endsWith(u8, url, "/profile/json"))
-            try a.dupe(u8, prepared_run_profile)
-        else
-            return error.UnexpectedFixtureRequest;
-        errdefer a.free(body);
-        return .{ .bytes = body, .final_url = try a.dupe(u8, url), .status = 200 };
-    }
-};
-fn preparedRunTarget(prepared: *const loader_install.PreparedMetadata) loader_install.MetadataTarget {
-    return .{ .root = prepared.root, .instance_id = prepared.instance_id, .instance_name = prepared.instance_name, .generation = prepared.generation, .selection = prepared.selection, .environment = prepared.environment };
-}
 fn preparedRunConfig(minecraft: []const u8) Config {
     return .{ .version_id = "1.20.1", .root = minecraft, .instance_name = "private-stage", .environment = .{ .os_name = "linux", .arch = "x86_64" }, .manifest_url = "https://example.invalid/not-replay", .metadata_path = "missing-prepared-version.json" };
-}
-
-test "prepared executor binds final target and actual planner environment before artifact IO" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    const minecraft = try std.fs.path.join(a, &.{ root, ".minecraft" });
-    defer a.free(minecraft);
-    var fixture: PreparedRunFixture = .{};
-    var prepared = try fixture.prepare(a, io, root);
-    defer prepared.deinit();
-    const target = preparedRunTarget(&prepared);
-    const config = preparedRunConfig(minecraft);
-    var service: dl.Service = undefined;
-    // Private stage name must not be compared with the final prepared name.
-    try std.testing.expectError(error.MissingAssetIndex, runPrepared(a, io, &service, config, &prepared, target, prepared_run_control));
-    var wrong_target = target;
-    wrong_target.generation = 8;
-    try std.testing.expectError(error.PreparedMetadataGenerationMismatch, runPrepared(a, io, &service, config, &prepared, wrong_target, prepared_run_control));
-    wrong_target = target;
-    wrong_target.generation = 0;
-    try std.testing.expectError(error.PreparedMetadataGenerationMismatch, runPrepared(a, io, &service, config, &prepared, wrong_target, prepared_run_control));
-    wrong_target = target;
-    wrong_target.instance_id = "different-instance";
-    try std.testing.expectError(error.PreparedMetadataMismatch, runPrepared(a, io, &service, config, &prepared, wrong_target, prepared_run_control));
-    wrong_target = target;
-    wrong_target.instance_name = "different-final-name";
-    try std.testing.expectError(error.PreparedMetadataMismatch, runPrepared(a, io, &service, config, &prepared, wrong_target, prepared_run_control));
-    wrong_target = target;
-    wrong_target.selection.loader_id = "changed-loader";
-    try std.testing.expectError(error.PreparedMetadataMismatch, runPrepared(a, io, &service, config, &prepared, wrong_target, prepared_run_control));
-    var wrong_config = config;
-    wrong_config.version_id = "1.20.2";
-    try std.testing.expectError(error.PreparedMetadataMismatch, runPrepared(a, io, &service, wrong_config, &prepared, target, prepared_run_control));
-    wrong_config = config;
-    wrong_config.root = root;
-    try std.testing.expectError(error.PreparedMetadataMismatch, runPrepared(a, io, &service, wrong_config, &prepared, target, prepared_run_control));
-    wrong_config = config;
-    wrong_config.environment.arch = "aarch64";
-    try std.testing.expectError(error.PreparedMetadataMismatch, runPrepared(a, io, &service, wrong_config, &prepared, target, prepared_run_control));
-    wrong_config = config;
-    wrong_config.environment.os_version = "changed-os";
-    try std.testing.expectError(error.PreparedMetadataMismatch, runPrepared(a, io, &service, wrong_config, &prepared, target, prepared_run_control));
-    wrong_config = config;
-    wrong_config.environment.features = &.{.{ .name = "demo", .enabled = true }};
-    try std.testing.expectError(error.PreparedMetadataMismatch, runPrepared(a, io, &service, wrong_config, &prepared, target, prepared_run_control));
-    try std.testing.expectEqual(@as(usize, 1), fixture.vanilla_calls);
-    try std.testing.expectEqual(@as(usize, 2), fixture.loader_calls);
-    const stage_descriptor = try std.fs.path.join(a, &.{ minecraft, "versions", "private-stage", "private-stage.json" });
-    defer a.free(stage_descriptor);
-    try std.testing.expectError(error.FileNotFound, fs.read(a, io, stage_descriptor, 1024, null));
-}
-
-test "prepared executor validates window IDs cancellation and deadline without touching owners" {
-    const prepared: loader_install.PreparedMetadata = undefined;
-    const target: loader_install.MetadataTarget = .{ .root = ".", .instance_id = "pack-fixture", .instance_name = "Final Pack", .generation = 7, .selection = .{ .kind = .fabric, .base_id = "1.20.1", .loader_id = "0.16.0" }, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
-    var service: dl.Service = undefined;
-    var config = preparedRunConfig(".minecraft");
-    config.window = 0;
-    try std.testing.expectError(error.InvalidWindow, runPrepared(std.testing.allocator, std.testing.io, &service, config, &prepared, target, prepared_run_control));
-    config.window = 129;
-    try std.testing.expectError(error.InvalidWindow, runPrepared(std.testing.allocator, std.testing.io, &service, config, &prepared, target, prepared_run_control));
-    config.window = 16;
-    config.version_id = "../escape";
-    try std.testing.expectError(error.UnsafeVersionId, runPrepared(std.testing.allocator, std.testing.io, &service, config, &prepared, target, prepared_run_control));
-    config.version_id = "1.20.1";
-    config.instance_name = "../escape";
-    try std.testing.expectError(error.UnsafeVersionId, runPrepared(std.testing.allocator, std.testing.io, &service, config, &prepared, target, prepared_run_control));
-    config.instance_name = "private-stage";
-    var cancel = std.atomic.Value(bool).init(true);
-    config.cancel = &cancel;
-    try std.testing.expectError(error.Canceled, runPrepared(std.testing.allocator, std.testing.io, &service, config, &prepared, target, prepared_run_control));
-    config.cancel = null;
-    var control = prepared_run_control;
-    control.cancel = &cancel;
-    try std.testing.expectError(error.Canceled, runPrepared(std.testing.allocator, std.testing.io, &service, config, &prepared, target, control));
-    control.cancel = null;
-    control.deadline_ms = 0;
-    try std.testing.expectError(error.DeadlineExceeded, runPrepared(std.testing.allocator, std.testing.io, &service, config, &prepared, target, control));
-}
-
-test "prepared executor preserves frozen owners across shared-executor errors and rejects mutation" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    const minecraft = try std.fs.path.join(a, &.{ root, ".minecraft" });
-    defer a.free(minecraft);
-    var fixture: PreparedRunFixture = .{};
-    var prepared = try fixture.prepare(a, io, root);
-    defer prepared.deinit();
-    const target = preparedRunTarget(&prepared);
-    const config = preparedRunConfig(minecraft);
-    var service: dl.Service = undefined;
-    const original_class = prepared.base.value.main_class;
-    prepared.base.value.main_class = "changed.Main";
-    try std.testing.expectError(error.PreparedMetadataChanged, runPrepared(a, io, &service, config, &prepared, target, prepared_run_control));
-    prepared.base.value.main_class = original_class;
-    const original_profile = prepared.bundle.profile;
-    prepared.bundle.profile = "{}";
-    try std.testing.expectError(error.PreparedMetadataChanged, runPrepared(a, io, &service, config, &prepared, target, prepared_run_control));
-    prepared.bundle.profile = original_profile;
-    for (0..2) |_| try std.testing.expectError(error.MissingAssetIndex, runPrepared(a, io, &service, config, &prepared, target, prepared_run_control));
-    try prepared.validateBinding(a, io, target);
-    try std.testing.expectEqualStrings("vanilla.Main", prepared.base.value.main_class.?);
-    try std.testing.expectEqualStrings(prepared_run_base, prepared.vanilla_sources[0].bytes);
-    try std.testing.expectEqual(@as(usize, 1), fixture.vanilla_calls);
-    try std.testing.expectEqual(@as(usize, 2), fixture.loader_calls);
-}
-
-fn preparedRunAllocationFailure(a: A, config: Config, prepared: *const loader_install.PreparedMetadata, target: loader_install.MetadataTarget) !void {
-    var service: dl.Service = undefined;
-    var installed = runPrepared(a, std.testing.io, &service, config, prepared, target, prepared_run_control) catch |err| switch (err) {
-        error.MissingAssetIndex => return,
-        else => return err,
-    };
-    installed.deinit();
-    return error.UnexpectedFixtureInstallSuccess;
-}
-test "prepared replay and consuming executor release independent owners on every allocation failure" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    const minecraft = try std.fs.path.join(a, &.{ root, ".minecraft" });
-    defer a.free(minecraft);
-    var fixture: PreparedRunFixture = .{};
-    var prepared = try fixture.prepare(a, io, root);
-    defer prepared.deinit();
-    const target = preparedRunTarget(&prepared);
-    try std.testing.checkAllAllocationFailures(a, preparedRunAllocationFailure, .{ preparedRunConfig(minecraft), &prepared, target });
-    try prepared.validateBinding(a, io, target);
-    try std.testing.expectEqual(@as(usize, 1), fixture.vanilla_calls);
-    try std.testing.expectEqual(@as(usize, 2), fixture.loader_calls);
 }
 
 test "vanilla prepared executor validates config binding and cancellation before reading owner" {
@@ -990,77 +868,9 @@ test "vanilla prepared replay and consuming executor release owners on every all
     var prepared = try fixture.prepare(a, io, root);
     defer prepared.deinit();
     const target = vanillaRunTarget(root);
-    try std.testing.checkAllAllocationFailures(a, vanillaRunAllocationFailure, .{ preparedRunConfig(minecraft), &prepared, target });
+    try @import("test_allocations").checkAllAllocationFailures(a, vanillaRunAllocationFailure, .{ preparedRunConfig(minecraft), &prepared, target });
     try prepared.validateBinding(a, io, target);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-}
-
-const PostReplayClock = struct {
-    calls: usize = 0,
-    deadline_after: ?usize = null,
-    cancel_at: ?usize = null,
-    cancel_target: ?*std.atomic.Value(bool) = null,
-    fn now(raw: ?*anyopaque) u64 {
-        const self: *PostReplayClock = @ptrCast(@alignCast(raw.?));
-        self.calls += 1;
-        if (self.cancel_at) |n| {
-            if (self.calls == n) {
-                if (self.cancel_target) |flag| flag.store(true, .release);
-            }
-        }
-        if (self.deadline_after) |n| if (self.calls > n) return 1;
-        return 0;
-    }
-};
-
-test "prepared executor retains deadline and distinct cancellation flags after replay" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    const minecraft = try std.fs.path.join(a, &.{ root, ".minecraft" });
-    defer a.free(minecraft);
-    var fixture: PreparedRunFixture = .{};
-    var prepared = try fixture.prepare(a, io, root);
-    defer prepared.deinit();
-    const target = preparedRunTarget(&prepared);
-    var config_cancel: std.atomic.Value(bool) = .init(false);
-    var loader_cancel: std.atomic.Value(bool) = .init(false);
-    var config = preparedRunConfig(minecraft);
-    config.cancel = &config_cancel;
-    var clock: PostReplayClock = .{};
-    const control: loaders.Control = .{ .cancel = &loader_cancel, .deadline_ms = 1, .context = &clock, .now_ms = PostReplayClock.now };
-    var replay = try prepared.replayBase(a, io, target, control);
-    // Calibrate replay's checks; runPrepared adds one entry check before replay.
-    const last_replay_check = clock.calls + 1;
-    replay.deinit();
-    try std.testing.expect(prepared.base.value.asset_index == null);
-    const vanilla_calls = fixture.vanilla_calls;
-    const loader_calls = fixture.loader_calls;
-    var service: dl.Service = undefined;
-    clock.calls = 0;
-    clock.deadline_after = last_replay_check;
-    try std.testing.expectError(error.DeadlineExceeded, runPrepared(a, io, &service, config, &prepared, target, control));
-    try std.testing.expectEqual(last_replay_check + 1, clock.calls);
-    clock.deadline_after = null;
-    const flags = [_]*std.atomic.Value(bool){ &config_cancel, &loader_cancel };
-    for (flags) |flag| {
-        config_cancel.store(false, .release);
-        loader_cancel.store(false, .release);
-        clock.calls = 0;
-        clock.cancel_at = last_replay_check;
-        clock.cancel_target = flag;
-        try std.testing.expectError(error.Canceled, runPrepared(a, io, &service, config, &prepared, target, control));
-        try std.testing.expectEqual(last_replay_check, clock.calls);
-        try std.testing.expect(flag.load(.acquire));
-        const other = if (flag == &config_cancel) &loader_cancel else &config_cancel;
-        try std.testing.expect(!other.load(.acquire));
-    }
-    try prepared.validateBinding(a, io, target);
-    try std.testing.expectEqual(vanilla_calls, fixture.vanilla_calls);
-    try std.testing.expectEqual(loader_calls, fixture.loader_calls);
 }
 
 test "installer namespace blocker rejects artifacts-only runs before any IO" {
@@ -1099,33 +909,6 @@ test "installer prepared entry validates namespace stamps and never releases a b
     try current.recheck();
 }
 
-test "artifacts-only consuming executor releases direct namespace and retains borrowed namespace on error" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    var fixture: PreparedRunFixture = .{};
-    var prepared = try fixture.prepare(a, io, root);
-    defer prepared.deinit();
-    const minecraft = try std.fs.path.join(a, &.{ root, ".minecraft" });
-    defer a.free(minecraft);
-    var config = preparedRunConfig(minecraft);
-    config.publish_metadata = false;
-    const target = preparedRunTarget(&prepared);
-    var service: dl.Service = undefined;
-    try std.testing.expectError(error.MissingAssetIndex, runPrepared(a, io, &service, config, &prepared, target, prepared_run_control));
-    const token = try namespace.acquire(io);
-    defer token.release();
-    config.namespace_token = token;
-    try std.testing.expectError(error.MissingAssetIndex, runPrepared(a, io, &service, config, &prepared, target, prepared_run_control));
-    try token.recheck();
-    try std.testing.expectError(error.InstanceNamespaceBusy, namespace.acquire(io));
-    try std.testing.expectEqual(@as(usize, 1), fixture.vanilla_calls);
-    try std.testing.expectEqual(@as(usize, 2), fixture.loader_calls);
-}
-
 test "worker installer admission preserves active namespace busy and stale borrowed stamp errors before IO" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -1146,4 +929,164 @@ test "worker installer admission preserves active namespace busy and stale borro
     try std.testing.expectError(error.InstanceNamespaceLeaseLost, run(a, io, &service, config));
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "versions", .{ .follow_symlinks = false }));
     try current.recheck();
+}
+
+test "loaded executor consumes independent owners when validation or namespace admission fails" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const minecraft = try std.fs.path.join(a, &.{ root, ".minecraft" });
+    defer a.free(minecraft);
+    var fixture: VanillaRunFixture = .{};
+    var prepared = try fixture.prepare(a, io, root);
+    defer prepared.deinit();
+    const target = vanillaRunTarget(root);
+    var service: dl.Service = undefined; // All cases must fail before artifact service IO.
+    var flag: std.atomic.Value(bool) = .init(false);
+    const failures = [_]anyerror{ error.InvalidWindow, error.Canceled, error.InstanceNamespaceBusy };
+    for (failures, 0..) |expected, index| {
+        const loaded = try prepared.replayBase(a, io, target, null);
+        var config = preparedRunConfig(minecraft);
+        config.window = if (index == 0) 0 else 16;
+        config.cancel = &flag;
+        flag.store(index == 1, .release);
+        const token: ?namespace.Token = if (index == 2) try namespace.acquire(io) else null;
+        defer if (token) |held| held.release();
+        try std.testing.expectError(expected, runLoaded(a, io, &service, config, loaded, null));
+        if (token) |held| try held.recheck();
+        flag.store(false, .release);
+    }
+    try prepared.validateBinding(a, io, target);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "live downloader snapshots aggregate omitted transfers before a file completes" {
+    // Only Task.snapshot's coherent mutex/Io path is exercised. No service workers,
+    // curl handles, submissions, filesystem artifacts or network exist in this fixture.
+    var service: dl.Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1 };
+    var url = "https://example.invalid/fixture.jar".*;
+    var downloads: [12]dl.Task = undefined;
+    var pending: [12]PendingDownload = undefined;
+    for (&downloads, &pending) |*download, *item| {
+        download.* = .{ .service = &service, .request = .{ .url = &url }, .url = &url, .temp = &.{}, .progress = .{ .phase = .downloading, .received = 10, .total = 100, .bytes_per_second = 5 } };
+        item.* = .{ .task = download, .path = "/assets/object" };
+    }
+    var registry = task_registry.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    const target = try registry.create(.game_install, "Batch");
+    reportDownloads(target, &pending, 0, 12, 8, 10, null, null);
+    const live = target.details();
+    try std.testing.expectEqual(@as(u64, 0), live.completed);
+    try std.testing.expectEqual(@as(u64, 128), live.received);
+    try std.testing.expectEqual(@as(?u64, 1210), live.total_bytes);
+    try std.testing.expectEqual(@as(f64, 60), live.bytes_per_second);
+    try std.testing.expectEqual(@as(usize, 8), live.file_count);
+    try std.testing.expectEqual(@as(usize, 4), live.omitted_files);
+    downloads[11].progress.total = null;
+    downloads[11].progress.phase = .failed;
+    downloads[11].failure = error.ChecksumMismatch;
+    pending[11].path = "/libraries/bad.jar";
+    reportDownloads(target, &pending, 0, 12, 8, 10, null, null);
+    const failed = target.details();
+    try std.testing.expectEqual(@as(?u64, null), failed.total_bytes);
+    try std.testing.expectEqual(@as(f64, 55), failed.bytes_per_second);
+    try std.testing.expectEqualStrings("bad.jar", failed.files[7].name());
+    try std.testing.expectEqual(@as(?anyerror, error.ChecksumMismatch), failed.files[7].failure);
+    try std.testing.expectEqual(@as(f64, 0), failed.files[7].bytes_per_second);
+}
+
+test "batch download rate survives short file replacement and stops when idle" {
+    var rate: DownloadRate = .{ .io = std.testing.io, .last_time = 0 };
+    try std.testing.expectEqual(@as(f64, 0), rate.update(0, 0));
+    const measured = rate.update(10 * std.time.ns_per_ms, 1024);
+    try std.testing.expectEqual(@as(f64, 102400), measured);
+    // The completed file is removed: the same bytes remain in received_done.
+    try std.testing.expectEqual(measured, rate.update(20 * std.time.ns_per_ms, 1024));
+    // A second small file finishes before the next regular sampling interval.
+    try std.testing.expectEqual(measured, rate.update(30 * std.time.ns_per_ms, 2048));
+    try std.testing.expect(rate.update(110 * std.time.ns_per_ms, 2048) > 0);
+    try std.testing.expectEqual(@as(f64, 0), rate.update(2 * std.time.ns_per_s, 2048));
+    try std.testing.expect(rate.update(2 * std.time.ns_per_s + std.time.ns_per_ms, 3072) > 0);
+}
+
+test "cached artifact checks replace stale metadata and retain bounded owned recent filenames" {
+    var registry = task_registry.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    const target = try registry.create(.game_install, "Cached install");
+    var stale: task_registry.Details = .{ .stage = .metadata, .received = 596992, .total_bytes = 596992 };
+    stale.addFile(task_registry.File.init("assets/34.json", 596992, 596992, 0, .complete, null));
+    target.reportDetails(stale);
+    var recent: task_registry.Details = .{};
+    var rate: DownloadRate = .{ .io = std.testing.io, .last_time = 0, .speed = 1024 };
+    const file: planner.File = .{ .kind = .asset, .path = "assets/objects/current-object", .url = "unused", .sha1 = null, .size = 100 };
+    reportChecking(target, &.{}, &recent, file, 5002, 5216, 0, 0, &rate);
+    const checking = target.details();
+    try std.testing.expectEqual(task_registry.Stage.verifying, checking.stage);
+    try std.testing.expectEqual(@as(u64, 5002), checking.completed);
+    try std.testing.expectEqual(@as(?u64, 5216), checking.total);
+    try std.testing.expectEqual(@as(u64, 0), checking.received);
+    try std.testing.expectEqual(@as(?u64, 0), checking.total_bytes);
+    try std.testing.expectEqual(@as(f64, 0), checking.bytes_per_second);
+    try std.testing.expectEqualStrings("current-object", checking.files[0].name());
+    try std.testing.expectEqual(task_registry.FileState.verifying, checking.files[0].state);
+    var path_buffer: [96]u8 = undefined;
+    for (0..1000) |index| {
+        const path = try std.fmt.bufPrint(&path_buffer, "assets/objects/object-{d}", .{index});
+        rememberFile(&recent, task_registry.File.init(path, 100, 100, 0, .complete, null));
+    }
+    @memset(&path_buffer, 0);
+    reportDownloads(target, &.{}, 1000, 1000, 0, 0, &rate, &recent);
+    const reused = target.details();
+    try std.testing.expectEqual(task_registry.Stage.verifying, reused.stage);
+    try std.testing.expectEqual(@as(u64, 1000), reused.completed);
+    try std.testing.expectEqual(@as(usize, 8), reused.file_count);
+    try std.testing.expectEqualStrings("object-999", reused.files[0].name());
+    try std.testing.expectEqualStrings("object-992", reused.files[7].name());
+    try std.testing.expectEqual(@as(u64, 0), reused.received);
+    try std.testing.expectEqual(@as(f64, 0), reused.bytes_per_second);
+}
+
+test "active artifact transfers precede recent checks without double-counting files or bytes" {
+    var registry = task_registry.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    const target = try registry.create(.game_install, "Mixed install");
+    var service: dl.Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1 };
+    var url = "https://example.invalid/fixture.jar".*;
+    var first: dl.Task = .{ .service = &service, .request = .{ .url = &url }, .url = &url, .temp = &.{}, .progress = .{ .phase = .downloading, .received = 20, .total = 100, .bytes_per_second = 5 } };
+    var second: dl.Task = .{ .service = &service, .request = .{ .url = &url }, .url = &url, .temp = &.{}, .progress = .{ .phase = .downloading, .received = 30, .total = 100, .bytes_per_second = 7 } };
+    const pending = [_]PendingDownload{ .{ .task = &first, .path = "libraries/first.jar" }, .{ .task = &second, .path = "libraries/second.jar" } };
+    var recent: task_registry.Details = .{};
+    var path_buffer: [96]u8 = undefined;
+    for (0..6) |index| {
+        const path = try std.fmt.bufPrint(&path_buffer, "assets/objects/cached-{d}", .{index});
+        rememberFile(&recent, task_registry.File.init(path, 1000, 1000, 0, .complete, null));
+    }
+    rememberFile(&recent, task_registry.File.init(pending[0].path, 0, 100, 0, .verifying, null));
+    rememberFile(&recent, task_registry.File.init("assets/objects/checking-now", 0, 1000, 0, .verifying, null));
+    reportDownloads(target, &pending, 10, 20, 50, 50, null, &recent);
+    const mixed = target.details();
+    try std.testing.expectEqual(task_registry.Stage.downloading, mixed.stage);
+    try std.testing.expectEqual(@as(u64, 100), mixed.received);
+    try std.testing.expectEqual(@as(?u64, 250), mixed.total_bytes);
+    try std.testing.expectEqual(@as(f64, 12), mixed.bytes_per_second);
+    try std.testing.expectEqualStrings("first.jar", mixed.files[0].name());
+    try std.testing.expectEqualStrings("second.jar", mixed.files[1].name());
+    try std.testing.expectEqualStrings("checking-now", mixed.files[2].name());
+    try std.testing.expectEqual(@as(usize, 8), mixed.file_count);
+    try std.testing.expectEqual(@as(usize, 1), mixed.omitted_files);
+    // Once the first handle is released, its owned final name remains visible.
+    first.progress.phase = .complete;
+    first.progress.received = 100;
+    rememberFile(&recent, telemetry.file(pending[0].path, first.snapshot()));
+    reportDownloads(target, pending[1..], 11, 20, 150, 150, null, &recent);
+    const next = target.details();
+    try std.testing.expectEqual(@as(u64, 180), next.received);
+    try std.testing.expectEqual(@as(f64, 7), next.bytes_per_second);
+    try std.testing.expectEqualStrings("second.jar", next.files[0].name());
+    try std.testing.expectEqualStrings("first.jar", next.files[1].name());
+    try std.testing.expectEqual(task_registry.FileState.complete, next.files[1].state);
+    try std.testing.expectEqual(@as(f64, 0), next.files[1].bytes_per_second);
 }

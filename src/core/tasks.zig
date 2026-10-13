@@ -1,5 +1,5 @@
 //! Main-thread task registry; services own and join their std.Io.Future workers.
-//! Only report(), progress(), and canceled() may be called from worker threads.
+//! Only report(), reportDetails(), progress(), details(), and canceled() may be called from workers.
 //! Call finish() only after joining every worker that references the task, and
 //! deinit() only after all workers have joined. Terminal tasks may be pruned.
 const std = @import("std");
@@ -34,6 +34,82 @@ pub const Stage = enum {
 };
 pub const Outcome = union(enum) { succeeded, canceled, failed: anyerror };
 pub const Progress = struct { stage: Stage, completed: u64, total: ?u64 };
+pub const FileState = enum { queued, downloading, verifying, complete, failed, canceled };
+pub const File = struct {
+    name_bytes: [160]u8 = @splat(0),
+    name_len: usize = 0,
+    path_bytes: [512]u8 = @splat(0),
+    path_len: usize = 0,
+    received: u64 = 0,
+    total: ?u64 = null,
+    bytes_per_second: f64 = 0,
+    state: FileState = .queued,
+    failure: ?anyerror = null,
+
+    pub fn init(path_value: []const u8, received: u64, total: ?u64, speed: f64, state: FileState, failure: ?anyerror) File {
+        var result: File = .{ .received = received, .total = total, .bytes_per_second = validSpeed(speed), .state = state, .failure = failure };
+        // URLs are labels too: avoid retaining query credentials in diagnostic text.
+        const is_url = std.mem.startsWith(u8, path_value, "https://") or std.mem.startsWith(u8, path_value, "http://");
+        const label = if (is_url) path_value[0 .. std.mem.indexOfAny(u8, path_value, "?#") orelse path_value.len] else path_value;
+        result.path_len = copyText(&result.path_bytes, label);
+        result.name_len = copyText(&result.name_bytes, std.fs.path.basename(label));
+        if (state == .complete or state == .failed or state == .canceled) result.bytes_per_second = 0;
+        return result;
+    }
+    pub fn name(self: *const File) []const u8 {
+        return self.name_bytes[0..self.name_len];
+    }
+    pub fn path(self: *const File) []const u8 {
+        return self.path_bytes[0..self.path_len];
+    }
+};
+
+fn validSpeed(speed: f64) f64 {
+    return if (std.math.isFinite(speed) and speed > 0) speed else 0;
+}
+fn copyText(destination: []u8, source: []const u8) usize {
+    var n = @min(destination.len, source.len);
+    // Never split a UTF-8 codepoint. Invalid input is rendered as bounded ASCII.
+    const valid_utf8 = std.unicode.utf8ValidateSlice(source);
+    if (valid_utf8) {
+        while (n > 0 and !std.unicode.utf8ValidateSlice(source[0..n])) n -= 1;
+    }
+    for (source[0..n], destination[0..n]) |byte, *out| out.* = if (byte < 32 or byte == 127 or (!valid_utf8 and byte >= 128)) '?' else byte;
+    return n;
+}
+
+/// Owns every displayed byte. Transfer totals describe the current transfer batch.
+pub const Details = struct {
+    stage: Stage = .queued,
+    completed: u64 = 0,
+    total: ?u64 = null,
+    received: u64 = 0,
+    total_bytes: ?u64 = null,
+    bytes_per_second: f64 = 0,
+    file_count: usize = 0,
+    omitted_files: usize = 0,
+    files: [8]File = @splat(.{}),
+
+    pub fn addFile(self: *Details, file: File) void {
+        if (self.file_count < self.files.len) {
+            self.files[self.file_count] = file;
+            self.file_count += 1;
+        } else {
+            self.omitted_files += 1;
+            // Cleanup cancellation must not hide an earlier genuine failure.
+            if (file.failure) |failure| {
+                const retained = self.files[self.files.len - 1].failure;
+                const retained_failure = if (retained) |previous| previous != error.Canceled else false;
+                if (failure != error.Canceled or !retained_failure)
+                    self.files[self.files.len - 1] = file;
+            }
+        }
+    }
+    pub fn stop(self: *Details) void {
+        self.bytes_per_second = 0;
+        for (self.files[0..self.file_count]) |*file| file.bytes_per_second = 0;
+    }
+};
 
 pub const Task = struct {
     // Main-thread fields. The registry owns title; callers must not mutate it.
@@ -45,7 +121,7 @@ pub const Task = struct {
     cancellation: std.atomic.Value(bool) = .init(false),
 
     progress_lock: std.atomic.Mutex = .unlocked,
-    reported: Progress = .{ .stage = .queued, .completed = 0, .total = null },
+    reported: Details = .{},
 
     pub fn canceled(self: *const Task) bool {
         return self.cancellation.load(.acquire);
@@ -55,14 +131,37 @@ pub const Task = struct {
     pub fn report(self: *Task, stage: Stage, completed: u64, total: ?u64) void {
         self.lockProgress();
         defer self.progress_lock.unlock();
-        self.reported = .{
-            .stage = stage,
-            .completed = if (total) |limit| @min(completed, limit) else completed,
-            .total = total,
-        };
+        const continuing_transfer = self.reported.stage == stage and (stage == .downloading or stage == .metadata);
+        self.reported.stage = stage;
+        self.reported.completed = if (total) |limit| @min(completed, limit) else completed;
+        self.reported.total = total;
+        if (!continuing_transfer) self.reported.stop();
     }
 
     pub fn progress(self: *Task) Progress {
+        self.lockProgress();
+        defer self.progress_lock.unlock();
+        return .{ .stage = self.reported.stage, .completed = self.reported.completed, .total = self.reported.total };
+    }
+
+    pub fn reportDetails(self: *Task, value: Details) void {
+        self.lockProgress();
+        defer self.progress_lock.unlock();
+        self.reported = value;
+        self.reported.file_count = @min(value.file_count, value.files.len);
+        self.reported.bytes_per_second = validSpeed(value.bytes_per_second);
+        for (self.reported.files[0..self.reported.file_count]) |*file| {
+            file.name_len = @min(file.name_len, file.name_bytes.len);
+            file.path_len = @min(file.path_len, file.path_bytes.len);
+            file.bytes_per_second = switch (file.state) {
+                .complete, .failed, .canceled => 0,
+                else => validSpeed(file.bytes_per_second),
+            };
+        }
+        if (value.total) |total| self.reported.completed = @min(value.completed, total);
+    }
+
+    pub fn details(self: *Task) Details {
         self.lockProgress();
         defer self.progress_lock.unlock();
         return self.reported;
@@ -139,6 +238,15 @@ pub const Registry = struct {
                 task.failure = failure;
             },
         }
+        task.lockProgress();
+        task.reported.stop();
+        for (task.reported.files[0..task.reported.file_count]) |*file| {
+            switch (file.state) {
+                .queued, .downloading, .verifying => file.state = if (task.state == .succeeded) .complete else .canceled,
+                .complete, .failed, .canceled => {},
+            }
+        }
+        task.progress_lock.unlock();
     }
 
     /// Borrowed list slice, invalidated by create/dismiss/prune/deinit. Surviving
@@ -426,7 +534,7 @@ fn allocationExercise(allocator: Allocator) !void {
 }
 
 test "all create and list-growth allocation failures are leak-free" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
 }
 
 test "id exhaustion never wraps or reuses an id" {
@@ -515,4 +623,68 @@ test "dismiss retains a worker-owned task until join and terminal acknowledgemen
     registry.finish(task, .canceled);
     try std.testing.expect(registry.dismiss(id));
     try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
+}
+
+test "bounded telemetry owns UTF8 labels and preserves failure beyond display bound" {
+    var label: [600]u8 = @splat('x');
+    @memcpy(label[159..165], "世界");
+    const copied = File.init(&label, 64, null, 25, .downloading, null);
+    @memset(&label, 'z');
+    try std.testing.expectEqual(@as(usize, 159), copied.name_len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(copied.name()));
+    try std.testing.expect(copied.path_len <= copied.path_bytes.len);
+    try std.testing.expectEqual(@as(u8, 'x'), copied.path()[0]);
+    const sanitized = File.init("https://example.invalid/bad\n.jar?secret=value", 0, null, std.math.nan(f64), .queued, null);
+    try std.testing.expectEqualStrings("bad?.jar", sanitized.name());
+    try std.testing.expectEqualStrings("https://example.invalid/bad?.jar", sanitized.path());
+    try std.testing.expectEqual(@as(f64, 0), sanitized.bytes_per_second);
+    const local = File.init("/folder/l#q?.jar", 0, null, 0, .queued, null);
+    try std.testing.expectEqualStrings("l#q?.jar", local.name());
+    try std.testing.expectEqualStrings("/folder/l#q?.jar", local.path());
+    var details: Details = .{};
+    for (0..12) |_| details.addFile(copied);
+    details.addFile(File.init("early-canceled.jar", 12, 128, 0, .canceled, error.Canceled));
+    try std.testing.expectEqualStrings("early-canceled.jar", details.files[7].name());
+    details.addFile(File.init("offending.jar", 64, 128, 999, .failed, error.ChecksumMismatch));
+    try std.testing.expectEqual(@as(usize, 8), details.file_count);
+    try std.testing.expectEqual(@as(usize, 6), details.omitted_files);
+    try std.testing.expectEqualStrings("offending.jar", details.files[7].name());
+    try std.testing.expectEqual(@as(?anyerror, error.ChecksumMismatch), details.files[7].failure);
+    try std.testing.expectEqual(@as(f64, 0), details.files[7].bytes_per_second);
+    for (0..3) |_| details.addFile(File.init("cleanup-canceled.jar", 16, 128, 0, .canceled, error.Canceled));
+    try std.testing.expectEqual(@as(usize, 8), details.file_count);
+    try std.testing.expectEqual(@as(usize, 9), details.omitted_files);
+    try std.testing.expectEqualStrings("offending.jar", details.files[7].name());
+    try std.testing.expectEqual(@as(?anyerror, error.ChecksumMismatch), details.files[7].failure);
+}
+
+test "terminal telemetry stops every transfer and survives value copy after dismissal" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    for ([_]Outcome{ .succeeded, .canceled, .{ .failed = error.ChecksumMismatch } }) |outcome| {
+        const task = try registry.create(.game_install, "Files");
+        try registry.start(task);
+        var details: Details = .{ .stage = .downloading, .received = 90, .total_bytes = null, .bytes_per_second = 50 };
+        details.addFile(File.init("active.jar", 64, 128, 25, .downloading, null));
+        details.addFile(File.init("failed.jar", 26, null, 25, .failed, error.ChecksumMismatch));
+        task.reportDetails(details);
+        const live = task.details();
+        try std.testing.expectEqual(@as(u64, 0), live.completed);
+        try std.testing.expectEqual(@as(f64, 25), live.files[0].bytes_per_second);
+        task.report(.downloading, 1, 10);
+        try std.testing.expectEqual(@as(f64, 50), task.details().bytes_per_second);
+        try std.testing.expectEqual(@as(f64, 25), task.details().files[0].bytes_per_second);
+        task.report(.verifying, 1, 10);
+        try std.testing.expectEqual(@as(f64, 0), task.details().bytes_per_second);
+        registry.finish(task, outcome);
+        const retained = task.details();
+        const id = task.id;
+        try std.testing.expectEqual(@as(f64, 0), retained.bytes_per_second);
+        try std.testing.expectEqual(@as(f64, 0), retained.files[0].bytes_per_second);
+        try std.testing.expectEqual(if (task.state == .succeeded) FileState.complete else FileState.canceled, retained.files[0].state);
+        try std.testing.expectEqual(FileState.failed, retained.files[1].state);
+        try std.testing.expect(registry.dismiss(id));
+        try std.testing.expectEqualStrings("failed.jar", retained.files[1].name());
+        try std.testing.expectEqual(@as(?anyerror, error.ChecksumMismatch), retained.files[1].failure);
+    }
 }

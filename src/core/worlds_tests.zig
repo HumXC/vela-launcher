@@ -186,7 +186,7 @@ fn failBackup(allocator: std.mem.Allocator) !void {
     defer outcome.deinit();
 }
 test "world backup cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(a, failBackup, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, failBackup, .{});
 }
 
 test "confirmed overwrite retains previous world and case collisions fail" {
@@ -249,7 +249,7 @@ fn pngChunk(out: *std.Io.Writer.Allocating, kind: []const u8, data: []const u8) 
     try out.writer.writeInt(u32, @intCast(data.len), .big);
     try out.writer.writeAll(kind);
     try out.writer.writeAll(data);
-    var crc: std.hash.crc.Crc32 = .init();
+    var crc: std.hash.crc.@"CRC-32/ISO-HDLC" = .init();
     crc.update(kind);
     crc.update(data);
     try out.writer.writeInt(u32, crc.final(), .big);
@@ -330,14 +330,14 @@ const Fault = struct {
     }
 };
 test "rename failures rollback or explicitly retain uncertain committed state" {
-    inline for (@typeInfo(Fault.Mode).@"enum".fields) |field| {
+    inline for (@typeInfo(Fault.Mode).@"enum".field_values) |value| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var paths = try fixturePaths(tmp);
         defer paths.deinit();
         var coordinator = instance_leases.Coordinator.init(io);
         try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "world payload");
-        Fault.mode = @enumFromInt(field.value);
+        Fault.mode = @fromBackingInt(@intCast(value));
         Fault.candidate_committed = false;
         var table = io.vtable.*;
         table.dirRenamePreserve = Fault.rename;
@@ -421,11 +421,11 @@ const LeaseIo = struct {
         self.coordinator.tick();
         return !self.failed;
     }
-    fn openDir(userdata: ?*anyopaque, dir: OpenDir.params[1].type.?, path: OpenDir.params[2].type.?, options: OpenDir.params[3].type.?) OpenDir.return_type.? {
+    fn openDir(userdata: ?*anyopaque, dir: OpenDir.param_types[1].?, path: OpenDir.param_types[2].?, options: OpenDir.param_types[3].?) OpenDir.return_type.? {
         if (!observe()) return error.Unexpected;
         return io.vtable.dirOpenDir(userdata, dir, path, options);
     }
-    fn openFile(userdata: ?*anyopaque, dir: OpenFile.params[1].type.?, path: OpenFile.params[2].type.?, options: OpenFile.params[3].type.?) OpenFile.return_type.? {
+    fn openFile(userdata: ?*anyopaque, dir: OpenFile.param_types[1].?, path: OpenFile.param_types[2].?, options: OpenFile.param_types[3].?) OpenFile.return_type.? {
         if (!observe()) return error.Unexpected;
         return io.vtable.dirOpenFile(userdata, dir, path, options);
     }
@@ -619,4 +619,366 @@ test "held transaction gate rejects all scoped world entry points before filesys
         .confirmed_destructive = true,
     });
     try std.testing.expectEqual(@as(usize, 0), observer.calls);
+}
+
+const world_lock = @import("worlds_lock.zig");
+const builtin = @import("builtin");
+extern "c" fn fork() std.c.pid_t;
+
+/// A separate process owns a traditional fcntl record lock, as Java FileChannel does.
+/// The child uses only libc calls after fork; pipe handshakes avoid timing assumptions.
+const JavaLockProcess = struct {
+    pid: std.c.pid_t,
+    release_fd: std.c.fd_t,
+
+    fn start(directory: std.Io.Dir, name: []const u8) !JavaLockProcess {
+        const file = try directory.createFile(io, name, .{ .read = true, .truncate = false });
+        defer file.close(io);
+        var ready: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&ready) != 0) return error.Unexpected;
+        defer _ = std.c.close(ready[0]);
+        defer _ = std.c.close(ready[1]);
+        var release: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&release) != 0) return error.Unexpected;
+        errdefer _ = std.c.close(release[1]);
+        defer _ = std.c.close(release[0]);
+        const pid = fork();
+        if (pid == -1) return error.Unexpected;
+        if (pid == 0) {
+            var region = std.mem.zeroes(std.c.Flock);
+            region.type = std.c.F.WRLCK;
+            region.whence = std.c.SEEK.SET;
+            // Zig 0.16 F.SETLK compares @sizeOf(usize) to 64 rather than 8.
+            // Linux x86_64/aarch64 use F_SETLK=6, verified against the native ABI.
+            const command: i32 = if (@sizeOf(usize) == 8) 6 else std.os.linux.F.SETLK;
+            const lock_error = std.os.linux.errno(std.os.linux.fcntl(file.handle, command, @intFromPtr(&region)));
+            const success = lock_error == .SUCCESS;
+            const marker: [1]u8 = .{if (success) 'L' else @intCast(@backingInt(lock_error))};
+            if (std.c.write(ready[1], &marker, 1) != 1 or !success) std.c._exit(1);
+            var token: [1]u8 = undefined;
+            if (std.c.read(release[0], &token, 1) != 1) std.c._exit(2);
+            std.c._exit(0);
+        }
+        var process: JavaLockProcess = .{ .pid = pid, .release_fd = release[1] };
+        errdefer process.stop();
+        var marker: [1]u8 = undefined;
+        if (std.c.read(ready[0], &marker, 1) != 1 or marker[0] != 'L') {
+            std.debug.print("child lock errno {d}\n", .{marker[0]});
+            return error.Unexpected;
+        }
+        return process;
+    }
+
+    fn stop(self: JavaLockProcess) void {
+        const token = [_]u8{'Q'};
+        _ = std.c.write(self.release_fd, &token, 1);
+        _ = std.c.close(self.release_fd);
+        var status: c_int = 0;
+        while (std.c.waitpid(self.pid, &status, 0) == -1) {
+            if (std.posix.errno(-1) != .INTR) break;
+        }
+    }
+};
+
+fn expectAccess(paths: *instances.Paths, coordinator: *instance_leases.Coordinator, folder: []const u8, access: w.WorldAccess) !void {
+    var listing = try w.list(a, io, paths, one, null, .{ .scope = coordinator.worldScope(3) });
+    defer listing.deinit();
+    for (listing.items) |world| {
+        if (std.mem.eql(u8, world.folder, folder)) {
+            try std.testing.expectEqual(access, world.access);
+            return;
+        }
+    }
+    return error.WorldMissing;
+}
+
+test "per-world access probe is noncreating and distinguishes stale Java locks and unsafe tokens" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "original");
+    const directory = try tmp.dir.openDir(io, ".minecraft/versions/One/saves/World", .{});
+    defer directory.close(io);
+    try expectAccess(&paths, &coordinator, "World", .available);
+    try std.testing.expectError(error.FileNotFound, directory.statFile(io, "session.lock", .{ .follow_symlinks = false }));
+    try write(directory, "session.lock", "stale bytes");
+    try expectAccess(&paths, &coordinator, "World", .available);
+    {
+        const player = try JavaLockProcess.start(directory, "session.lock");
+        defer player.stop();
+        try expectAccess(&paths, &coordinator, "World", .in_use);
+        try std.testing.expectError(error.WorldLocked, world_lock.acquire(io, directory, "session.lock"));
+    }
+    try expectAccess(&paths, &coordinator, "World", .available);
+    try directory.deleteFile(io, "session.lock");
+    try directory.symLink(io, "data", "session.lock", .{});
+    try expectAccess(&paths, &coordinator, "World", .unavailable);
+    const refused = world_lock.acquire(io, directory, "session.lock");
+    if (refused) |held| {
+        held.close(io);
+        return error.UnsafeLockAccepted;
+    } else |_| {}
+}
+
+test "Java locked source blocks every world data operation and locked overwrite blocks copy restore" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "source");
+    try write(tmp.dir, ".minecraft/versions/Two/saves/Target/data", "target");
+    const source: w.WorldRef = .{ .instance = one, .folder = "World" };
+    const target: w.WorldRef = .{ .instance = two, .folder = "Target" };
+    const options: w.Options = .{ .scope = coordinator.worldScope(3), .confirmed_destructive = true };
+    var backed = try w.backup(a, io, &paths, source, options);
+    defer backed.deinit();
+    const source_dir = try tmp.dir.openDir(io, ".minecraft/versions/One/saves/World", .{});
+    defer source_dir.close(io);
+    const target_dir = try tmp.dir.openDir(io, ".minecraft/versions/Two/saves/Target", .{});
+    defer target_dir.close(io);
+    {
+        const player = try JavaLockProcess.start(source_dir, "session.lock");
+        defer player.stop();
+        try std.testing.expectError(error.WorldLocked, w.backup(a, io, &paths, source, options));
+        try std.testing.expectError(error.WorldLocked, w.copy(a, io, &paths, source, target, options));
+        try std.testing.expectError(error.WorldLocked, w.renameFolder(a, io, &paths, source, "Renamed", options));
+        try std.testing.expectError(error.WorldLocked, w.renameDisplayName(a, io, &paths, source, "New name", options));
+        try std.testing.expectError(error.WorldLocked, w.delete(a, io, &paths, source, options));
+    }
+    {
+        const player = try JavaLockProcess.start(target_dir, "session.lock");
+        defer player.stop();
+        try std.testing.expectError(error.WorldLocked, w.copy(a, io, &paths, source, target, options));
+        try std.testing.expectError(error.WorldLocked, w.restore(a, io, &paths, .{ .instance = one, .id = backed.recovery_id }, target, options));
+    }
+}
+
+test "world and absent destination locks stay held across unrelated descriptor closes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const readable = try tmp.dir.openDir(io, ".", .{ .iterate = true });
+    defer readable.close(io);
+    try write(readable, "session.lock", "stale original bytes");
+    const held = try world_lock.acquire(io, readable, "session.lock");
+    defer held.close(io);
+    const unrelated = try tmp.dir.openFile(io, "session.lock", .{});
+    unrelated.close(io);
+    try std.testing.expectError(error.WorldLocked, world_lock.acquire(io, tmp.dir, "session.lock"));
+    try std.testing.expectEqual(w.WorldAccess.in_use, world_lock.probe(io, tmp.dir, "session.lock"));
+    const repository = try world_lock.acquire(io, readable, ".operation.lock");
+    defer repository.close(io);
+    try std.testing.expectError(error.WorldLocked, world_lock.acquire(io, tmp.dir, ".operation.lock"));
+    try tmp.dir.rename("session.lock", tmp.dir, "old-token", io);
+    try write(tmp.dir, "session.lock", "replacement");
+    try std.testing.expectError(error.WorldLockChanged, held.recheck(io));
+}
+
+test "recovery excludes transient root locks and copies get fresh native lock inodes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "source");
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/session.lock", "stale token");
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/mod/session.lock", "mod data");
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Two");
+    var copied = try w.copy(a, io, &paths, .{ .instance = one, .folder = "World" }, .{ .instance = two, .folder = "Target" }, .{ .scope = coordinator.worldScope(3) });
+    defer copied.deinit();
+    const payload = try std.fs.path.join(a, &.{ copied.recovery_directory, "payload", "session.lock" });
+    defer a.free(payload);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, payload, .{ .follow_symlinks = false }));
+    const source_stat = try tmp.dir.statFile(io, ".minecraft/versions/One/saves/World/session.lock", .{});
+    const target_stat = try tmp.dir.statFile(io, ".minecraft/versions/Two/saves/Target/session.lock", .{});
+    try std.testing.expect(source_stat.inode != target_stat.inode);
+    try std.testing.expectEqual(@as(u64, 0), target_stat.size);
+    try std.testing.expectEqual(@as(u64, 8), (try tmp.dir.statFile(io, ".minecraft/versions/Two/saves/Target/mod/session.lock", .{})).size);
+}
+
+test "cross-process repository guard blocks operations on absent destinations" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "source");
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Two/saves/.vela-worlds");
+    const repository = try tmp.dir.openDir(io, ".minecraft/versions/Two/saves/.vela-worlds", .{});
+    defer repository.close(io);
+    const competing = try JavaLockProcess.start(repository, ".operation.lock");
+    defer competing.stop();
+    try std.testing.expectError(error.InstanceBusy, w.copy(a, io, &paths, .{ .instance = one, .folder = "World" }, .{ .instance = two, .folder = "Absent" }, .{ .scope = coordinator.worldScope(3) }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/Two/saves/Absent", .{}));
+}
+
+test "source target and candidate remain natively locked through committed notification" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "source");
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Two");
+    const Observer = struct {
+        root: std.Io.Dir,
+        checked: bool = false,
+        failed: bool = false,
+        fn committed(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.checked = true;
+            const source = self.root.openDir(io, ".minecraft/versions/One/saves/World", .{}) catch {
+                self.failed = true;
+                return;
+            };
+            defer source.close(io);
+            const target = self.root.openDir(io, ".minecraft/versions/Two/saves/Target", .{}) catch {
+                self.failed = true;
+                return;
+            };
+            defer target.close(io);
+            self.failed = world_lock.probe(io, source, "session.lock") != .in_use or world_lock.probe(io, target, "session.lock") != .in_use;
+        }
+    };
+    var observer: Observer = .{ .root = tmp.dir };
+    var copied = try w.copy(a, io, &paths, .{ .instance = one, .folder = "World" }, .{ .instance = two, .folder = "Target" }, .{ .scope = coordinator.worldScope(3), .hooks = .{ .context = &observer, .committed = Observer.committed } });
+    defer copied.deinit();
+    try std.testing.expect(observer.checked and !observer.failed);
+    const target = try tmp.dir.openDir(io, ".minecraft/versions/Two/saves/Target", .{});
+    defer target.close(io);
+    try std.testing.expectEqual(w.WorldAccess.available, world_lock.probe(io, target, "session.lock"));
+}
+
+test "legacy recovery session token is excluded from integrity data but held during restore" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const tree = @import("worlds_tree.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "source");
+    try tmp.dir.createDirPath(io, ".minecraft/versions/Two");
+    const options: w.Options = .{ .scope = coordinator.worldScope(3) };
+    var backed = try w.backup(a, io, &paths, .{ .instance = one, .folder = "World" }, options);
+    defer backed.deinit();
+    const record = try std.Io.Dir.cwd().openDir(io, backed.recovery_directory, .{ .iterate = true });
+    defer record.close(io);
+    const payload = try record.openDir(io, "payload", .{ .iterate = true });
+    defer payload.close(io);
+    const token = "legacy token bytes";
+    try write(payload, "session.lock", token);
+    const bytes = try tree.readBounded(a, io, record, "manifest.json", 1024 * 1024);
+    defer a.free(bytes);
+    const parsed = try std.json.parseFromSlice(w.Manifest, a, bytes, .{});
+    defer parsed.deinit();
+    var legacy = parsed.value;
+    const entries = try a.alloc(tree.Entry, legacy.entries.len + 1);
+    defer a.free(entries);
+    @memcpy(entries[0..legacy.entries.len], legacy.entries);
+    entries[legacy.entries.len] = .{ .path = "session.lock", .directory = false, .size = token.len };
+    legacy.entries = entries;
+    legacy.bytes += token.len;
+    const document = try std.json.Stringify.valueAlloc(a, legacy, .{});
+    defer a.free(document);
+    try write(record, "manifest.json", document);
+    const target: w.WorldRef = .{ .instance = two, .folder = "Restored" };
+    {
+        const player = try JavaLockProcess.start(payload, "session.lock");
+        defer player.stop();
+        try std.testing.expectError(error.WorldLocked, w.restore(a, io, &paths, .{ .instance = one, .id = backed.recovery_id }, target, options));
+    }
+    var restored = try w.restore(a, io, &paths, .{ .instance = one, .id = backed.recovery_id }, target, options);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u64, 0), (try tmp.dir.statFile(io, ".minecraft/versions/Two/saves/Restored/session.lock", .{})).size);
+}
+
+test "overwrite rechecks target data after candidate preparation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "source");
+    try write(tmp.dir, ".minecraft/versions/Two/saves/Target/data", "target");
+    const Actor = struct {
+        root: std.Io.Dir,
+        mutated: bool = false,
+        failed: bool = false,
+        fn progress(context: ?*anyopaque, _: usize, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.mutated or self.failed) return;
+            const repository = self.root.openDir(io, ".minecraft/versions/Two/saves/.vela-worlds", .{ .iterate = true }) catch {
+                self.failed = true;
+                return;
+            };
+            defer repository.close(io);
+            var it = repository.iterate();
+            while (it.next(io) catch {
+                self.failed = true;
+                return;
+            }) |entry| {
+                if (!std.mem.startsWith(u8, entry.name, ".stage-")) continue;
+                const stage = repository.openDir(io, entry.name, .{}) catch {
+                    self.failed = true;
+                    return;
+                };
+                defer stage.close(io);
+                const candidate = stage.statFile(io, "candidate", .{ .follow_symlinks = false }) catch |err| {
+                    if (err == error.FileNotFound) continue;
+                    self.failed = true;
+                    return;
+                };
+                if (candidate.kind != .directory) continue;
+                write(self.root, ".minecraft/versions/Two/saves/Target/data", "changed externally") catch {
+                    self.failed = true;
+                    return;
+                };
+                self.mutated = true;
+                return;
+            }
+        }
+    };
+    var actor: Actor = .{ .root = tmp.dir };
+    try std.testing.expectError(error.IntegrityMismatch, w.copy(a, io, &paths, .{ .instance = one, .folder = "World" }, .{ .instance = two, .folder = "Target" }, .{ .scope = coordinator.worldScope(3), .confirmed_destructive = true, .hooks = .{ .context = &actor, .progress = Actor.progress } }));
+    try std.testing.expect(actor.mutated and !actor.failed);
+    const target = try tmp.dir.openDir(io, ".minecraft/versions/Two/saves/Target", .{});
+    defer target.close(io);
+    const data = try @import("worlds_tree.zig").readBounded(a, io, target, "data", 64);
+    defer a.free(data);
+    try std.testing.expectEqualStrings("changed externally", data);
+}
+
+test "read-only world providers and held scopes cannot authorize mutations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try fixturePaths(tmp);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(io);
+    try write(tmp.dir, ".minecraft/versions/One/saves/World/data", "source");
+    var read_scope = coordinator.worldScope(3);
+    read_scope.read_only = true;
+    const options: w.Options = .{ .scope = read_scope, .confirmed_destructive = true, .guard = .{ .running_ids = &.{"one"} } };
+    var listed = try w.list(a, io, &paths, one, null, options);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listed.items.len);
+    const source: w.WorldRef = .{ .instance = one, .folder = "World" };
+    const target: w.WorldRef = .{ .instance = two, .folder = "Target" };
+    try std.testing.expectError(error.ReadOnlyWorldScope, w.backup(a, io, &paths, source, options));
+    try std.testing.expectError(error.ReadOnlyWorldScope, w.copy(a, io, &paths, source, target, options));
+    try std.testing.expectError(error.ReadOnlyWorldScope, w.renameFolder(a, io, &paths, source, "Renamed", options));
+    try std.testing.expectError(error.ReadOnlyWorldScope, w.renameDisplayName(a, io, &paths, source, "New name", options));
+    try std.testing.expectError(error.ReadOnlyWorldScope, w.delete(a, io, &paths, source, options));
+    try std.testing.expectError(error.ReadOnlyWorldScope, w.restore(a, io, &paths, .{ .instance = one, .id = "00112233445566778899aabbccddeeff" }, target, options));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/One/saves/World/session.lock", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/One/saves/.vela-worlds", .{}));
+    const entry = try w.enterReadScope(options, .{ .source = one.id });
+    defer entry.deinit();
+    try std.testing.expectError(error.ReadOnlyWorldScope, w.backup(a, io, &paths, source, .{ .held_scope = entry.held }));
 }

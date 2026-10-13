@@ -1,6 +1,6 @@
 //! Worker-only offline instance transactions. Caller owns the stable-ID lease through
 //! config publication and confirms rename/delete before invocation. No config writes.
-//! Recovery manifests describe prepared intent; directory presence identifies commit.
+//! Rename recovery manifests describe prepared intent; deletion permanently erases files.
 const std = @import("std");
 const builtin = @import("builtin");
 const content_fs = @import("content_fs.zig");
@@ -9,7 +9,7 @@ const config = @import("config.zig");
 const instances = @import("instances.zig");
 const tree = @import("worlds_tree.zig");
 const worlds = @import("worlds.zig");
-const safe = @import("minecraft/safe_fs.zig");
+const safe = @import("install/safe_fs.zig");
 const loader = @import("minecraft/metadata_loader.zig");
 const metadata = @import("minecraft/metadata/version.zig");
 const A = std.mem.Allocator;
@@ -21,12 +21,12 @@ fn windowsReadOnlyPermissions(before: std.Io.File.Permissions) std.Io.File.Permi
     var attributes = before.toAttributes();
     attributes.READONLY = true;
     attributes.NORMAL = false;
-    return @enumFromInt(@as(std.os.windows.DWORD, @bitCast(attributes)));
+    return @fromBackingInt(@intCast(@as(std.os.windows.DWORD, @bitCast(attributes))));
 }
 
-pub const Operation = enum { imported, renamed, deleted };
+pub const Operation = enum { inspected, renamed, deleted };
 /// Borrowed only while its owned, authenticated preparation remains alive.
-/// This proof is for inspection/import, never a rename/delete exemption.
+/// This proof is for existing-instance inspection, never a rename/delete exemption.
 pub const TrustedVanilla = struct {
     prepared: *const loader.PreparedVanilla,
     generation: u64,
@@ -58,6 +58,7 @@ pub const Result = struct {
     /// Official metadata pin and actual local client hash/size, not full readiness.
     local_client_verified: bool = false,
     publication_proof: ?PublicationProof = null,
+    deletion_proof: ?DeletionProof = null,
     /// Direct inspection transfers ownership while its returned proof keeps files open.
     owned_ns: ?namespace.Token = null,
 
@@ -65,12 +66,19 @@ pub const Result = struct {
     pub fn releasePublicationProof(self: *Result) void {
         if (self.publication_proof) |proof| proof.close();
         self.publication_proof = null;
+        if (self.deletion_proof) |proof| proof.close();
+        self.deletion_proof = null;
         if (self.owned_ns) |token| token.release();
         self.owned_ns = null;
     }
 
     /// Caller holds the stable-ID lease and namespace reservation. No content rehash.
     pub fn recheckPublication(self: *const Result, root: []const u8) !void {
+        if (self.operation == .deleted) {
+            const proof = self.deletion_proof orelse return error.InvalidCompletedPublication;
+            try proof.recheck(root, self.instance.name);
+            return;
+        }
         if (!self.local_client_verified) return;
         const proof = self.publication_proof orelse return error.InvalidCompletedPublication;
         try proof.recheck(root, self.instance.name);
@@ -174,6 +182,23 @@ const Root = struct {
         try sameInode(try directoryStat(io, self.root), try directoryStat(io, current.root));
         try sameInode(try directoryStat(io, self.minecraft), try directoryStat(io, current.minecraft));
         try sameInode(try directoryStat(io, self.versions), try directoryStat(io, current.versions));
+    }
+};
+const DeletionProof = struct {
+    io: std.Io,
+    root: Root,
+
+    fn close(self: DeletionProof) void {
+        self.root.close(self.io);
+    }
+
+    fn recheck(self: DeletionProof, root: []const u8, name: []const u8) !void {
+        try self.root.verify(self.io, root);
+        _ = self.root.versions.statFile(self.io, name, .{ .follow_symlinks = false }) catch |err| {
+            if (err == error.FileNotFound) return;
+            return err;
+        };
+        return error.TreeChanged;
     }
 };
 fn collision(io: std.Io, dir: Dir, name: []const u8) !void {
@@ -522,23 +547,18 @@ fn inspect(a: A, io: std.Io, root: []const u8, handles: Root, instance: config.I
     return identity;
 }
 
-/// Validates the existing named tree and resolves local metadata inheritance only.
-/// Does not promise client JAR, libraries, assets, Java, or launch completeness.
-pub fn importExisting(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
-    return inspectExisting(a, io, root, instance, options, false);
-}
 /// Proves local base/loader identity and the resolved client JAR, not libraries/assets/Java.
 pub fn inspectInstalled(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
-    return inspectExisting(a, io, root, instance, options, true);
+    return inspectExisting(a, io, root, instance, options);
 }
 /// Parent holds the stable-ID lease across this call and publication of its result.
 /// Lease callbacks and all filesystem work run outside the gate.
 pub fn inspectInstalledLeased(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options, lease: LeaseCheck) !Result {
     var scoped = options;
     scoped.lease = lease;
-    return inspectExisting(a, io, root, instance, scoped, true);
+    return inspectExisting(a, io, root, instance, scoped);
 }
-fn inspectExisting(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options, verify_client: bool) !Result {
+fn inspectExisting(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
     const lease = try requireScope(options);
     try validate(instance, options);
     try lease.recheck(lease.context, instance.id);
@@ -548,7 +568,7 @@ fn inspectExisting(a: A, io: std.Io, root: []const u8, instance: config.Instance
     defer if (release_token) token.release();
     try recheckNamespace(token, options);
     try check(io, instance, options);
-    var result = try inspectExistingBody(a, io, root, instance, options, verify_client);
+    var result = try inspectExistingBody(a, io, root, instance, options);
     errdefer result.deinit();
     try lease.recheck(lease.context, instance.id);
     try recheckNamespace(token, options);
@@ -647,8 +667,8 @@ fn canonicalVanilla(a: A, io: std.Io, root: []const u8, source: Dir, instance: c
     return error.MissingClientDownload;
 }
 
-fn inspectExistingBody(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options, verify_client: bool) !Result {
-    var result: Result = .{ .arena = .init(a), .operation = .imported, .instance = undefined };
+fn inspectExistingBody(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
+    var result: Result = .{ .arena = .init(a), .operation = .inspected, .instance = undefined };
     errdefer result.deinit();
     var scratch: std.heap.ArenaAllocator = .init(a);
     defer scratch.deinit();
@@ -679,7 +699,7 @@ fn inspectExistingBody(a: A, io: std.Io, root: []const u8, instance: config.Inst
     result.instance.minecraft_version = try output.dupe(u8, identity.minecraft_version);
     result.instance.loader = identity.loader;
     result.instance.loader_version = if (identity.loader_version) |version| try output.dupe(u8, version) else null;
-    if (verify_client or identity.ambiguous_flattened) held_client = try verifyClient(io, handles, client orelse return error.MissingClientDownload, options);
+    held_client = try verifyClient(io, handles, client orelse return error.MissingClientDownload, options);
     try verified(ar, io, source, snapshot, options);
     try sameDirectory(before, try handles.versions.statFile(io, instance.name, .{ .follow_symlinks = false }));
     if (identity.ambiguous_flattened) {
@@ -775,7 +795,160 @@ pub fn rename(a: A, io: std.Io, root: []const u8, instance: config.Instance, new
     return transact(a, io, root, instance, new_name, .renamed, options);
 }
 pub fn remove(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
-    return transact(a, io, root, instance, null, .deleted, options);
+    return eraseInstance(a, io, root, instance, options);
+}
+
+/// Every directory is pinned before erasure; paths used for unlink are single
+/// validated components relative to those handles, never recursive string paths.
+const ErasePlan = struct {
+    const Directory = struct { handle: Dir, parent: ?usize, name: []const u8, stat: Stat };
+    const File = struct { parent: usize, name: []const u8, stat: Stat, identity: bool };
+    allocator: A,
+    directories: std.ArrayList(Directory) = .empty,
+    files: std.ArrayList(File) = .empty,
+    entries: usize = 0,
+
+    fn close(self: *ErasePlan, io: std.Io) void {
+        // The root is borrowed from eraseInstance; descendant handles are owned.
+        for (self.directories.items[1..]) |directory| directory.handle.close(io);
+        self.directories.deinit(self.allocator);
+        self.files.deinit(self.allocator);
+    }
+
+    fn collect(self: *ErasePlan, io: std.Io, parent: usize, depth: usize, json_name: []const u8, receipt_name: ?[]const u8, options: Options) anyerror!void {
+        if (depth > options.limits.max_depth) return error.ResourceLimit;
+        const dir = self.directories.items[parent].handle;
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            try hooks(options).check(io);
+            try safe.component(entry.name);
+            self.entries += 1;
+            if (self.entries > options.limits.max_files) return error.ResourceLimit;
+            const name = try self.allocator.dupe(u8, entry.name);
+            const stat = try dir.statFile(io, name, .{ .follow_symlinks = false });
+            switch (stat.kind) {
+                .directory => {
+                    const child = try tree.child(io, dir, name, false);
+                    var retained = false;
+                    defer if (!retained) child.close(io);
+                    try sameInode(stat, try directoryStat(io, child));
+                    const index = self.directories.items.len;
+                    try self.directories.append(self.allocator, .{ .handle = child, .parent = parent, .name = name, .stat = stat });
+                    retained = true;
+                    try self.collect(io, index, depth + 1, json_name, receipt_name, options);
+                },
+                .file => {
+                    if (stat.nlink != 1) return error.HardLinkAlias;
+                    const identity = parent == 0 and (std.mem.eql(u8, name, json_name) or (if (receipt_name) |receipt| std.mem.eql(u8, name, receipt) else false));
+                    try self.files.append(self.allocator, .{ .parent = parent, .name = name, .stat = stat, .identity = identity });
+                },
+                else => return error.UnsafeFileType,
+            }
+        }
+    }
+
+    fn verifyDirectories(self: *const ErasePlan, io: std.Io, index: usize) !void {
+        var current = index;
+        while (self.directories.items[current].parent) |parent| {
+            const directory = self.directories.items[current];
+            try sameInode(directory.stat, try directoryStat(io, directory.handle));
+            try sameInode(directory.stat, try self.directories.items[parent].handle.statFile(io, directory.name, .{ .follow_symlinks = false }));
+            current = parent;
+        }
+        try sameInode(self.directories.items[0].stat, try directoryStat(io, self.directories.items[0].handle));
+    }
+
+    fn eraseFile(self: *const ErasePlan, io: std.Io, file: File) !void {
+        try self.verifyDirectories(io, file.parent);
+        const dir = self.directories.items[file.parent].handle;
+        const current = try dir.statFile(io, file.name, .{ .follow_symlinks = false });
+        try sameInode(file.stat, current);
+        if (current.nlink != 1 or current.size != file.stat.size or current.mtime.nanoseconds != file.stat.mtime.nanoseconds) return error.TreeChanged;
+        try dir.deleteFile(io, file.name);
+    }
+};
+
+fn eraseInstance(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
+    const lease = try requireScope(options);
+    try validate(instance, options);
+    try lease.recheck(lease.context, instance.id);
+    const token = try reserveNamespace(io, options);
+    defer if (options.namespace_token == null) token.release();
+    try recheckNamespace(token, options);
+    var result: Result = .{ .arena = .init(a), .operation = .deleted, .instance = undefined };
+    errdefer result.deinit();
+    result.instance = try owned(result.arena.allocator(), instance);
+    result.original_name = try result.arena.allocator().dupe(u8, instance.name);
+    var scratch: std.heap.ArenaAllocator = .init(a);
+    defer scratch.deinit();
+    const ar = scratch.allocator();
+    const handles = try Root.open(io, root);
+    var release_handles = true;
+    defer if (release_handles) handles.close(io);
+    try check(io, instance, options);
+    const source = try tree.child(io, handles.versions, instance.name, false);
+    defer source.close(io);
+    const source_stat = try directoryStat(io, source);
+    const identity = try inspect(ar, io, root, handles, instance, options);
+    if (identity.ambiguous_flattened) return error.CanonicalVersionProtected;
+    try canonicalProtection(ar, io, handles.versions, instance, identity.minecraft_version, options);
+    try auditTree(io, source, options, false);
+    var snapshot = try tree.snapshot(ar, io, source, null, options.limits, hooks(options));
+    defer snapshot.deinit();
+    var plan: ErasePlan = .{ .allocator = ar };
+    // Install the borrowed root before the cleanup scope uses directories[1..].
+    try plan.directories.append(ar, .{ .handle = source, .parent = null, .name = instance.name, .stat = source_stat });
+    defer plan.close(io);
+    const json_name = try std.fmt.allocPrint(ar, "{s}.json", .{instance.name});
+    try plan.collect(io, 0, 0, json_name, if (identity.receipt) |receipt| receipt.name else null, options);
+    try lease.recheck(lease.context, instance.id);
+    try recheckNamespace(token, options);
+    try check(io, instance, options);
+    try handles.verify(io, root);
+    try sameInode(source_stat, try handles.versions.statFile(io, instance.name, .{ .follow_symlinks = false }));
+    try canonicalProtection(ar, io, handles.versions, instance, identity.minecraft_version, options);
+    try verified(ar, io, source, snapshot, options);
+    for (plan.directories.items, 0..) |_, index| try plan.verifyDirectories(io, index);
+    try lease.recheck(lease.context, instance.id);
+    try recheckNamespace(token, options);
+    try check(io, instance, options);
+
+    // Transfer the already acquired roots before the first destructive operation.
+    // Failure cleanup closes them; success retains rooted absence for publication.
+    result.deletion_proof = .{ .io = io, .root = handles };
+    release_handles = false;
+
+    // From the first unlink onward there is no rollback. Retain intervention debt
+    // on any failure instead of treating an unknown partial erasure as cancellation.
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    for ([_]bool{ false, true }) |identity_files| {
+        for (plan.files.items) |file| {
+            if (file.identity != identity_files) continue;
+            handles.verify(io, root) catch return error.PermanentDeletionIncomplete;
+            sameInode(source_stat, handles.versions.statFile(io, instance.name, .{ .follow_symlinks = false }) catch return error.PermanentDeletionIncomplete) catch return error.PermanentDeletionIncomplete;
+            plan.eraseFile(io, file) catch return error.PermanentDeletionIncomplete;
+        }
+        if (!identity_files) {
+            var index = plan.directories.items.len;
+            while (index > 1) {
+                index -= 1;
+                const directory = plan.directories.items[index];
+                handles.verify(io, root) catch return error.PermanentDeletionIncomplete;
+                sameInode(source_stat, handles.versions.statFile(io, instance.name, .{ .follow_symlinks = false }) catch return error.PermanentDeletionIncomplete) catch return error.PermanentDeletionIncomplete;
+                plan.verifyDirectories(io, index) catch return error.PermanentDeletionIncomplete;
+                plan.directories.items[directory.parent.?].handle.deleteDir(io, directory.name) catch return error.PermanentDeletionIncomplete;
+            }
+        }
+    }
+    handles.verify(io, root) catch return error.PermanentDeletionIncomplete;
+    sameInode(source_stat, handles.versions.statFile(io, instance.name, .{ .follow_symlinks = false }) catch return error.PermanentDeletionIncomplete) catch return error.PermanentDeletionIncomplete;
+    handles.versions.deleteDir(io, instance.name) catch return error.PermanentDeletionIncomplete;
+    if (!namedAbsent(io, handles.versions, instance.name)) return error.PermanentDeletionIncomplete;
+    tree.syncDir(io, handles.versions) catch {
+        result.durability_uncertain = true;
+    };
+    return result;
 }
 fn transact(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_name: ?[]const u8, operation: Operation, options: Options) !Result {
     const lease = try requireScope(options);
@@ -1045,7 +1218,7 @@ fn updateExpected(entry: *tree.Entry, bytes: []const u8, total: *u64) void {
     std.crypto.hash.sha2.Sha256.hash(bytes, &entry.sha256, .{});
 }
 
-const TestCall = enum { import_existing, inspect_installed, rename_instance, remove_instance };
+const TestCall = enum { inspect_installed, rename_instance, remove_instance };
 const TestCheckChain = struct {
     mutation: *@import("instance_leases.zig").Mutation,
     injected: ?LeaseCheck,
@@ -1068,14 +1241,10 @@ fn testScopedCall(a: A, io: std.Io, root: []const u8, instance: config.Instance,
     var chain: TestCheckChain = .{ .mutation = mutation, .injected = options.lease };
     scoped.lease = .{ .context = &chain, .recheck = TestCheckChain.recheck };
     return switch (call) {
-        .import_existing => importExisting(a, io, root, instance, scoped),
         .inspect_installed => inspectInstalled(a, io, root, instance, scoped),
         .rename_instance => rename(a, io, root, instance, new_name.?, scoped),
         .remove_instance => remove(a, io, root, instance, scoped),
     };
-}
-fn testImportExisting(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
-    return testScopedCall(a, io, root, instance, null, options, .import_existing);
 }
 fn testInspectInstalled(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
     return testScopedCall(a, io, root, instance, null, options, .inspect_installed);
@@ -1088,7 +1257,7 @@ fn testRemove(a: A, io: std.Io, root: []const u8, instance: config.Instance, opt
 }
 
 const fixture_instance: config.Instance = .{ .id = "stable-id", .name = "Play", .minecraft_version = "placeholder", .java_path = "/fixture/java", .origin = .{ .kind = .modrinth, .project_id = "project", .version_id = "release" } };
-const fixture_base = "{\"id\":\"1.21\",\"mainClass\":\"net.minecraft.client.main.Main\",\"downloads\":{\"client\":{\"url\":\"https://example.invalid/client\",\"size\":4}},\"arguments\":{\"game\":[],\"jvm\":[]}}";
+const fixture_base = "{\"id\":\"1.21\",\"mainClass\":\"net.minecraft.client.main.Main\",\"downloads\":{\"client\":{\"url\":\"https://example.invalid/client\",\"size\":4,\"sha1\":\"1405df66cbe219b0bf6355bc3d60361a8376b6b4\"}},\"arguments\":{\"game\":[],\"jvm\":[]}}";
 const fixture_alias = "{\"id\":\"Play\",\"inheritsFrom\":\"1.21\"}";
 fn fixture(io: std.Io, dir: Dir) !void {
     try dir.createDirPath(io, ".minecraft/versions/1.21");
@@ -1098,6 +1267,7 @@ fn fixture(io: std.Io, dir: Dir) !void {
     try dir.createDirPath(io, ".minecraft/assets");
     try dir.createDirPath(io, ".minecraft/libraries");
     try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/1.21/1.21.json", .data = fixture_base });
+    try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/1.21/1.21.jar", .data = "base" });
     try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/Play.json", .data = fixture_alias });
     try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/saves/World/level.dat", .data = "world" });
     try dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/config/options.txt", .data = "config" });
@@ -1122,26 +1292,6 @@ fn fixtureWritable(io: std.Io, dir: Dir) void {
             child.close(io);
         }
     }
-}
-
-test "instance transaction import derives identity without claiming installation" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    try fixture(io, tmp.dir);
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    var imported = try testImportExisting(a, io, root, fixture_instance, .{});
-    defer imported.deinit();
-    try std.testing.expectEqual(.imported, imported.operation);
-    try std.testing.expectEqualStrings("1.21", imported.instance.minecraft_version);
-    try std.testing.expectEqual(.vanilla, imported.instance.loader);
-    try std.testing.expect(imported.recovery_directory == null);
-    try std.testing.expect(imported.instance.id.ptr != fixture_instance.id.ptr);
-    try std.testing.expect(imported.instance.origin.?.project_id.ptr != fixture_instance.origin.?.project_id.ptr);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
-    try expectBytes(io, tmp.dir, ".minecraft/versions/Play/Play.json", fixture_alias);
 }
 
 test "instance transaction rename preserves metadata payload shared data and recovery" {
@@ -1183,12 +1333,12 @@ test "instance transaction rename preserves metadata payload shared data and rec
     try std.testing.expectEqualStrings("Play", manifest.value.old_name);
     try std.testing.expectEqualStrings("New Play", manifest.value.new_name.?);
     try std.testing.expectEqual(.renamed, manifest.value.operation);
-    var renamed_import = try testImportExisting(a, io, root, result.instance, .{});
-    defer renamed_import.deinit();
-    try std.testing.expectEqualStrings("1.21", renamed_import.instance.minecraft_version);
+    var renamed_inspection = try testInspectInstalled(a, io, root, result.instance, .{});
+    defer renamed_inspection.deinit();
+    try std.testing.expectEqualStrings("1.21", renamed_inspection.instance.minecraft_version);
 }
 
-test "instance transaction deletion moves exact tree without unlinking data" {
+test "instance transaction permanently deletes only the owned instance tree" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1201,13 +1351,250 @@ test "instance transaction deletion moves exact tree without unlinking data" {
     defer result.deinit();
     try std.testing.expectEqual(.deleted, result.operation);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/Play", .{}));
-    const recovery = try tree.openAbsolute(io, result.recovery_directory.?);
-    defer recovery.close(io);
-    try expectBytes(io, recovery, "original/saves/World/level.dat", "world");
-    try expectBytes(io, recovery, "backup/saves/World/level.dat", "world");
+    try std.testing.expect(result.recovery_directory == null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     try expectBytes(io, tmp.dir, ".minecraft/assets/shared", "asset");
     try expectBytes(io, tmp.dir, ".minecraft/libraries/shared", "library");
     try expectBytes(io, tmp.dir, ".minecraft/versions/1.21/1.21.json", fixture_base);
+}
+
+test "deleted result publication rejects recreated directory file and symlink without erasing them" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Kind = enum { directory, file, symlink };
+    for ([_]Kind{ .directory, .file, .symlink }) |kind| {
+        if (kind == .symlink and builtin.os.tag == .windows) continue;
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try fixture(io, tmp.dir);
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var result = try testRemove(a, io, root, fixture_instance, .{});
+        defer result.deinit();
+        try std.testing.expect(!result.local_client_verified and result.deletion_proof != null);
+        try result.recheckPublication(root);
+        const path = ".minecraft/versions/Play";
+        switch (kind) {
+            .directory => {
+                try tmp.dir.createDirPath(io, path);
+                try tmp.dir.writeFile(io, .{ .sub_path = path ++ "/retained", .data = "replacement" });
+            },
+            .file => try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "replacement" }),
+            .symlink => try tmp.dir.symLink(io, "../assets/shared", path, .{}),
+        }
+        try std.testing.expectError(error.TreeChanged, result.recheckPublication(root));
+        try std.testing.expectError(error.TreeChanged, result.recheckPublication(root));
+        switch (kind) {
+            .directory => try expectBytes(io, tmp.dir, path ++ "/retained", "replacement"),
+            .file => try expectBytes(io, tmp.dir, path, "replacement"),
+            .symlink => {
+                const stat = try tmp.dir.statFile(io, path, .{ .follow_symlinks = false });
+                try std.testing.expectEqual(.sym_link, stat.kind);
+            },
+        }
+        try expectBytes(io, tmp.dir, ".minecraft/assets/shared", "asset");
+        try expectBytes(io, tmp.dir, ".minecraft/libraries/shared", "library");
+    }
+}
+
+test "deleted result publication rejects replacement root minecraft and versions" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_][]const u8{ "launcher", "launcher/.minecraft", "launcher/.minecraft/versions" }) |path| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        {
+            const launcher = try tree.child(io, tmp.dir, "launcher", true);
+            defer launcher.close(io);
+            try fixture(io, launcher);
+        }
+        const root = try tmp.dir.realPathFileAlloc(io, "launcher", a);
+        defer a.free(root);
+        var result = try testRemove(a, io, root, fixture_instance, .{});
+        defer result.deinit();
+        try result.recheckPublication(root);
+        try tmp.dir.renamePreserve(path, tmp.dir, "previous", io);
+        try tmp.dir.createDirPath(io, "launcher/.minecraft/versions");
+        try tmp.dir.writeFile(io, .{ .sub_path = "launcher/.minecraft/versions/retained", .data = "replacement" });
+        try std.testing.expectError(error.TreeChanged, result.recheckPublication(root));
+        try expectBytes(io, tmp.dir, "launcher/.minecraft/versions/retained", "replacement");
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "launcher/.minecraft/versions/Play", .{}));
+    }
+}
+
+const DeletionCloseIo = struct {
+    var closes: usize = 0;
+
+    fn close(context: ?*anyopaque, dirs: []const Dir) void {
+        closes += dirs.len;
+        std.testing.io.vtable.dirClose(context, dirs);
+    }
+};
+
+test "deleted result requires publication proof and closes retained roots exactly once" {
+    const a = std.testing.allocator;
+    const real_io = std.testing.io;
+    var missing: Result = .{ .arena = .init(a), .operation = .deleted, .instance = fixture_instance };
+    defer missing.deinit();
+    try std.testing.expectError(error.InvalidCompletedPublication, missing.recheckPublication("/missing-proof"));
+    for ([_]bool{ false, true }) |full_cleanup| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try fixture(real_io, tmp.dir);
+        const root = try tmp.dir.realPathFileAlloc(real_io, ".", a);
+        defer a.free(root);
+        var vtable = real_io.vtable.*;
+        vtable.dirClose = DeletionCloseIo.close;
+        const io: std.Io = .{ .userdata = real_io.userdata, .vtable = &vtable };
+        DeletionCloseIo.closes = 0;
+        var result = try testRemove(a, io, root, fixture_instance, .{});
+        var result_live = true;
+        defer if (result_live) result.deinit();
+        try result.recheckPublication(root);
+        const before = DeletionCloseIo.closes;
+        if (full_cleanup) {
+            result.deinit();
+            result_live = false;
+        } else {
+            result.releasePublicationProof();
+            try std.testing.expect(result.deletion_proof == null);
+            try std.testing.expectError(error.InvalidCompletedPublication, result.recheckPublication(root));
+            result.releasePublicationProof();
+            result.deinit();
+            result_live = false;
+        }
+        try std.testing.expectEqual(before + 3, DeletionCloseIo.closes);
+    }
+}
+
+const EraseFaultIo = struct {
+    var files: usize = 0;
+    var fail_file: ?usize = null;
+    var fail_root: bool = false;
+    var late_cancel: ?*std.atomic.Value(bool) = null;
+
+    fn deleteFile(context: ?*anyopaque, dir: Dir, path: []const u8) Dir.DeleteFileError!void {
+        files += 1;
+        if (fail_file == files) return error.FileSystem;
+        try std.testing.io.vtable.dirDeleteFile(context, dir, path);
+        if (late_cancel) |flag| flag.store(true, .release);
+    }
+
+    fn deleteDir(context: ?*anyopaque, dir: Dir, path: []const u8) Dir.DeleteDirError!void {
+        if (fail_root and std.mem.eql(u8, path, "Play")) return error.FileSystem;
+        return std.testing.io.vtable.dirDeleteDir(context, dir, path);
+    }
+
+    fn wrap(vtable: *std.Io.VTable) std.Io {
+        vtable.* = std.testing.io.vtable.*;
+        vtable.dirDeleteFile = deleteFile;
+        vtable.dirDeleteDir = deleteDir;
+        return .{ .userdata = std.testing.io.userdata, .vtable = vtable };
+    }
+
+    fn reset() void {
+        files = 0;
+        fail_file = null;
+        fail_root = false;
+        late_cancel = null;
+    }
+};
+
+test "permanent instance deletion stops before unlink if the source changes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try fixture(io, tmp.dir);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var mutation: CommitFixture = .{ .dir = tmp.dir, .at = 2, .action = .change_source };
+    try std.testing.expectError(error.IntegrityMismatch, testRemove(a, io, root, fixture_instance, .{ .lease = .{ .context = &mutation, .recheck = CommitFixture.recheck } }));
+    try expectBytes(io, tmp.dir, ".minecraft/versions/Play/Play.json", fixture_alias);
+    try expectBytes(io, tmp.dir, ".minecraft/versions/Play/saves/World/level.dat", "world");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
+}
+
+test "permanent instance deletion reports partial IO failure without removing identity or shared files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try fixture(io, tmp.dir);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    EraseFaultIo.reset();
+    defer EraseFaultIo.reset();
+    EraseFaultIo.fail_file = 2;
+    var vtable: std.Io.VTable = undefined;
+    try std.testing.expectError(error.PermanentDeletionIncomplete, testRemove(a, EraseFaultIo.wrap(&vtable), root, fixture_instance, .{}));
+    try std.testing.expectEqual(@as(usize, 2), EraseFaultIo.files);
+    try expectBytes(io, tmp.dir, ".minecraft/versions/Play/Play.json", fixture_alias);
+    try expectBytes(io, tmp.dir, ".minecraft/assets/shared", "asset");
+    try expectBytes(io, tmp.dir, ".minecraft/libraries/shared", "library");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
+}
+
+test "permanent instance deletion never calls an empty residual root a completed deletion" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try fixture(io, tmp.dir);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    EraseFaultIo.reset();
+    defer EraseFaultIo.reset();
+    EraseFaultIo.fail_root = true;
+    var vtable: std.Io.VTable = undefined;
+    try std.testing.expectError(error.PermanentDeletionIncomplete, testRemove(a, EraseFaultIo.wrap(&vtable), root, fixture_instance, .{}));
+    const remaining = try tree.child(io, tmp.dir, ".minecraft", false);
+    defer remaining.close(io);
+    try tmp.dir.access(io, ".minecraft/versions/Play", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/Play/Play.json", .{}));
+    try expectBytes(io, tmp.dir, ".minecraft/versions/1.21/1.21.json", fixture_base);
+}
+
+test "permanent instance deletion reports completed erasure after late cancellation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try fixture(io, tmp.dir);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var flag = std.atomic.Value(bool).init(false);
+    EraseFaultIo.reset();
+    defer EraseFaultIo.reset();
+    EraseFaultIo.late_cancel = &flag;
+    var vtable: std.Io.VTable = undefined;
+    var result = try testRemove(a, EraseFaultIo.wrap(&vtable), root, fixture_instance, .{ .cancel = &flag });
+    defer result.deinit();
+    try std.testing.expect(flag.load(.acquire));
+    try std.testing.expectEqual(Operation.deleted, result.operation);
+    try std.testing.expect(result.recovery_directory == null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/Play", .{}));
+}
+
+test "permanent instance deletion can unlink readonly payload without changing unrelated data" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    defer fixtureWritable(io, tmp.dir);
+    try fixture(io, tmp.dir);
+    const payload = try tmp.dir.openFile(io, ".minecraft/versions/Play/extraMods/mod.jar", .{ .mode = .read_write });
+    try payload.setPermissions(io, .fromMode(0o400));
+    payload.close(io);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var result = try testRemove(a, io, root, fixture_instance, .{});
+    defer result.deinit();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/Play", .{}));
+    try expectBytes(io, tmp.dir, ".minecraft/versions/1.21/1.21.json", fixture_base);
+    try expectBytes(io, tmp.dir, ".minecraft/assets/shared", "asset");
 }
 
 test "instance transaction preflight rejects collision cancellation running guard and names" {
@@ -1224,9 +1611,9 @@ test "instance transaction preflight rejects collision cancellation running guar
     try std.testing.expectError(error.UnsafeInstance, testRename(a, io, root, fixture_instance, "../outside", .{}));
     var cancel = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, testRemove(a, io, root, fixture_instance, .{ .cancel = &cancel }));
-    try std.testing.expectError(error.Canceled, testImportExisting(a, io, root, fixture_instance, .{ .cancel = &cancel }));
+    try std.testing.expectError(error.Canceled, testInspectInstalled(a, io, root, fixture_instance, .{ .cancel = &cancel }));
     try std.testing.expectError(error.InstanceRunning, testRemove(a, io, root, fixture_instance, .{ .guard = .{ .running_ids = &.{"stable-id"} } }));
-    try std.testing.expectError(error.ResourceLimit, testImportExisting(a, io, root, fixture_instance, .{ .limits = .{ .max_files = 1 } }));
+    try std.testing.expectError(error.ResourceLimit, testInspectInstalled(a, io, root, fixture_instance, .{ .limits = .{ .max_files = 1 } }));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     try expectBytes(io, tmp.dir, ".minecraft/versions/Play/Play.json", fixture_alias);
 }
@@ -1240,12 +1627,13 @@ test "instance transaction rejects symlinks hardlinks and linked root components
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     try tmp.dir.symLink(io, "../1.21/1.21.json", ".minecraft/versions/Play/link", .{});
-    try std.testing.expectError(error.UnsafeFileType, testImportExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.UnsafeFileType, testInspectInstalled(a, io, root, fixture_instance, .{}));
     try std.testing.expectError(error.UnsafeFileType, testRemove(a, io, root, fixture_instance, .{}));
     try tmp.dir.deleteFile(io, ".minecraft/versions/Play/link");
     try tmp.dir.hardLink(".minecraft/assets/shared", tmp.dir, ".minecraft/versions/Play/alias", io, .{});
-    try std.testing.expectError(error.HardLinkAlias, testImportExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.HardLinkAlias, testInspectInstalled(a, io, root, fixture_instance, .{}));
     try std.testing.expectError(error.HardLinkAlias, testRename(a, io, root, fixture_instance, "New", .{}));
+    try std.testing.expectError(error.HardLinkAlias, testRemove(a, io, root, fixture_instance, .{}));
     try tmp.dir.symLink(io, ".minecraft", "linked", .{ .is_directory = true });
     const linked = try std.fs.path.join(a, &.{ root, "linked" });
     defer a.free(linked);
@@ -1270,10 +1658,11 @@ test "instance transaction protects canonical versions and referenced aliases" {
     try tmp.dir.createDirPath(io, ".minecraft/versions/Sibling");
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Sibling/Sibling.json", .data = "{\"id\":\"Sibling\",\"inheritsFrom\":\"Play\"}" });
     try std.testing.expectError(error.CanonicalVersionProtected, testRename(a, io, root, fixture_instance, "New", .{}));
+    try std.testing.expectError(error.CanonicalVersionProtected, testRemove(a, io, root, fixture_instance, .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
 }
 
-test "instance transaction import detects Fabric and rejects unknown loader" {
+test "instance transaction inspection detects Fabric and rejects unknown loader" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1282,13 +1671,13 @@ test "instance transaction import detects Fabric and rejects unknown loader" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/Play.json", .data = "{\"id\":\"Play\",\"inheritsFrom\":\"1.21\",\"mainClass\":\"net.fabricmc.loader.impl.launch.knot.KnotClient\",\"libraries\":[{\"name\":\"net.fabricmc:fabric-loader:0.16.10\"}]}" });
-    var result = try testImportExisting(a, io, root, fixture_instance, .{});
+    var result = try testInspectInstalled(a, io, root, fixture_instance, .{});
     defer result.deinit();
     try std.testing.expectEqual(.fabric, result.instance.loader);
     try std.testing.expectEqualStrings("0.16.10", result.instance.loader_version.?);
     try std.testing.expectEqualStrings("1.21", result.instance.minecraft_version);
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/Play.json", .data = "{\"id\":\"Play\",\"inheritsFrom\":\"1.21\",\"mainClass\":\"unknown.CustomLoader\"}" });
-    try std.testing.expectError(error.UnknownLoaderIdentity, testImportExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.UnknownLoaderIdentity, testInspectInstalled(a, io, root, fixture_instance, .{}));
 }
 
 const CommitFixture = struct {
@@ -1367,7 +1756,7 @@ fn allocationFixture(a: A, operation: Operation) !void {
     const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     var result = (switch (operation) {
-        .imported => testImportExisting(a, io, root, fixture_instance, .{}),
+        .inspected => testInspectInstalled(a, io, root, fixture_instance, .{}),
         .renamed => testRename(a, io, root, fixture_instance, "New", .{}),
         .deleted => testRemove(a, io, root, fixture_instance, .{}),
     }) catch |err| {
@@ -1377,9 +1766,9 @@ fn allocationFixture(a: A, operation: Operation) !void {
     defer result.deinit();
 }
 test "instance transaction allocation failures leave source and release owned memory" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{Operation.imported});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{Operation.renamed});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{Operation.deleted});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{Operation.inspected});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{Operation.renamed});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{Operation.deleted});
 }
 const RenameFault = enum { first_before, first_after, publish_after, rollback_before };
 var rename_fault: ?RenameFault = null;
@@ -1492,15 +1881,15 @@ fn expectFlattenedRename(kind: config.Loader) !void {
     defer a.free(root);
     const original = try tmp.dir.readFileAlloc(io, ".minecraft/versions/Play/Play.json", a, .limited(1024 * 1024));
     defer a.free(original);
-    var imported = try testImportExisting(a, io, root, fixture_instance, .{});
-    defer imported.deinit();
-    try std.testing.expectEqualStrings("1.21", imported.instance.minecraft_version);
-    try std.testing.expectEqualStrings("stable-id", imported.instance.id);
-    try std.testing.expectEqual(kind, imported.instance.loader);
+    var inspected = try testInspectInstalled(a, io, root, fixture_instance, .{});
+    defer inspected.deinit();
+    try std.testing.expectEqualStrings("1.21", inspected.instance.minecraft_version);
+    try std.testing.expectEqualStrings("stable-id", inspected.instance.id);
+    try std.testing.expectEqual(kind, inspected.instance.loader);
     var installed = try testInspectInstalled(a, io, root, fixture_instance, .{});
     defer installed.deinit();
     try std.testing.expectEqualStrings("1.21", installed.instance.minecraft_version);
-    var renamed = try testRename(a, io, root, imported.instance, "New", .{});
+    var renamed = try testRename(a, io, root, inspected.instance, "New", .{});
     defer renamed.deinit();
     try std.testing.expectEqualStrings("New", renamed.instance.name);
     try std.testing.expectEqualStrings("1.21", renamed.instance.minecraft_version);
@@ -1532,11 +1921,11 @@ fn expectFlattenedRename(kind: config.Loader) !void {
     try std.testing.expectEqualStrings("New", receipt.value.object.get("instance_name").?.string);
     try std.testing.expectEqualStrings("previous-id", receipt.value.object.get("instance_id").?.string);
     try std.testing.expectEqualStrings("preserve-me", receipt.value.object.get("audit_extra").?.string);
-    var reimported = try testImportExisting(a, io, root, renamed.instance, .{});
-    defer reimported.deinit();
-    try std.testing.expectEqualStrings("1.21", reimported.instance.minecraft_version);
-    try std.testing.expectEqual(kind, reimported.instance.loader);
-    if (kind == .forge) try std.testing.expectEqualStrings("47.3.0", reimported.instance.loader_version.?);
+    var reinspected = try testInspectInstalled(a, io, root, renamed.instance, .{});
+    defer reinspected.deinit();
+    try std.testing.expectEqualStrings("1.21", reinspected.instance.minecraft_version);
+    try std.testing.expectEqual(kind, reinspected.instance.loader);
+    if (kind == .forge) try std.testing.expectEqualStrings("47.3.0", reinspected.instance.loader_version.?);
     var ready = try testInspectInstalled(a, io, root, renamed.instance, .{});
     defer ready.deinit();
     const minecraft = try std.fs.path.join(a, &.{ root, ".minecraft" });
@@ -1546,14 +1935,13 @@ fn expectFlattenedRename(kind: config.Loader) !void {
     try std.testing.expectEqualStrings("New", loaded.version.value.jar orelse loaded.version.value.id);
     var deleted = try testRemove(a, io, root, renamed.instance, .{});
     defer deleted.deinit();
-    const removed = try tree.openAbsolute(io, deleted.recovery_directory.?);
-    defer removed.close(io);
-    try expectBytes(io, removed, "original/New.jar", fixture_private_jar);
-    try expectBytes(io, removed, "original/New.json", next);
+    try std.testing.expect(deleted.recovery_directory == null);
+    // Renaming retains its original recovery copy; deleting creates no new one.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/New/New.jar", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/New", .{}));
     try expectBytes(io, tmp.dir, ".minecraft/versions/1.21/1.21.json", fixture_base);
 }
-test "instance transaction flattened vanilla receipts prove identity rename private jar and recover delete" {
+test "instance transaction flattened vanilla receipts prove identity rename and permanent delete" {
     try expectFlattenedRename(.vanilla);
 }
 test "instance transaction flattened loader receipts preserve actual base and processor client bindings" {
@@ -1617,7 +2005,6 @@ test "instance transaction rejects missing malformed mismatched and unbound mana
             .hardlinked => error.HardLinkAlias,
             else => error.InvalidInstallReceipt,
         };
-        try std.testing.expectError(expected, testImportExisting(a, io, root, fixture_instance, .{}));
         try std.testing.expectError(expected, testInspectInstalled(a, io, root, fixture_instance, .{}));
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     }
@@ -1651,10 +2038,6 @@ test "instance transaction installed managed client validation rejects corrupt a
             .hardlinked => error.HardLinkAlias,
         };
         try std.testing.expectError(expected, testInspectInstalled(a, io, root, fixture_instance, .{}));
-        if (case == .hash or case == .size or case == .missing) {
-            var metadata_only = try testImportExisting(a, io, root, fixture_instance, .{});
-            metadata_only.deinit();
-        }
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     }
 }
@@ -1666,6 +2049,9 @@ test "instance transaction installed inherited client validation uses resolved c
     try fixture(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
+    const missing_hash = try std.json.Stringify.valueAlloc(a, .{ .id = "1.21", .mainClass = "net.minecraft.client.main.Main", .downloads = .{ .client = .{ .url = "https://example.invalid/base", .size = 4 } } }, .{});
+    defer a.free(missing_hash);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/1.21/1.21.json", .data = missing_hash });
     try std.testing.expectError(error.MissingClientHash, testInspectInstalled(a, io, root, fixture_instance, .{}));
     var hash: [20]u8 = undefined;
     std.crypto.hash.Sha1.hash("base", &hash, .{});
@@ -1742,14 +2128,13 @@ test "instance transaction managed loader receipt cannot contradict descriptor v
         const changed = try std.json.Stringify.valueAlloc(a, receipt.value, .{});
         defer a.free(changed);
         try tmp.dir.writeFile(io, .{ .sub_path = path, .data = changed });
-        try std.testing.expectError(error.InstallReceiptMismatch, testImportExisting(a, io, root, fixture_instance, .{}));
         try std.testing.expectError(error.InstallReceiptMismatch, testInspectInstalled(a, io, root, fixture_instance, .{}));
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     }
 }
 test "instance transaction managed receipt parser inspection and rewrite allocation failures preserve source" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, managedAllocationFixture, .{false});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, managedAllocationFixture, .{true});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, managedAllocationFixture, .{false});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, managedAllocationFixture, .{true});
 }
 
 const LeaseProbe = struct {
@@ -1788,7 +2173,7 @@ test "instance transaction leased installed inspection reads outside gate and re
     try flattenedFixture(real_io, tmp.dir, .vanilla);
     const root = try tmp.dir.realPathFileAlloc(real_io, ".", a);
     defer a.free(root);
-    const bytes = [_]u8{0x5a} ** (3 * 64 * 1024);
+    const bytes: [3 * 64 * 1024]u8 = @splat(0x5a);
     try tmp.dir.writeFile(real_io, .{ .sub_path = ".minecraft/versions/Play/Play.jar", .data = &bytes });
     var client_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&bytes, &client_hash, .{});
@@ -1926,9 +2311,9 @@ test "instance transaction accepts producer 4096 artifact receipt and preserves 
     const old_bytes = try tmp.dir.readFileAlloc(io, old_path, a, .limited(receipt_limit));
     defer a.free(old_bytes);
     try std.testing.expect(old_bytes.len > 64 * 1024 and old_bytes.len < receipt_limit);
-    var imported = try testImportExisting(a, io, root, fixture_instance, .{});
-    defer imported.deinit();
-    var moved = try testRename(a, io, root, imported.instance, "New", .{});
+    var inspected = try testInspectInstalled(a, io, root, fixture_instance, .{});
+    defer inspected.deinit();
+    var moved = try testRename(a, io, root, inspected.instance, "New", .{});
     defer moved.deinit();
     var proof = try testInspectInstalled(a, io, root, moved.instance, .{});
     defer proof.deinit();
@@ -1957,42 +2342,42 @@ test "instance transaction receipt preflight bounds bytes depth tokens strings a
     defer a.free(root);
     const path = ".minecraft/versions/Play/.vela-loader.json";
     try artifactReceiptFixture(a, io, tmp.dir, 4097);
-    try std.testing.expectError(error.ResourceLimit, testImportExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.ResourceLimit, testInspectInstalled(a, io, root, fixture_instance, .{}));
     const too_deep = "{\"unknown\":[[[[[[[[0]]]]]]]]}";
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = too_deep });
-    try std.testing.expectError(error.ResourceLimit, testImportExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.ResourceLimit, testInspectInstalled(a, io, root, fixture_instance, .{}));
     const many = try a.alloc(u8, 2 * 65536 + 10);
     defer a.free(many);
     @memcpy(many[0..6], "{\"x\":[");
     for (0..65536) |index| @memcpy(many[6 + index * 2 ..][0..2], "0,");
     @memcpy(many[6 + 2 * 65536 ..], "0]} ");
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = many });
-    try std.testing.expectError(error.ResourceLimit, testImportExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.ResourceLimit, testInspectInstalled(a, io, root, fixture_instance, .{}));
     try artifactReceiptFixture(a, io, tmp.dir, 0);
     const original = try tmp.dir.readFileAlloc(io, path, a, .limited(receipt_limit));
     defer a.free(original);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, original, .{});
     defer parsed.deinit();
-    const long_string = [_]u8{'a'} ** 4097;
+    const long_string: [4097]u8 = @splat('a');
     for ([_]usize{ 4096, 4097 }) |length| {
         try parsed.value.object.put(parsed.arena.allocator(), "unknown", .{ .string = long_string[0..length] });
         const changed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
         defer a.free(changed);
         try tmp.dir.writeFile(io, .{ .sub_path = path, .data = changed });
         if (length == 4096) {
-            var result = try testImportExisting(a, io, root, fixture_instance, .{});
+            var result = try testInspectInstalled(a, io, root, fixture_instance, .{});
             result.deinit();
-        } else try std.testing.expectError(error.ResourceLimit, testImportExisting(a, io, root, fixture_instance, .{}));
+        } else try std.testing.expectError(error.ResourceLimit, testInspectInstalled(a, io, root, fixture_instance, .{}));
     }
     const padded = try a.alloc(u8, receipt_limit + 1);
     defer a.free(padded);
     @memset(padded, ' ');
     @memcpy(padded[0..original.len], original);
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = padded[0..receipt_limit] });
-    var accepted = try testImportExisting(a, io, root, fixture_instance, .{});
+    var accepted = try testInspectInstalled(a, io, root, fixture_instance, .{});
     accepted.deinit();
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = padded });
-    try std.testing.expectError(error.MetadataTooLarge, testImportExisting(a, io, root, fixture_instance, .{}));
+    try std.testing.expectError(error.MetadataTooLarge, testInspectInstalled(a, io, root, fixture_instance, .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
 }
 
@@ -2026,7 +2411,7 @@ test "instance transaction receipt artifacts reject aliases nonflat shapes unsaf
         const changed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
         defer a.free(changed);
         try tmp.dir.writeFile(io, .{ .sub_path = path, .data = changed });
-        if (mode < 2) try std.testing.expectError(error.DuplicateArtifactPath, testImportExisting(a, io, root, fixture_instance, .{})) else try std.testing.expectError(error.InvalidInstallReceipt, testImportExisting(a, io, root, fixture_instance, .{}));
+        if (mode < 2) try std.testing.expectError(error.DuplicateArtifactPath, testInspectInstalled(a, io, root, fixture_instance, .{})) else try std.testing.expectError(error.InvalidInstallReceipt, testInspectInstalled(a, io, root, fixture_instance, .{}));
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     }
 }
@@ -2038,7 +2423,7 @@ fn artifactAllocationFixture(a: A) !void {
     try artifactReceiptFixture(std.testing.allocator, io, tmp.dir, 2);
     const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
-    var result = try testImportExisting(a, io, root, fixture_instance, .{});
+    var result = try testInspectInstalled(a, io, root, fixture_instance, .{});
     defer result.deinit();
 }
 
@@ -2070,7 +2455,7 @@ fn canonicalPreparation(a: A, io: std.Io, root: []const u8, cancel: ?*const std.
 }
 const canonical_instance: config.Instance = .{ .id = "canonical-local", .name = "26.3", .minecraft_version = "26.3" };
 
-test "canonical import requires independent official metadata pin and actual client proof without modifying local files" {
+test "canonical registered-instance inspection requires independent official metadata pin and actual client proof without modifying local files" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -2078,19 +2463,19 @@ test "canonical import requires independent official metadata pin and actual cli
     try canonicalFixture(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    try std.testing.expectError(error.MissingInstallReceipt, testImportExisting(a, io, root, canonical_instance, .{}));
+    try std.testing.expectError(error.MissingInstallReceipt, testInspectInstalled(a, io, root, canonical_instance, .{}));
     var prepared = try canonicalPreparation(a, io, root, null);
     defer prepared.deinit();
     try std.testing.expectEqual(@as(u64, 25), prepared.runtime_major);
     const options: Options = .{ .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment } };
-    var imported = try testImportExisting(a, io, root, canonical_instance, options);
-    defer imported.deinit();
-    try std.testing.expect(imported.local_client_verified);
-    try imported.recheckPublication(root);
-    try std.testing.expect(imported.instance.origin == null);
-    try std.testing.expectEqualStrings("26.3", imported.instance.minecraft_version);
-    imported.releasePublicationProof();
-    var installed = try testInspectInstalled(a, io, root, imported.instance, options);
+    var inspected = try testInspectInstalled(a, io, root, canonical_instance, options);
+    defer inspected.deinit();
+    try std.testing.expect(inspected.local_client_verified);
+    try inspected.recheckPublication(root);
+    try std.testing.expect(inspected.instance.origin == null);
+    try std.testing.expectEqualStrings("26.3", inspected.instance.minecraft_version);
+    inspected.releasePublicationProof();
+    var installed = try testInspectInstalled(a, io, root, inspected.instance, options);
     defer installed.deinit();
     try std.testing.expect(installed.local_client_verified);
     try expectBytes(io, tmp.dir, ".minecraft/versions/26.3/mods/keep.jar", "mod");
@@ -2098,30 +2483,30 @@ test "canonical import requires independent official metadata pin and actual cli
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/26.3/.vela-instance.json", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela", .{}));
     installed.releasePublicationProof();
-    try std.testing.expectError(error.CanonicalVersionProtected, testRename(a, io, root, imported.instance, "New", options));
-    try std.testing.expectError(error.CanonicalVersionProtected, testRemove(a, io, root, imported.instance, options));
+    try std.testing.expectError(error.CanonicalVersionProtected, testRename(a, io, root, inspected.instance, "New", options));
+    try std.testing.expectError(error.CanonicalVersionProtected, testRemove(a, io, root, inspected.instance, options));
     var wrong = options;
     wrong.trusted_vanilla.?.generation += 1;
-    try std.testing.expectError(error.PreparedMetadataGenerationMismatch, testImportExisting(a, io, root, canonical_instance, wrong));
+    try std.testing.expectError(error.PreparedMetadataGenerationMismatch, testInspectInstalled(a, io, root, canonical_instance, wrong));
     wrong = options;
     wrong.trusted_vanilla.?.environment.os_version = "changed";
-    try std.testing.expectError(error.PreparedMetadataMismatch, testImportExisting(a, io, root, canonical_instance, wrong));
+    try std.testing.expectError(error.PreparedMetadataMismatch, testInspectInstalled(a, io, root, canonical_instance, wrong));
     var changed_id = canonical_instance;
     changed_id.id = "other-id";
-    try std.testing.expectError(error.PreparedMetadataMismatch, testImportExisting(a, io, root, changed_id, options));
+    try std.testing.expectError(error.PreparedMetadataMismatch, testInspectInstalled(a, io, root, changed_id, options));
     var other = std.testing.tmpDir(.{ .iterate = true });
     defer other.cleanup();
     try canonicalFixture(io, other.dir);
     const other_root = try other.dir.realPathFileAlloc(io, ".", a);
     defer a.free(other_root);
-    try std.testing.expectError(error.PreparedMetadataMismatch, testImportExisting(a, io, other_root, canonical_instance, options));
+    try std.testing.expectError(error.PreparedMetadataMismatch, testInspectInstalled(a, io, other_root, canonical_instance, options));
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.jar", .data = "evil" });
-    try std.testing.expectError(error.ClientHashMismatch, testImportExisting(a, io, root, canonical_instance, options));
+    try std.testing.expectError(error.ClientHashMismatch, testInspectInstalled(a, io, root, canonical_instance, options));
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.jar", .data = "large" });
-    try std.testing.expectError(error.ClientSizeMismatch, testImportExisting(a, io, root, canonical_instance, options));
+    try std.testing.expectError(error.ClientSizeMismatch, testInspectInstalled(a, io, root, canonical_instance, options));
     try tmp.dir.deleteFile(io, ".minecraft/versions/26.3/26.3.jar");
     try tmp.dir.symLink(io, "mods/keep.jar", ".minecraft/versions/26.3/26.3.jar", .{});
-    try std.testing.expectError(error.UnsafeFileType, testImportExisting(a, io, root, canonical_instance, options));
+    try std.testing.expectError(error.UnsafeFileType, testInspectInstalled(a, io, root, canonical_instance, options));
     try tmp.dir.deleteFile(io, ".minecraft/versions/26.3/26.3.jar");
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.jar", .data = "base" });
     const bytes = try canonicalFixtureBytes(a);
@@ -2132,10 +2517,10 @@ test "canonical import requires independent official metadata pin and actual cli
     altered[major + 1] = '4';
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.json", .data = altered });
     try std.testing.expectError(error.ChecksumMismatch, canonicalPreparation(a, io, root, null));
-    try std.testing.expectError(error.PreparedMetadataChanged, testImportExisting(a, io, root, canonical_instance, options));
+    try std.testing.expectError(error.PreparedMetadataChanged, testInspectInstalled(a, io, root, canonical_instance, options));
     try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/26.3/26.3.json", .data = bytes });
     @constCast(prepared.sources)[0].bytes = altered;
-    try std.testing.expectError(error.PreparedMetadataChanged, testImportExisting(a, io, root, canonical_instance, options));
+    try std.testing.expectError(error.PreparedMetadataChanged, testInspectInstalled(a, io, root, canonical_instance, options));
 }
 fn canonicalAllocationFixture(a: A) !void {
     const io = std.testing.io;
@@ -2146,13 +2531,13 @@ fn canonicalAllocationFixture(a: A) !void {
     defer std.testing.allocator.free(root);
     var prepared = try canonicalPreparation(a, io, root, null);
     defer prepared.deinit();
-    var result = try testImportExisting(a, io, root, canonical_instance, .{ .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment } });
+    var result = try testInspectInstalled(a, io, root, canonical_instance, .{ .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment } });
     defer result.deinit();
     try std.testing.expect(result.local_client_verified);
     try expectBytes(io, tmp.dir, ".minecraft/versions/26.3/26.3.jar", "base");
 }
 test "canonical proof allocation failures and cancellation release ownership without writing receipts" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, canonicalAllocationFixture, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, canonicalAllocationFixture, .{});
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -2166,18 +2551,18 @@ test "canonical proof allocation failures and cancellation release ownership wit
     var prepared = try canonicalPreparation(a, io, root, &cancel);
     defer prepared.deinit();
     cancel.store(true, .release);
-    try std.testing.expectError(error.Canceled, testImportExisting(a, io, root, canonical_instance, .{ .cancel = &cancel, .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment } }));
+    try std.testing.expectError(error.Canceled, testInspectInstalled(a, io, root, canonical_instance, .{ .cancel = &cancel, .trusted_vanilla = .{ .prepared = &prepared, .generation = 17, .environment = prepared.target.environment } }));
     try expectBytes(io, tmp.dir, ".minecraft/versions/26.3/26.3.jar", "base");
 }
 
 test "instance transaction artifact receipt allocation failures release typed and alias scratch" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, artifactAllocationFixture, .{});
+    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, artifactAllocationFixture, .{});
 }
 
-const ScopeIoKind = enum { directory_open, directory_stat, file_open, file_stat, read, iterate, create, write, close, rename, sync };
+const ScopeIoKind = enum { directory_open, directory_stat, file_open, file_stat, read, iterate, create, write, close, rename, delete_file, delete_dir, sync };
 const ScopeIoProbe = struct {
     const Leases = @import("instance_leases.zig");
-    counts: [std.meta.fields(ScopeIoKind).len]usize = @splat(0),
+    counts: [@typeInfo(ScopeIoKind).@"enum".field_names.len]usize = @splat(0),
     coordinator: ?*Leases.Coordinator = null,
     mutation: ?*Leases.Mutation = null,
     competing: ?*Leases.Mutation = null,
@@ -2193,7 +2578,7 @@ const ScopeIoProbe = struct {
     hook_failed: bool = false,
 
     fn count(self: *const ScopeIoProbe, kind: ScopeIoKind) usize {
-        return self.counts[@intFromEnum(kind)];
+        return self.counts[@backingInt(kind)];
     }
     fn total(self: *const ScopeIoProbe) usize {
         var n: usize = 0;
@@ -2201,7 +2586,7 @@ const ScopeIoProbe = struct {
         return n;
     }
     fn observe(self: *ScopeIoProbe, kind: ScopeIoKind) void {
-        self.counts[@intFromEnum(kind)] += 1;
+        self.counts[@backingInt(kind)] += 1;
         if (!worlds.transaction_gate.tryLock()) {
             self.gate_unavailable = true;
             return;
@@ -2307,6 +2692,14 @@ fn scopeRename(context: ?*anyopaque, old_dir: Dir, old_path: []const u8, new_dir
     scope_io_probe.?.observe(.rename);
     return std.testing.io.vtable.dirRenamePreserve(context, old_dir, old_path, new_dir, new_path);
 }
+fn scopeDeleteFile(context: ?*anyopaque, dir: Dir, path: []const u8) Dir.DeleteFileError!void {
+    scope_io_probe.?.observe(.delete_file);
+    return std.testing.io.vtable.dirDeleteFile(context, dir, path);
+}
+fn scopeDeleteDir(context: ?*anyopaque, dir: Dir, path: []const u8) Dir.DeleteDirError!void {
+    scope_io_probe.?.observe(.delete_dir);
+    return std.testing.io.vtable.dirDeleteDir(context, dir, path);
+}
 fn scopeSync(context: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
     scope_io_probe.?.observe(.sync);
     return std.testing.io.vtable.fileSync(context, file);
@@ -2325,6 +2718,8 @@ fn scopeIoVtable() std.Io.VTable {
     vtable.dirClose = scopeCloseDirs;
     vtable.fileClose = scopeCloseFiles;
     vtable.dirRenamePreserve = scopeRename;
+    vtable.dirDeleteFile = scopeDeleteFile;
+    vtable.dirDeleteDir = scopeDeleteDir;
     vtable.fileSync = scopeSync;
     return vtable;
 }
@@ -2343,7 +2738,6 @@ test "cold instance transaction APIs require stable scope before any filesystem 
     defer worlds.transaction_gate.unlock(io);
     for ([_]Options{ .{}, .{ .namespace_token = token } }) |options| {
         try std.testing.expectError(error.MissingStableScope, inspectInstalled(a, io, "/no-scope-io", fixture_instance, options));
-        try std.testing.expectError(error.MissingStableScope, importExisting(a, io, "/no-scope-io", fixture_instance, options));
         try std.testing.expectError(error.MissingStableScope, rename(a, io, "/no-scope-io", fixture_instance, "New", options));
         try std.testing.expectError(error.MissingStableScope, remove(a, io, "/no-scope-io", fixture_instance, options));
     }
@@ -2399,13 +2793,12 @@ test "cold instance transaction APIs reject dynamic guards before lease namespac
             if (gate_busy) try std.testing.expect(worlds.transaction_gate.tryLock());
             defer if (gate_busy) worlds.transaction_gate.unlock(real_io);
             try std.testing.expectError(error.UnsupportedInstanceGuard, inspectInstalled(a, io, "/no-guard-io", fixture_instance, options));
-            try std.testing.expectError(error.UnsupportedInstanceGuard, importExisting(a, io, "/no-guard-io", fixture_instance, options));
             try std.testing.expectError(error.UnsupportedInstanceGuard, rename(a, io, "/no-guard-io", fixture_instance, "New", options));
             try std.testing.expectError(error.UnsupportedInstanceGuard, remove(a, io, "/no-guard-io", fixture_instance, options));
             try std.testing.expectError(error.UnsupportedInstanceGuard, inspectInstalledLeased(a, io, "/no-guard-io", fixture_instance, options, lease));
             var unscoped = options;
             unscoped.lease = null;
-            try std.testing.expectError(error.MissingStableScope, importExisting(a, io, "/no-guard-io", fixture_instance, unscoped));
+            try std.testing.expectError(error.MissingStableScope, inspectInstalled(a, io, "/no-guard-io", fixture_instance, unscoped));
             try std.testing.expectEqual(@as(usize, 0), guard_calls);
             try std.testing.expectEqual(@as(usize, 0), probe.checks);
             try std.testing.expectEqual(@as(usize, 0), probe.total());
@@ -2417,7 +2810,7 @@ test "instance transaction actual filesystem and hook IO retain Coordinator leas
     const leases = @import("instance_leases.zig");
     const a = std.testing.allocator;
     const real_io = std.testing.io;
-    for ([_]TestCall{ .import_existing, .inspect_installed, .rename_instance, .remove_instance }) |call| {
+    for ([_]TestCall{ .inspect_installed, .rename_instance, .remove_instance }) |call| {
         for ([_]bool{ false, true }) |borrowed| {
             var tmp = std.testing.tmpDir(.{ .iterate = true });
             defer tmp.cleanup();
@@ -2446,20 +2839,22 @@ test "instance transaction actual filesystem and hook IO retain Coordinator leas
                 .namespace_token = token,
             };
             var result = try switch (call) {
-                .import_existing => importExisting(a, io, root, fixture_instance, options),
                 .inspect_installed => inspectInstalledLeased(a, io, root, fixture_instance, options, options.lease.?),
                 .rename_instance => rename(a, io, root, fixture_instance, "New", options),
                 .remove_instance => remove(a, io, root, fixture_instance, options),
             };
             defer result.deinit();
-            try std.testing.expectEqual(@as(usize, if (call == .import_existing or call == .inspect_installed) 2 else 3), probe.checks);
+            try std.testing.expectEqual(@as(usize, if (call == .inspect_installed) 2 else 3), probe.checks);
             try std.testing.expectEqual(probe.checks - 1, probe.hook_calls);
             try std.testing.expect(!probe.gate_unavailable and !probe.admission_failed and !probe.hook_failed);
             for ([_]ScopeIoKind{ .directory_open, .directory_stat, .file_open, .file_stat, .read, .iterate, .close }) |kind| {
                 try std.testing.expect(probe.count(kind) > 0);
             }
-            if (call == .rename_instance or call == .remove_instance) {
+            if (call == .rename_instance) {
                 for ([_]ScopeIoKind{ .create, .write, .rename, .sync }) |kind| try std.testing.expect(probe.count(kind) > 0);
+            } else if (call == .remove_instance) {
+                for ([_]ScopeIoKind{ .delete_file, .delete_dir, .sync }) |kind| try std.testing.expect(probe.count(kind) > 0);
+                for ([_]ScopeIoKind{ .create, .write, .rename }) |kind| try std.testing.expectEqual(@as(usize, 0), probe.count(kind));
             }
             try std.testing.expect(probe.unrelated_launches > 0);
             for (probe.namespace_blocks) |count| try std.testing.expect(count > 0);
@@ -2497,13 +2892,12 @@ test "cold instance transaction APIs reject busy namespace and lost borrowed sta
     for ([_]Options{ .{ .lease = lease }, .{ .lease = lease, .namespace_token = lost } }, 0..) |options, index| {
         const expected = if (index == 0) error.InstanceNamespaceBusy else error.InstanceNamespaceLeaseLost;
         try std.testing.expectError(expected, inspectInstalled(a, io, "/no-namespace-io", fixture_instance, options));
-        try std.testing.expectError(expected, importExisting(a, io, "/no-namespace-io", fixture_instance, options));
         try std.testing.expectError(expected, rename(a, io, "/no-namespace-io", fixture_instance, "New", options));
         try std.testing.expectError(expected, remove(a, io, "/no-namespace-io", fixture_instance, options));
         try std.testing.expectEqual(@as(usize, 0), probe.total());
         try held.recheck();
     }
-    try std.testing.expectEqual(@as(usize, 8), probe.checks);
+    try std.testing.expectEqual(@as(usize, 6), probe.checks);
 }
 
 test "canonical inspection retains owning namespace through publication recheck and all returned proof closes" {
@@ -2552,7 +2946,7 @@ test "canonical inspection retains owning namespace through publication recheck 
                 var result = try if (installed)
                     inspectInstalledLeased(a, io, root, canonical_instance, options, options.lease.?)
                 else
-                    importExisting(a, io, root, canonical_instance, options);
+                    inspectInstalled(a, io, root, canonical_instance, options);
                 var result_live = true;
                 defer if (result_live) result.deinit();
                 try std.testing.expect(result.publication_proof != null);

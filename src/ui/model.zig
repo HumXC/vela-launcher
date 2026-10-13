@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Panel = enum { home, players, versions, more, library, java, servers, logs, instances, content, worlds };
+pub const Panel = enum { home, players, versions, more, library, java, servers, logs, instances, worlds };
 pub const Category = enum { game, settings };
 pub const VersionFilter = enum { release, snapshot, all };
 
@@ -34,13 +34,14 @@ pub const Msg = union(enum) {
     open_servers,
     open_logs,
     open_instances,
-    open_content,
     open_worlds,
     utility_back,
     select_category: Category,
     get_game,
     inspect_game: []const u8,
     use_game: []const u8,
+    select_instance: []const u8,
+    select_server: []const u8,
     choose_download: []const u8,
     filter_versions: VersionFilter,
     back,
@@ -52,7 +53,10 @@ pub const Msg = union(enum) {
 pub const Model = struct {
     labels: @import("labels.zig").Labels = .{},
     panel: Panel = .home,
-    sidebar_width: f32 = 276,
+    instance_parent: Panel = .more,
+    panel_parents: [@typeInfo(Panel).@"enum".field_names.len]Panel = @splat(.more),
+    sidebar_width: f32 = @import("style.zig").layout.sidebar_width,
+    instance_sidebar_width: f32 = @import("style.zig").layout.sidebar_width,
     instance_leave: ?Msg = null,
     players: []const Player = &preview_players,
     versions: []const Version = &preview_versions,
@@ -62,11 +66,55 @@ pub const Model = struct {
     category: Category = .game,
     getting_game: bool = true,
     version_filter: VersionFilter = .release,
+    game_instances_expanded: bool = true,
+    game_servers_expanded: bool = true,
     library_game: GameName = .{},
     download_game: GameName = .{},
     active_game: GameName = .{},
     search: [64]u8 = @splat(0),
     library_error: ?anyerror = null,
+
+    fn enterInstances(model: *Model) void {
+        if (model.panel != .instances and model.panel != .library) model.instance_parent = model.panel;
+        model.panel = .instances;
+        model.launch_notice = false;
+    }
+
+    fn enterPanel(model: *Model, panel: Panel) void {
+        if (model.panel != panel) model.panel_parents[@backingInt(panel)] = model.panel;
+        model.panel = panel;
+    }
+
+    pub fn parentPanel(model: *const Model) Panel {
+        return switch (model.panel) {
+            .home, .players, .versions, .more => .home,
+            .instances, .library => model.instance_parent,
+            else => model.panel_parents[@backingInt(model.panel)],
+        };
+    }
+
+    pub fn parentLabel(model: *const Model) []const u8 {
+        return switch (model.parentPanel()) {
+            .home => model.labels.home,
+            .more => "返回更多",
+            .players => "返回选择玩家",
+            .versions => "返回选择游戏",
+            .instances, .library => "返回实例管理",
+            .java => "返回 Java 管理",
+            .servers => "返回服务器",
+            .logs => "返回游戏日志",
+            .worlds => "返回存档",
+        };
+    }
+
+    pub fn parentMessage(model: *const Model) Msg {
+        return switch (model.panel) {
+            .java => .java_back,
+            .instances, .library => .library_back,
+            .servers, .logs, .worlds => .utility_back,
+            else => .back,
+        };
+    }
 
     pub fn player(model: *const Model) ?Player {
         for (model.players) |item| if (item.id == model.selected_player) return item;
@@ -127,62 +175,46 @@ pub fn transition(model: *Model, msg: Msg) void {
             model.panel = .more;
             model.launch_notice = false;
         },
-        .open_library => {
-            model.panel = .instances;
-            model.launch_notice = false;
-        },
+        .open_library, .open_instances, .get_game, .inspect_game, .choose_download, .filter_versions => model.enterInstances(),
         .open_java => {
-            model.panel = .java;
+            model.enterPanel(.java);
             model.launch_notice = false;
         },
         .java_back => {
-            if (model.panel == .java) model.panel = .more;
+            if (model.panel == .java) model.panel = model.parentPanel();
         },
         .library_back => {
-            if (model.panel == .library or model.panel == .instances) model.panel = .more;
+            if (model.panel == .instances) {
+                model.panel = model.instance_parent;
+            } else if (model.panel == .library) model.panel = .more;
         },
         .open_servers => {
-            model.panel = .servers;
-            model.launch_notice = false;
-        },
-        .open_instances => {
-            model.panel = .instances;
-            model.launch_notice = false;
-        },
-        .open_content => {
-            model.panel = .content;
+            model.enterPanel(.servers);
             model.launch_notice = false;
         },
         .open_worlds => {
-            model.panel = .worlds;
+            model.enterPanel(.worlds);
             model.launch_notice = false;
         },
         .open_logs => {
-            model.panel = .logs;
+            model.enterPanel(.logs);
             model.launch_notice = false;
         },
         .utility_back => {
-            if (model.panel == .servers or model.panel == .logs or model.panel == .instances or model.panel == .content or model.panel == .worlds) {
-                model.panel = .more;
+            if (model.panel == .servers or model.panel == .logs or model.panel == .instances or model.panel == .worlds) {
+                model.panel = model.parentPanel();
                 model.category = .game;
             }
         },
         .select_category => |category| {
             if (model.panel == .more) model.category = category;
         },
-        .get_game, .inspect_game => {
-            model.panel = .instances;
-            model.launch_notice = false;
-        },
+        .select_instance, .select_server => model.launch_notice = false,
         .use_game => |name| {
             if (model.panel == .versions and model.active_game.set(name)) {
                 model.panel = .home;
                 model.launch_notice = false;
             }
-        },
-        .choose_download, .filter_versions => {
-            model.panel = .instances;
-            model.launch_notice = false;
         },
         .back => {
             model.panel = .home;
@@ -274,7 +306,7 @@ test "legacy directory aliases route to instance management without a second cat
         try std.testing.expectEqual(Panel.instances, model.panel);
         try std.testing.expectEqualStrings("1.21.1", model.active_game.get());
         transition(&model, .library_back);
-        try std.testing.expectEqual(Panel.more, model.panel);
+        try std.testing.expectEqual(Panel.home, model.panel);
     }
 }
 
@@ -317,7 +349,7 @@ test "Java management navigation preserves game and player selections" {
 
 test "independent archives and instance management return to game without changing selections" {
     for ([_]Msg{ .open_worlds, .open_instances }) |message| {
-        var model: Model = .{ .category = .settings };
+        var model: Model = .{ .panel = .more, .category = .settings };
         _ = model.active_game.set("1.21.1");
         _ = model.library_game.set("1.20.1");
         transition(&model, message);
@@ -333,4 +365,27 @@ test "independent archives and instance management return to game without changi
         try std.testing.expect(model.isHome());
         try std.testing.expectEqualStrings("1.21.1", model.active_game.get());
     }
+}
+
+test "instance management returns to its entry panel across repeated visits" {
+    var model: Model = .{};
+    _ = model.active_game.set("1.21.1");
+    transition(&model, .open_instances);
+    transition(&model, .utility_back);
+    try std.testing.expectEqual(Panel.home, model.panel);
+    transition(&model, .open_more);
+    transition(&model, .open_instances);
+    transition(&model, .{ .inspect_game = "1.21.1" });
+    transition(&model, .utility_back);
+    try std.testing.expectEqual(Panel.more, model.panel);
+    transition(&model, .back);
+    transition(&model, .open_library);
+    transition(&model, .library_back);
+    try std.testing.expectEqual(Panel.home, model.panel);
+    transition(&model, .get_game);
+    transition(&model, .{ .filter_versions = .snapshot });
+    transition(&model, .utility_back);
+    try std.testing.expectEqual(Panel.home, model.panel);
+    try std.testing.expectEqualStrings("1.21.1", model.active_game.get());
+    try std.testing.expectEqual(@as(u32, 1), model.selected_player);
 }

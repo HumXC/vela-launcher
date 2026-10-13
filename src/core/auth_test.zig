@@ -519,7 +519,7 @@ test "signout is locally complete before secure-store delete is entered" {
     try login(&c);
     var observer: DeleteObserver = .{ .client = &c };
     c.store = .{ .ctx = &observer, .vtable = &.{ .put = DeleteObserver.put, .get = DeleteObserver.get, .delete = DeleteObserver.delete } };
-    const ref = [_]u8{'a'} ** 32;
+    const ref: [32]u8 = @splat('a');
     try testing.expectError(error.CredentialPersistenceFailed, c.signOut(&ref));
     try testing.expect(observer.observed_cleared);
 }

@@ -3,9 +3,10 @@
 //! directory; successfully written files may remain. The caller owns/exclusively
 //! controls the directory capability and its lifetime (no concurrent mutation).
 //! Regular-file links become independent copies after archive validation; no
-//! filesystem links are created. Directory links, special files, ZIP64 and
-//! global PAX remain unsupported. UTF-8 paths use ASCII collision preflight plus
-//! exclusive native filesystem creates, not universal Unicode case folding.
+//! filesystem links are created. Directory-link copies require explicit opt-in.
+//! Special files, ZIP64 and global PAX remain unsupported. UTF-8 paths use ASCII
+//! collision preflight plus exclusive native filesystem creates, not universal
+//! Unicode case folding.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -30,8 +31,13 @@ pub const Limits = struct {
     max_total_path_bytes: usize = 32 * 1024 * 1024,
     /// Bounds decoded compression; link-copy output uses max_total_bytes.
     max_expansion_ratio: u64 = 200,
-    /// Maximum number of link edges followed to a regular-file target.
+    /// Maximum link edges along any materialized branch (including directory copies).
     max_link_depth: usize = 64,
+    /// Java distributions may opt in to independent copies of in-archive trees.
+    /// Root targets, directory hardlinks, and repeated active aliases are rejected.
+    /// The last rule conservatively refuses even finite file references through
+    /// an alias already being expanded, rather than admitting recursive trees.
+    materialize_directory_links: bool = false,
 };
 pub const Kind = enum { file, directory };
 pub const Entry = struct {
@@ -108,7 +114,7 @@ const CheckedReader = struct {
 };
 
 const Node = struct { index: usize, explicit: bool, link_index: ?usize = null };
-const Link = struct { index: usize, target: []const u8 };
+const Link = struct { index: usize, target: []const u8, hard: bool };
 const Context = struct {
     allocator: Allocator,
     io: Io,
@@ -195,38 +201,140 @@ const Context = struct {
         const registered = try self.register(path, .file, 0, false);
         if (length > self.limits.max_total_path_bytes - self.total_path_bytes) return error.ArchivePathLimitExceeded;
         const node = try self.lookup(registered);
-        try self.links.append(self.allocator, .{ .index = node.index, .target = normalized });
+        try self.links.append(self.allocator, .{ .index = node.index, .target = normalized, .hard = hard });
         node.link_index = self.links.items.len - 1;
         self.total_path_bytes += length;
     }
 
-    fn materializeLinks(self: *Context) !void {
-        for (self.links.items) |link| {
-            try checkpoint(self.cancel);
-            var node = try self.lookup(link.target);
-            var depth: usize = 1;
-            while (node.link_index) |next| {
-                if (node.index == link.index) return error.ArchiveLinkCycle;
-                if (depth >= self.limits.max_link_depth) return error.ArchiveLinkDepthExceeded;
-                depth += 1;
-                node = try self.lookup(self.links.items[next].target);
+    const Copy = struct { source: usize, destination: usize, depth: usize };
+    const CopyTask = union(enum) { copy: Copy, leave_link };
+
+    fn followLink(self: *Context, index: usize, depth: *usize, active: *std.ArrayList(usize), tasks: *std.ArrayList(CopyTask)) !Link {
+        try checkpoint(self.cancel);
+        if (std.mem.indexOfScalar(usize, active.items, index) != null) return error.ArchiveLinkCycle;
+        if (depth.* >= self.limits.max_link_depth) return error.ArchiveLinkDepthExceeded;
+        depth.* += 1;
+        try active.append(self.allocator, index);
+        try tasks.append(self.allocator, .leave_link);
+        return self.links.items[(try self.lookup(self.entries.items[index].path)).link_index.?];
+    }
+
+    // Resolve only the immutable archive namespace, including aliases in a target's
+    // parent components. Generated copies can never become new resolution sources.
+    fn resolveCopy(self: *Context, source: usize, original_count: usize, depth: *usize, active: *std.ArrayList(usize), tasks: *std.ArrayList(CopyTask)) !struct { index: usize, hard: bool } {
+        var index = source;
+        var hard = false;
+        while ((try self.lookup(self.entries.items[index].path)).link_index != null) {
+            const link = try self.followLink(index, depth, active, tasks);
+            hard = hard or link.hard;
+            var path_buffer: [4096]u8 = undefined;
+            @memcpy(path_buffer[0..link.target.len], link.target);
+            var length = link.target.len;
+            resolve_path: while (true) {
+                try checkpoint(self.cancel);
+                const node = self.lookup(path_buffer[0..length]) catch null;
+                if (node) |found| {
+                    if (found.index < original_count) {
+                        index = found.index;
+                        break :resolve_path;
+                    }
+                }
+                var position: usize = 0;
+                while (std.mem.indexOfScalarPos(u8, path_buffer[0..length], position, '/')) |end| {
+                    position = end + 1;
+                    const prefix = self.lookup(path_buffer[0..end]) catch continue;
+                    if (prefix.index >= original_count or prefix.link_index == null) continue;
+                    const parent_link = try self.followLink(prefix.index, depth, active, tasks);
+                    if (parent_link.hard) return error.UnsupportedDirectoryLink;
+                    const suffix = path_buffer[end..length];
+                    if (parent_link.target.len + suffix.len > self.limits.max_path_bytes) return error.ArchivePathLimitExceeded;
+                    var rewritten: [4096]u8 = undefined;
+                    @memcpy(rewritten[0..parent_link.target.len], parent_link.target);
+                    @memcpy(rewritten[parent_link.target.len..][0..suffix.len], suffix);
+                    length = parent_link.target.len + suffix.len;
+                    _ = try validatePath(rewritten[0..length], false, self.limits);
+                    @memcpy(path_buffer[0..length], rewritten[0..length]);
+                    continue :resolve_path;
+                }
+                return error.MissingArchiveLinkTarget;
             }
-            if (depth > self.limits.max_link_depth) return error.ArchiveLinkDepthExceeded;
-            const source = self.entries.items[node.index];
-            if (source.kind != .file) return error.UnsupportedDirectoryLink;
-            try self.reserveSize(source.size);
-            var parent = try self.openParent(source.path);
-            defer parent.close(self.io);
-            const file = try parent.openFile(self.io, std.fs.path.basename(source.path), .{ .follow_symlinks = false, .allow_directory = false });
-            defer file.close(self.io);
-            const stat = try file.stat(self.io);
-            if (stat.kind != .file or stat.size != source.size) return error.ArchiveLinkTargetChanged;
-            var buffer: [chunk_size]u8 = undefined;
-            var reader = file.reader(self.io, &buffer);
-            const destination = &self.entries.items[link.index];
-            _ = try self.writeEntry(destination.path, &reader.interface, source.size, source.executable);
-            destination.size = source.size;
-            destination.executable = source.executable;
+        }
+        return .{ .index = index, .hard = hard };
+    }
+
+    fn materializeLinks(self: *Context) !void {
+        if (self.links.items.len == 0) return;
+        const original_count = self.entries.items.len;
+        const none = std.math.maxInt(usize);
+        const first_child = try self.allocator.alloc(usize, original_count);
+        defer self.allocator.free(first_child);
+        const next_sibling = try self.allocator.alloc(usize, original_count);
+        defer self.allocator.free(next_sibling);
+        @memset(first_child, none);
+        @memset(next_sibling, none);
+        for (self.entries.items, 0..) |entry, index| {
+            try checkpoint(self.cancel);
+            if (std.mem.lastIndexOfScalar(u8, entry.path, '/')) |end| {
+                const parent = (try self.lookup(entry.path[0..end])).index;
+                next_sibling[index] = first_child[parent];
+                first_child[parent] = index;
+            }
+        }
+        var tasks: std.ArrayList(CopyTask) = .empty;
+        defer tasks.deinit(self.allocator);
+        var active: std.ArrayList(usize) = .empty;
+        defer active.deinit(self.allocator);
+        for (self.links.items) |link| {
+            try tasks.append(self.allocator, .{ .copy = .{ .source = link.index, .destination = link.index, .depth = 0 } });
+            while (tasks.pop()) |task| {
+                try checkpoint(self.cancel);
+                const copy = switch (task) {
+                    .leave_link => {
+                        _ = active.pop();
+                        continue;
+                    },
+                    .copy => |value| value,
+                };
+                var depth = copy.depth;
+                const resolved = try self.resolveCopy(copy.source, original_count, &depth, &active, &tasks);
+                const source = self.entries.items[resolved.index];
+                const destination_path = self.entries.items[copy.destination].path;
+                if (source.kind == .directory) {
+                    if (!self.limits.materialize_directory_links or resolved.hard) return error.UnsupportedDirectoryLink;
+                    if (self.entries.items[copy.destination].kind != .directory) {
+                        var parent = try self.openParent(destination_path);
+                        defer parent.close(self.io);
+                        parent.createDir(self.io, std.fs.path.basename(destination_path), dirPermissions()) catch |err| switch (err) {
+                            error.PathAlreadyExists => return error.AliasCollision,
+                            else => return err,
+                        };
+                        self.entries.items[copy.destination].kind = .directory;
+                    }
+                    var child = first_child[resolved.index];
+                    while (child != none) : (child = next_sibling[child]) {
+                        try checkpoint(self.cancel);
+                        const entry = self.entries.items[child];
+                        const child_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ destination_path, std.fs.path.basename(entry.path) });
+                        defer self.allocator.free(child_path);
+                        const registered = try self.register(child_path, entry.kind, 0, false);
+                        const destination = (try self.lookup(registered)).index;
+                        try tasks.append(self.allocator, .{ .copy = .{ .source = child, .destination = destination, .depth = depth } });
+                    }
+                } else {
+                    try self.reserveSize(source.size);
+                    var parent = try self.openParent(source.path);
+                    defer parent.close(self.io);
+                    const file = try parent.openFile(self.io, std.fs.path.basename(source.path), .{ .follow_symlinks = false, .allow_directory = false });
+                    defer file.close(self.io);
+                    const stat = try file.stat(self.io);
+                    if (stat.kind != .file or stat.size != source.size) return error.ArchiveLinkTargetChanged;
+                    var buffer: [chunk_size]u8 = undefined;
+                    var reader = file.reader(self.io, &buffer);
+                    _ = try self.writeEntry(destination_path, &reader.interface, source.size, source.executable);
+                    self.entries.items[copy.destination].size = source.size;
+                    self.entries.items[copy.destination].executable = source.executable;
+                }
+            }
         }
     }
 

@@ -15,3 +15,5 @@ zig-pkg
 build
 result
 .minecraft
+.ulpi
+.vela
