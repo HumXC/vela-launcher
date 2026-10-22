@@ -15,7 +15,7 @@ pub fn runPrepared(a: std.mem.Allocator, io: std.Io, service: *downloader.Servic
     var reserved_config = config;
     reserved_config.namespace_token = token;
     try control.check();
-    if (!std.mem.eql(u8, config.version_id, target.selection.base_id)) return error.PreparedMetadataMismatch;
+    if (!std.mem.eql(u8, config.version_id, target.selection.base_id) or !std.mem.eql(u8, config.target.name, target.instance_name)) return error.PreparedMetadataMismatch;
     var expected_paths = try instances.Paths.init(a, io, target.root);
     defer expected_paths.deinit();
     var actual_paths = try instances.Paths.init(a, io, config.root);

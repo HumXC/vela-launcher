@@ -243,8 +243,8 @@ pub fn initPrepared(self: *Context, a: A, io: Io, root: []const u8) !void {
 
 pub fn registerMarkers(self: *Context, manager: *java.Manager) !void {
     const data = self.prepared orelse return error.FixtureMetadataUnavailable;
-    try manager.addDownloaded(.{ .path = data.java17_path, .major = 17, .vendor = label });
-    try manager.addDownloaded(.{ .path = data.java8_path, .major = 8, .vendor = label });
+    try manager.addDownloaded(.{ .path = data.java17_path, .major = 17, .architecture = @import("core/java_runtime.zig").host(), .vendor = label });
+    try manager.addDownloaded(.{ .path = data.java8_path, .major = 8, .architecture = @import("core/java_runtime.zig").host(), .vendor = label });
 }
 
 fn checkCancel(cancel: ?*const CancelToken) !void {
@@ -295,7 +295,7 @@ fn markerProbe(raw: ?*anyopaque, a: A, io: Io, path: []const u8, cancel: ?*const
     try checkCancel(cancel);
     const owned_path = try a.dupe(u8, path);
     errdefer a.free(owned_path);
-    return .{ .path = owned_path, .major = major, .vendor = try a.dupe(u8, label) };
+    return .{ .path = owned_path, .major = major, .architecture = @import("core/java_runtime.zig").host(), .vendor = try a.dupe(u8, label) };
 }
 
 pub fn environment() !metadata.rules.Environment {
@@ -321,9 +321,7 @@ fn loaderControl(io: *const Io, cancel: *const std.atomic.Value(bool)) loaders.C
 pub fn prepareProof(self: *Context, a: A, io: Io, target: loader_install.MetadataTarget, cancel: *const std.atomic.Value(bool)) !loader_install.PreparedMetadata {
     var manifest = try syntheticManifest(self, a, io, cancel);
     defer manifest.deinit();
-    var p = try paths.Paths.init(a, io, target.root);
-    defer p.deinit();
-    return loader_install.prepareMetadata(a, io, .{ .root = target.root, .worker_checks = true, .instance_id = target.instance_id, .instance_name = target.instance_name, .generation = target.generation, .selection = target.selection, .environment = target.environment, .vanilla = .{ .root = p.minecraft, .version_id = target.selection.base_id, .manifest = manifest.value, .cancel = cancel }, .fetcher = .{ .context = self, .fetch = syntheticMetadata }, .transport = .{ .context = self, .get = syntheticGet } }, loaderControl(&io, cancel));
+    return loader_install.prepareMetadata(a, io, .{ .root = target.root, .worker_checks = true, .instance_id = target.instance_id, .instance_name = target.instance_name, .generation = target.generation, .selection = target.selection, .environment = target.environment, .vanilla = .{ .version_id = target.selection.base_id, .manifest = manifest.value, .cancel = cancel }, .fetcher = .{ .context = self, .fetch = syntheticMetadata }, .transport = .{ .context = self, .get = syntheticGet } }, loaderControl(&io, cancel));
 }
 
 // Request fields are checked against the genuine owner, not a rewritten proof.
@@ -538,7 +536,8 @@ fn syntheticInstall(raw: ?*anyopaque, a: A, io: Io, request: instances_manager.C
     if (self.fail_after_staging.load(.acquire)) return error.FixtureSyntheticStagingFailure;
     var assets = try metadata.asset_index.parseSlice(g, index_bytes);
     defer assets.deinit();
-    var plan = try install_plan.build(g, recipe.value.version, assets.value, try environment(), .{ .root = p.minecraft, .instance_name = request.instance.name, .game_directory = final, .cpu_arch = @tagName(builtin.cpu.arch), .native_arch = if (@bitSizeOf(usize) == 64) .bits64 else .bits32 });
+    const client_relative_path = try (@import("core/minecraft/layout.zig").Target{ .directory_name = request.instance.name, .name = request.instance.name }).clientPath(g);
+    var plan = try install_plan.build(g, recipe.value.version, assets.value, try environment(), .{ .root = p.minecraft, .client_relative_path = client_relative_path, .instance_name = request.instance.name, .game_directory = final });
     defer plan.deinit();
     // The declared synthetic metadata has no processors, natives, logging or assets.
     // Reject a changed plan instead of silently skipping any required artifact.

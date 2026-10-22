@@ -1,6 +1,7 @@
 //! UI-thread registry. Workers own private memory; tick publishes after joining.
 const std = @import("std");
 const builtin = @import("builtin");
+const java_runtime = @import("../core/java_runtime.zig");
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const max_entries = 256;
@@ -14,7 +15,7 @@ const probe_ms = 2000;
 const operation_ms = 30000;
 const java_name = if (builtin.os.tag == .windows) "java.exe" else "java";
 
-pub const Runtime = struct { path: []const u8, major: u32, vendor: []const u8 };
+pub const Runtime = struct { path: []const u8, major: u32, vendor: []const u8, architecture: java_runtime.Architecture };
 pub fn compatible(major: u32, required: u32) bool {
     return major == required;
 }
@@ -292,36 +293,27 @@ pub fn probe(a: Allocator, io: std.Io, path: []const u8, canceled: ?*const std.a
     if (canonical.len > max_path) return error.InvalidJavaPath;
     const stat = try Dir.cwd().statFile(io, canonical, .{});
     if (stat.kind != .file) return error.InvalidJavaExecutable;
-    var result = try capture(a, io, &.{ canonical, "-XshowSettings:properties", "-version" }, canceled);
+    const result = try capture(a, io, &.{ canonical, "-XshowSettings:properties", "-version" }, canceled);
     defer {
         a.free(result.stdout);
         a.free(result.stderr);
     }
-    var ok = switch (result.term) {
+    const ok = switch (result.term) {
         .exited => |code| code == 0,
         else => false,
     };
-    if (!ok) {
-        const fallback = try capture(a, io, &.{ canonical, "-version" }, canceled);
-        a.free(result.stdout);
-        a.free(result.stderr);
-        result = fallback;
-        ok = switch (result.term) {
-            .exited => |code| code == 0,
-            else => false,
-        };
-    }
     if (!ok) return error.InvalidJavaExecutable;
     const output = try std.mem.concat(a, u8, &.{ result.stderr, "\n", result.stdout });
     defer a.free(output);
     const major = parseMajor(output) orelse return error.InvalidJavaVersion;
+    const architecture = try java_runtime.parse(output);
     const vendor = try a.dupe(u8, parseVendor(output));
     errdefer a.free(vendor);
-    return .{ .path = try a.dupe(u8, canonical), .major = major, .vendor = vendor };
+    return .{ .path = try a.dupe(u8, canonical), .major = major, .vendor = vendor, .architecture = architecture };
 }
 
 const Choice = struct { game: []const u8, path: []const u8 };
-const Document = struct { version: u32 = 1, runtimes: []const Runtime = &.{}, choices: []const Choice = &.{}, hidden: []const Runtime = &.{} };
+const Document = struct { version: u32, runtimes: []const Runtime, choices: []const Choice, hidden: []const Runtime };
 const State = struct {
     arena: std.heap.ArenaAllocator,
     runtimes: std.ArrayList(Runtime) = .empty,
@@ -341,7 +333,7 @@ const State = struct {
     }
     fn copy(self: *State, runtime: Runtime) !void {
         const a = self.arena.allocator();
-        try self.runtimes.append(a, .{ .path = try a.dupe(u8, runtime.path), .major = runtime.major, .vendor = try a.dupe(u8, runtime.vendor) });
+        try self.runtimes.append(a, .{ .path = try a.dupe(u8, runtime.path), .major = runtime.major, .vendor = try a.dupe(u8, runtime.vendor), .architecture = runtime.architecture });
     }
     fn clone(self: *const State, a: Allocator) !*State {
         const next = try State.create(a);
@@ -355,7 +347,7 @@ const State = struct {
     }
     fn copyHidden(self: *State, runtime: Runtime) !void {
         const a = self.arena.allocator();
-        try self.hidden.append(a, .{ .path = try a.dupe(u8, runtime.path), .major = runtime.major, .vendor = try a.dupe(u8, runtime.vendor) });
+        try self.hidden.append(a, .{ .path = try a.dupe(u8, runtime.path), .major = runtime.major, .vendor = try a.dupe(u8, runtime.vendor), .architecture = runtime.architecture });
     }
     fn hiddenIndex(self: *const State, path: []const u8) ?usize {
         for (self.hidden.items, 0..) |r, i| if (std.mem.eql(u8, r.path, path)) return i;
@@ -665,12 +657,13 @@ pub const Manager = struct {
         const existing = self.state.find(runtime.path);
         if (existing) |i| {
             const old = self.state.runtimes.items[i];
-            if (old.major == runtime.major and std.mem.eql(u8, old.vendor, runtime.vendor)) return;
+            if (old.major == runtime.major and old.architecture == runtime.architecture and std.mem.eql(u8, old.vendor, runtime.vendor)) return;
         } else if (self.state.runtimes.items.len >= max_entries) return error.TooManyRuntimes;
         const next = try self.state.clone(self.a);
         errdefer next.destroy(self.a);
         if (existing) |i| {
             next.runtimes.items[i].major = runtime.major;
+            next.runtimes.items[i].architecture = runtime.architecture;
             next.runtimes.items[i].vendor = try next.arena.allocator().dupe(u8, runtime.vendor);
         } else try next.copy(runtime);
         try self.commit(next);
@@ -717,7 +710,7 @@ pub const Manager = struct {
             const r = self.state.runtimes.items[index];
             return if (compatible(r.major, required)) r else null;
         }
-        for (self.entries()) |r| if (compatible(r.major, required)) return r;
+        for (self.entries()) |r| if (compatible(r.major, required) and r.architecture == java_runtime.host()) return r;
         return null;
     }
     fn lookup(self: *const Manager, path: []const u8) !?usize {
@@ -726,7 +719,7 @@ pub const Manager = struct {
     }
     fn commit(self: *Manager, next: *State) !void {
         try next.refresh(if (self.published) |job| job.results else &.{});
-        const json = try std.json.Stringify.valueAlloc(self.a, Document{ .runtimes = next.runtimes.items, .choices = next.choices.items, .hidden = next.hidden.items }, .{ .whitespace = .indent_2 });
+        const json = try std.json.Stringify.valueAlloc(self.a, Document{ .version = 2, .runtimes = next.runtimes.items, .choices = next.choices.items, .hidden = next.hidden.items }, .{ .whitespace = .indent_2 });
         defer self.a.free(json);
         if (json.len > max_json) return error.RegistryTooLarge;
         var atomic = try Dir.cwd().createFileAtomic(self.io, self.file, .{ .make_path = true, .replace = true });
@@ -749,10 +742,13 @@ pub const Manager = struct {
             else => return err,
         };
         defer self.a.free(bytes);
-        const parsed = try std.json.parseFromSlice(Document, self.a, bytes, .{ .allocate = .alloc_always, .max_value_len = max_path });
+        const parsed = std.json.parseFromSlice(Document, self.a, bytes, .{ .allocate = .alloc_always, .max_value_len = max_path }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidJavaRegistry,
+        };
         defer parsed.deinit();
         const doc = parsed.value;
-        if (doc.version != 1 or doc.runtimes.len > max_entries or doc.choices.len > max_choices or doc.hidden.len > max_entries) return error.InvalidJavaRegistry;
+        if (doc.version != 2 or doc.runtimes.len > max_entries or doc.choices.len > max_choices or doc.hidden.len > max_entries) return error.InvalidJavaRegistry;
         const a = self.state.arena.allocator();
         for (doc.runtimes) |r| {
             if (!validText(r.path, max_path) or !std.fs.path.isAbsolute(r.path) or !validText(r.vendor, 256) or r.major == 0 or r.major > 1000) return error.InvalidJavaRegistry;
@@ -794,10 +790,10 @@ fn fakeJava(dir: Dir, path: []const u8, script: []const u8) !void {
     try file.writeStreamingAll(io, script);
     try file.setPermissions(io, .fromMode(0o755));
 }
-const openjdk25 = "#!/bin/sh\nprintf '%s\\n' 'java.version = 25.0.1' 'java.vendor = OpenJDK' >&2\n";
-const zulu25 = "#!/bin/sh\nprintf '%s\\n' 'java.version = 25.0.1' 'java.vendor = Azul Systems, Inc.' >&2\n";
-const java21 = "#!/bin/sh\nprintf '%s\\n' 'openjdk version \"21.0.1\"' >&2\n";
-const hostile = "#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' 'openjdk version \"25\"' >&2\nexec 1>&- 2>&-\nwhile :; do :; done\n";
+const openjdk25 = "#!/bin/sh\nprintf '%s\\n' 'java.version = 25.0.1' 'java.vendor = OpenJDK' 'os.arch = amd64' 'sun.arch.data.model = 64' >&2\n";
+const zulu25 = "#!/bin/sh\nprintf '%s\\n' 'java.version = 25.0.1' 'java.vendor = Azul Systems, Inc.' 'os.arch = aarch64' 'sun.arch.data.model = 64' >&2\n";
+const java21 = "#!/bin/sh\nprintf '%s\\n' 'openjdk version \"21.0.1\"' 'os.arch = i686' 'sun.arch.data.model = 32' >&2\n";
+const hostile = "#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' 'openjdk version \"25\"' 'os.arch = amd64' >&2\nexec 1>&- 2>&-\nwhile :; do :; done\n";
 fn waitSearch(manager: *Manager) !void {
     const start = std.Io.Clock.awake.now(std.testing.io);
     while (manager.isSearching()) {
@@ -839,8 +835,14 @@ test "explicit directory search stable publication no autoadd and canonical dedu
     var seen_zulu = false;
     for (manager.searchResults()) |r| {
         try std.testing.expectEqual(@as(u32, 25), r.major);
-        if (std.mem.eql(u8, r.vendor, "OpenJDK")) seen_openjdk = true;
-        if (std.mem.eql(u8, r.vendor, "Azul Systems, Inc.")) seen_zulu = true;
+        if (std.mem.eql(u8, r.vendor, "OpenJDK")) {
+            seen_openjdk = true;
+            try std.testing.expectEqual(java_runtime.Architecture.x86_64, r.architecture);
+        }
+        if (std.mem.eql(u8, r.vendor, "Azul Systems, Inc.")) {
+            seen_zulu = true;
+            try std.testing.expectEqual(java_runtime.Architecture.aarch64, r.architecture);
+        }
     }
     try std.testing.expect(seen_openjdk and seen_zulu);
     try fakeJava(tmp.dir, "renamed Java executable", java21);
@@ -911,7 +913,7 @@ test "add choose persistence remove references and never delete executables" {
     try std.testing.expect(loaded.selectedPath("game") == null);
     try std.testing.expectError(error.JavaNotRegistered, manager.remove(p2));
 }
-test "invalid probes fallback timeout cancellation and shutdown" {
+test "invalid probes reject version-only fallback timeout cancellation and shutdown" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -928,9 +930,7 @@ test "invalid probes fallback timeout cancellation and shutdown" {
     defer a.free(fallback);
     const invalid = try std.fs.path.join(a, &.{ root, "invalid" });
     defer a.free(invalid);
-    const runtime = try probe(a, io, fallback, null);
-    defer freeRuntime(a, runtime);
-    try std.testing.expectEqual(@as(u32, 8), runtime.major);
+    try std.testing.expectError(error.InvalidJavaExecutable, probe(a, io, fallback, null));
     try std.testing.expectError(error.InvalidJavaVersion, probe(a, io, invalid, null));
     const start = std.Io.Clock.awake.now(io);
     try std.testing.expectError(error.JavaProbeTimedOut, probe(a, io, bad, null));
@@ -1146,7 +1146,7 @@ const JoinSearchFixture = struct {
         const job = try std.heap.page_allocator.create(Job);
         job.* = .{ .io = manager.io, .path = "" };
         errdefer job.destroy();
-        if (late_result) job.results = &.{.{ .path = "fixture/java", .major = 21, .vendor = "Fixture" }};
+        if (late_result) job.results = &.{.{ .path = "fixture/java", .major = 21, .vendor = "Fixture", .architecture = .x86_64 }};
         job.thread = try std.Thread.spawn(.{}, work, .{ job, late_result });
         manager.active = job;
         return job;
@@ -1222,8 +1222,8 @@ test "hidden metadata persists filters choices and survives forgetting until exp
     defer a.free(first_path);
     const second_path = try std.fs.path.join(a, &.{ root, "second", "bin", java_name });
     defer a.free(second_path);
-    const first: Runtime = .{ .path = first_path, .major = 21, .vendor = "OpenJDK" };
-    const second: Runtime = .{ .path = second_path, .major = 21, .vendor = "Zulu" };
+    const first: Runtime = .{ .path = first_path, .major = 21, .vendor = "OpenJDK", .architecture = .x86 };
+    const second: Runtime = .{ .path = second_path, .major = 21, .vendor = "Zulu", .architecture = java_runtime.host() };
     var manager = try Manager.init(a, io, root);
     defer manager.deinit();
     try manager.addDownloaded(first);
@@ -1242,7 +1242,9 @@ test "hidden metadata persists filters choices and survives forgetting until exp
         var loaded = try Manager.init(a, io, root);
         defer loaded.deinit();
         try std.testing.expect(loaded.isHidden(first_path));
+        try std.testing.expectEqual(java_runtime.Architecture.x86, loaded.hiddenEntries()[0].architecture);
         try std.testing.expectEqual(@as(usize, 1), loaded.entries().len);
+        try std.testing.expectEqual(java_runtime.host(), loaded.entries()[0].architecture);
         try std.testing.expect(loaded.selectedPath("game") == null);
         try std.testing.expectEqualStrings(second_path, loaded.resolve("game", 21).?.path);
     }
@@ -1271,7 +1273,7 @@ test "scanned hidden paths stay suppressed on fresh publication without auto reg
     const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
     const path = try std.fs.path.join(a, &.{ root, "scanned", java_name });
     defer a.free(path);
-    const runtime: Runtime = .{ .path = path, .major = 25, .vendor = "Zulu" };
+    const runtime: Runtime = .{ .path = path, .major = 25, .vendor = "Zulu", .architecture = .aarch64 };
     var manager = try Manager.init(a, io, root);
     defer manager.deinit();
     const results = [_]Runtime{runtime};
@@ -1310,7 +1312,7 @@ test "failed hidden save leaves registry choices and visible snapshots intact" {
     defer a.free(path);
     var manager = try Manager.init(a, io, root);
     defer manager.deinit();
-    try manager.addDownloaded(.{ .path = path, .major = 21, .vendor = "OpenJDK" });
+    try manager.addDownloaded(.{ .path = path, .major = 21, .vendor = "OpenJDK", .architecture = .x86_64 });
     try manager.choose("game", path, 21);
     try tmp.dir.createDir(io, "blocked", .default_dir);
     const original_file = manager.file;
@@ -1325,4 +1327,90 @@ test "failed hidden save leaves registry choices and visible snapshots intact" {
     try std.testing.expect(!manager.isHidden(path));
     try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
     try std.testing.expectEqualStrings(path, manager.selectedPath("game").?);
+}
+
+test "probe rejects missing unknown and contradictory architecture properties" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const path = try std.fs.path.join(a, &.{ root, "java" });
+    defer a.free(path);
+    const cases = [_]struct { properties: []const u8, failure: anyerror }{
+        .{ .properties = "sun.arch.data.model = 64", .failure = error.MissingJavaArchitecture },
+        .{ .properties = "os.arch = riscv64", .failure = error.UnsupportedJavaArchitecture },
+        .{ .properties = "os.arch = amd64\nsun.arch.data.model = 32", .failure = error.JavaArchitectureDataModelMismatch },
+    };
+    for (cases) |case| {
+        const script = try std.fmt.allocPrint(a, "#!/bin/sh\nprintf '%s\\n' 'java.version = 21' 'java.vendor = Test JVM' '{s}' >&2\n", .{case.properties});
+        defer a.free(script);
+        try fakeJava(tmp.dir, "java", script);
+        try std.testing.expectError(case.failure, probe(a, io, path, null));
+    }
+    try fakeJava(tmp.dir, "java", zulu25);
+    const runtime = try probe(a, io, path, null);
+    defer freeRuntime(a, runtime);
+    try std.testing.expectEqual(java_runtime.Architecture.aarch64, runtime.architecture);
+}
+
+test "registry v2 rejects old schemas and missing or unknown architecture" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try tmp.dir.createDirPath(io, ".vela");
+    for ([_][]const u8{
+        "{\"version\":1,\"runtimes\":[],\"choices\":[],\"hidden\":[]}",
+        "{\"runtimes\":[],\"choices\":[],\"hidden\":[]}",
+    }) |json| {
+        try tmp.dir.writeFile(io, .{ .sub_path = ".vela/java.json", .data = json });
+        try std.testing.expectError(error.InvalidJavaRegistry, Manager.init(a, io, root));
+    }
+    const path = try std.fs.path.join(a, &.{ root, "java" });
+    defer a.free(path);
+    const json_path = try std.json.Stringify.valueAlloc(a, path, .{});
+    defer a.free(json_path);
+    for ([_][]const u8{ "", ",\"architecture\":\"amd64\"", ",\"architecture\":\"riscv64\"" }) |field| {
+        const json = try std.fmt.allocPrint(a, "{{\"version\":2,\"runtimes\":[{{\"path\":{s},\"major\":21,\"vendor\":\"Test JVM\"{s}}}],\"choices\":[],\"hidden\":[]}}", .{ json_path, field });
+        defer a.free(json);
+        try tmp.dir.writeFile(io, .{ .sub_path = ".vela/java.json", .data = json });
+        try std.testing.expectError(error.InvalidJavaRegistry, Manager.init(a, io, root));
+    }
+}
+
+test "architecture-only registration updates survive cloning hiding and reload" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const path = try std.fs.path.join(a, &.{ root, "java" });
+    defer a.free(path);
+    var runtime: Runtime = .{ .path = path, .major = 21, .vendor = "Test JVM", .architecture = .x86 };
+    var manager = try Manager.init(a, io, root);
+    defer manager.deinit();
+    try manager.addDownloaded(runtime);
+    try manager.choose("game", path, 21);
+    try std.testing.expectEqual(java_runtime.Architecture.x86, manager.resolve("game", 21).?.architecture);
+    runtime.architecture = .aarch64;
+    try manager.addDownloaded(runtime);
+    try std.testing.expectEqual(java_runtime.Architecture.aarch64, manager.resolve("game", 21).?.architecture);
+    {
+        var loaded = try Manager.init(a, io, root);
+        defer loaded.deinit();
+        try std.testing.expectEqual(java_runtime.Architecture.aarch64, loaded.resolve("game", 21).?.architecture);
+    }
+    try manager.hide(path);
+    var loaded = try Manager.init(a, io, root);
+    defer loaded.deinit();
+    try std.testing.expectEqual(java_runtime.Architecture.aarch64, loaded.hiddenEntries()[0].architecture);
+    try std.testing.expectEqual(java_runtime.Architecture.aarch64, loaded.allEntries()[0].architecture);
+    try loaded.unhide(path);
+    try std.testing.expectEqual(java_runtime.Architecture.aarch64, loaded.entries()[0].architecture);
 }

@@ -60,8 +60,9 @@ pub const LaunchDescriptor = struct {
 /// Pass address/port into game_launch.LaunchOptions.server at the call site.
 pub fn selectLaunch(server: config.Server, instances: []const config.Instance) !LaunchDescriptor {
     const endpoint = try validateAddress(server.address, server.port);
+    const instance_id = server.instance_id orelse return error.UnboundInstance;
     for (instances) |*instance| {
-        if (std.mem.eql(u8, instance.id, server.instance_id))
+        if (std.mem.eql(u8, instance.id, instance_id))
             return .{ .instance = instance, .address = endpoint.host, .port = endpoint.port };
     }
     return error.UnboundInstance;

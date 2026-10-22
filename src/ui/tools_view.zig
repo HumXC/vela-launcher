@@ -38,14 +38,15 @@ pub fn moreContent(model: *const state.Model, pending: *?state.Msg) void {
             gap(@src(), theme.spacing.page_title_gap);
             const scroll = components.scrollBody(@src());
             defer scroll.deinit();
-            var cards = card_grid.init(@src(), 4, .{ .min_width = 240, .tag = "game-tool-cards" });
-            defer cards.deinit();
             const entries = .{
                 .{ "实例管理", dvui.entypo.box, state.Msg.open_instances },
+                .{ "资源管理", dvui.entypo.layers, state.Msg.open_mods },
                 .{ "存档管理", dvui.entypo.folder, state.Msg.open_worlds },
                 .{ "Java 管理", dvui.entypo.cog, state.Msg.open_java },
                 .{ "服务器", dvui.entypo.network, state.Msg.open_servers },
             };
+            var cards = card_grid.init(@src(), entries.len, .{ .min_width = 240, .tag = "game-tool-cards" });
+            defer cards.deinit();
             inline for (entries, 0..) |entry, index| {
                 const cell = cards.cell(@src(), index, entry[0]);
                 defer cell.deinit();

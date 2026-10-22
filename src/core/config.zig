@@ -36,7 +36,7 @@ pub const Server = struct {
     name: []const u8,
     address: []const u8,
     port: u16 = 25565,
-    instance_id: []const u8,
+    instance_id: ?[]const u8 = null,
     show_on_home: bool = false,
 };
 pub const AccountKind = enum { offline, microsoft };
@@ -55,6 +55,7 @@ pub const Settings = struct {
     curseforge_enabled: bool = false,
     curseforge_credential_ref: ?[]const u8 = null,
     curseforge_terms_approved: bool = false,
+    resource_list_view: bool = false,
 };
 pub const Document = struct {
     schema_version: u32 = 1,
@@ -153,7 +154,7 @@ fn validate(doc: Document) !void {
         if (!validText(server.name, 200, false)) return error.InvalidServerName;
         if (!validText(server.address, 4096, false) or std.mem.indexOfAny(u8, server.address, " /\\") != null) return error.InvalidServerAddress;
         if (server.port == 0) return error.InvalidServerPort;
-        if (!containsId(Instance, doc.instances, server.instance_id)) return error.DanglingServerInstance;
+        if (server.instance_id) |id| if (!containsId(Instance, doc.instances, id)) return error.DanglingServerInstance;
     }
     for (doc.accounts) |account| {
         if (!validText(account.name, 200, false)) return error.InvalidAccountName;
@@ -177,7 +178,7 @@ fn serialize(a: Allocator, doc: Document) ![]u8 {
 
 fn parse(a: Allocator, bytes: []const u8) !std.json.Parsed(Document) {
     // Check the version before decoding newer fields or enum values.
-    const header = try std.json.parseFromSlice(struct { schema_version: u32 = 1 }, a, bytes, .{
+    const header = try std.json.parseFromSlice(struct { schema_version: u32 }, a, bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
@@ -190,6 +191,12 @@ fn parse(a: Allocator, bytes: []const u8) !std.json.Parsed(Document) {
     errdefer parsed.deinit();
     try validate(parsed.value);
     return parsed;
+}
+
+fn initDefaults(a: Allocator) !std.json.Parsed(Document) {
+    const arena = try a.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(a);
+    return .{ .arena = arena, .value = .{} };
 }
 
 // Keep the lock inode forever; unlinking it would split cooperating writers.
@@ -266,7 +273,7 @@ pub const Store = struct {
         errdefer a.free(file);
         const stat = Dir.cwd().statFile(io, file, .{}) catch |err| switch (err) {
             error.FileNotFound => {
-                return .{ .a = a, .io = io, .root = owned_root, .file = file, .state = try parse(a, "{}"), .writer = writer };
+                return .{ .a = a, .io = io, .root = owned_root, .file = file, .state = try initDefaults(a), .writer = writer };
             },
             else => return err,
         };
@@ -291,7 +298,7 @@ pub const Store = struct {
         errdefer a.free(file);
         var loaded = windows_fs.load(&capability, a, "config.json", max_json) catch |err| return windowsError(err);
         defer if (loaded) |*bytes| bytes.deinit();
-        return .{ .a = a, .io = io, .root = root, .file = file, .state = try parse(a, if (loaded) |bytes| bytes.bytes else "{}"), .windows_root = capability, .publication_uncertain = capability.publication_uncertain };
+        return .{ .a = a, .io = io, .root = root, .file = file, .state = if (loaded) |bytes| try parse(a, bytes.bytes) else try initDefaults(a), .windows_root = capability, .publication_uncertain = capability.publication_uncertain };
     }
 
     /// Separate from read-only init. App calls this before any worker or consumer.
@@ -522,15 +529,22 @@ test "serialization omits all null optionals but retains non-null values" {
     try std.testing.expect(parsed.value.instances[0].origin == null);
 }
 
-test "legacy minimum heap defaults to null and non-null heap roundtrips with schema one" {
+test "existing config requires an explicit schema marker" {
     const a = std.testing.allocator;
-    const legacy = try parse(a, "{\"instances\":[{\"id\":\"world\",\"name\":\"World\",\"minecraft_version\":\"1.21\",\"max_memory_mb\":4096}]}");
-    defer legacy.deinit();
-    try std.testing.expectEqual(@as(u32, 1), legacy.value.schema_version);
-    try std.testing.expectEqual(@as(?u32, null), legacy.value.instances[0].min_memory_mb);
-    var instance = legacy.value.instances[0];
+    for ([_][]const u8{
+        "{}",
+        "{\"instances\":[{\"id\":\"world\",\"name\":\"World\",\"minecraft_version\":\"1.21\",\"max_memory_mb\":4096}]}",
+    }) |bytes| try std.testing.expectError(error.MissingField, parse(a, bytes));
+}
+
+test "current schema optional heap values roundtrip" {
+    const a = std.testing.allocator;
+    const current = try parse(a, "{\"schema_version\":1,\"instances\":[{\"id\":\"world\",\"name\":\"World\",\"minecraft_version\":\"1.21\",\"max_memory_mb\":4096}]}");
+    defer current.deinit();
+    try std.testing.expectEqual(@as(?u32, null), current.value.instances[0].min_memory_mb);
+    var instance = current.value.instances[0];
     instance.min_memory_mb = 1024;
-    var doc = legacy.value;
+    var doc = current.value;
     doc.instances = (&instance)[0..1];
     const bytes = try serialize(a, doc);
     defer a.free(bytes);
@@ -668,6 +682,18 @@ test "bindings selections and server ports must be valid" {
     try std.testing.expectError(error.DanglingServerInstance, validate(doc));
     server.instance_id = "GAME";
     try std.testing.expectError(error.DanglingServerInstance, validate(doc));
+    server.instance_id = null;
+    doc.instances = &.{};
+    doc.selected_instance = null;
+    try validate(doc);
+    const bytes = try serialize(std.testing.allocator, doc);
+    defer std.testing.allocator.free(bytes);
+    var parsed = try parse(std.testing.allocator, bytes);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.servers[0].instance_id == null);
+    try std.testing.expectEqualStrings(doc.selected_server.?, parsed.value.selected_server.?);
+    doc = sample;
+    doc.servers = (&server)[0..1];
     server = sample.servers[0];
     server.address = "https://example.com";
     try std.testing.expectError(error.InvalidServerAddress, validate(doc));
@@ -720,9 +746,9 @@ test "invalid existing files are preserved without fallback or rewriting" {
     defer a.free(root);
     try tmp.dir.createDir(io, ".vela", .default_dir);
     for ([_][]const u8{
-        "",                                                                                                    "{broken",                                                                                                            "[]",                    "{\"schema_version\":0}",
-        "{\"settings\":{\"default_memory_mb\":0}}",                                                            "{\"selected_instance\":\"missing\"}",                                                                                "{\"unknown_field\":1}", "{\"schema_version\":1,\"schema_version\":1}",
-        "{\"accounts\":[{\"id\":\"p\",\"name\":\"P\",\"uuid\":\"u\",\"access_token\":\"not-a-real-token\"}]}", "{\"servers\":[{\"id\":\"s\",\"name\":\"S\",\"address\":\"localhost\",\"port\":65536,\"instance_id\":\"missing\"}]}",
+        "",                                                                                                                                        "{broken",                                                  "[]",                                         "{}",                                          "{\"schema_version\":0}",
+        "{\"schema_version\":1,\"settings\":{\"default_memory_mb\":0}}",                                                                           "{\"schema_version\":1,\"selected_instance\":\"missing\"}", "{\"schema_version\":1,\"unknown_field\":1}", "{\"schema_version\":1,\"schema_version\":1}", "{\"schema_version\":1,\"accounts\":[{\"id\":\"p\",\"name\":\"P\",\"uuid\":\"u\",\"access_token\":\"not-a-real-token\"}]}",
+        "{\"schema_version\":1,\"servers\":[{\"id\":\"s\",\"name\":\"S\",\"address\":\"localhost\",\"port\":65536,\"instance_id\":\"missing\"}]}",
     }) |bad| {
         try tmp.dir.writeFile(io, .{ .sub_path = ".vela/config.json", .data = bad });
         if (Store.init(a, io, root)) |loaded| {
@@ -870,7 +896,7 @@ test "save failures before commit and after rename block all stale updates until
         try fault.expectBlocked(&store);
 
         // Recovery uses current disk bytes, not old memory or the attempted sample.
-        const authoritative = "{ \"settings\": { \"download_connections\": 7 } }\n";
+        const authoritative = "{\"schema_version\":1,\"settings\":{\"download_connections\":7}}\n";
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/config.json", .data = authoritative });
         fault.reset();
         try store.reconcile();
@@ -942,7 +968,7 @@ test "reconcile rejects missing nonregular invalid oversized and unreadable disk
     try tmp.dir.createDir(std.testing.io, ".vela/config.json", .default_dir);
     try std.testing.expectError(error.InvalidConfigFile, store.reconcile());
     try tmp.dir.deleteDir(std.testing.io, ".vela/config.json");
-    for ([_][]const u8{ "", "{broken", "[]", "{\"schema_version\":2}", "{\"selected_instance\":\"missing\"}" }) |bad| {
+    for ([_][]const u8{ "", "{broken", "[]", "{}", "{\"schema_version\":2}", "{\"schema_version\":1,\"selected_instance\":\"missing\"}" }) |bad| {
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/config.json", .data = bad });
         if (store.reconcile()) |_| return error.ExpectedLoadFailure else |_| {}
         try std.testing.expectEqual(@as(usize, 0), old.instances.len);
@@ -955,7 +981,7 @@ test "reconcile rejects missing nonregular invalid oversized and unreadable disk
     defer oversized.close(std.testing.io);
     try oversized.setLength(std.testing.io, max_json + 1);
     try std.testing.expectError(error.ConfigTooLarge, store.reconcile());
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/config.json", .data = "{}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/config.json", .data = "{\"schema_version\":1}" });
     fault.deny_read = true;
     try std.testing.expectError(error.AccessDenied, store.reconcile());
     try fault.expectBlocked(&store);
@@ -1010,7 +1036,7 @@ test "update preparation and reconcile allocation failures clean up without publ
 
 test "CurseForge reference settings default validate clone and roundtrip" {
     const a = std.testing.allocator;
-    const defaults = try parse(a, "{}");
+    const defaults = try initDefaults(a);
     defer defaults.deinit();
     try std.testing.expect(defaults.value.settings.curseforge_credential_ref == null);
     try std.testing.expect(!defaults.value.settings.curseforge_terms_approved);
@@ -1057,7 +1083,7 @@ test "Windows config init is read only and preparation creates only storage dire
     try std.testing.expectError(error.InvalidRoot, windows_fs.openRootWithOps(a, "relative", .ordinary_config, relative.nativeOps()));
     try std.testing.expect(relative.opens == 0 and relative.ensures == 0);
     var ordinary: WindowsConfigFake = .{ .directory_private = false, .file_private = false };
-    ordinary.seed("{}");
+    ordinary.seed("{\"schema_version\":1}");
     var inherited = try windowsConfig(a, &ordinary);
     defer inherited.deinit();
     try inherited.prepareStorage();
@@ -1130,7 +1156,7 @@ test "Windows config failed reconciliation retains both barriers and exact autho
         const prior = store.state.arena;
         if (which == 0 or which == 6) {
             fake.drift_at_load = fake.load_count + (if (which == 0) @as(usize, 2) else 3);
-            fake.drift_bytes = "{}";
+            fake.drift_bytes = "{\"schema_version\":1}";
         }
         if (which == 1) fake.present = false;
         if (which == 2) fake.seed("{broken");
@@ -1156,7 +1182,7 @@ test "Windows config init consumes root on parser security limit load and privac
     const a = std.testing.allocator;
     for (0..5) |which| {
         var fake: WindowsConfigFake = .{};
-        fake.seed(if (which == 0) "{broken" else "{}");
+        fake.seed(if (which == 0) "{broken" else "{\"schema_version\":1}");
         if (which == 1) fake.hardlink = true;
         if (which == 2) fake.disk_len = max_json + 1;
         if (which == 3) fake.fail_load_at = 1;

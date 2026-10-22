@@ -96,7 +96,7 @@ const OfficialMetadata = struct {
         var response = try self.client.execute(.{ .url = request.url, .max_response_bytes = request.max_bytes, .cancel = self.cancel, .require_public_address = true, .follow_redirects = false });
         defer response.deinit();
         if (response.status != 200) return error.MetadataHttpFailure;
-        // loadTrusted verifies the official manifest SHA-1 before parsing.
+        // fetchSources verifies the official manifest SHA-1 before parsing.
         return a.dupe(u8, response.body);
     }
 };
@@ -273,7 +273,7 @@ fn runInner(init: std.process.Init, o: Options, report: *Report) anyerror!void {
             var manifest = try metadata.manifest.parseSlice(a, response.body);
             defer manifest.deinit();
             var vanilla_fetch: OfficialMetadata = .{ .client = &client, .cancel = &flag };
-            prepared = try loader_install.prepareMetadata(a, io, .{ .root = paths.root, .instance_id = instance.id, .instance_name = instance.name, .generation = 1, .selection = .{ .kind = std.meta.stringToEnum(loaders.Kind, @tagName(o.kind)).?, .base_id = o.base, .loader_id = o.version.? }, .environment = env, .vanilla = .{ .root = paths.minecraft, .version_id = o.base, .manifest = manifest.value, .cancel = &flag }, .fetcher = .{ .context = &vanilla_fetch, .fetch = OfficialMetadata.get } }, .{ .cancel = &flag, .deadline_ms = nowMilliseconds(@constCast(&io)) + 300_000, .context = @constCast(&io), .now_ms = nowMilliseconds });
+            prepared = try loader_install.prepareMetadata(a, io, .{ .root = paths.root, .instance_id = instance.id, .instance_name = instance.name, .generation = 1, .selection = .{ .kind = std.meta.stringToEnum(loaders.Kind, @tagName(o.kind)).?, .base_id = o.base, .loader_id = o.version.? }, .environment = env, .vanilla = .{ .version_id = o.base, .manifest = manifest.value, .cancel = &flag }, .fetcher = .{ .context = &vanilla_fetch, .fetch = OfficialMetadata.get } }, .{ .cancel = &flag, .deadline_ms = nowMilliseconds(@constCast(&io)) + 300_000, .context = @constCast(&io), .now_ms = nowMilliseconds });
             report.required_java_major = prepared.?.requirements.runtime_major;
             if (report.required_java_major.? != runtime.major) return error.JavaMajorMismatch;
             try manager.startCreatePreparedWithJava(instance, &prepared.?, 1, o.installer_java);
@@ -327,13 +327,15 @@ fn runInner(init: std.process.Init, o: Options, report: *Report) anyerror!void {
     report.phase = "installed";
     try save(a, io, o.report, report.*);
     if (o.mode == .install) return;
-    var loaded = try metadata_loader.load(a, io, .{ .root = paths.minecraft, .version_id = instance.name, .metadata_path = document }, .{});
+    var loaded = try metadata_loader.loadInstalled(a, io, .{ .root = paths.minecraft, .version_id = instance.name, .metadata_path = document });
     defer loaded.deinit();
     report.required_java_major = metadata.version.requiredJavaMajor(loaded.version.value);
     if (report.required_java_major.? != runtime.major) return error.JavaMajorMismatch;
     var assets = try library.loadAssets(a, io, paths.minecraft, (loaded.version.value.asset_index orelse return error.MissingAssetIndex).id);
     defer assets.deinit();
-    var plan = try planner.buildInstalled(a, loaded.version.value, assets.value, env, .{ .root = paths.minecraft, .instance_name = instance.name, .game_directory = directory, .native_arch = .bits64, .cpu_arch = @tagName(builtin.cpu.arch) });
+    const client_relative_path = try @import("core/minecraft/layout.zig").installedClient(a, loaded.version.value);
+    defer a.free(client_relative_path);
+    var plan = try planner.buildInstalled(a, loaded.version.value, assets.value, env, .{ .root = paths.minecraft, .client_relative_path = client_relative_path, .instance_name = instance.name, .game_directory = directory });
     defer plan.deinit();
     const uuid = offlineUuid();
     var command = try launch.build(a, loaded.version.value, plan.value, env, .{ .root = paths.minecraft, .java_executable = o.runtime_java, .identity = .{ .name = "Acceptance", .uuid = &uuid }, .game_directory = directory, .max_memory_mb = o.memory, .extra_jvm = o.extra_jvm.items, .extra_game = o.extra_game.items });

@@ -12,7 +12,6 @@ pub const Options = struct {
     width: f32,
     tag: []const u8,
     in_grid: bool = false,
-    require_instance: bool = true,
 };
 
 fn fmt(comptime format: []const u8, args: anytype) []const u8 {
@@ -21,7 +20,7 @@ fn fmt(comptime format: []const u8, args: anytype) []const u8 {
 
 /// Shared server target presentation for Home, Choose Game and management.
 pub fn draw(src: std.builtin.SourceLocation, server: config.Server, document: *const config.Document, query: server_manager.Snapshot, options: Options) bool {
-    const instance = instances.findById(document, server.instance_id);
+    const instance = if (server.instance_id) |id| instances.findById(document, id) else null;
     var signal: components.Signal = .unknown;
     var status: []const u8 = "尚未查询";
     if (query.server) |queried| {
@@ -41,7 +40,7 @@ pub fn draw(src: std.builtin.SourceLocation, server: config.Server, document: *c
     }
     return components.selectionCard(src, server.id, server.name, .{
         .selected = options.selected,
-        .enabled = options.enabled and (!options.require_instance or instance != null),
+        .enabled = options.enabled,
         .width = options.width,
         .height = if (options.in_grid) style.cards.server_height else 0,
         .compact = !options.in_grid,

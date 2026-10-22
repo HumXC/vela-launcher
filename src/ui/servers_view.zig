@@ -9,7 +9,7 @@ const server_card = @import("server_card.zig");
 const R = dvui.Rect;
 const Allocator = std.mem.Allocator;
 
-const Action = enum { add, edit, select, select_sidebar, clear_server, refresh, cancel_query, save, cancel_edit, ask_delete, delete, cancel_delete };
+const Action = enum { add, edit, edit_binding, cancel_binding, select, select_sidebar, clear_server, refresh, cancel_query, save, cancel_edit, ask_delete, delete, cancel_delete };
 const Pending = struct { action: Action, id: ?[]u8 = null };
 const Draft = struct {
     id: ?[]u8 = null,
@@ -28,7 +28,7 @@ const Draft = struct {
         var draft: Draft = .{};
         errdefer draft.deinit(a);
         draft.id = try a.dupe(u8, server.id);
-        draft.instance_id = try a.dupe(u8, server.instance_id);
+        draft.instance_id = if (server.instance_id) |id| try a.dupe(u8, id) else null;
         @memcpy(draft.name[0..server.name.len], server.name);
         @memcpy(draft.address[0..server.address.len], server.address);
         @memset(&draft.port, 0);
@@ -45,7 +45,7 @@ const Draft = struct {
         _ = try servers.validateAddress(address, port);
         const name = std.mem.trim(u8, text(&self.name), " \t\r\n");
         if (name.len == 0) return error.InvalidServerName;
-        return .{ .id = self.id orelse return error.InvalidId, .name = name, .address = address, .port = port, .instance_id = self.instance_id orelse return error.DanglingServerInstance, .show_on_home = self.show_on_home };
+        return .{ .id = self.id orelse return error.InvalidId, .name = name, .address = address, .port = port, .instance_id = self.instance_id, .show_on_home = self.show_on_home };
     }
 };
 
@@ -57,6 +57,8 @@ pub const Ui = struct {
     dirty: bool = false,
     save_timer: ?dvui.Id = null,
     deleting_id: ?[]u8 = null,
+    binding_prompt_id: ?[]u8 = null,
+    binding_navigation_ready: bool = false,
     pending: ?Pending = null,
     failure: ?anyerror = null,
 
@@ -66,6 +68,7 @@ pub const Ui = struct {
     pub fn deinit(self: *Ui) void {
         self.draft.deinit(self.allocator);
         if (self.deleting_id) |id| self.allocator.free(id);
+        if (self.binding_prompt_id) |id| self.allocator.free(id);
         if (self.pending) |pending| if (pending.id) |id| self.allocator.free(id);
         self.* = undefined;
     }
@@ -146,12 +149,12 @@ pub fn drawHomeSummary(ui: *Ui, doc: *const config.Document, compact: bool) void
             const address = dvui.textLayout(@src(), .{}, detail_options.override(.{ .tag = "home-server-address" }));
             address.addText(fmt("{s}:{d}", .{ server.address, server.port }), .{});
             address.deinit();
-            for (doc.instances) |instance| if (std.mem.eql(u8, instance.id, server.instance_id)) {
-                const bound_instance = dvui.textLayout(@src(), .{}, detail_options.override(.{ .tag = "home-server-instance", .color_text = .{ .color = theme.muted } }));
-                bound_instance.addText(instance.name, .{});
-                bound_instance.deinit();
-                break;
-            };
+            const bound_name = if (server.instance_id) |bound| for (doc.instances) |instance| {
+                if (std.mem.eql(u8, instance.id, bound)) break instance.name;
+            } else "未绑定实例" else "未绑定实例";
+            const bound_instance = dvui.textLayout(@src(), .{}, detail_options.override(.{ .tag = "home-server-instance", .color_text = .{ .color = theme.muted } }));
+            bound_instance.addText(bound_name, .{});
+            bound_instance.deinit();
         }
     }
 }
@@ -209,28 +212,27 @@ fn drawEditor(ui: *Ui, doc: *const config.Document) void {
         const cell = fields.cell(@src(), 1);
         defer cell.deinit();
         components.fieldLabel(@src(), "绑定实例");
-        const labels = dvui.currentWindow().arena().alloc([]const u8, doc.instances.len) catch {
+        const labels = dvui.currentWindow().arena().alloc([]const u8, doc.instances.len + 1) catch {
             ui.failure = error.OutOfMemory;
             return;
         };
-        var choice: ?usize = null;
+        labels[0] = "未绑定实例";
+        var choice: ?usize = 0;
         for (doc.instances, 0..) |instance, index| {
-            labels[index] = instance.name;
-            if (sameId(ui.draft.instance_id, instance.id)) choice = index;
+            labels[index + 1] = instance.name;
+            if (sameId(ui.draft.instance_id, instance.id)) choice = index + 1;
         }
-        if (labels.len > 0) {
-            if (components.dropdownStyled(@src(), "绑定实例", labels, .{ .choice_nullable = &choice }, .{ .placeholder = "选择实例", .null_selectable = false }, .{ .margin = R.all(0) })) {
-                if (choice) |index| {
-                    const owned = ui.allocator.dupe(u8, doc.instances[index].id) catch |err| {
-                        ui.failure = err;
-                        return;
-                    };
-                    if (ui.draft.instance_id) |old| ui.allocator.free(old);
-                    ui.draft.instance_id = owned;
-                    changed(ui);
-                }
+        if (components.dropdownStyled(@src(), "绑定实例", labels, .{ .choice_nullable = &choice }, .{ .null_selectable = false }, .{ .tag = "server-instance-binding", .margin = R.all(0) })) {
+            if (choice) |index| {
+                const owned = if (index == 0) null else ui.allocator.dupe(u8, doc.instances[index - 1].id) catch |err| {
+                    ui.failure = err;
+                    return;
+                };
+                if (ui.draft.instance_id) |old| ui.allocator.free(old);
+                ui.draft.instance_id = owned;
+                changed(ui);
             }
-        } else components.emptyState(@src(), "暂无实例");
+        }
     }
     if (!ui.adding) {
         if (ui.draft.id) |id| if (components.button(@src(), "删除", .{ .tag = "server-delete", .destructive = true, .expand = true, .enabled = ui.deleting_id == null })) ui.queue(.ask_delete, id);
@@ -250,7 +252,7 @@ pub fn drawSidebar(ui: *Ui, store: *config.Store, manager: *server_manager.Manag
         const row = dvui.box(@src(), .{}, .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, server.id))), .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = if (index + 1 == doc.servers.len) 0 else theme.spacing.card_gap } });
         defer row.deinit();
         const selected = if (ui.editor_open) sameId(ui.draft.id, server.id) else sameId(doc.selected_server, server.id);
-        if (server_card.draw(@src(), server, doc, manager.pickerSnapshot(server.id), .{ .selected = selected, .enabled = enabled, .require_instance = false, .width = row.data().contentRect().w, .tag = fmt("server-option-{s}", .{server.id}) })) ui.queue(.select_sidebar, server.id);
+        if (server_card.draw(@src(), server, doc, manager.pickerSnapshot(server.id), .{ .selected = selected, .enabled = enabled, .width = row.data().contentRect().w, .tag = fmt("server-option-{s}", .{server.id}) })) ui.queue(.select_sidebar, server.id);
     }
 }
 
@@ -267,7 +269,64 @@ pub fn draw(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) voi
     } else components.emptyState(@src(), if (doc.servers.len == 0) "暂无服务器" else "从左侧选择服务器");
 }
 
+fn clearBindingPrompt(ui: *Ui) void {
+    if (ui.binding_prompt_id) |id| ui.allocator.free(id);
+    ui.binding_prompt_id = null;
+    ui.binding_navigation_ready = false;
+}
+
+/// Admit the binding reminder before any account, Java or game launch work.
+pub fn requestLaunchBinding(ui: *Ui, doc: *const config.Document) !bool {
+    const id = doc.selected_server orelse {
+        clearBindingPrompt(ui);
+        return false;
+    };
+    const server = findServer(doc, id) orelse return error.ServerNotFound;
+    if (server.instance_id != null) {
+        clearBindingPrompt(ui);
+        return false;
+    }
+    if (!sameId(ui.binding_prompt_id, id)) {
+        const owned = try ui.allocator.dupe(u8, id);
+        clearBindingPrompt(ui);
+        ui.binding_prompt_id = owned;
+    }
+    return true;
+}
+
+fn drawBindingPrompt(ui: *Ui, server: config.Server) void {
+    const modal = components.modal(@src(), "服务器未绑定实例", theme.style.dialogs.server_binding_height);
+    defer modal.deinit();
+    dvui.tag("server-binding-modal", .{ .id = modal.data().id, .rect = modal.data().borderRectScale().r, .visible = modal.data().visible() });
+    for (dvui.events()) |*event| {
+        if (!dvui.eventMatch(event, .{ .id = modal.data().id, .focus_id = dvui.focusedWidgetIdInCurrentSubwindow(), .r = modal.data().rectScale().r })) continue;
+        if (event.evt == .key and event.evt.key.action == .down and event.evt.key.code == .escape) {
+            event.handle(@src(), modal.data());
+            ui.queue(.cancel_binding, null);
+        }
+    }
+    {
+        const actions = components.modalActions(@src(), 2);
+        defer actions.deinit();
+        if (components.button(@src(), "取消", .{ .tag = "server-binding-cancel", .placement = .footer, .enabled = ui.pending == null })) ui.queue(.cancel_binding, null);
+        if (components.button(@src(), "前往编辑", .{ .tag = "server-binding-edit", .placement = .footer, .gravity_x = 1, .primary = true, .enabled = ui.pending == null })) ui.queue(.edit_binding, server.id);
+    }
+    const body = components.scrollBody(@src());
+    defer body.deinit();
+    components.text(@src(), "请先前往服务器编辑页面绑定实例，再启动游戏。", theme.foreground);
+    if (ui.failure) |err| components.text(@src(), fmt("无法打开编辑页面：{s}", .{@errorName(err)}), theme.danger);
+}
+
 pub fn drawModal(ui: *Ui, doc: *const config.Document) void {
+    if (ui.binding_prompt_id) |id| {
+        if (findServer(doc, id)) |server| {
+            if (server.instance_id == null) {
+                drawBindingPrompt(ui, server);
+                return;
+            }
+        }
+        clearBindingPrompt(ui);
+    }
     const id = ui.deleting_id orelse return;
     const server = findServer(doc, id) orelse return;
     const window = components.modal(@src(), "删除服务器", theme.style.dialogs.server_delete_height);
@@ -293,8 +352,12 @@ fn selectTarget(store: *config.Store, id: []const u8, validate_launch: bool) !vo
     var document = store.snapshot().*;
     const server = findServer(&document, id) orelse return error.ServerNotFound;
     // Management must remain accessible when a stored endpoint needs repair.
-    if (validate_launch) _ = try servers.selectLaunch(server, document.instances);
-    if (sameId(document.selected_server, server.id) and sameId(document.selected_instance, server.instance_id)) return;
+    if (validate_launch) {
+        _ = try servers.validateAddress(server.address, server.port);
+        if (server.instance_id != null) _ = try servers.selectLaunch(server, document.instances);
+    }
+    const same_instance = if (server.instance_id) |bound| sameId(document.selected_instance, bound) else document.selected_instance == null;
+    if (sameId(document.selected_server, server.id) and same_instance) return;
     document.selected_server = server.id;
     document.selected_instance = server.instance_id;
     try store.update(document);
@@ -328,7 +391,7 @@ fn save(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) !void {
     const server = try ui.draft.value();
     if (store.publicationUncertain()) try store.reconcile();
     var document = store.snapshot().*;
-    _ = try servers.selectLaunch(server, document.instances);
+    if (server.instance_id != null) _ = try servers.selectLaunch(server, document.instances);
     const existing = findServer(&document, server.id) != null;
     const items = try ui.allocator.alloc(config.Server, document.servers.len + @as(usize, if (existing) 0 else 1));
     defer ui.allocator.free(items);
@@ -404,7 +467,7 @@ pub fn finish(ui: *Ui, store: *config.Store, manager: *server_manager.Manager) v
 fn apply(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, pending: Pending) !void {
     // Persist an existing draft before navigation; on failure keep it editable.
     switch (pending.action) {
-        .add, .edit, .select_sidebar => if (ui.dirty and !ui.adding) try save(ui, store, manager),
+        .add, .edit, .edit_binding, .select_sidebar => if (ui.dirty and !ui.adding) try save(ui, store, manager),
         else => {},
     }
     switch (pending.action) {
@@ -415,7 +478,7 @@ fn apply(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, pendin
             ui.dirty = false;
             ui.save_timer = null;
         },
-        .edit => {
+        .edit, .edit_binding => {
             const server = findServer(store.snapshot(), pending.id.?) orelse return error.ServerNotFound;
             const draft = try Draft.fromServer(ui.allocator, server);
             ui.draft.deinit(ui.allocator);
@@ -424,7 +487,12 @@ fn apply(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, pendin
             ui.adding = false;
             ui.dirty = false;
             ui.save_timer = null;
+            if (pending.action == .edit_binding) {
+                clearBindingPrompt(ui);
+                ui.binding_navigation_ready = true;
+            }
         },
+        .cancel_binding => clearBindingPrompt(ui),
         .select => try selectLaunchTarget(store, manager, pending.id.?),
         .refresh => {
             try selectTarget(store, pending.id.?, true);
@@ -479,7 +547,7 @@ test "server drafts own strings preserve exact bindings and validate numeric por
     var draft = try Draft.fromServer(std.testing.allocator, .{ .id = "server", .name = "Example", .address = "[::1]", .port = 25565, .instance_id = "Instance", .show_on_home = false });
     defer draft.deinit(std.testing.allocator);
     const server = try draft.value();
-    try std.testing.expectEqualStrings("Instance", server.instance_id);
+    try std.testing.expectEqualStrings("Instance", server.instance_id.?);
     try std.testing.expectEqualStrings("[::1]", server.address);
     try std.testing.expect(!server.show_on_home);
     draft.port = .{ '0', 0, 0, 0, 0, 0 };
@@ -708,4 +776,82 @@ fn oomDraft(a: Allocator) !void {
 }
 test "server editor cloning frees allocations at every failure point" {
     try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, oomDraft, .{});
+}
+
+test "unbound server survives selection persistence and reminder navigation then can bind" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try fixtureRoot(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    try store.update(.{ .instances = fixtureInstances, .servers = &.{
+        .{ .id = "other", .name = "Other", .address = "127.0.0.1", .instance_id = "One" },
+        .{ .id = "unbound", .name = "Unbound", .address = "127.0.0.1", .port = 25566 },
+    }, .selected_instance = "One" });
+    var manager = server_manager.Manager.initWithQuery(a, std.testing.io, offlineFixture);
+    defer manager.deinit();
+    var ui = Ui.init(a);
+    defer ui.deinit();
+    try selectLaunchTarget(&store, &manager, "unbound");
+    try std.testing.expect(store.snapshot().selected_instance == null);
+    try std.testing.expectEqualStrings("unbound", store.snapshot().selected_server.?);
+    try store.reconcile();
+    try std.testing.expect(store.snapshot().servers[1].instance_id == null);
+    try std.testing.expect(try requestLaunchBinding(&ui, store.snapshot()));
+    ui.queue(.cancel_binding, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.binding_prompt_id == null and !ui.editor_open and !ui.binding_navigation_ready);
+    try std.testing.expectEqualStrings("unbound", store.snapshot().selected_server.?);
+    try std.testing.expect(try requestLaunchBinding(&ui, store.snapshot()));
+    ui.queue(.edit_binding, ui.binding_prompt_id.?);
+    try std.testing.expect(!ui.editor_open);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.failure == null and ui.editor_open and ui.binding_navigation_ready);
+    try std.testing.expect(ui.binding_prompt_id == null and ui.draft.instance_id == null);
+    try std.testing.expectEqualStrings("unbound", ui.draft.id.?);
+    try std.testing.expectEqualStrings("Unbound", text(&ui.draft.name));
+    ui.draft.instance_id = try a.dupe(u8, "Two");
+    ui.dirty = true;
+    ui.queue(.save, null);
+    finish(&ui, &store, &manager);
+    try std.testing.expect(ui.failure == null and !ui.dirty);
+    try std.testing.expectEqualStrings("Two", store.snapshot().selected_instance.?);
+    try std.testing.expectEqualStrings("Two", store.snapshot().servers[1].instance_id.?);
+    try std.testing.expectEqualStrings("One", store.snapshot().servers[0].instance_id.?);
+    try std.testing.expect(!(try requestLaunchBinding(&ui, store.snapshot())));
+    a.free(ui.draft.instance_id.?);
+    ui.draft.instance_id = null;
+    ui.dirty = true;
+    ui.queue(.save, null);
+    finish(&ui, &store, &manager);
+    try store.reconcile();
+    try std.testing.expect(ui.failure == null and store.snapshot().servers[1].instance_id == null);
+    try std.testing.expect(store.snapshot().selected_instance == null);
+    try std.testing.expectEqual(@as(u16, 25566), store.snapshot().servers[1].port);
+}
+
+test "binding reminder preserves a dirty draft when editor navigation cannot save" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try fixtureRoot(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    try store.update(.{ .servers = &.{.{ .id = "unbound", .name = "Unbound", .address = "127.0.0.1" }}, .selected_server = "unbound" });
+    var manager = server_manager.Manager.initWithQuery(a, std.testing.io, offlineFixture);
+    defer manager.deinit();
+    var ui = Ui.init(a);
+    defer ui.deinit();
+    ui.draft.id = try a.dupe(u8, "unsaved");
+    ui.dirty = true;
+    try std.testing.expect(try requestLaunchBinding(&ui, store.snapshot()));
+    ui.queue(.edit_binding, ui.binding_prompt_id.?);
+    finish(&ui, &store, &manager);
+    try std.testing.expectEqual(error.InvalidAddress, ui.failure.?);
+    try std.testing.expect(!ui.binding_navigation_ready);
+    try std.testing.expectEqualStrings("unsaved", ui.draft.id.?);
+    try std.testing.expectEqualStrings("unbound", ui.binding_prompt_id.?);
 }

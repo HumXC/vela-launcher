@@ -179,7 +179,7 @@ const Fixture = struct {
             .selection = .{ .kind = .fabric, .base_id = base_id, .loader_id = "0.15.0" },
             .base = f.base.value,
             .base_plan = base_plan,
-            .base_directory = if (f.private_base) f.base_directory else null,
+            .base_directory = f.base_directory,
             .environment = .{ .os_name = "linux", .arch = "x86_64" },
             .namespace_token = f.namespace_token,
             .lease = .{ .context = f, .acquire = acquire, .recheck = recheck, .release = release },

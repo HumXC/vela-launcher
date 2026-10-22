@@ -275,7 +275,7 @@ test "authentic Forge 2860 recipe keeps embedded runtime authority through Java 
         try std.testing.expectEqual(@as(usize, 1), embedded);
         // The download planner handles vanilla sources. Embedded runtime paths
         // come from the verified recipe rather than a fabricated download URL.
-        var base_plan = try install.build(a, base.value, .{ .objects = &.{}, .virtual = null, .map_to_resources = null }, env, .{ .root = "/fixture-stage", .native_arch = .bits64, .cpu_arch = "x86_64" });
+        var base_plan = try install.build(a, base.value, .{ .objects = &.{}, .virtual = null, .map_to_resources = null }, env, .{ .root = "/fixture-stage", .client_relative_path = ".loader/minecraft.jar" });
         defer base_plan.deinit();
         const g = recipe.arena.allocator();
         var classpath: std.ArrayList([]const u8) = .empty;
@@ -295,7 +295,7 @@ test "authentic Forge 2860 recipe keeps embedded runtime authority through Java 
         }
         var plan = base_plan.value;
         plan.classpath = classpath.items;
-        try std.testing.expectEqualStrings("/fixture-stage/versions/1.12.2/1.12.2.jar", plan.client_path);
+        try std.testing.expectEqualStrings("/fixture-stage/.loader/minecraft.jar", plan.client_path);
         var classpath_entries: usize = 0;
         for (plan.classpath) |entry| {
             if (std.mem.eql(u8, entry, "/fixture-stage/" ++ path)) classpath_entries += 1;
@@ -382,7 +382,7 @@ test "authentic flat Forge 1230 keeps vanilla native proofs and Java 8 launch pl
         }
         try std.testing.expectEqual(@as(usize, 1), embedded);
         const env: m.rules.Environment = .{ .os_name = os, .arch = "x86_64" };
-        const directories: install.Directories = .{ .root = "/fixture-stage", .instance_name = "Forge 1230", .native_arch = .bits64, .cpu_arch = "x86_64" };
+        const directories: install.Directories = .{ .root = "/fixture-stage", .client_relative_path = "versions/Forge 1230/Forge 1230.jar", .instance_name = "Forge 1230" };
         const assets: m.asset_index.AssetIndex = .{ .objects = &.{}, .virtual = null, .map_to_resources = null };
         var vanilla_plan = try install.build(a, base.value, assets, env, directories);
         defer vanilla_plan.deinit();
@@ -406,7 +406,7 @@ test "authentic flat Forge 1230 keeps vanilla native proofs and Java 8 launch pl
             try std.testing.expect(found);
         }
         try std.testing.expectEqual(plan.value.native_extractions.len, native_files);
-        try std.testing.expectEqualStrings("/fixture-stage/versions/1.7.10/1.7.10.jar", plan.value.client_path);
+        try std.testing.expectEqualStrings("/fixture-stage/versions/Forge 1230/Forge 1230.jar", plan.value.client_path);
         var forge_classpath: usize = 0;
         for (plan.value.classpath) |entry| {
             if (std.mem.eql(u8, entry, "/fixture-stage/libraries/net/minecraftforge/forge/1.7.10-10.13.2.1230/forge-1.7.10-10.13.2.1230.jar")) forge_classpath += 1;

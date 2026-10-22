@@ -2,9 +2,12 @@
 const std = @import("std");
 const config = @import("core/config.zig");
 const view = @import("ui/instances_view.zig");
-const Phase = enum { idle, working, awaiting_publication, complete, failed, canceled };
+const manager_module = @import("ui/instances_manager.zig");
+const Phase = manager_module.Phase;
 const FixtureManager = struct {
     phase: Phase = .idle,
+    operation: manager_module.Operation = .none,
+    failure: ?anyerror = null,
     selects: usize = 0,
     saves: usize = 0,
     starts: usize = 0,
@@ -36,8 +39,8 @@ const FixtureManager = struct {
     pub fn isBusy(self: *FixtureManager) bool {
         return self.phase == .working;
     }
-    pub fn snapshot(self: *FixtureManager) struct { phase: Phase, task_id: ?u64 } {
-        return .{ .phase = self.phase, .task_id = self.task_id };
+    pub fn snapshot(self: *FixtureManager) manager_module.Snapshot {
+        return .{ .phase = self.phase, .operation = self.operation, .task_id = self.task_id, .failure = self.failure, .instance = null, .recovery_directory = null, .completed = 0, .total = 0 };
     }
     pub fn cancel(self: *FixtureManager) void {
         self.cancellations += 1;
@@ -47,7 +50,11 @@ const FixtureManager = struct {
         self.selects += 1;
         store.state.value.selected_instance = try store.state.arena.allocator().dupe(u8, id);
     }
-    pub fn saveOptions(self: *FixtureManager, store: *config.Store, instance: config.Instance) !void {
+    pub fn saveOptionsChecked(self: *FixtureManager, store: *config.Store, original: config.Instance, instance: config.Instance) !void {
+        for (store.snapshot().instances) |entry| if (std.mem.eql(u8, entry.id, instance.id)) {
+            if (!manager_module.sameInstance(entry, original)) return error.InstanceConfigurationChanged;
+            break;
+        };
         self.saves += 1;
         if (self.fail_save) return error.DiskFailure;
         capture(&self.captured_java, instance.java_path orelse "");
@@ -915,9 +922,6 @@ test "working task cannot dismiss and explicit cancellation closes without reset
     try std.testing.expectEqualDeep(before, ui.draft);
     view.syncTaskSnapshot(&ui, taskSnapshot(17));
     try std.testing.expect(!ui.task.visible);
-    ui.queue(.reopen_task, null);
-    view.finishWithManager(&ui, &store, &manager);
-    try std.testing.expect(!ui.task.visible);
 }
 
 test "task identity retains terminal result without reopening and opens the next operation" {
@@ -1331,4 +1335,49 @@ test "ordinary form failures stay local and admission failures keep original err
     view.finishWithPreflight(&ui, &store, &manager, &controller, {}, true);
     try std.testing.expectEqual(error.InstallAdapterUnavailable, ui.task.failure.?);
     try std.testing.expect(ui.task.visible and ui.task.admission_failure and !ui.submitted);
+}
+
+test "catalogue navigation waits for cancellation and retains the pending destination" {
+    var store = try storeFixture();
+    defer store.state.deinit();
+    var ui = view.Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    var manager: FixtureManager = .{ .phase = .working, .operation = .loading_loaders };
+    ui.mode = .create;
+    ui.create_step = .loader;
+    ui.draft.base = try std.testing.allocator.dupe(u8, "1.21.1");
+    ui.queue(.previous_step, null);
+    view.finishWithManager(&ui, &store, &manager);
+    try std.testing.expectEqual(@as(usize, 1), manager.cancellations);
+    try std.testing.expect(ui.pending != null);
+    try std.testing.expectEqual(view.CreateStep.loader, ui.create_step);
+    view.finishWithManager(&ui, &store, &manager);
+    try std.testing.expect(ui.pending == null);
+    try std.testing.expectEqual(view.CreateStep.version, ui.create_step);
+}
+
+test "submitted worker failures retain the draft and restore unsaved navigation" {
+    for ([_]Phase{ .failed, .canceled }) |phase| {
+        var store = try storeFixture();
+        defer store.state.deinit();
+        var ui = view.Ui.init(std.testing.allocator);
+        defer ui.deinit();
+        var manager: FixtureManager = .{};
+        ui.queue(.edit, "first");
+        view.finishWithManager(&ui, &store, &manager);
+        capture(&ui.draft.name, "Updated name");
+        ui.queue(.select, "second");
+        view.finishWithManager(&ui, &store, &manager);
+        ui.queue(.save_navigation, null);
+        view.finishWithManager(&ui, &store, &manager);
+        try std.testing.expect(ui.submitted and ui.saving_navigation and ui.navigation != null);
+        manager.phase = phase;
+        manager.failure = if (phase == .failed) error.WorkerUnavailable else error.Canceled;
+        view.finishWithManager(&ui, &store, &manager);
+        try std.testing.expect(!ui.submitted and !ui.saving_navigation);
+        try std.testing.expect(ui.navigation != null and ui.navigation_prompt);
+        try std.testing.expectEqual(manager.failure.?, ui.failure.?);
+        try std.testing.expectEqualStrings("Updated name", string(&ui.draft.name));
+        try std.testing.expectEqual(@as(usize, 0), manager.selects);
+    }
 }

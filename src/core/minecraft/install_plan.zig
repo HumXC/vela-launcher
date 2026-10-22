@@ -1,12 +1,11 @@
 //! Pure installation planning for resolved modern/legacy metadata. No IO.
 const std = @import("std");
 const m = @import("metadata/root.zig");
-pub const NativeArch = enum { bits32, bits64 };
 pub const Directories = struct {
     root: []const u8 = ".minecraft",
+    /// Explicit root-relative client destination; never inferred from source metadata.
+    client_relative_path: []const u8,
     natives: ?[]const u8 = null,
-    native_arch: ?NativeArch = null,
-    cpu_arch: ?[]const u8 = null,
     instance_name: ?[]const u8 = null,
     game_directory: ?[]const u8 = null,
 };
@@ -57,7 +56,7 @@ fn buildPlan(allocator: std.mem.Allocator, version: m.version.Version, assets: m
     try component(instance);
     const game_directory = directories.game_directory orelse directories.root;
     if (game_directory.len == 0 or std.mem.indexOfScalar(u8, game_directory, 0) != null) return error.InvalidDirectories;
-    const cpu = directories.cpu_arch orelse if (@hasField(m.rules.Environment, "cpu_arch")) environment.cpu_arch else environment.arch;
+    const cpu = environment.arch;
     const native_destination = if (directories.natives) |path| try a.dupe(u8, path) else try std.fs.path.join(a, &.{ directories.root, "versions", instance, "natives" });
     var native_checks: std.ArrayList(NativeCheck) = .empty;
     var context: Context = .{ .a = a, .root = directories.root, .windows = std.mem.eql(u8, environment.os_name, "windows"), .installed = installed_mode };
@@ -70,9 +69,7 @@ fn buildPlan(allocator: std.mem.Allocator, version: m.version.Version, assets: m
         break;
     };
     const jar = client orelse return error.MissingClientDownload;
-    const jar_id = version.jar orelse version.id;
-    const jar_name = try std.fmt.allocPrint(a, "{s}.jar", .{jar_id});
-    const client_path = try context.add(.client, &.{ "versions", jar_id, jar_name }, jar);
+    const client_path = try context.add(.client, &.{directories.client_relative_path}, jar);
     const index = version.asset_index orelse return error.MissingAssetIndex;
     try component(index.id);
     const index_name = try std.fmt.allocPrint(a, "{s}.json", .{index.id});
@@ -104,7 +101,7 @@ fn buildPlan(allocator: std.mem.Allocator, version: m.version.Version, assets: m
         }
         for (library.natives) |native| {
             if (!std.mem.eql(u8, native.key, environment.os_name)) continue;
-            var classifier = try classifierName(a, native.value, directories.native_arch);
+            var classifier = try classifierName(a, native.value, cpu);
             if (downloads) |d| classifier = try hostClassifier(a, classifier, d.classifiers, cpu);
             const suitability = nativeSuitability(library.name, classifier, environment.os_name, cpu);
             if (suitability == .incompatible) return error.IncompatibleNativeArchitecture;
@@ -329,15 +326,16 @@ fn relative(path: []const u8) !void {
         }
     }
 }
-fn classifierName(a: std.mem.Allocator, template: []const u8, arch: ?NativeArch) ![]const u8 {
+fn classifierName(a: std.mem.Allocator, template: []const u8, cpu: []const u8) ![]const u8 {
     const marker = "$" ++ "{arch}";
     var result: std.ArrayList(u8) = .empty;
     var rest = template;
     while (std.mem.indexOf(u8, rest, marker)) |i| {
         try result.appendSlice(a, rest[0..i]);
-        try result.appendSlice(a, switch (arch orelse return error.NativeArchRequired) {
-            .bits32 => "32",
-            .bits64 => "64",
+        try result.appendSlice(a, switch (cpuKind(cpu)) {
+            .x86, .arm => "32",
+            .x86_64, .arm64 => "64",
+            .unknown => return error.NativeArchRequired,
         });
         rest = rest[i + marker.len ..];
     }
@@ -350,7 +348,7 @@ const fixture =
     "{\"id\":\"v1\",\"downloads\":{\"client\":{\"url\":\"https://example/client\",\"size\":10}},\"assetIndex\":{\"id\":\"a1\",\"url\":\"https://example/index\"},\"libraries\":[{\"name\":\"base\",\"downloads\":{\"artifact\":{\"path\":\"org/base.jar\",\"url\":\"https://example/base\",\"size\":20},\"classifiers\":{\"native-64\":{\"path\":\"org/native.jar\",\"url\":\"https://example/native\",\"size\":30},\"unused\":{\"path\":\"unused.jar\",\"url\":\"https://example/unused\"}}},\"natives\":{\"linux\":\"native-${arch}\"},\"extract\":{\"exclude\":[\"META-INF/\"]}},{\"name\":\"excluded\",\"rules\":[]}],\"logging\":{\"client\":{\"argument\":\"arg\",\"type\":\"xml\",\"file\":{\"id\":\"log.xml\",\"url\":\"https://example/log\"}},\"server\":{\"argument\":\"arg\",\"type\":\"xml\",\"file\":{\"id\":\"server.xml\",\"url\":\"https://example/server\"}}}}";
 const asset_fixture =
     "{\"objects\":{\"中文:one\":{\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":5},\"two\":{\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":5}}}";
-const dirs: Directories = .{ .root = "/game", .natives = "/instance/natives", .native_arch = .bits64 };
+const dirs: Directories = .{ .client_relative_path = "versions/v1/v1.jar", .root = "/game", .natives = "/instance/natives" };
 const env: m.rules.Environment = .{ .os_name = "linux", .arch = "x86_64" };
 
 test "plan owns sources and selects artifacts natives assets logging and ordered classpath" {
@@ -379,7 +377,7 @@ test "legacy layouts and jar overrides plan while unresolved inheritance fails" 
     defer version.deinit();
     var assets = try m.asset_index.parseSlice(a, "{\"objects\":{\"sound/foo\":{\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":5},\"sound/bar\":{\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":5}}}");
     defer assets.deinit();
-    try std.testing.expectError(error.NativeArchRequired, build(a, version.value, assets.value, env, .{ .root = "/g", .natives = "/n" }));
+    try std.testing.expectError(error.NativeArchRequired, build(a, version.value, assets.value, .{ .os_name = "linux", .arch = "" }, .{ .client_relative_path = "versions/v1/v1.jar", .root = "/g", .natives = "/n" }));
     assets.value.virtual = true;
     var virtual = try build(a, version.value, assets.value, env, dirs);
     defer virtual.deinit();
@@ -392,7 +390,7 @@ test "legacy layouts and jar overrides plan while unresolved inheritance fails" 
     version.value.jar = "parent";
     var shared = try build(a, version.value, assets.value, env, dirs);
     defer shared.deinit();
-    try std.testing.expectEqualStrings("/game/versions/parent/parent.jar", shared.value.client_path);
+    try std.testing.expectEqualStrings("/game/versions/v1/v1.jar", shared.value.client_path);
 }
 test "portable metadata paths reject traversal windows aliases and controls" {
     for ([_][]const u8{ "../escape", "/abs", "C:/abs", "a/../b", "a//b", "CON.txt", "nul", "path.", "path ", "a?b", "a/b/", "a/./b" }) |path| try std.testing.expectError(error.UnsafePath, relative(path));
@@ -497,6 +495,7 @@ test "Windows Unicode ancestors survive full virtual and resources planning" {
     for ([_][]const u8{ "C:/Users/Νίκος/.minecraft", "C:/Users/Иван/.minecraft", "C:/Users/😀/.minecraft" }) |ancestor| {
         for ([_]bool{ false, true }) |external| {
             const directories: Directories = .{
+                .client_relative_path = "versions/v1/v1.jar",
                 .root = if (external) "C:/launcher" else ancestor,
                 .game_directory = ancestor,
             };
@@ -575,12 +574,12 @@ test "default root is local minecraft with version isolated natives" {
     library.natives = &names;
     const libraries = [_]m.version.Library{library};
     version.value.libraries = &libraries;
-    var first = try build(a, version.value, assets.value, env, .{});
+    var first = try build(a, version.value, assets.value, env, .{ .client_relative_path = "versions/v1/v1.jar" });
     defer first.deinit();
     try std.testing.expectEqualStrings(".minecraft/versions/v1/v1.jar", first.value.client_path);
     try std.testing.expectEqualStrings(".minecraft/versions/v1/natives", first.value.native_extractions[0].destination);
     version.value.id = "v2";
-    var second = try build(a, version.value, assets.value, env, .{});
+    var second = try build(a, version.value, assets.value, env, .{ .client_relative_path = "versions/v1/v1.jar" });
     defer second.deinit();
     try std.testing.expectEqualStrings(".minecraft/versions/v2/natives", second.value.native_extractions[0].destination);
 }
@@ -592,7 +591,7 @@ fn legacyPlanAllocationCase(a: std.mem.Allocator) !void {
     defer version.deinit();
     var assets = try m.asset_index.parseSlice(a, legacy_assets_fixture);
     defer assets.deinit();
-    var planned = try build(a, version.value, assets.value, env, .{ .root = "/game", .game_directory = "/game/versions/My Forge", .instance_name = "My Forge" });
+    var planned = try build(a, version.value, assets.value, env, .{ .client_relative_path = "versions/v1/v1.jar", .root = "/game", .game_directory = "/game/versions/My Forge", .instance_name = "My Forge" });
     defer planned.deinit();
     try std.testing.expectEqual(@as(usize, 2), planned.value.asset_materializations.len);
 }
@@ -604,7 +603,7 @@ test "legacy Maven URLs and asset aliases share object storage" {
     defer version.deinit();
     var assets = try m.asset_index.parseSlice(a, legacy_assets_fixture);
     defer assets.deinit();
-    var planned = try build(a, version.value, assets.value, env, .{ .root = "/game", .instance_name = "My Forge", .game_directory = "/game/versions/My Forge" });
+    var planned = try build(a, version.value, assets.value, env, .{ .client_relative_path = "versions/My Forge/My Forge.jar", .root = "/game", .instance_name = "My Forge", .game_directory = "/game/versions/My Forge" });
     defer planned.deinit();
     try std.testing.expectEqualStrings("https://libraries.minecraft.net/net/minecraft/launchwrapper/1.12/launchwrapper-1.12.jar", planned.value.files[2].url);
     try std.testing.expectEqualStrings("https://maven.minecraftforge.net/net/minecraftforge/forge/1.7.10-10.13.4.1614/forge-1.7.10-10.13.4.1614-universal.jar", planned.value.files[3].url);
@@ -612,7 +611,7 @@ test "legacy Maven URLs and asset aliases share object storage" {
     try std.testing.expectEqualStrings("/game/versions/My Forge/resources/sounds/test.ogg", planned.value.asset_materializations[1].destination);
     try std.testing.expectEqualStrings(planned.value.asset_materializations[0].source_path, planned.value.asset_materializations[1].source_path);
     try std.testing.expectEqualStrings("/game/assets/virtual/legacy", planned.value.game_assets_directory.?);
-    try std.testing.expectEqualStrings("/game/versions/1.7.10/1.7.10.jar", planned.value.client_path);
+    try std.testing.expectEqualStrings("/game/versions/My Forge/My Forge.jar", planned.value.client_path);
     var bad = try m.asset_index.parseSlice(a, "{\"map_to_resources\":true,\"objects\":{\"a\":{\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":5},\"a/b\":{\"hash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"size\":5}}}");
     defer bad.deinit();
     try std.testing.expectError(error.PathConflict, build(a, version.value, bad.value, env, dirs));
@@ -634,7 +633,7 @@ test "Windows Unicode asset aliases fail before virtual or resources materializa
                 .{ .name = names[1], .hash = @splat(2), .size = 5 },
             };
             const assets: m.asset_index.AssetIndex = .{ .objects = &objects, .virtual = virtual, .map_to_resources = !virtual };
-            const directories: Directories = .{ .root = "中文目录", .instance_name = "中文实例", .game_directory = "中文目录/versions/中文实例" };
+            const directories: Directories = .{ .client_relative_path = "versions/v1/v1.jar", .root = "中文目录", .instance_name = "中文实例", .game_directory = "中文目录/versions/中文实例" };
             const windows: m.rules.Environment = .{ .os_name = "windows", .arch = "x86_64" };
             try std.testing.expectError(error.PathConflict, build(a, version.value, assets, windows, directories));
             try std.testing.expectError(error.PathConflict, buildInstalled(a, version.value, assets, windows, directories));
@@ -651,6 +650,7 @@ test "Windows Unicode asset aliases fail before virtual or resources materializa
         .map_to_resources = true,
     };
     var chinese = try buildInstalled(a, version.value, chinese_assets, .{ .os_name = "windows", .arch = "x86_64" }, .{
+        .client_relative_path = "versions/中文版本/中文版本.jar",
         .root = "中文目录",
         .instance_name = "中文实例",
         .game_directory = "中文目录/versions/中文实例",
@@ -677,14 +677,14 @@ test "OS-only native variants select a matching CPU without hiding missing archi
     var version = try m.version.parseSlice(a, metadata);
     defer version.deinit();
     for ([_][]const u8{ "x86_64", "aarch64" }, [_][]const u8{ "natives-linux", "natives-linux-arm64" }) |cpu, classifier| {
-        var plan = try build(a, version.value, assets.value, .{ .os_name = "linux", .arch = cpu }, .{ .root = "/game", .cpu_arch = cpu });
+        var plan = try build(a, version.value, assets.value, .{ .os_name = "linux", .arch = cpu }, .{ .client_relative_path = "versions/v1/v1.jar", .root = "/game" });
         defer plan.deinit();
         try std.testing.expectEqual(@as(usize, 1), plan.value.native_checks.len);
         try std.testing.expectEqualStrings(classifier, plan.value.native_checks[0].classifier);
         try std.testing.expectEqual(@as(usize, 2), plan.value.classpath.len);
     }
     version.value.libraries = version.value.libraries.?[1..];
-    try std.testing.expectError(error.IncompatibleNativeArchitecture, build(a, version.value, assets.value, env, .{ .root = "/game", .cpu_arch = "x86_64" }));
+    try std.testing.expectError(error.IncompatibleNativeArchitecture, build(a, version.value, assets.value, env, .{ .client_relative_path = "versions/v1/v1.jar", .root = "/game" }));
 }
 
 test "ARM64 artifact natives and provided classifiers select accurate host archives" {
@@ -694,16 +694,16 @@ test "ARM64 artifact natives and provided classifiers select accurate host archi
     var version = try m.version.parseSlice(a, "{\"id\":\"modern\",\"downloads\":{\"client\":{\"url\":\"https://example/client\"}},\"assetIndex\":{\"id\":\"modern\",\"url\":\"https://example/index\"},\"libraries\":[{\"name\":\"org.lwjgl:lwjgl:3.3.3:natives-linux-arm64\",\"downloads\":{\"artifact\":{\"url\":\"https://example/arm\",\"path\":\"org/lwjgl/arm.jar\"}}}]}");
     defer version.deinit();
     const arm: m.rules.Environment = .{ .os_name = "linux", .arch = "aarch64" };
-    var planned = try build(a, version.value, assets.value, arm, .{ .root = "/game", .cpu_arch = "aarch64" });
+    var planned = try build(a, version.value, assets.value, arm, .{ .client_relative_path = "versions/v1/v1.jar", .root = "/game" });
     defer planned.deinit();
     try std.testing.expectEqual(@as(usize, 0), planned.value.native_extractions.len);
     try std.testing.expectEqual(@as(usize, 2), planned.value.classpath.len);
     try std.testing.expectEqual(Kind.native, planned.value.files[2].kind);
     try std.testing.expectEqual(NativeSuitability.compatible, planned.value.native_checks[0].suitability);
-    try std.testing.expectError(error.IncompatibleNativeArchitecture, build(a, version.value, assets.value, env, .{ .root = "/game", .cpu_arch = "x86_64" }));
+    try std.testing.expectError(error.IncompatibleNativeArchitecture, build(a, version.value, assets.value, env, .{ .client_relative_path = "versions/v1/v1.jar", .root = "/game" }));
     var mapped = try m.version.parseSlice(a, "{\"id\":\"modern\",\"downloads\":{\"client\":{\"url\":\"https://example/client\"}},\"assetIndex\":{\"id\":\"modern\",\"url\":\"https://example/index\"},\"libraries\":[{\"name\":\"org.lwjgl:lwjgl:3.3.3\",\"downloads\":{\"artifact\":{\"url\":\"https://example/library\",\"path\":\"org/lwjgl/library.jar\"},\"classifiers\":{\"natives-linux\":{\"url\":\"https://example/x86\",\"path\":\"org/lwjgl/x86.jar\"},\"natives-linux-arm64\":{\"url\":\"https://example/arm\",\"path\":\"org/lwjgl/arm.jar\"}}},\"natives\":{\"linux\":\"natives-linux\"}}]}");
     defer mapped.deinit();
-    var selected = try build(a, mapped.value, assets.value, arm, .{ .root = "/game", .cpu_arch = "aarch64", .instance_name = "My Forge" });
+    var selected = try build(a, mapped.value, assets.value, arm, .{ .client_relative_path = "versions/v1/v1.jar", .root = "/game", .instance_name = "My Forge" });
     defer selected.deinit();
     try std.testing.expectEqualStrings("natives-linux-arm64", selected.value.native_checks[0].classifier);
     try std.testing.expectEqualStrings("/game/versions/My Forge/natives", selected.value.native_extractions[0].destination);
@@ -712,13 +712,13 @@ test "ARM64 artifact natives and provided classifiers select accurate host archi
     var bitmapped = original;
     bitmapped.natives = &.{.{ .key = "linux", .value = "natives-linux-$" ++ "{arch}" }};
     mapped.value.libraries = &.{bitmapped};
-    var from_bits = try build(a, mapped.value, assets.value, arm, .{ .cpu_arch = "aarch64", .native_arch = .bits64 });
+    var from_bits = try build(a, mapped.value, assets.value, arm, .{ .client_relative_path = "versions/v1/v1.jar" });
     defer from_bits.deinit();
     try std.testing.expectEqualStrings("natives-linux-arm64", from_bits.value.native_checks[0].classifier);
     var lib = original;
     lib.downloads.?.classifiers = lib.downloads.?.classifiers[0..1];
     mapped.value.libraries = &.{lib};
-    try std.testing.expectError(error.IncompatibleNativeArchitecture, build(a, mapped.value, assets.value, arm, .{ .cpu_arch = "aarch64" }));
+    try std.testing.expectError(error.IncompatibleNativeArchitecture, build(a, mapped.value, assets.value, arm, .{ .client_relative_path = "versions/v1/v1.jar" }));
 }
 
 test "generic unknown natives require inspection rather than inventing ARM mirrors" {
@@ -741,7 +741,7 @@ test "authentic classic metadata binds mixed CPU families across platforms and e
         var version = try m.version.parseSlice(a, bytes);
         defer version.deinit();
         for ([_][]const u8{ "linux", "windows", "osx" }) |os| {
-            var plan = try build(a, version.value, assets.value, .{ .os_name = os, .arch = "x86_64" }, .{ .root = "/classic", .cpu_arch = "x86_64", .native_arch = .bits64 });
+            var plan = try build(a, version.value, assets.value, .{ .os_name = os, .arch = "x86_64" }, .{ .client_relative_path = "versions/v1/v1.jar", .root = "/classic" });
             defer plan.deinit();
             try std.testing.expect(plan.value.native_checks.len >= 2);
             try std.testing.expectEqual(plan.value.native_checks.len, plan.value.native_extractions.len);
@@ -778,7 +778,7 @@ test "authentic classic metadata binds mixed CPU families across platforms and e
         }
         var spoofed = version.value;
         spoofed.libraries = libraries;
-        var untrusted_family = try build(a, spoofed, assets.value, .{ .os_name = "linux", .arch = "x86_64" }, .{ .root = "/classic", .cpu_arch = "x86_64", .native_arch = .bits64 });
+        var untrusted_family = try build(a, spoofed, assets.value, .{ .os_name = "linux", .arch = "x86_64" }, .{ .client_relative_path = "versions/v1/v1.jar", .root = "/classic" });
         defer untrusted_family.deinit();
         var found_impostor = false;
         for (untrusted_family.value.native_checks) |check| {
@@ -836,7 +836,7 @@ test "path contract Unicode version instance asset index and metadata paths" {
     version.value.asset_index.?.id = "资源索引";
     var assets = try m.asset_index.parseSlice(a, "{\"objects\":{}}");
     defer assets.deinit();
-    var plan = try buildInstalled(a, version.value, assets.value, env, .{ .root = "game", .instance_name = "中文实例", .native_arch = .bits64 });
+    var plan = try buildInstalled(a, version.value, assets.value, env, .{ .client_relative_path = "versions/中文版本/中文版本.jar", .root = "game", .instance_name = "中文实例" });
     defer plan.deinit();
     const client = try std.fs.path.join(a, &.{ "game", "versions", "中文版本", "中文版本.jar" });
     defer a.free(client);

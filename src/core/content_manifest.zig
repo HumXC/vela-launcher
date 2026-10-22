@@ -4,49 +4,33 @@ const providers = @import("content_providers.zig");
 const J = providers.Json;
 const Owned = providers.Owned;
 
-pub const schema_version: u32 = 2;
-pub const legacy_schema_version: u32 = 1;
+pub const schema_version: u32 = 3;
 pub const max_path_bytes = 1024;
 pub const Side = enum { client, server };
 pub const FileRole = enum { content, configuration, override };
-pub const IdentityProvenance = enum { legacy_unknown, official_file, pack_archive, pack_override };
+pub const IdentityProvenance = enum { official_file, pack_archive, pack_override };
 pub const PackMembership = struct { identity: PackIdentity, paths: []const []const u8 };
 pub const ManagedFile = struct {
     path: []const u8,
     provider: providers.Provider,
     project_id: []const u8,
     version_id: []const u8,
+    /// Expected distributor hashes and size, not observations of local bytes.
     hashes: providers.Hashes,
     size: ?u64 = null,
     role: FileRole = .content,
+    /// Runtime observation or desired operation state; never stored in content.json.
     enabled: bool = true,
     /// pack_archive IDs name the archive, not a fabricated official child identity.
-    identity_provenance: IdentityProvenance = .legacy_unknown,
+    identity_provenance: IdentityProvenance,
     standalone: bool = true,
 };
 pub const Manifest = struct {
-    schema_version: u32 = 1,
+    schema_version: u32 = 3,
     instance_id: []const u8,
     pack_version: []const u8,
     files: []const ManagedFile = &.{},
     pack_membership: ?PackMembership = null,
-};
-// The exact v1 shape rejects unknown fields instead of interpreting new permissions.
-const LegacyFile = struct {
-    path: []const u8,
-    provider: providers.Provider,
-    project_id: []const u8,
-    version_id: []const u8,
-    hashes: providers.Hashes,
-    size: ?u64 = null,
-    role: FileRole = .content,
-    enabled: bool = true,
-};
-const LegacyManifest = struct {
-    schema_version: u32 = 1,
-    instance_id: []const u8,
-    pack_version: []const u8,
-    files: []const LegacyFile = &.{},
 };
 
 /// Lexical path validation only. The executor must use a guarded instance root,
@@ -98,10 +82,53 @@ pub fn validatePathsForInstance(document: Manifest, instance_name: ?[]const u8) 
         for (membership.paths) |path| try checkedPathForInstance(path, instance_name);
     }
 }
+/// Paths must share one exact spelling for every common directory, even when
+/// their leaves differ. File/directory prefixes and case-folded leaves collide too.
 pub fn pathsCollide(a: []const u8, b: []const u8) bool {
-    const len = @min(a.len, b.len);
-    if (!std.ascii.eqlIgnoreCase(a[0..len], b[0..len])) return false;
-    return a.len == b.len or (a.len > len and a[len] == '/') or (b.len > len and b[len] == '/');
+    var left = std.mem.splitScalar(u8, a, '/');
+    var right = std.mem.splitScalar(u8, b, '/');
+    while (true) {
+        const first = left.next() orelse return true;
+        const second = right.next() orelse return true;
+        if (!std.ascii.eqlIgnoreCase(first, second)) return false;
+        if (!std.mem.eql(u8, first, second)) return true;
+    }
+}
+fn requireConsistentSpelling(path: []const u8, other: []const u8) !void {
+    if (std.mem.eql(u8, path, other) or !pathsCollide(path, other)) return;
+    if (std.ascii.eqlIgnoreCase(path, other)) return error.PathCaseChanged;
+    return error.PathCollision;
+}
+// Receipts retain ownership, provenance and expected integrity. Physical state
+// is observed from the instance directory when a receipt is used.
+const StoredFile = struct {
+    path: []const u8,
+    provider: providers.Provider,
+    project_id: []const u8,
+    version_id: []const u8,
+    hashes: providers.Hashes,
+    size: ?u64 = null,
+    role: FileRole = .content,
+    identity_provenance: IdentityProvenance,
+    standalone: bool = true,
+};
+const StoredManifest = struct {
+    schema_version: u32,
+    instance_id: []const u8,
+    pack_version: []const u8,
+    files: []const StoredFile = &.{},
+    pack_membership: ?PackMembership = null,
+};
+fn storedFile(file: ManagedFile) StoredFile {
+    var result: StoredFile = undefined;
+    inline for (@typeInfo(StoredFile).@"struct".field_names) |field_name| @field(result, field_name) = @field(file, field_name);
+    return result;
+}
+fn runtimeFile(file: StoredFile) ManagedFile {
+    var result: ManagedFile = undefined;
+    inline for (@typeInfo(StoredFile).@"struct".field_names) |field_name| @field(result, field_name) = @field(file, field_name);
+    result.enabled = true;
+    return result;
 }
 fn validText(text: []const u8) bool {
     return text.len != 0 and text.len <= 256 and std.unicode.utf8ValidateSlice(text) and std.mem.indexOfScalar(u8, text, 0) == null;
@@ -109,7 +136,7 @@ fn validText(text: []const u8) bool {
 /// Logical ownership stays at the JAR name; both physical spellings are reserved.
 pub fn toggleable(file: ManagedFile) bool {
     return (file.role == .content or file.role == .override) and
-        std.mem.startsWith(u8, file.path, "mods/") and std.mem.endsWith(u8, file.path, ".jar") and
+        std.mem.startsWith(u8, file.path, "mods/") and @import("mod_path.zig").isMod(file.path) and !@import("mod_path.zig").isDisabled(file.path) and
         file.path.len <= max_path_bytes - ".disabled".len;
 }
 pub fn physicalPath(a: std.mem.Allocator, file: ManagedFile) ![]u8 {
@@ -127,8 +154,7 @@ fn validateFile(file: ManagedFile) !void {
 }
 pub fn validate(document: Manifest) !void {
     try validatePathsForInstance(document, null);
-    if (document.schema_version != schema_version and document.schema_version != legacy_schema_version) return error.UnsupportedSchema;
-    if (document.schema_version == legacy_schema_version and document.pack_membership != null) return error.ReceiptUpgradeRequired;
+    if (document.schema_version != schema_version) return error.UnsupportedSchema;
     if (!config.validId(document.instance_id)) return error.InvalidInstanceId;
     if (!validText(document.pack_version)) return error.InvalidPackVersion;
     if (document.files.len > providers.max_items) return error.TooManyItems;
@@ -148,8 +174,7 @@ pub fn validate(document: Manifest) !void {
             try checkedPath(path);
             for (membership.paths[0..i]) |other| if (pathsCollide(path, other)) return error.PathCollision;
             const record = findManaged(document.files, path) orelse return error.MissingPackMember;
-            if (!std.mem.eql(u8, record.path, path) or record.provider != membership.identity.provider or
-                record.identity_provenance == .legacy_unknown) return error.UnverifiedPackMember;
+            if (!std.mem.eql(u8, record.path, path) or record.provider != membership.identity.provider) return error.UnverifiedPackMember;
             if (record.identity_provenance == .pack_archive or record.identity_provenance == .pack_override) {
                 if (!std.mem.eql(u8, record.project_id, membership.identity.project_id) or
                     !std.mem.eql(u8, record.version_id, membership.identity.version_id)) return error.PackIdentityMismatch;
@@ -166,39 +191,21 @@ pub fn parseForInstance(a: std.mem.Allocator, bytes: []const u8, instance_name: 
     const aa = arena.allocator();
     const raw = try J.parse(aa, bytes);
     const version = try J.number(raw.value, "schema_version");
-    const document: Manifest = if (version == legacy_schema_version) legacy: {
-        const parsed = try std.json.parseFromSlice(LegacyManifest, aa, bytes, .{ .allocate = .alloc_always, .max_value_len = providers.max_string_bytes });
-        const files = try aa.alloc(ManagedFile, parsed.value.files.len);
-        for (parsed.value.files, files) |file, *out| out.* = .{
-            .path = file.path,
-            .provider = file.provider,
-            .project_id = file.project_id,
-            .version_id = file.version_id,
-            .hashes = file.hashes,
-            .size = file.size,
-            .role = file.role,
-            .enabled = file.enabled,
-        };
-        break :legacy .{ .schema_version = 1, .instance_id = parsed.value.instance_id, .pack_version = parsed.value.pack_version, .files = files };
-    } else if (version == schema_version) modern: {
-        const parsed = try std.json.parseFromSlice(Manifest, aa, bytes, .{ .allocate = .alloc_always, .max_value_len = providers.max_string_bytes });
-        break :modern parsed.value;
-    } else return error.UnsupportedSchema;
+    if (version != schema_version) return error.UnsupportedSchema;
+    const parsed = try std.json.parseFromSlice(StoredManifest, aa, bytes, .{ .allocate = .alloc_always, .max_value_len = providers.max_string_bytes });
+    const files = try aa.alloc(ManagedFile, parsed.value.files.len);
+    for (parsed.value.files, files) |file, *out| out.* = runtimeFile(file);
+    const document: Manifest = .{ .schema_version = schema_version, .instance_id = parsed.value.instance_id, .pack_version = parsed.value.pack_version, .files = files, .pack_membership = parsed.value.pack_membership };
     try validatePathsForInstance(document, instance_name);
     try validate(document);
     return .{ .arena = arena, .value = document };
 }
 pub fn serialize(a: std.mem.Allocator, document: Manifest) ![]u8 {
     try validate(document);
-    const bytes = if (document.schema_version == legacy_schema_version) legacy: {
-        const files = try a.alloc(LegacyFile, document.files.len);
-        defer a.free(files);
-        for (document.files, files) |file, *out| {
-            if (file.identity_provenance != .legacy_unknown or !file.standalone) return error.ReceiptUpgradeRequired;
-            out.* = .{ .path = file.path, .provider = file.provider, .project_id = file.project_id, .version_id = file.version_id, .hashes = file.hashes, .size = file.size, .role = file.role, .enabled = file.enabled };
-        }
-        break :legacy try std.json.Stringify.valueAlloc(a, LegacyManifest{ .instance_id = document.instance_id, .pack_version = document.pack_version, .files = files }, .{ .emit_null_optional_fields = false });
-    } else try std.json.Stringify.valueAlloc(a, document, .{ .emit_null_optional_fields = false });
+    const files = try a.alloc(StoredFile, document.files.len);
+    defer a.free(files);
+    for (document.files, files) |file, *out| out.* = storedFile(file);
+    const bytes = try std.json.Stringify.valueAlloc(a, StoredManifest{ .schema_version = schema_version, .instance_id = document.instance_id, .pack_version = document.pack_version, .files = files, .pack_membership = document.pack_membership }, .{ .emit_null_optional_fields = false });
     errdefer a.free(bytes);
     if (bytes.len > providers.max_json_bytes) return error.ResponseTooLarge;
     return bytes;
@@ -225,7 +232,7 @@ pub fn membershipForPack(a: std.mem.Allocator, pack: PackPlan) !Owned(PackMember
         try records.append(aa, file.record);
     }
     const membership: PackMembership = .{ .identity = pack.identity, .paths = paths.items };
-    try validate(.{ .schema_version = 2, .instance_id = "proof", .pack_version = pack.version, .files = records.items, .pack_membership = membership });
+    try validate(.{ .instance_id = "proof", .pack_version = pack.version, .files = records.items, .pack_membership = membership });
     const value = try cloneInto(PackMembership, aa, membership);
     return .{ .arena = arena, .value = value };
 }
@@ -242,34 +249,13 @@ pub fn packReplacementPaths(a: std.mem.Allocator, previous: Manifest, identity: 
         if (membership.identity.provider != identity.provider or !std.mem.eql(u8, membership.identity.project_id, identity.project_id)) return error.PackIdentityMismatch;
         for (membership.paths) |path| {
             const record = findManaged(previous.files, path).?;
-            if (record.standalone or record.identity_provenance == .legacy_unknown) continue;
+            if (record.standalone) continue;
             try paths.append(aa, try aa.dupe(u8, path));
         }
     }
     return .{ .arena = arena, .value = try paths.toOwnedSlice(aa) };
 }
 
-pub const LegacyApproval = struct { path: []const u8, expected_hashes: providers.Hashes, expected_size: ?u64 };
-pub fn legacyReplacementPaths(a: std.mem.Allocator, previous: Manifest, recorded_identity: PackIdentity, approvals: []const LegacyApproval) !Owned([]const []const u8) {
-    try validate(previous);
-    try validateIdentity(recorded_identity);
-    if (approvals.len > providers.max_items) return error.TooManyItems;
-    var arena = std.heap.ArenaAllocator.init(a);
-    errdefer arena.deinit();
-    const aa = arena.allocator();
-    const paths = try aa.alloc([]const u8, approvals.len);
-    for (approvals, paths, 0..) |approval, *out, i| {
-        try checkedPath(approval.path);
-        for (approvals[0..i]) |other| if (pathsCollide(approval.path, other.path)) return error.PathCollision;
-        const record = findManaged(previous.files, approval.path) orelse return error.StaleLegacyApproval;
-        if (!std.mem.eql(u8, record.path, approval.path) or record.identity_provenance != .legacy_unknown or
-            record.provider != recorded_identity.provider or !std.mem.eql(u8, record.project_id, recorded_identity.project_id) or
-            !std.mem.eql(u8, record.version_id, recorded_identity.version_id) or record.size != approval.expected_size or
-            !providers.hashesMatch(record.hashes, approval.expected_hashes) or !providers.hashesMatch(approval.expected_hashes, record.hashes)) return error.StaleLegacyApproval;
-        out.* = try aa.dupe(u8, approval.path);
-    }
-    return .{ .arena = arena, .value = paths };
-}
 pub const InstallFile = struct {
     record: ManagedFile,
     download: providers.Download,
@@ -541,7 +527,7 @@ pub const ConflictReason = enum { modified_managed, unmanaged, unknown_hash };
 pub const ConflictChoice = enum { keep_local, replace };
 pub const ConflictDecision = struct { path: []const u8, choice: ConflictChoice };
 pub const Conflict = struct { path: []const u8, reason: ConflictReason, choice: ?ConflictChoice = null };
-pub const ActionKind = enum { backup, install, remove, toggle };
+pub const ActionKind = enum { backup, install, remove };
 pub const Action = struct {
     kind: ActionKind,
     path: []const u8,
@@ -549,7 +535,7 @@ pub const Action = struct {
     expected_before: ?providers.Hashes = null,
     expected_size: ?u64 = null,
     desired: ?ManagedFile = null,
-    /// Exact persisted ownership and state, rechecked by the executor.
+    /// Exact ownership and observed state, rechecked by the executor.
     previous: ?ManagedFile = null,
 };
 pub const UpdatePlan = struct {
@@ -560,31 +546,6 @@ pub const UpdatePlan = struct {
     /// False for keep_local overrides. Ready means decisions made, not installed.
     fully_applied: bool,
 };
-
-/// An explicit local state override never approves replacing modified bytes.
-pub fn buildEnabledPlan(a: std.mem.Allocator, previous: Manifest, path: []const u8, enabled: bool, observed: []const ObservedFile, instance_guard: InstanceGuard) !Owned(UpdatePlan) {
-    if (observed.len > providers.max_items) return error.TooManyItems;
-    try validatePathsForInstance(previous, instance_guard.instance_name);
-    try checkedPathForInstance(path, instance_guard.instance_name);
-    try validate(previous);
-    const old = findManaged(previous.files, path) orelse return error.UnmanagedFile;
-    if (!std.mem.eql(u8, old.path, path)) return error.PathCaseChanged;
-    if (!toggleable(old)) return error.UnsupportedEnabledState;
-    const actual = for (observed) |file| {
-        if (std.mem.eql(u8, file.path, path)) break file;
-    } else return error.LocalFileChanged;
-    if (!observedMatches(old, actual)) return error.LocalFileChanged;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const files = try arena.allocator().dupe(ManagedFile, previous.files);
-    for (files) |*file| if (std.mem.eql(u8, file.path, path)) {
-        file.enabled = enabled;
-        break;
-    };
-    var desired = previous;
-    desired.files = files;
-    return buildUpdatePlan(a, previous, desired, observed, &.{}, instance_guard);
-}
 
 /// Pure transaction plan: no filesystem reads, downloads or writes. Each backup
 /// must durably finish before its install/remove; manifest publication is last.
@@ -602,13 +563,22 @@ pub fn buildUpdatePlan(a: std.mem.Allocator, previous: Manifest, desired: Manife
     try validate(desired);
     if (instance_guard.running) return error.InstanceRunning;
     if (!std.mem.eql(u8, instance_guard.instance_id, previous.instance_id) or !std.mem.eql(u8, instance_guard.instance_id, desired.instance_id)) return error.InstanceMismatch;
+    // Old removals and new installs still operate in the same directory tree.
+    for (previous.files) |old| for (desired.files) |new| {
+        try requireConsistentSpelling(old.path, new.path);
+    };
     for (observed, 0..) |file, i| {
         if (!safeRelativePath(file.path)) return error.UnsafeRelativePath;
         if (file.hashes) |h| try providers.validateHashes(h);
         for (observed[0..i]) |other| if (pathsCollide(file.path, other.path)) return error.PathCollision;
+        for (previous.files) |other| try requireConsistentSpelling(file.path, other.path);
+        for (desired.files) |other| try requireConsistentSpelling(file.path, other.path);
     }
     for (decisions, 0..) |decision, i| {
         try checkedPath(decision.path);
+        for (previous.files) |file| try requireConsistentSpelling(decision.path, file.path);
+        for (desired.files) |file| try requireConsistentSpelling(decision.path, file.path);
+        for (observed) |file| try requireConsistentSpelling(decision.path, file.path);
         if (findManaged(previous.files, decision.path) == null and findManaged(desired.files, decision.path) == null) return error.InvalidDecision;
         for (decisions[0..i]) |other| if (std.ascii.eqlIgnoreCase(decision.path, other.path)) return error.DuplicateDecision;
     }
@@ -624,7 +594,7 @@ pub fn buildUpdatePlan(a: std.mem.Allocator, previous: Manifest, desired: Manife
     for (previous.files) |old| if (findManaged(desired.files, old.path) == null) try builder.change(old, null);
     const next_files = try builder.files.toOwnedSlice(aa);
     const membership = try survivingMembership(aa, previous, desired, next_files, builder.ready and builder.fully_applied);
-    const next: Manifest = .{ .schema_version = if (previous.schema_version == schema_version) schema_version else desired.schema_version, .instance_id = desired.instance_id, .pack_version = desired.pack_version, .files = next_files, .pack_membership = membership };
+    const next: Manifest = .{ .instance_id = desired.instance_id, .pack_version = desired.pack_version, .files = next_files, .pack_membership = membership };
     try validate(next);
     const plan: UpdatePlan = .{ .actions = try builder.actions.toOwnedSlice(aa), .conflicts = try builder.conflicts.toOwnedSlice(aa), .next_manifest = next, .ready = builder.ready, .fully_applied = builder.ready and builder.fully_applied };
     const value = try cloneInto(UpdatePlan, aa, plan);
@@ -661,6 +631,9 @@ const UpdateBuilder = struct {
     fully_applied: bool = true,
     fn change(self: *UpdateBuilder, old: ?ManagedFile, new: ?ManagedFile) !void {
         const path = if (new) |f| f.path else old.?.path;
+        if (old) |prior| if (new) |current| {
+            if (prior.enabled != current.enabled) return error.InvalidEnabledTransition;
+        };
         var actual: ?ObservedFile = null;
         for (self.observed) |file| {
             if (std.ascii.eqlIgnoreCase(file.path, path)) {
@@ -670,13 +643,7 @@ const UpdateBuilder = struct {
             } else if (pathsCollide(file.path, path)) return error.PathCollision;
         }
         if (actual) |local| {
-            if (old) |prior| if (new) |f| if (observedMatches(f, local)) {
-                if (prior.enabled != f.enabled) {
-                    if (!observedMatches(prior, local)) return error.LocalFileChanged;
-                    const backup: Action = .{ .kind = .backup, .path = path, .expected_before = local.hashes, .expected_size = local.size };
-                    try self.actions.append(self.a, backup);
-                    try self.actions.append(self.a, .{ .kind = .toggle, .path = path, .expected_before = local.hashes, .expected_size = local.size, .previous = prior, .desired = f });
-                }
+            if (old != null) if (new) |f| if (observedMatches(f, local)) {
                 try self.files.append(self.a, f);
                 return;
             };
@@ -726,7 +693,7 @@ const cfpack_fixture =
 const mr_identity: PackIdentity = .{ .provider = .modrinth, .project_id = "pack", .version_id = "version1" };
 const cf_identity: PackIdentity = .{ .provider = .curseforge, .project_id = "1", .version_id = "2" };
 fn managed(path: []const u8, hash: []const u8, version: []const u8) ManagedFile {
-    return .{ .path = path, .provider = .modrinth, .project_id = "P1", .version_id = version, .hashes = .{ .sha1 = hash }, .size = 3, .role = roleFor(path) };
+    return .{ .path = path, .provider = .modrinth, .project_id = "P1", .version_id = version, .hashes = .{ .sha1 = hash }, .size = 3, .role = roleFor(path), .identity_provenance = .official_file };
 }
 fn manifest(files: []const ManagedFile, version: []const u8) Manifest {
     return .{ .instance_id = "instance", .pack_version = version, .files = files };
@@ -744,8 +711,33 @@ test "portable paths reject traversal devices collisions protected saves and sch
     try testing.expect(!pathsCollide("mods/a", "mods/abc"));
     try testing.expectError(error.ProtectedPath, validate(manifest(&.{managed("SAVES/world/level.dat", sha1_a, "v1")}, "v1")));
     try testing.expectError(error.PathCollision, validate(manifest(&.{ managed("mods/A.jar", sha1_a, "v1"), managed("mods/a.jar", sha1_a, "v1") }, "v1")));
-    try testing.expectError(error.UnsupportedSchema, parse(testing.allocator, "{\"schema_version\":3,\"future_key\":true}"));
+    try testing.expectError(error.UnsupportedSchema, parse(testing.allocator, "{\"schema_version\":4,\"future_key\":true}"));
     try testing.expectError(error.MissingField, parse(testing.allocator, "{}"));
+}
+test "shared directory spelling is consistent across manifests plans and observations" {
+    for ([_][2][]const u8{
+        .{ "config/Foo/a.cfg", "config/foo/b.cfg" },
+        .{ "config/Foo/deep/a.cfg", "config/foo/other/b.cfg" },
+        .{ "Config/a.cfg", "config/b.cfg" },
+    }) |paths| {
+        try testing.expect(pathsCollide(paths[0], paths[1]));
+        try testing.expect(pathsCollide(paths[1], paths[0]));
+        const first = managed(paths[0], sha1_a, "v1");
+        const second = managed(paths[1], sha1_a, "v2");
+        try testing.expectError(error.PathCollision, validate(manifest(&.{ first, second }, "v2")));
+        try testing.expectError(error.PathCollision, buildUpdatePlan(testing.allocator, manifest(&.{first}, "v1"), manifest(&.{second}, "v2"), &.{observedFile(first.path, sha1_a)}, &.{}, guard));
+        try testing.expectError(error.PathCollision, buildUpdatePlan(testing.allocator, manifest(&.{}, "v1"), manifest(&.{}, "v2"), &.{ observedFile(first.path, sha1_a), observedFile(second.path, sha1_a) }, &.{}, guard));
+        try testing.expectError(error.PathCollision, buildUpdatePlan(testing.allocator, manifest(&.{}, "v1"), manifest(&.{first}, "v2"), &.{observedFile(second.path, sha1_a)}, &.{}, guard));
+        try testing.expectError(error.PathCollision, buildUpdatePlan(testing.allocator, manifest(&.{first}, "v1"), manifest(&.{first}, "v2"), &.{observedFile(first.path, sha1_a)}, &.{.{ .path = second.path, .choice = .keep_local }}, guard));
+    }
+    try testing.expect(!pathsCollide("config/Foo/a.cfg", "config/Foo/b.cfg"));
+    try testing.expect(!pathsCollide("config/one/Foo/a.cfg", "config/two/foo/b.cfg"));
+    try validate(manifest(&.{ managed("config/Foo/a.cfg", sha1_a, "v1"), managed("config/Foo/b.cfg", sha1_a, "v1") }, "v1"));
+    const valid = try serialize(testing.allocator, manifest(&.{ managed("config/Foo/a.cfg", sha1_a, "v1"), managed("config/Foo/b.cfg", sha1_a, "v1") }, "v1"));
+    defer testing.allocator.free(valid);
+    const aliased = try std.mem.replaceOwned(u8, testing.allocator, valid, "config/Foo/b.cfg", "config/foo/b.cfg");
+    defer testing.allocator.free(aliased);
+    try testing.expectError(error.PathCollision, parse(testing.allocator, aliased));
 }
 fn exerciseManifest(a: std.mem.Allocator) !void {
     const original = manifest(&.{managed("mods/a.jar", sha1_a, "v1")}, "v1");
@@ -765,7 +757,7 @@ test "manifest roundtrip owns strings omits null fields rejects unknown fields a
     const encoded = try serialize(testing.allocator, result.value);
     defer testing.allocator.free(encoded);
     try testing.expect(std.mem.indexOf(u8, encoded, "null") == null);
-    try testing.expectError(error.UnknownField, parse(testing.allocator, "{\"schema_version\":1,\"instance_id\":\"instance\",\"pack_version\":\"v1\",\"secret\":\"not-allowed\"}"));
+    try testing.expectError(error.UnknownField, parse(testing.allocator, "{\"schema_version\":3,\"instance_id\":\"instance\",\"pack_version\":\"v1\",\"secret\":\"not-allowed\"}"));
     try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseManifest, .{});
 }
 fn exercisePacks(a: std.mem.Allocator) !void {
@@ -978,12 +970,12 @@ fn exerciseModernReceipt(a: std.mem.Allocator) !void {
     var file = managed("mods/a.jar", sha1_a, "v1");
     file.identity_provenance = .official_file;
     file.standalone = false;
-    const document: Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "v1", .files = &.{file}, .pack_membership = .{ .identity = mr_identity, .paths = &.{file.path} } };
+    const document: Manifest = .{ .instance_id = "instance", .pack_version = "v1", .files = &.{file}, .pack_membership = .{ .identity = mr_identity, .paths = &.{file.path} } };
     const bytes = try serialize(a, document);
     defer a.free(bytes);
     var parsed = try parse(a, bytes);
     defer parsed.deinit();
-    try testing.expectEqual(@as(u32, 2), parsed.value.schema_version);
+    try testing.expectEqual(schema_version, parsed.value.schema_version);
     try testing.expectEqual(IdentityProvenance.official_file, parsed.value.files[0].identity_provenance);
     try testing.expectEqualStrings("P1", parsed.value.files[0].project_id);
     try testing.expectEqualStrings("pack", parsed.value.pack_membership.?.identity.project_id);
@@ -991,45 +983,10 @@ fn exerciseModernReceipt(a: std.mem.Allocator) !void {
     defer paths.deinit();
     try testing.expectEqualStrings(file.path, paths.value[0]);
 }
-test "strict v2 receipt roundtrip and allocation failures preserve real child identity" {
+test "strict current receipt roundtrip and allocation failures preserve real child identity" {
     try exerciseModernReceipt(testing.allocator);
     try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseModernReceipt, .{});
-    try testing.expectError(error.UnknownField, parse(testing.allocator, "{\"schema_version\":2,\"instance_id\":\"instance\",\"pack_version\":\"v2\",\"authorization\":{}}"));
-    try testing.expectError(error.UnknownField, parse(testing.allocator, "{\"schema_version\":1,\"instance_id\":\"instance\",\"pack_version\":\"v1\",\"pack_membership\":null}"));
-    var promoted = managed("mods/a.jar", sha1_a, "v1");
-    promoted.identity_provenance = .official_file;
-    try testing.expectError(error.ReceiptUpgradeRequired, serialize(testing.allocator, manifest(&.{promoted}, "v1")));
-}
-fn exerciseLegacyApproval(a: std.mem.Allocator) !void {
-    const prior = manifest(&.{managed("mods/old.jar", sha1_a, "recorded-pack-version")}, "display-version");
-    const bytes = try serialize(a, prior);
-    defer a.free(bytes);
-    var parsed = try parse(a, bytes);
-    defer parsed.deinit();
-    const file = parsed.value.files[0];
-    try testing.expectEqual(IdentityProvenance.legacy_unknown, file.identity_provenance);
-    try testing.expect(file.standalone and parsed.value.pack_membership == null);
-    try testing.expectEqualStrings("recorded-pack-version", file.version_id);
-    const identity: PackIdentity = .{ .provider = .modrinth, .project_id = "P1", .version_id = "recorded-pack-version" };
-    var approved = try legacyReplacementPaths(a, parsed.value, identity, &.{.{ .path = file.path, .expected_hashes = file.hashes, .expected_size = file.size }});
-    defer approved.deinit();
-    try testing.expectEqual(@as(usize, 1), approved.value.len);
-    const desired = manifest(&.{managed("mods/new.jar", sha1_b, "fresh-file-version")}, "new-display");
-    var plan = try buildUpdatePlan(a, prior, desired, &.{observedFile(file.path, sha1_a)}, &.{}, guard);
-    defer plan.deinit();
-    try testing.expect(plan.value.ready and plan.value.fully_applied);
-    try testing.expectEqual(@as(usize, 3), plan.value.actions.len);
-}
-test "strict legacy read literal tuples and exact approval allow explicit reviewed updates" {
-    try exerciseLegacyApproval(testing.allocator);
-    try @import("test_allocations").checkAllAllocationFailures(testing.allocator, exerciseLegacyApproval, .{});
-    const old = manifest(&.{managed("mods/old.jar", sha1_a, "v1")}, "v1");
-    const identity: PackIdentity = .{ .provider = .modrinth, .project_id = "P1", .version_id = "v1" };
-    try testing.expectError(error.StaleLegacyApproval, legacyReplacementPaths(testing.allocator, old, identity, &.{.{ .path = "mods/old.jar", .expected_hashes = .{ .sha1 = sha1_b }, .expected_size = 3 }}));
-    try testing.expectError(error.StaleLegacyApproval, legacyReplacementPaths(testing.allocator, old, identity, &.{.{ .path = "mods/old.jar", .expected_hashes = .{ .sha1 = sha1_a }, .expected_size = 4 }}));
-    var unapproved = try legacyReplacementPaths(testing.allocator, old, identity, &.{});
-    defer unapproved.deinit();
-    try testing.expectEqual(@as(usize, 0), unapproved.value.len);
+    try testing.expectError(error.UnknownField, parse(testing.allocator, "{\"schema_version\":3,\"instance_id\":\"instance\",\"pack_version\":\"v3\",\"authorization\":{}}"));
 }
 test "MR archive membership permits obsolete removal without inventing official child IDs" {
     var pack = try parseMrpack(testing.allocator, mrpack_fixture, mr_identity, .client);
@@ -1040,11 +997,11 @@ test "MR archive membership permits obsolete removal without inventing official 
     try testing.expectEqual(IdentityProvenance.pack_archive, file.identity_provenance);
     try testing.expectEqualStrings(mr_identity.project_id, file.project_id);
     try testing.expectEqual(@as(usize, 1), proof.value.paths.len);
-    const prior: Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "old", .files = &.{file}, .pack_membership = proof.value };
+    const prior: Manifest = .{ .instance_id = "instance", .pack_version = "old", .files = &.{file}, .pack_membership = proof.value };
     var removals = try packReplacementPaths(testing.allocator, prior, .{ .provider = .modrinth, .project_id = "pack", .version_id = "new" });
     defer removals.deinit();
     try testing.expectEqualStrings(file.path, removals.value[0]);
-    const next: Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "new" };
+    const next: Manifest = .{ .instance_id = "instance", .pack_version = "new" };
     var plan = try buildUpdatePlan(testing.allocator, prior, next, &.{.{ .path = file.path, .hashes = file.hashes, .size = file.size.? }}, &.{}, guard);
     defer plan.deinit();
     try testing.expect(plan.value.actions.len == 2 and plan.value.actions[1].kind == .remove);
@@ -1064,14 +1021,14 @@ test "CF pack membership retains true file IDs and standalone members need separ
     try testing.expectEqualStrings("34", record.version_id);
     try testing.expectEqual(IdentityProvenance.official_file, record.identity_provenance);
     record.standalone = true;
-    const prior: Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "old", .files = &.{record}, .pack_membership = proof.value };
+    const prior: Manifest = .{ .instance_id = "instance", .pack_version = "old", .files = &.{record}, .pack_membership = proof.value };
     var removals = try packReplacementPaths(testing.allocator, prior, cf_identity);
     defer removals.deinit();
     try testing.expectEqual(@as(usize, 0), removals.value.len);
-    var legacy = record;
-    legacy.identity_provenance = .legacy_unknown;
+    var foreign = record;
+    foreign.provider = .modrinth;
     var invalid = prior;
-    invalid.files = &.{legacy};
+    invalid.files = &.{foreign};
     try testing.expectError(error.UnverifiedPackMember, validate(invalid));
 }
 test "partial keep-local receipt retains prior ownership without claiming a new pack version" {
@@ -1082,8 +1039,8 @@ test "partial keep-local receipt retains prior ownership without claiming a new 
     var fresh = old;
     fresh.version_id = "version2";
     fresh.hashes.sha1 = sha1_b;
-    const prior: Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "old", .files = &.{old}, .pack_membership = .{ .identity = mr_identity, .paths = &.{old.path} } };
-    const next: Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "new", .files = &.{fresh}, .pack_membership = .{ .identity = .{ .provider = .modrinth, .project_id = "pack", .version_id = "version2" }, .paths = &.{fresh.path} } };
+    const prior: Manifest = .{ .instance_id = "instance", .pack_version = "old", .files = &.{old}, .pack_membership = .{ .identity = mr_identity, .paths = &.{old.path} } };
+    const next: Manifest = .{ .instance_id = "instance", .pack_version = "new", .files = &.{fresh}, .pack_membership = .{ .identity = .{ .provider = .modrinth, .project_id = "pack", .version_id = "version2" }, .paths = &.{fresh.path} } };
     var plan = try buildUpdatePlan(testing.allocator, prior, next, &.{observedFile(old.path, "2222222222222222222222222222222222222222")}, &.{.{ .path = old.path, .choice = .keep_local }}, guard);
     defer plan.deinit();
     try testing.expect(plan.value.ready and !plan.value.fully_applied);
@@ -1105,7 +1062,7 @@ fn exerciseAuthorizedCFPack(a: std.mem.Allocator) !void {
     try testing.expectEqualStrings("12", resolved.value.files[0].record.project_id);
     var membership = try membershipForPack(a, resolved.value);
     defer membership.deinit();
-    const bytes = try serialize(a, .{ .schema_version = 2, .instance_id = "instance", .pack_version = "v2", .files = &.{resolved.value.files[0].record}, .pack_membership = membership.value });
+    const bytes = try serialize(a, .{ .instance_id = "instance", .pack_version = "v2", .files = &.{resolved.value.files[0].record}, .pack_membership = membership.value });
     defer a.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "authorization") == null and std.mem.indexOf(u8, bytes, "forgecdn.net") == null);
 }
@@ -1126,17 +1083,18 @@ test "managed mod enabled state has canonical physical paths and reserved counte
     defer a.free(disabled_path);
     try testing.expectEqualStrings("mods/state.jar", enabled_path);
     try testing.expectEqualStrings("mods/state.jar.disabled", disabled_path);
-    const document: Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "local", .files = &.{disabled} };
+    const document: Manifest = .{ .instance_id = "instance", .pack_version = "local", .files = &.{disabled} };
     const bytes = try serialize(a, document);
     defer a.free(bytes);
     var parsed = try parse(a, bytes);
     defer parsed.deinit();
     try testing.expectEqualStrings(file.path, parsed.value.files[0].path);
-    try testing.expect(!parsed.value.files[0].enabled);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"enabled\"") == null);
+    try testing.expect(parsed.value.files[0].enabled);
     for ([_][]const u8{ "mods/STATE.jar.disabled", "mods/state.jar.disabled/child" }) |path| {
         var collision = file;
         collision.path = path;
-        try testing.expectError(error.PathCollision, validate(.{ .schema_version = 2, .instance_id = "instance", .pack_version = "local", .files = &.{ file, collision } }));
+        try testing.expectError(error.PathCollision, validate(.{ .instance_id = "instance", .pack_version = "local", .files = &.{ file, collision } }));
     }
     for ([_][]const u8{ "resourcepacks/state.jar", "config/state.jar", "mods/state.zip", "assets/state.jar", "mods/state.jar.disabled" }) |path| {
         var unsupported = disabled;
@@ -1154,37 +1112,6 @@ test "managed mod enabled state has canonical physical paths and reserved counte
     try testing.expect(toggleable(override));
 }
 
-test "enabled state plan preserves receipts and rejects unsafe or unowned requests" {
-    const a = testing.allocator;
-    const hashes: providers.Hashes = .{ .sha256 = "0000000000000000000000000000000000000000000000000000000000000000" };
-    const file: ManagedFile = .{ .path = "mods/state.jar", .provider = .modrinth, .project_id = "project", .version_id = "v1", .hashes = hashes, .size = 3, .identity_provenance = .official_file };
-    const previous: Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "local", .files = &.{file} };
-    const observed = [_]ObservedFile{.{ .path = file.path, .hashes = hashes, .size = 3 }};
-    const instance_state_guard: InstanceGuard = .{ .instance_id = "instance", .running = false };
-    var off = try buildEnabledPlan(a, previous, file.path, false, &observed, instance_state_guard);
-    defer off.deinit();
-    try testing.expect(off.value.ready);
-    try testing.expectEqual(@as(usize, 2), off.value.actions.len);
-    try testing.expectEqual(ActionKind.backup, off.value.actions[0].kind);
-    try testing.expectEqual(ActionKind.toggle, off.value.actions[1].kind);
-    try testing.expectEqualDeep(file, off.value.actions[1].previous.?);
-    var expected = file;
-    expected.enabled = false;
-    try testing.expectEqualDeep(expected, off.value.next_manifest.files[0]);
-    var again = try buildEnabledPlan(a, off.value.next_manifest, file.path, false, &observed, instance_state_guard);
-    defer again.deinit();
-    try testing.expectEqual(@as(usize, 0), again.value.actions.len);
-    try testing.expectError(error.UnmanagedFile, buildEnabledPlan(a, previous, "mods/user.jar", false, &observed, instance_state_guard));
-    try testing.expectError(error.PathCaseChanged, buildEnabledPlan(a, previous, "mods/STATE.jar", false, &observed, instance_state_guard));
-    try testing.expectError(error.LocalFileChanged, buildEnabledPlan(a, previous, file.path, false, &.{}, instance_state_guard));
-    const changed = [_]ObservedFile{.{ .path = file.path, .hashes = hashes, .size = 4 }};
-    try testing.expectError(error.LocalFileChanged, buildEnabledPlan(a, previous, file.path, false, &changed, instance_state_guard));
-    const unsafe = [_]ObservedFile{.{ .path = file.path, .hashes = hashes, .size = 3, .regular = false }};
-    try testing.expectError(error.LocalFileChanged, buildEnabledPlan(a, previous, file.path, false, &unsafe, instance_state_guard));
-    try testing.expectError(error.InstanceRunning, buildEnabledPlan(a, previous, file.path, false, &observed, .{ .instance_id = "instance", .running = true }));
-    try testing.expectError(error.InstanceMismatch, buildEnabledPlan(a, previous, file.path, false, &observed, .{ .instance_id = "another", .running = false }));
-}
-
 test "launcher root receipts and exact target metadata reserve case aliases and descendants" {
     const a = testing.allocator;
     const target_guard: InstanceGuard = .{ .instance_id = "instance", .instance_name = "Test", .running = true };
@@ -1195,11 +1122,8 @@ test "launcher root receipts and exact target metadata reserve case aliases and 
         const document = manifest(&.{file}, "v1");
         try testing.expectError(error.ProtectedPath, buildUpdatePlan(a, empty, document, &.{}, &.{}, target_guard));
         try testing.expectError(error.ProtectedPath, buildUpdatePlan(a, document, empty, &.{}, &.{}, target_guard));
-        try testing.expectError(error.ProtectedPath, buildEnabledPlan(a, empty, path, false, &.{}, target_guard));
         try testing.expectError(error.ProtectedPath, buildUpdatePlan(a, empty, empty, &.{}, &.{.{ .path = path, .choice = .replace }}, target_guard));
-        var wire_document = document;
-        wire_document.schema_version = schema_version;
-        const bytes = try std.json.Stringify.valueAlloc(a, wire_document, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .schema_version = schema_version, .instance_id = document.instance_id, .pack_version = document.pack_version, .files = &.{storedFile(file)} }, .{});
         defer a.free(bytes);
         try testing.expectError(error.ProtectedPath, parseForInstance(a, bytes, "Test"));
         var membership_only: Manifest = .{ .schema_version = schema_version, .instance_id = "instance", .pack_version = "v1" };
@@ -1243,4 +1167,39 @@ test "path preflight bounds precede uninitialized collections and strings" {
     const oversized_path = try a.alloc(u8, max_path_bytes + 1);
     defer a.free(oversized_path);
     try testing.expectError(error.UnsafeRelativePath, checkedPathForInstance(oversized_path, "Test"));
+}
+
+test "ownership receipt serialization ignores runtime enabled state" {
+    const a = testing.allocator;
+    const file: ManagedFile = .{ .path = "mods/Example.JAR", .provider = .modrinth, .project_id = "project", .version_id = "version", .hashes = .{ .sha1 = "0000000000000000000000000000000000000000" }, .identity_provenance = .official_file };
+    const first = try serialize(a, .{ .schema_version = schema_version, .instance_id = "instance", .pack_version = "local", .files = &.{file} });
+    defer a.free(first);
+    var disabled = file;
+    disabled.enabled = false;
+    const second = try serialize(a, .{ .schema_version = schema_version, .instance_id = "instance", .pack_version = "local", .files = &.{disabled} });
+    defer a.free(second);
+    try testing.expectEqualStrings(first, second);
+    try testing.expect(std.mem.indexOf(u8, first, "\"enabled\"") == null);
+    var parsed = try parse(a, first);
+    defer parsed.deinit();
+    try testing.expectEqual(schema_version, parsed.value.schema_version);
+    try testing.expectEqualStrings("project", parsed.value.files[0].project_id);
+    try testing.expectEqual(IdentityProvenance.official_file, parsed.value.files[0].identity_provenance);
+}
+test "receipts reject old schemas and require explicit provenance" {
+    const a = testing.allocator;
+    for ([_]u32{ 1, 2, 4 }) |version| {
+        const bytes = try std.fmt.allocPrint(a, "{{\"schema_version\":{d},\"instance_id\":\"instance\",\"pack_version\":\"local\"}}", .{version});
+        defer a.free(bytes);
+        try testing.expectError(error.UnsupportedSchema, parse(a, bytes));
+        var document = manifest(&.{}, "local");
+        document.schema_version = version;
+        try testing.expectError(error.UnsupportedSchema, serialize(a, document));
+    }
+    const missing = "{\"schema_version\":3,\"instance_id\":\"instance\",\"pack_version\":\"local\",\"files\":[{\"path\":\"mods/local.jar\",\"provider\":\"modrinth\",\"project_id\":\"project\",\"version_id\":\"version\",\"hashes\":{\"sha1\":\"0000000000000000000000000000000000000000\"}}]}";
+    try testing.expectError(error.MissingField, parse(a, missing));
+    const file = managed("mods/local.jar", sha1_a, "version");
+    const runtime_flags = try std.json.Stringify.valueAlloc(a, manifest(&.{file}, "local"), .{});
+    defer a.free(runtime_flags);
+    try testing.expectError(error.UnknownField, parse(a, runtime_flags));
 }

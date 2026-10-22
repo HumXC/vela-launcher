@@ -270,7 +270,6 @@ pub const Controller = struct {
     }
 };
 
-pub const Manager = Controller;
 const Action = enum { set, remove, acknowledge, recover };
 const Job = struct {
     allocator: Allocator,

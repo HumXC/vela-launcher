@@ -34,7 +34,7 @@ pub const metrics = struct {
 pub const Mode = enum { none, create, options, rename, delete_confirm };
 pub const CreateStep = enum { version, loader, confirm };
 pub const VersionFilter = enum { release, snapshot, old };
-pub const Action = enum { create, edit, ask_rename, ask_delete, select, submit, confirm, close, cancel, close_task, reopen_task, retry_publication, choose_base, choose_loader_kind, choose_loader, load_loaders, next_step, previous_step, save_navigation, discard_navigation, cancel_navigation, leave };
+pub const Action = enum { create, edit, ask_rename, ask_delete, select, submit, confirm, close, cancel, close_task, retry_publication, choose_base, choose_loader_kind, choose_loader, load_loaders, next_step, previous_step, save_navigation, discard_navigation, cancel_navigation, leave };
 const Pending = struct { action: Action, text: ?[]u8 = null, kind: config.Loader = .vanilla, force_refresh: bool = false };
 pub const Draft = struct {
     id: ?[]u8 = null,
@@ -148,6 +148,7 @@ pub const Ui = struct {
     /// Incremented only after an admitted navigation executes; modal clicks do not count.
     navigation_serial: u64 = 0,
     exit_requested: bool = false,
+    manage_requested: bool = false,
     failure: ?anyerror = null,
     task: task_view.State = .{},
     task_can_cancel: bool = false,
@@ -287,30 +288,17 @@ fn saveInstalled(ui: *Ui, store: *config.Store, manager: anytype) !void {
     if (!manager_module.sameInstance(original, try find(store.snapshot(), original.id))) return error.InstanceChanged;
     const updated = try ui.draft.value(.options, store.snapshot());
     if (!std.mem.eql(u8, original.name, updated.name)) {
-        if (comptime @hasDecl(@TypeOf(manager.*), "startRenameWithOptions")) {
-            manager.startRenameWithOptions(original, updated) catch |err| {
-                ui.task.failAdmission(ui.allocator, .renaming, updated.name, err);
-                return err;
-            };
-        } else {
-            // Keep the old fixture seam for name-only renames, never partially save options.
-            var name_only = updated;
-            name_only.name = original.name;
-            if (!manager_module.sameInstance(original, name_only)) return error.CombinedRenameUnavailable;
-            manager.startRename(original, updated.name) catch |err| {
-                ui.task.failAdmission(ui.allocator, .renaming, updated.name, err);
-                return err;
-            };
-        }
+        manager.startRenameWithOptions(original, updated) catch |err| {
+            ui.task.failAdmission(ui.allocator, .renaming, updated.name, err);
+            return err;
+        };
         ui.submitted = true;
         ui.publication_failed = false;
         return;
     }
     var refreshed = try Draft.fromInstance(ui.allocator, updated);
     errdefer refreshed.deinit(ui.allocator);
-    if (comptime @hasDecl(@TypeOf(manager.*), "saveOptionsChecked")) {
-        try manager.saveOptionsChecked(store, original, updated);
-    } else try manager.saveOptions(store, updated);
+    try manager.saveOptionsChecked(store, original, updated);
     ui.reset();
     ui.draft = refreshed;
     ui.mode = .options;
@@ -418,24 +406,18 @@ fn performDirect(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !v
         .close_task => {
             if (ui.task.phase != .working and ui.task.phase != .awaiting_publication) ui.task.visible = false;
         },
-        // Task results have no reopen affordance; only a new task opens this modal.
-        .reopen_task => {},
         .cancel => {
             const current = manager.snapshot();
             // A worker can finish between the click and this deferred action.
             if (current.phase != .working) return;
-            if (comptime @hasField(@TypeOf(current), "task_id")) {
-                if (ui.task.task_id == null or ui.task.task_id != current.task_id) return;
-            }
+            if (ui.task.task_id == null or ui.task.task_id != current.task_id) return;
             manager.cancel();
             ui.task.visible = false;
         },
         .retry_publication => {
             const current = manager.snapshot();
             if (current.phase != .awaiting_publication) return error.NoPendingPublication;
-            if (comptime @hasField(@TypeOf(current), "task_id")) {
-                if (ui.task.task_id == null or ui.task.task_id != current.task_id) return error.NoPendingPublication;
-            }
+            if (ui.task.task_id == null or ui.task.task_id != current.task_id) return error.NoPendingPublication;
             ui.publication_failed = true;
             try manager.publish(store);
             ui.publication_failed = false;
@@ -544,11 +526,9 @@ pub fn finishWithManager(ui: *Ui, store: *config.Store, manager: anytype) void {
         const can_skip_catalogue = ui.mode == .create and ui.create_step == .loader and (p.action == .next_step or p.action == .previous_step or (p.action == .choose_loader_kind and p.kind == .vanilla));
         if (can_skip_catalogue and manager.isBusy()) {
             const state = manager.snapshot();
-            if (comptime @hasField(@TypeOf(state), "operation")) {
-                if (state.operation == .loading_loaders) {
-                    manager.cancel();
-                    return;
-                }
+            if (state.operation == .loading_loaders) {
+                manager.cancel();
+                return;
             }
         }
         ui.pending = null;
@@ -559,13 +539,13 @@ pub fn finishWithManager(ui: *Ui, store: *config.Store, manager: anytype) void {
             if (ui.navigation != null and !ui.submitted) ui.navigation_prompt = true;
             return;
         };
-        if (p.action == .close_task or p.action == .reopen_task or p.action == .cancel) return;
+        if (p.action == .close_task or p.action == .cancel) return;
         ui.failure = null;
     }
     const snapshot = manager.snapshot();
     if (ui.submitted and (snapshot.phase == .failed or snapshot.phase == .canceled)) {
         ui.submitted = false;
-        if (comptime @hasField(@TypeOf(snapshot), "failure")) ui.failure = snapshot.failure;
+        ui.failure = snapshot.failure;
         if (ui.navigation != null) {
             ui.saving_navigation = false;
             ui.navigation_prompt = true;
@@ -771,15 +751,13 @@ pub fn chooseBase(ui: *Ui, doc: *const config.Document, base: []const u8) !void 
 
 pub fn chooseLoader(ui: *Ui, doc: *const config.Document, kind: config.Loader, version: []const u8) !void {
     if (ui.mode != .create or ui.create_step != .loader) return error.InvalidAction;
-    // queue() retains its vanilla default for older callers; the browser owns kind.
-    const selected_kind = if (kind == .vanilla) ui.browse_loader else kind;
-    if (selected_kind != ui.browse_loader or !validText(version, false)) return error.InvalidLoaderVersion;
-    const selected = ui.draft.loader == selected_kind and if (ui.draft.loader_version) |current| std.mem.eql(u8, current, version) else false;
+    if (kind == .vanilla or kind != ui.browse_loader or !validText(version, false)) return error.InvalidLoaderVersion;
+    const selected = ui.draft.loader == kind and if (ui.draft.loader_version) |current| std.mem.eql(u8, current, version) else false;
     if (selected) {
         clearLoader(ui);
     } else {
         try replaceOwned(ui.allocator, &ui.draft.loader_version, version);
-        ui.draft.loader = selected_kind;
+        ui.draft.loader = kind;
     }
     try refreshGeneratedName(ui, doc);
 }
@@ -1111,10 +1089,14 @@ fn drawAcquisition(ui: *Ui, doc: *const config.Document, manager: *manager_modul
             wizardSearch(@src(), "搜索加载器版本", "instance-loader-search", &ui.loader_search, !locked);
             const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .tag = "instance-wizard-loader-list", .expand = .both, .background = false, .padding = R.all(0), .margin = R.all(0), .border = R.all(0) });
             defer scroll.deinit();
-            if (matches) if (loaders.failure) |err| components.text(@src(), fmt("加载器目录：{s}", .{@errorName(err)}), theme.muted);
-            if (matches and loaders.failure != null) if (components.button(@src(), "重试", .{ .enabled = !locked })) {
-                ui.queue(.load_loaders, null);
-                if (ui.pending) |*p| p.force_refresh = true;
+            if (matches) if (loaders.failure) |err| {
+                if (err != error.NonPublicAddress) {
+                    components.text(@src(), fmt("加载器目录：{s}", .{@errorName(err)}), theme.muted);
+                    if (components.button(@src(), "重试", .{ .enabled = !locked })) {
+                        ui.queue(.load_loaders, null);
+                        if (ui.pending) |*p| p.force_refresh = true;
+                    }
+                }
             };
             var count: usize = 0;
             if (matches) for (loaders.entries) |loader| {
@@ -1406,7 +1388,7 @@ fn drawDeleteConfirmation(ui: *Ui, enabled: bool) void {
     const information = components.modalSection(@src(), .{ .min_height = 204, .gap_after = 0, .tag = "instance-delete-confirm-information" });
     defer information.deinit();
     deleteModalText(@src(), "instance-delete-confirm-warning", fmt("实例「{s}」目录内的存档、Mod 和配置将永久删除，无法恢复。", .{text(&ui.draft.original_name)}), false);
-    deleteModalText(@src(), "instance-delete-confirm-servers", "绑定服务器配置也将移除。共享 Minecraft 资源、其他实例和外部服务器文件不受影响。", false);
+    deleteModalText(@src(), "instance-delete-confirm-servers", "绑定服务器将保留，仅解除与此实例的绑定。共享 Minecraft 资源、其他实例和外部服务器文件不受影响。", false);
     if (ui.failure) |err| deleteModalText(@src(), "instance-delete-confirm-failure", fmt("操作失败：{s}", .{failureMessage(err)}), false);
 }
 
@@ -1437,14 +1419,14 @@ fn taskOperation(operation: manager_module.Operation) []const u8 {
 fn taskStatus(ui: *const Ui) []const u8 {
     return switch (ui.task.phase) {
         .idle => "等待开始",
-        .working => "处理中",
-        .awaiting_publication => if (ui.publication_failed) "文件操作已完成，保存配置失败。" else "文件操作已完成，等待保存配置。",
+        .working => if (ui.task.operation == .deleting) "正在永久删除实例。" else "处理中",
+        .awaiting_publication => if (ui.task.operation == .deleting) (if (ui.publication_failed) "实例文件已删除，保存配置失败。" else "实例文件已删除，等待保存配置。") else if (ui.publication_failed) "文件操作已完成，保存配置失败。" else "文件操作已完成，等待保存配置。",
         .failed => if (ui.task.admission_failure) "任务未能启动。" else "任务失败。",
         .canceled => "操作已取消。",
         .complete => switch (ui.task.operation) {
             .creating => "实例安装已完成。",
             .renaming => "实例已重命名。",
-            .deleting => if (ui.task.durability_uncertain) "实例删除已完成，但文件同步状态不确定；绑定服务器配置已移除。" else "实例已永久删除，绑定服务器配置已移除。",
+            .deleting => if (ui.task.durability_uncertain) "实例删除已完成，但文件同步状态不确定；服务器已保留并解除绑定。" else "实例已永久删除，服务器已保留并解除绑定。",
             else => "操作已完成。",
         },
     };
@@ -1517,7 +1499,10 @@ fn taskError(err: anyerror) []const u8 {
 }
 
 fn drawTaskPopup(ui: *Ui, _: bool) void {
-    const modal = components.modalPanel(@src(), "实例任务详情", if (ui.task.failure != null) theme.style.dialogs.task_failed_height else theme.style.dialogs.task_height, null);
+    const deleting = ui.task.operation == .deleting;
+    const delete_error = ui.task.failure != null or ui.task.durability_uncertain or ui.task.recovery_directory != null or ui.task_can_retry;
+    const height = if (deleting) (if (delete_error) theme.style.dialogs.instance_delete_task_error_height else theme.style.dialogs.instance_delete_task_height) else if (ui.task.failure != null) theme.style.dialogs.task_failed_height else theme.style.dialogs.task_height;
+    const modal = components.modalPanel(@src(), "实例任务详情", height, null);
     const content_size = modal.data().contentRect().size();
     defer modal.deinit();
     dvui.tag("instance-task-modal", .{ .id = modal.data().id, .rect = modal.data().borderRectScale().r, .visible = modal.data().visible() });
@@ -1543,7 +1528,8 @@ fn drawTaskPopup(ui: *Ui, _: bool) void {
         const button_width = @min(theme.style.dialogs.task_action_width, footer.data().contentRect().w);
         const unfinished = ui.task.phase == .working or ui.task.phase == .awaiting_publication;
         const allowed = ui.pending == null and (!unfinished or ui.task_can_cancel);
-        if (deleteModalButton(@src(), if (unfinished) "取消" else "关闭", if (unfinished) "instance-task-cancel" else "instance-task-close", allowed, true, button_width, dvui.firstFrame(modal.data().id))) ui.queue(if (unfinished) .cancel else .close_task, null);
+        const finished_install = ui.task.operation == .creating and ui.task.phase == .complete;
+        if (deleteModalButton(@src(), if (unfinished) "取消" else if (finished_install) "完成" else "关闭", if (unfinished) "instance-task-cancel" else "instance-task-close", allowed, true, button_width, dvui.firstFrame(modal.data().id))) ui.queue(if (unfinished) .cancel else .close_task, null);
     }
     const body = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{
         .tag = "instance-task-body",
@@ -1556,6 +1542,15 @@ fn drawTaskPopup(ui: *Ui, _: bool) void {
     });
     defer body.deinit();
     components.modalTitle(@src(), fmt("{s} · {s}", .{ taskOperation(ui.task.operation), ui.task.instance_name orelse "未知实例" }), "instance-task-operation");
+    if (deleting) {
+        // Deletion has no useful transfer telemetry; keep its result and recovery actions.
+        taskText(@src(), "instance-task-status", taskStatus(ui));
+        if (ui.task.failure) |err| if (err != error.Canceled) taskText(@src(), "instance-task-failure", taskError(err));
+        if (ui.task_can_retry and components.button(@src(), "重试保存配置", .{ .tag = "instance-task-retry", .enabled = ui.pending == null })) ui.queue(.retry_publication, null);
+        if (ui.task.durability_uncertain) taskText(@src(), "instance-task-durability", durabilityMessage(ui.task.operation));
+        if (ui.task.recovery_directory) |path| taskText(@src(), "instance-task-recovery", fmt("恢复目录：{s}", .{path}));
+        return;
+    }
     const details = &ui.task.details;
     {
         const summary = components.modalSection(@src(), .{ .min_height = 132, .tag = "instance-task-summary" });
@@ -1668,11 +1663,16 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Man
     if (settingsMode(ui.mode)) {
         const editable = !locked and ui.mode != .delete_confirm;
         {
-            const panel = components.formPanel(@src(), .{ .tag = "instance-identity" });
+            const panel = components.formPanel(@src(), .{ .tag = "instance-identity", .options = .{ .margin = R.all(0) } });
             defer panel.deinit();
             installedEntry(ui, @src(), "名称", "instance-settings-name", &ui.draft.name, false, editable);
             _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.field_gap) });
             javaPicker(ui, @src(), registered_java, editable);
+        }
+        {
+            const actions = dvui.box(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .y = theme.spacing.group_gap, .h = theme.spacing.group_gap }, .background = false });
+            defer actions.deinit();
+            if (ui.draft.id != null and components.button(@src(), "资源管理", .{ .tag = "instance-manage-mods", .enabled = editable, .expand = true, .placement = .footer })) ui.manage_requested = true;
         }
         {
             const available = dvui.parentGet().data().contentRect().w;
@@ -1834,6 +1834,8 @@ fn failureMessage(err: anyerror) []const u8 {
         error.InvalidInstanceName => "实例名称无效，请勿使用路径分隔符或保留名称。",
         error.InvalidMemory => "内存必须为 256–1048576 MiB，且最小内存不能大于最大内存（留空时使用默认值）。",
         error.InstanceNameUnchanged => "暂不支持仅修改名称大小写，请使用不同名称。",
+        error.InstanceReferenced => "此实例正被其他版本继承或引用，暂时无法删除或重命名。请先处理依赖它的版本。",
+        error.MissingInstallReceipt => "缺少实例安装信息，无法安全核对版本身份。请修复或重新安装实例后重试。",
         error.PermanentDeletionIncomplete => "删除未完成，部分文件可能已经删除。请检查实例目录。",
         error.SizeMismatch => "下载文件大小与预期不符，文件可能不完整。",
         error.ChecksumMismatch => "文件内容与预期校验值不一致，请重新获取后重试。",
@@ -1961,6 +1963,14 @@ test "deletion confirmation admission guards busy submitted pending and navigati
     try std.testing.expect(!settingsMode(.rename));
 }
 
+test "instance reference protection explains the actual blocker" {
+    const message = failureMessage(error.InstanceReferenced);
+    try std.testing.expect(std.mem.indexOf(u8, message, "继承或引用") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "网络") == null);
+    try std.testing.expect(!std.mem.eql(u8, message, @errorName(error.InstanceReferenced)));
+    try std.testing.expect(!std.mem.eql(u8, failureMessage(error.MissingInstallReceipt), @errorName(error.MissingInstallReceipt)));
+}
+
 test "permanent deletion uncertainty does not promise recovery while rename retains it" {
     try std.testing.expectEqualStrings("删除未完成，部分文件可能已经删除。请检查实例目录。", failureMessage(error.PermanentDeletionIncomplete));
     try std.testing.expectEqualStrings("删除已完成，但文件同步状态不确定。请检查实例目录，勿重复执行删除。", durabilityMessage(.deleting));
@@ -1974,8 +1984,8 @@ test "Java picker preserves legacy bindings and resolves registered choices by p
     var draft = try Draft.fromInstance(a, .{ .id = "stable", .name = "Play", .minecraft_version = "1.21", .java_path = "/legacy/java" });
     defer draft.deinit(a);
     var entries = [_]java_module.Runtime{
-        .{ .path = "/registered/java-a", .major = 21, .vendor = "Vendor" },
-        .{ .path = "/registered/java-b", .major = 21, .vendor = "Vendor" },
+        .{ .path = "/registered/java-a", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor" },
+        .{ .path = "/registered/java-b", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor" },
     };
     try std.testing.expect(javaChoice(text(&draft.java_path), &entries) == null);
     try std.testing.expect(!draft.dirty());
@@ -1995,15 +2005,15 @@ test "Java picker preserves legacy bindings and resolves registered choices by p
 test "Java selection copies registry bytes and rejected choices preserve the draft" {
     var draft: Draft = .{};
     var path = "/registered/java".*;
-    const entries = [_]java_module.Runtime{.{ .path = &path, .major = 21, .vendor = "Vendor" }};
+    const entries = [_]java_module.Runtime{.{ .path = &path, .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor" }};
     try chooseJava(&draft, &entries, 1);
     @memset(&path, 'x');
     try std.testing.expectEqualStrings("/registered/java", text(&draft.java_path));
     try std.testing.expectError(error.JavaNotRegistered, chooseJava(&draft, &entries, 2));
-    const invalid = [_]java_module.Runtime{.{ .path = "bad\npath", .major = 21, .vendor = "Vendor" }};
+    const invalid = [_]java_module.Runtime{.{ .path = "bad\npath", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor" }};
     try std.testing.expectError(error.InvalidJavaPath, chooseJava(&draft, &invalid, 1));
     const oversized: [4097]u8 = @splat('x');
-    const too_long = [_]java_module.Runtime{.{ .path = &oversized, .major = 21, .vendor = "Vendor" }};
+    const too_long = [_]java_module.Runtime{.{ .path = &oversized, .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor" }};
     try std.testing.expectError(error.TextTooLong, chooseJava(&draft, &too_long, 1));
     try std.testing.expectEqualStrings("/registered/java", text(&draft.java_path));
 }
@@ -2090,6 +2100,8 @@ test "wizard loader rows toggle explicit selection and preserve selection on bac
     ui.mode = .create;
     try chooseBase(&ui, &.{}, "26.3");
     try advanceCreateStep(&ui);
+    try std.testing.expectError(error.InvalidLoaderVersion, chooseLoader(&ui, &.{}, .vanilla, "0.19.1"));
+    try std.testing.expect(ui.draft.loader_version == null);
     try chooseLoader(&ui, &.{}, .fabric, "0.19.1");
     try std.testing.expectEqual(config.Loader.fabric, ui.draft.loader);
     try std.testing.expectEqualStrings("26.3-Fabric", text(&ui.draft.name));

@@ -79,7 +79,9 @@ test "retained authentic vanilla metadata launches legacy and modern clients on 
         defer resolved.deinit();
         for ([_][]const u8{ "linux", "windows", "osx" }) |os| {
             const env: m.rules.Environment = .{ .os_name = os, .arch = "x86_64" };
-            var planned = try install.build(a, resolved.value, .{ .objects = &.{}, .virtual = null, .map_to_resources = null }, env, .{ .root = root, .native_arch = .bits64, .cpu_arch = "x86_64" });
+            const client_relative_path = try @import("minecraft/layout.zig").installedClient(a, resolved.value);
+            defer a.free(client_relative_path);
+            var planned = try install.build(a, resolved.value, .{ .objects = &.{}, .virtual = null, .map_to_resources = null }, env, .{ .root = root, .client_relative_path = client_relative_path });
             defer planned.deinit();
             var result = try launch.build(a, resolved.value, planned.value, env, options);
             defer result.deinit();
@@ -111,7 +113,9 @@ test "retained authentic Forge Fabric Quilt NeoForge metadata goes through inher
         try std.testing.expectEqualStrings(base.value.id, resolved.value.jar.?);
         for ([_][]const u8{ "linux", "windows" }) |os| {
             const env: m.rules.Environment = .{ .os_name = os, .arch = "x86_64" };
-            var planned = try install.build(a, resolved.value, .{ .objects = &.{}, .virtual = null, .map_to_resources = null }, env, .{ .root = root, .native_arch = .bits64, .cpu_arch = "x86_64" });
+            const client_relative_path = try @import("minecraft/layout.zig").installedClient(a, resolved.value);
+            defer a.free(client_relative_path);
+            var planned = try install.build(a, resolved.value, .{ .objects = &.{}, .virtual = null, .map_to_resources = null }, env, .{ .root = root, .client_relative_path = client_relative_path });
             defer planned.deinit();
             var result = try launch.build(a, resolved.value, planned.value, env, options);
             defer result.deinit();
@@ -154,7 +158,9 @@ test "retained authentic old Forge installer metadata preserves legacy tweak and
         defer resolved.deinit();
         try std.testing.expectEqualStrings(base.value.id, resolved.value.jar.?);
         const env: m.rules.Environment = .{ .os_name = "linux", .arch = "amd64" };
-        var base_plan = try install.build(a, base.value, .{ .objects = &.{}, .virtual = null, .map_to_resources = null }, env, .{ .root = root });
+        const client_relative_path = try @import("minecraft/layout.zig").installedClient(a, base.value);
+        defer a.free(client_relative_path);
+        var base_plan = try install.build(a, base.value, .{ .objects = &.{}, .virtual = null, .map_to_resources = null }, env, .{ .root = root, .client_relative_path = client_relative_path });
         defer base_plan.deinit();
         // Old installers embed the Forge runtime without a public artifact URL.
         // Supply its published runtime path to launch, leaving authentic metadata intact.
@@ -219,7 +225,9 @@ test "modern loader JVM overlay preserves legacy parent defaults and normalized 
     var resolved = try inheritance.resolve(a, child.value.id, &.{ base.value, child.value }, .{});
     defer resolved.deinit();
     const env: m.rules.Environment = .{ .os_name = "windows", .arch = "x86_64" };
-    var planned = try install.build(a, resolved.value, .{ .objects = &.{}, .virtual = null, .map_to_resources = null }, env, .{ .root = root, .native_arch = .bits64, .cpu_arch = "x86_64" });
+    const client_relative_path = try @import("minecraft/layout.zig").installedClient(a, resolved.value);
+    defer a.free(client_relative_path);
+    var planned = try install.build(a, resolved.value, .{ .objects = &.{}, .virtual = null, .map_to_resources = null }, env, .{ .root = root, .client_relative_path = client_relative_path });
     defer planned.deinit();
     var result = try launch.build(a, resolved.value, planned.value, env, options);
     defer result.deinit();

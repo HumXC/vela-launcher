@@ -321,6 +321,7 @@ fn cloneOptions(a: std.mem.Allocator, options: LaunchOptions) !LaunchOptions {
     for (options.java_candidates, candidates) |source, *dest| dest.* = .{
         .path = try a.dupe(u8, source.path),
         .major = source.major,
+        .architecture = source.architecture,
         .vendor = try a.dupe(u8, source.vendor),
     };
     result.java_candidates = candidates;
@@ -372,7 +373,7 @@ fn perform(job: *Job) !EndReason {
         try content_install.requireRecoveryClear(a, job.io, &paths, id, job.request.version);
         try job.checkCancel();
     }
-    var loaded = try loader.load(a, job.io, .{ .root = job.root, .version_id = job.request.version, .metadata_path = job.options.metadata_path, .cancel = &job.canceled }, .{});
+    var loaded = try loader.loadInstalled(a, job.io, .{ .root = job.root, .version_id = job.request.version, .metadata_path = job.options.metadata_path, .cancel = &job.canceled });
     defer loaded.deinit();
     const version = loaded.version.value;
     const required = metadata.version.requiredJavaMajor(version);
@@ -381,7 +382,7 @@ fn perform(job: *Job) !EndReason {
         const required_major = std.math.cast(u32, required) orelse return error.InvalidJavaVersion;
         const java_path = if (job.request.java_path.len != 0) job.request.java_path else blk: {
             for (job.options.java_candidates) |candidate| {
-                if (java.compatible(candidate.major, required_major)) break :blk candidate.path;
+                if (java.compatible(candidate.major, required_major) and candidate.architecture == @import("../core/java_runtime.zig").host()) break :blk candidate.path;
             }
             return error.NoCompatibleJava;
         };
@@ -390,11 +391,18 @@ fn perform(job: *Job) !EndReason {
         job.request.java_major = required_major;
     }
     if (required != job.request.java_major) return error.JavaMajorMismatch;
+    const runtime = try java.probe(a, job.io, job.request.java_path, &job.canceled);
+    defer java.freeRuntime(a, runtime);
+    if (runtime.major != required) return error.JavaMajorMismatch;
+    try runtime.architecture.requireHost();
     var assets = try library.loadAssets(a, job.io, job.root, (version.asset_index orelse return error.MissingAssetIndex).id);
     defer assets.deinit();
     var env = try library.hostEnvironment();
-    const cpu_arch = @tagName(@import("builtin").cpu.arch);
-    var plan = try planner.buildInstalled(a, version, assets.value, env, .{ .root = job.root, .instance_name = job.request.version, .game_directory = job.options.instance_directory, .native_arch = if (@sizeOf(usize) == 8) .bits64 else .bits32, .cpu_arch = cpu_arch });
+    env.arch = runtime.architecture.cpuName();
+    const cpu_arch = env.arch;
+    const client_relative_path = try @import("../core/minecraft/layout.zig").installedClient(a, version);
+    defer a.free(client_relative_path);
+    var plan = try planner.buildInstalled(a, version, assets.value, env, .{ .root = job.root, .client_relative_path = client_relative_path, .instance_name = job.request.version, .game_directory = job.options.instance_directory });
     defer plan.deinit();
     try validateLocalPlan(job, plan.value);
     try prepareNatives(job, plan.value, cpu_arch);
@@ -422,10 +430,6 @@ fn perform(job: *Job) !EndReason {
     defer command.deinit();
     // Command arguments contain credentials; never send argv to diagnostics.
     defer for (command.value.argv) |arg| std.crypto.secureZero(u8, @constCast(arg));
-    try job.checkCancel();
-    const runtime = try java.probe(a, job.io, job.request.java_path, &job.canceled);
-    defer java.freeRuntime(a, runtime);
-    if (runtime.major != required) return error.JavaMajorMismatch;
     try job.checkCancel();
     var disk: [2]?std.Io.File = .{ null, null };
     defer for (disk) |file| if (file) |value| value.close(job.io);
@@ -691,7 +695,7 @@ test "fresh native preparation repairs missing and damaged legacy outputs before
         defer tmp.cleanup();
         try writeFixture(tmp.dir, 21);
         if (missing) try tmp.dir.deleteTree(io, "versions/fixture/natives") else try tmp.dir.writeFile(io, .{ .sub_path = "versions/fixture/natives/stale", .data = "stale" });
-        try writeFakeJavaImpl(tmp.dir, 21, "test -f versions/fixture/natives/libfixture.so && test ! -e versions/fixture/natives/stale && test ! -e versions/fixture/natives/META-INF/fixture.txt || exit 89", true);
+        try writeFakeJavaImpl(tmp.dir, 21, "test -f versions/fixture/natives/libfixture.so && test ! -e versions/fixture/natives/stale && test ! -e versions/fixture/natives/META-INF/fixture.txt || exit 89", true, @import("../core/java_runtime.zig").host());
         var path: [4096]u8 = undefined;
         const len = try tmp.dir.realPath(io, &path);
         const java_path = try std.fs.path.join(a, &.{ path[0..len], "fake-java" });
@@ -712,7 +716,7 @@ test "fresh native preparation repairs missing and damaged legacy outputs before
         try expectNoNativeStages(tmp.dir);
     }
 }
-test "transient native archive mutation preserves old output and prevents Java" {
+test "transient native archive mutation preserves old output and prevents game execution" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -744,7 +748,7 @@ test "transient native archive mutation preserves old output and prevents Java" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFixture(tmp.dir, 21);
-    try writeFakeJavaImpl(tmp.dir, 21, "exit 0", true);
+    try writeFakeJavaImpl(tmp.dir, 21, "exit 0", true, @import("../core/java_runtime.zig").host());
     const before = try tmp.dir.readFileAlloc(io, "libraries/fixture/native.jar", a, .limited(1024));
     defer a.free(before);
     const replacement = try nativeFixtureZip(a, .{ .payload_tag = 1 });
@@ -781,7 +785,7 @@ test "transient native archive mutation preserves old output and prevents Java" 
     try std.testing.expect(Hook.held_during_mutation);
     try std.testing.expectEqual(Phase.failed, controller.snapshot().phase);
     try std.testing.expectEqual(@as(anyerror, error.NativeSourceChanged), controller.snapshot().failure.?);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "java-invocations", .{}));
+    try expectJavaProbeOnly(tmp.dir);
     const prior = try tmp.dir.readFileAlloc(io, "versions/fixture/natives/libfixture.so", a, .limited(128));
     defer a.free(prior);
     try std.testing.expectEqualStrings("damaged prior output", prior);
@@ -794,7 +798,7 @@ test "transient native archive mutation preserves old output and prevents Java" 
     try std.testing.expect(!guard.held and guard.released == 1);
     try expectNoNativeStages(tmp.dir);
 }
-test "matching archive hashes do not authorize corrupt CRC or wrong CPU before Java" {
+test "matching archive hashes do not authorize corrupt CRC or wrong CPU before game execution" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -803,7 +807,7 @@ test "matching archive hashes do not authorize corrupt CRC or wrong CPU before J
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         try writeNativeFixture(tmp.dir, 21, options);
-        try writeFakeJavaImpl(tmp.dir, 21, "exit 0", true);
+        try writeFakeJavaImpl(tmp.dir, 21, "exit 0", true, @import("../core/java_runtime.zig").host());
         var path: [4096]u8 = undefined;
         const len = try tmp.dir.realPath(io, &path);
         const java_path = try std.fs.path.join(a, &.{ path[0..len], "fake-java" });
@@ -815,7 +819,7 @@ test "matching archive hashes do not authorize corrupt CRC or wrong CPU before J
         try waitForTest(&controller);
         try std.testing.expectEqual(Phase.failed, controller.snapshot().phase);
         try std.testing.expect(controller.snapshot().failure != null);
-        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "java-invocations", .{}));
+        try expectJavaProbeOnly(tmp.dir);
         const prior = try tmp.dir.readFileAlloc(io, "versions/fixture/natives/libfixture.so", a, .limited(128));
         defer a.free(prior);
         try std.testing.expectEqualStrings("damaged prior output", prior);
@@ -823,7 +827,7 @@ test "matching archive hashes do not authorize corrupt CRC or wrong CPU before J
         try expectNoNativeStages(tmp.dir);
     }
 }
-test "native archive symlink ancestors fail closed before any Java invocation" {
+test "native archive symlink ancestors fail closed before game execution" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -832,7 +836,7 @@ test "native archive symlink ancestors fail closed before any Java invocation" {
     try writeFixture(tmp.dir, 21);
     try tmp.dir.rename("libraries/fixture", tmp.dir, "outside-library", io);
     try tmp.dir.symLink(io, "../outside-library", "libraries/fixture", .{ .is_directory = true });
-    try writeFakeJavaImpl(tmp.dir, 21, "exit 0", true);
+    try writeFakeJavaImpl(tmp.dir, 21, "exit 0", true, @import("../core/java_runtime.zig").host());
     var path: [4096]u8 = undefined;
     const len = try tmp.dir.realPath(io, &path);
     const java_path = try std.fs.path.join(a, &.{ path[0..len], "fake-java" });
@@ -843,7 +847,7 @@ test "native archive symlink ancestors fail closed before any Java invocation" {
     try controller.start(.{ .version = "fixture", .java_path = java_path, .java_major = 21, .username = "Player" });
     try waitForTest(&controller);
     try std.testing.expectEqual(Phase.failed, controller.snapshot().phase);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "java-invocations", .{}));
+    try expectJavaProbeOnly(tmp.dir);
     try std.testing.expect(!guard.held and guard.released == 1);
     try expectNoNativeStages(tmp.dir);
 }
@@ -855,7 +859,7 @@ test "modern classpath native archives are inspected but never legacy extracted"
     defer tmp.cleanup();
     try writeNativeFixture(tmp.dir, 21, .{ .modern = true });
     try tmp.dir.deleteTree(io, "versions/fixture/natives");
-    try writeFakeJavaImpl(tmp.dir, 21, "exit 0", true);
+    try writeFakeJavaImpl(tmp.dir, 21, "exit 0", true, @import("../core/java_runtime.zig").host());
     var path: [4096]u8 = undefined;
     const len = try tmp.dir.realPath(io, &path);
     const java_path = try std.fs.path.join(a, &.{ path[0..len], "fake-java" });
@@ -878,7 +882,7 @@ test "canceled native preparation runs no Java and keeps reservation until worke
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFixture(tmp.dir, 21);
-    try writeFakeJavaImpl(tmp.dir, 21, "exit 0", true);
+    try writeFakeJavaImpl(tmp.dir, 21, "exit 0", true, @import("../core/java_runtime.zig").host());
     var path: [4096]u8 = undefined;
     const len = try tmp.dir.realPath(io, &path);
     const java_path = try std.fs.path.join(a, &.{ path[0..len], "fake-java" });
@@ -1066,12 +1070,45 @@ fn writeNativeFixture(root: std.Io.Dir, major: ?u32, options: NativeFixture) !vo
     try root.writeFile(io, .{ .sub_path = "assets/indexes/fixture.json", .data = "{\"objects\":{}}" });
 }
 
-fn writeFakeJava(root: std.Io.Dir, major: u32, body: []const u8) !void {
-    return writeFakeJavaImpl(root, major, body, false);
+test "launch rejects a foreign JVM before native publication or game execution" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFixture(tmp.dir, 21);
+    const architecture = @import("../core/java_runtime.zig");
+    const foreign: architecture.Architecture = if (architecture.host() == .aarch64) .x86_64 else .aarch64;
+    try writeFakeJavaImpl(tmp.dir, 21, "touch \"${0%/*}/game-started\"", true, foreign);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const java_path = try std.fs.path.join(a, &.{ root, "fake-java" });
+    defer a.free(java_path);
+    var controller = try Controller.init(a, io, root);
+    defer controller.deinit();
+    try controller.start(.{ .version = "fixture", .java_path = java_path, .java_major = 21, .username = "Player" });
+    try waitForTest(&controller);
+    try std.testing.expectEqual(Phase.failed, controller.snapshot().phase);
+    try std.testing.expectEqual(error.JavaArchitectureMismatch, controller.snapshot().failure.?);
+    const invocations = try tmp.dir.readFileAlloc(io, "java-invocations", a, .limited(1024));
+    defer a.free(invocations);
+    try std.testing.expectEqualStrings("called\n", invocations);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "game-started", .{}));
+    try expectNoNativeStages(tmp.dir);
 }
-fn writeFakeJavaImpl(root: std.Io.Dir, major: u32, body: []const u8, record: bool) !void {
-    const marker = if (record) "printf 'called\n' >> java-invocations\n" else "";
-    const data = try std.fmt.allocPrint(std.testing.allocator, "#!/bin/sh\n{s}case \"$1\" in -version|-XshowSettings:properties) printf 'java.version = {d}.0.1\\njava.vendor = Fixture\\nopenjdk version \"{d}.0.1\"\\n' >&2; exit 0;; esac\n{s}\n", .{ marker, major, major, body });
+
+fn expectJavaProbeOnly(directory: std.Io.Dir) !void {
+    const bytes = try directory.readFileAlloc(std.testing.io, "java-invocations", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("called\n", bytes);
+}
+
+fn writeFakeJava(root: std.Io.Dir, major: u32, body: []const u8) !void {
+    return writeFakeJavaImpl(root, major, body, false, @import("../core/java_runtime.zig").host());
+}
+fn writeFakeJavaImpl(root: std.Io.Dir, major: u32, body: []const u8, record: bool, architecture: @import("../core/java_runtime.zig").Architecture) !void {
+    const marker = if (record) "printf 'called\n' >> \"${0%/*}/java-invocations\"\n" else "";
+    const data = try std.fmt.allocPrint(std.testing.allocator, "#!/bin/sh\n{s}case \"$1\" in -version|-XshowSettings:properties) printf 'java.version = {d}.0.1\\njava.vendor = Fixture\\nos.arch = {s}\\nopenjdk version \"{d}.0.1\"\\n' >&2; exit 0;; esac\n{s}\n", .{ marker, major, architecture.cpuName(), major, body });
     defer std.testing.allocator.free(data);
     try root.writeFile(std.testing.io, .{ .sub_path = "fake-java", .data = data });
     const file = try root.openFile(std.testing.io, "fake-java", .{});
@@ -1155,9 +1192,9 @@ test "deferred Java launch reads worker metadata without a published catalogue a
     defer a.free(java_path);
     var vendor = [_]u8{ 'F', 'i', 'x', 't', 'u', 'r', 'e' };
     var candidates = [_]java.Runtime{
-        .{ .path = "/not/java8", .major = 8, .vendor = "Old" },
-        .{ .path = java_path, .major = 21, .vendor = &vendor },
-        .{ .path = "/not/second/java21", .major = 21, .vendor = "Later" },
+        .{ .path = "/not/java8", .major = 8, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Old" },
+        .{ .path = java_path, .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = &vendor },
+        .{ .path = "/not/second/java21", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Later" },
     };
     var gate: NativeWorkerGate = .{};
     native_worker_gate = &gate;
@@ -1214,7 +1251,7 @@ test "deferred Java keeps explicit binding and validates the real executable" {
     var controller = try Controller.init(a, io, path[0..len]);
     defer controller.deinit();
     var request: Request = .{ .version = "fixture", .java_path = bound_java, .java_major = 0, .username = "Player" };
-    const candidates = [_]java.Runtime{.{ .path = compatible_java, .major = 21, .vendor = "Fixture" }};
+    const candidates = [_]java.Runtime{.{ .path = compatible_java, .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Fixture" }};
     try controller.startWithOptions(request, .{ .resolve_java_from_metadata = true, .java_candidates = &candidates });
     try waitForTest(&controller);
     try std.testing.expectEqual(error.JavaMajorMismatch, controller.snapshot().failure.?);
@@ -1251,7 +1288,7 @@ test "deferred Java reports no compatible candidate and uses legacy metadata def
     var controller = try Controller.init(a, io, path[0..len]);
     defer controller.deinit();
     const request: Request = .{ .version = "fixture", .java_path = "", .java_major = 0, .username = "Player" };
-    const candidates = [_]java.Runtime{.{ .path = java_path, .major = 8, .vendor = "Fixture" }};
+    const candidates = [_]java.Runtime{.{ .path = java_path, .major = 8, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Fixture" }};
     try controller.startWithOptions(request, .{ .resolve_java_from_metadata = true });
     try waitForTest(&controller);
     try std.testing.expectEqual(error.NoCompatibleJava, controller.snapshot().failure.?);
@@ -1582,8 +1619,8 @@ test "guarded launch blocks pending and malformed journals before probing but ac
     const marker_path = try std.fs.path.join(a, &.{ launcher_root, "java-invocations" });
     defer a.free(marker_path);
     const script = try std.fmt.allocPrint(a, "#!/bin/sh\ncase \"$1\" in -version|-XshowSettings:properties)\n" ++
-        "printf 'probe\\n' >> '{s}'; printf 'java.version = 21.0.1\\njava.vendor = Fixture\\nopenjdk version \"21.0.1\"\\n' >&2; exit 0;; esac\n" ++
-        "printf 'game\\n' >> '{s}'; printf '[INFO] fixture game exited\\n'; exit 0\n", .{ marker_path, marker_path });
+        "printf 'probe\\n' >> '{s}'; printf 'java.version = 21.0.1\\njava.vendor = Fixture\\nos.arch = {s}\\nopenjdk version \"21.0.1\"\\n' >&2; exit 0;; esac\n" ++
+        "printf 'game\\n' >> '{s}'; printf '[INFO] fixture game exited\\n'; exit 0\n", .{ marker_path, @tagName(@import("builtin").cpu.arch), marker_path });
     defer a.free(script);
     try tmp.dir.writeFile(io, .{ .sub_path = "fake-java", .data = script });
     const java_file = try tmp.dir.openFile(io, "fake-java", .{});
@@ -1601,7 +1638,7 @@ test "guarded launch blocks pending and malformed journals before probing but ac
     try fs.write(txn, io, "manifest-after", manifest_after);
     const manifest_fingerprint = (try fs.fingerprint(txn, io, "manifest-after", null, null)).?;
     const journal = try std.json.Stringify.valueAlloc(a, .{
-        .schema_version = @as(u32, 1),
+        .schema_version = @as(u32, 2),
         .instance_id = "instance",
         .instance_name = "fixture",
         .transaction_id = txn_id,

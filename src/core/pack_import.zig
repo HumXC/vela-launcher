@@ -333,7 +333,7 @@ const Walk = struct {
                     defer file.close(self.io);
                     const hash = try fs.stream(file, null, self.io, 1024 * 1024 * 1024, self.cancel, null);
                     const install: manifest.InstallFile = .{
-                        .record = .{ .path = path, .provider = self.identity.provider, .project_id = self.identity.project_id, .version_id = self.identity.version_id, .hashes = .{ .sha256 = try self.a.dupe(u8, &hash.sha256) }, .size = hash.size, .role = .override },
+                        .record = .{ .path = path, .provider = self.identity.provider, .project_id = self.identity.project_id, .version_id = self.identity.version_id, .hashes = .{ .sha256 = try self.a.dupe(u8, &hash.sha256) }, .size = hash.size, .role = .override, .identity_provenance = .pack_override, .standalone = false },
                         .download = .{ .manual_required = .{ .official_page = "", .reason = .missing_url } },
                         .required = true,
                         .selected = true,

@@ -29,6 +29,9 @@ const instances_manager = @import("instances_manager.zig");
 const instances_view = @import("instances_view.zig");
 const content_manager = @import("content_manager.zig");
 const instance_creation_controller = @import("instance_creation_controller.zig");
+const mods_controller = @import("mods_controller.zig");
+const mods_view = @import("mods_view.zig");
+const mods_page = @import("mods_page.zig");
 
 pub fn boundedSidebarWidth(requested: f32, available: f32) f32 {
     const upper = @max(1, @min(500, available - 280));
@@ -63,8 +66,8 @@ fn guardInstanceLeave(model: *state.Model, ui: *instances_view.Ui, pending: *?st
         }
     }
     if (pending.*) |destination| {
-        const leaving = (model.panel == .instances or model.panel == .library) and switch (destination) {
-            .back, .utility_back, .library_back => true,
+        const leaving = model.panel == .instances and switch (destination) {
+            .back, .utility_back, .instances_back, .open_mods => true,
             else => false,
         };
         if (leaving and !consumed_leave) {
@@ -138,7 +141,7 @@ test "instance exits remain deferred during save and failed publication and cons
     try std.testing.expectEqual(state.Panel.home, model.panel);
 }
 
-test "library back defers dirty instance exit until navigation acknowledges the destination" {
+test "instances back defers dirty instance exit until navigation acknowledges the destination" {
     var model: state.Model = .{ .panel = .home };
     state.transition(&model, .open_instances);
     try std.testing.expectEqual(state.Panel.instances, model.panel);
@@ -148,7 +151,7 @@ test "library back defers dirty instance exit until navigation acknowledges the 
     var pending: ?state.Msg = model.parentMessage();
     guardInstanceLeave(&model, &ui, &pending);
     try std.testing.expect(pending == null);
-    try std.testing.expectEqual(state.Msg.library_back, model.instance_leave.?);
+    try std.testing.expectEqual(state.Msg.instances_back, model.instance_leave.?);
     try std.testing.expectEqual(instances_view.Action.leave, ui.pending.?.action);
     ui.pending = null;
     ui.navigation = .{ .action = .leave, .text = null };
@@ -160,7 +163,7 @@ test "library back defers dirty instance exit until navigation acknowledges the 
     ui.navigation_prompt = false;
     ui.exit_requested = true;
     guardInstanceLeave(&model, &ui, &pending);
-    try std.testing.expectEqual(state.Msg.library_back, pending.?);
+    try std.testing.expectEqual(state.Msg.instances_back, pending.?);
     try std.testing.expect(model.instance_leave == null and !ui.exit_requested);
     state.transition(&model, pending.?);
     try std.testing.expectEqual(state.Panel.home, model.panel);
@@ -186,6 +189,8 @@ pub const Services = struct {
     instances: ?*instances_manager.Manager = null,
     instances_ui: ?*instances_view.Ui = null,
     content: ?*content_manager.Manager = null,
+    mods: ?*mods_controller.Controller = null,
+    mods_ui: ?*mods_view.Ui = null,
     ordinary_creation: ?*instance_creation_controller.Controller = null,
     allow_mutations: bool = true,
 };
@@ -251,9 +256,8 @@ fn discardInactivePickers(model: *const state.Model, java_ui: *java_view.Ui, ser
 
 pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Manager, java_ui: *java_view.Ui, launcher: *launch.Controller, services: Services) !void {
     theme.applyTypography();
+    if (services.mods) |controller| if (services.content) |backend| controller.tick(backend);
     discardInactivePickers(model, java_ui, services);
-    // Old callers may still restore the directory route; it is only an alias.
-    if (model.panel == .library) model.panel = .instances;
     if (services.allow_mutations) services.worlds_ui.setPageActive(model.panel == .worlds);
     const snapshot = library.snapshot();
     if (services.instances_ui) |ui| {
@@ -285,7 +289,7 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
     var command: ?tools.Command = null;
     {
         const available = @max(1, dvui.windowRect().w - 8);
-        const instance_panel = model.panel == .instances or model.panel == .library;
+        const instance_panel = model.panel == .instances;
         const sidebar_width = if (instance_panel) &model.instance_sidebar_width else &model.sidebar_width;
         const initial_width = if (instance_panel) boundedInstanceSidebarWidth(sidebar_width.*, available) else if (model.panel == .logs) boundedLogsSidebarWidth(sidebar_width.*, available) else boundedSidebarWidth(sidebar_width.*, available);
         var split = initial_width / available;
@@ -315,12 +319,15 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
                     if (services.logs.drawNavigationFooter(launcher)) pending = .back;
                     try services.logs.drawSidebar(launcher);
                 },
-                .instances, .library => {
+                .instances => {
                     const side = instances_view.sidebarPanel(@src());
                     defer side.deinit();
                     instances_view.sidebarHeading(@src());
                     if (instances_view.sidebarFooter(@src(), model.parentLabel())) pending = model.parentMessage();
                     if (services.instances) |instance_manager| if (services.instances_ui) |ui| instances_view.drawSidebar(ui, services.configuration, instance_manager, !gates.instances);
+                },
+                .mods => if (services.mods) |controller| {
+                    if (services.mods_ui) |ui| mods_page.sidebar(model, &pending, services.configuration.snapshot(), controller, ui, !gates.content);
                 },
                 .worlds => {
                     const side = tools.beginUtilityMenu("存档");
@@ -336,6 +343,13 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
         };
         if (root.showSecond()) try content(model, snapshot, &pending, &command, manager, java_ui, launcher, services);
     }
+    if (model.panel == .mods) if (services.mods) |controller| if (services.mods_ui) |ui| if (services.content) |backend| try mods_page.dialogs(model, services.configuration.snapshot(), controller, ui, backend, !gates.content);
+    if (services.instances_ui) |ui| if (ui.manage_requested) {
+        ui.manage_requested = false;
+        if (ui.draft.id) |id| {
+            if (model.mods_instance.set(id)) pending = .open_mods;
+        }
+    };
     if (!gates.instances) servers_view.drawModal(services.servers_ui, services.configuration.snapshot());
     if (services.instances_ui) |ui| {
         if (services.instances) |manager_| {
@@ -365,9 +379,8 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
         };
         if (transition_allowed) state.transition(model, msg);
         switch (msg) {
-            .open_library, .get_game => {},
             .start => if (!gates.instances and !gates.content and !services.java_download.isDeleting()) {
-                startGame(snapshot, manager, launcher, services);
+                startGame(manager, launcher, services);
                 if (launch_error) |err| components.alert(@src(), "无法启动游戏", launchFailureMessage(err));
             },
             .select_instance => |id| if (selection_allowed) {
@@ -402,7 +415,7 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
         }
     }
     if (services.instances_ui) |ui| {
-        if (ui.catalogue_requested and !gates.content and !gates.instances and snapshot.phase != .loading and snapshot.phase != .installing) {
+        if (ui.catalogue_requested and !gates.content and !gates.instances and snapshot.phase != .loading) {
             ui.catalogue_requested = false;
             command = .load;
         }
@@ -444,7 +457,14 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
         }
     }
     if (!java_blocked) java_download_view.finish(services.java_download_ui, services.java_download);
-    if (!gates.instances) servers_view.finish(services.servers_ui, services.configuration, services.servers);
+    if (services.mods) |controller| if (services.mods_ui) |ui| if (services.content) |backend| mods_page.finish(model, services.configuration, controller, ui, backend, !gates.content);
+    if (!gates.instances) {
+        servers_view.finish(services.servers_ui, services.configuration, services.servers);
+        if (services.servers_ui.binding_navigation_ready) {
+            services.servers_ui.binding_navigation_ready = false;
+            state.transition(model, .open_servers);
+        }
+    }
     services.logs.finish(launcher);
     if (services.allow_mutations) services.worlds_ui.setPageActive(model.panel == .worlds);
     if (!gates.worlds) worlds_view.finish(services.worlds_ui, services.configuration, services.worlds);
@@ -500,15 +520,18 @@ fn launchFailureMessage(err: anyerror) []const u8 {
     };
 }
 
-fn startGame(snapshot: games.Snapshot, manager: *java.Manager, launcher: *launch.Controller, services: Services) void {
+fn startGame(manager: *java.Manager, launcher: *launch.Controller, services: Services) void {
     const document = services.configuration.snapshot();
     launch_error = null;
     if (services.java_download.isDeleting()) {
         launch_error = error.JavaDeleteBusy;
         return;
     }
-    if (snapshot.phase == .installing) {
-        launch_error = error.InstallInProgress;
+    if (servers_view.requestLaunchBinding(services.servers_ui, document) catch |err| {
+        launch_error = err;
+        return;
+    }) {
+        dvui.refresh(null, @src(), null);
         return;
     }
     const selected_id = document.selected_instance orelse {
@@ -539,7 +562,7 @@ fn startGame(snapshot: games.Snapshot, manager: *java.Manager, launcher: *launch
     var endpoint: ?launch.ServerEndpoint = null;
     if (document.selected_server) |server_id| {
         for (document.servers) |server| if (std.mem.eql(u8, server.id, server_id)) {
-            if (!std.mem.eql(u8, server.instance_id, instance.id)) {
+            if (server.instance_id == null or !std.mem.eql(u8, server.instance_id.?, instance.id)) {
                 launch_error = error.ServerInstanceMismatch;
                 return;
             }
@@ -681,7 +704,7 @@ fn content(model: *state.Model, snapshot: games.Snapshot, pending: *?state.Msg, 
     const progress = if (dvui.animationGet(parent_id, "content_enter")) |a| a.value() else 1;
     const offset = 8 * (1 - progress);
     const compact_home = model.panel == .home and (services.task_viewport_height orelse dvui.windowRect().h) < 520;
-    const compact_instances = (model.panel == .instances or model.panel == .library) and (dvui.windowRect().w < theme.style.layout.compact_page_width or dvui.windowRect().h < theme.style.layout.compact_page_height);
+    const compact_instances = model.panel == .instances and (dvui.windowRect().w < theme.style.layout.compact_page_width or dvui.windowRect().h < theme.style.layout.compact_page_height);
     const padding: f32 = if (compact_home) theme.spacing.panel_compact_padding else if (compact_instances) theme.spacing.sidebar_padding else theme.spacing.page_padding;
     const pane = dvui.box(@src(), .{}, .{ .id_extra = @backingInt(model.panel), .expand = .both, .padding = .{ .x = padding + offset, .w = padding - offset, .y = padding, .h = padding } });
     defer pane.deinit();
@@ -690,9 +713,9 @@ fn content(model: *state.Model, snapshot: games.Snapshot, pending: *?state.Msg, 
     const previous_alpha = dvui.alpha(progress);
     defer dvui.alphaSet(previous_alpha);
     switch (model.panel) {
-        .home => try drawHome(model, snapshot, manager, launcher.snapshot(), pending, services),
-        .players => drawAccountSelection(model, snapshot, launcher.snapshot(), pending, services),
-        .versions => drawGameSelection(model, snapshot, launcher.snapshot(), pending, services),
+        .home => try drawHome(model, launcher.snapshot(), pending, services),
+        .players => drawAccountSelection(model, launcher.snapshot(), pending, services),
+        .versions => drawGameSelection(model, launcher.snapshot(), pending, services),
         .more => switch (model.category) {
             .settings => if (services.cf_credentials) |controller|
                 try settings_view.drawWithCredentials(services.settings, controller, services.configuration.snapshot().settings, gates.content or if (services.content) |content_service| content_service.isBusy() else false, services.configuration.publicationUncertain())
@@ -705,35 +728,37 @@ fn content(model: *state.Model, snapshot: games.Snapshot, pending: *?state.Msg, 
 
         .java => if (!gates.java) java_view.drawPage(java_ui, manager, services.java_download_ui, services.java_download) else components.hint(@src(), "游戏或实例创建任务进行中，Java 配置暂不可更改"),
         .servers => servers_view.draw(services.servers_ui, services.configuration, services.servers),
+        .mods => if (services.mods) |controller| {
+            if (services.mods_ui) |ui| if (services.content) |backend| try mods_page.draw(model, services.configuration.snapshot(), controller, ui, backend, !gates.content);
+        },
         .worlds => try worlds_view.drawWithEnabled(services.worlds_ui, services.configuration.snapshot(), services.worlds, !gates.worlds),
         .logs => try services.logs.draw(launcher),
-        .instances, .library => if (services.instances) |manager_| {
+        .instances => if (services.instances) |manager_| {
             if (services.instances_ui) |ui| instances_view.drawWithEnabled(ui, services.configuration, manager_, snapshot, manager.entries(), !gates.instances);
         },
     }
 }
 
-pub fn drawHome(model: *const state.Model, snapshot: games.Snapshot, manager: *java.Manager, process: launch.Snapshot, pending: *?state.Msg, services: Services) !void {
-    _ = manager;
+pub fn drawHome(model: *const state.Model, process: launch.Snapshot, pending: *?state.Msg, services: Services) !void {
     const frame = dvui.box(@src(), .{}, .{ .tag = "home-layout", .expand = .both, .padding = R.all(0), .margin = R.all(0) });
     defer frame.deinit();
-    drawStartFooter(model, snapshot, process, pending, services, frame.data().contentRect(), "home-footer", "home-start");
+    drawStartFooter(model, process, pending, services, frame.data().contentRect(), "home-footer", "home-start");
 }
 
-pub fn drawGameSelection(model: *state.Model, snapshot: games.Snapshot, process: launch.Snapshot, pending: *?state.Msg, services: Services) void {
-    drawLaunchSelection(model, snapshot, process, pending, services, .game);
+pub fn drawGameSelection(model: *state.Model, process: launch.Snapshot, pending: *?state.Msg, services: Services) void {
+    drawLaunchSelection(model, process, pending, services, .game);
 }
 
-pub fn drawAccountSelection(model: *state.Model, snapshot: games.Snapshot, process: launch.Snapshot, pending: *?state.Msg, services: Services) void {
-    drawLaunchSelection(model, snapshot, process, pending, services, .account);
+pub fn drawAccountSelection(model: *state.Model, process: launch.Snapshot, pending: *?state.Msg, services: Services) void {
+    drawLaunchSelection(model, process, pending, services, .account);
 }
 
-fn drawLaunchSelection(model: *state.Model, snapshot: games.Snapshot, process: launch.Snapshot, pending: *?state.Msg, services: Services, page: enum { game, account }) void {
+fn drawLaunchSelection(model: *state.Model, process: launch.Snapshot, pending: *?state.Msg, services: Services, page: enum { game, account }) void {
     const game_page = page == .game;
     const frame = dvui.box(@src(), .{}, .{ .tag = if (game_page) "game-selection-layout" else "account-selection-layout", .id_extra = @backingInt(page), .expand = .both, .padding = R.all(0), .margin = R.all(0) });
     defer frame.deinit();
     const bounds = frame.data().contentRect();
-    drawStartFooter(model, snapshot, process, pending, services, bounds, if (game_page) "game-selection-footer" else "account-selection-footer", if (game_page) "game-selection-start" else "account-selection-start");
+    drawStartFooter(model, process, pending, services, bounds, if (game_page) "game-selection-footer" else "account-selection-footer", if (game_page) "game-selection-start" else "account-selection-start");
     const body = dvui.box(@src(), .{}, .{ .tag = if (game_page) "game-selection-body" else "account-selection-body", .rect = .{ .x = 0, .y = 0, .w = bounds.w, .h = @max(0, bounds.h - theme.sizing.control_height - theme.spacing.footer_gap) }, .padding = R.all(0), .margin = R.all(0) });
     defer body.deinit();
     if (game_page) {
@@ -743,13 +768,13 @@ fn drawLaunchSelection(model: *state.Model, snapshot: games.Snapshot, process: l
     } else players(model, pending);
 }
 
-fn drawStartFooter(model: *const state.Model, snapshot: games.Snapshot, process: launch.Snapshot, pending: *?state.Msg, services: Services, bounds: R, footer_tag: []const u8, start_tag: []const u8) void {
+fn drawStartFooter(model: *const state.Model, process: launch.Snapshot, pending: *?state.Msg, services: Services, bounds: R, footer_tag: []const u8, start_tag: []const u8) void {
     const font = theme.bodyFont();
     const running = process.phase == .preparing or process.phase == .running;
     const start_label = if (process.phase == .preparing) "正在启动" else model.labels.start;
     const gates = serviceGates(services);
     // Readiness is checked for the selected instance only after a launch intent.
-    const disabled = gates.instances or gates.content or services.java_download.isDeleting() or running or snapshot.phase == .installing;
+    const disabled = gates.instances or gates.content or services.java_download.isDeleting() or running;
     const footer_height = theme.sizing.control_height;
     const footer = dvui.box(@src(), .{}, .{ .tag = footer_tag, .rect = .{ .x = 0, .y = @max(0, bounds.h - footer_height), .w = bounds.w, .h = footer_height }, .padding = R.all(0), .margin = R.all(0) });
     defer footer.deinit();

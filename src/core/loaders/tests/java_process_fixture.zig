@@ -29,8 +29,9 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
-    if (args.len == 2 and (std.mem.eql(u8, args[1], "-version") or std.mem.eql(u8, args[1], "--version"))) {
-        try std.Io.File.stderr().writeStreamingAll(init.io, "openjdk version \"17.0.1\"\n");
+    const settings = args.len == 3 and std.mem.eql(u8, args[1], "-XshowSettings:properties") and std.mem.eql(u8, args[2], "-version");
+    if (settings or (args.len == 2 and (std.mem.eql(u8, args[1], "-version") or std.mem.eql(u8, args[1], "--version")))) {
+        try std.Io.File.stderr().writeStreamingAll(init.io, "openjdk version \"17.0.1\"\n    java.version = 17.0.1\n    java.vendor = Vela Process Fixture\n    os.arch = " ++ @tagName(builtin.cpu.arch) ++ "\n");
         return;
     }
     if (args.len < 5 or !std.mem.eql(u8, args[1], "-cp")) std.process.exit(90);

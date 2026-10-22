@@ -10,7 +10,7 @@ const java = @import("java_manager.zig");
 const theme = @import("theme.zig");
 
 const saved: config.Instance = .{ .id = "settings-renderer-instance", .name = "Saved Fixture", .minecraft_version = "1.21.1", .min_memory_mb = 512, .max_memory_mb = 4096 };
-const runtime: java.Runtime = .{ .path = "/fixture/registered-settings-jdk/bin/java", .major = 21, .vendor = "Renderer Fixture" };
+const runtime: java.Runtime = .{ .path = "/fixture/registered-settings-jdk/bin/java", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Renderer Fixture" };
 
 fn contains(outer: dvui.Rect.Physical, inner: dvui.Rect.Physical, tolerance: f32) bool {
     return inner.x >= outer.x - tolerance and inner.y >= outer.y - tolerance and inner.x + inner.w <= outer.x + outer.w + tolerance and inner.y + inner.h <= outer.y + outer.h + tolerance;
@@ -138,7 +138,7 @@ const Frame = struct {
                 defer body.deinit();
                 const previous_clip = dvui.clip(body.data().contentRectScale().r);
                 defer dvui.clipSet(previous_clip);
-                view.drawWithEnabled(ui, store, manager, .{ .installed = &.{}, .available = &.{}, .phase = .idle, .failure = null, .completed = 0, .total = 0, .installing_version = null }, java_registry.entries(), enabled);
+                view.drawWithEnabled(ui, store, manager, .{ .installed = &.{}, .available = &.{}, .phase = .idle, .failure = null }, java_registry.entries(), enabled);
             }
         }
         view.drawModal(ui, enabled);
@@ -395,6 +395,13 @@ fn settingsGeometry() !void {
     const controls = [_][]const u8{ "instance-settings-name", "instance-settings-java-control", "instance-settings-min-memory", "instance-settings-max-memory" };
     const side_by_side = viewport.w >= 700;
     const memory = (try Frame.captured("instance-resources")).border;
+    const identity = (try Frame.captured("instance-identity")).border;
+    const manage = (try Frame.captured("instance-manage-mods")).border;
+    try std.testing.expectApproxEqAbs(identity.x, manage.x, 0.1);
+    try std.testing.expectApproxEqAbs(identity.x + identity.w, manage.x + manage.w, 0.1);
+    try std.testing.expectApproxEqAbs(identity.y + identity.h + theme.spacing.group_gap, manage.y, 0.1);
+    try std.testing.expectApproxEqAbs(@as(f32, 48), manage.h, 0.1);
+    try std.testing.expectApproxEqAbs(manage.y + manage.h + theme.spacing.group_gap, memory.y, 0.1);
     const debug_panel = (try Frame.captured("instance-debug")).border;
     if (side_by_side) {
         try std.testing.expectApproxEqAbs(memory.y, debug_panel.y, 0.1);
@@ -587,7 +594,7 @@ fn deleteModalGeometry() !void {
     try std.testing.expectEqualDeep(theme.headingFont(), heading.font);
     try expectInside(modal, heading.rect);
     try deleteParagraph("instance-delete-confirm-warning", &.{ "实例「", saved.name, "目录内的存档", "Mod", "配置将永久删除", "无法恢复" }, modal);
-    try deleteParagraph("instance-delete-confirm-servers", &.{ "绑定服务器配置也将移除", "共享 Minecraft 资源", "其他实例", "外部服务器文件不受影响" }, modal);
+    try deleteParagraph("instance-delete-confirm-servers", &.{ "绑定服务器将保留", "仅解除与此实例的绑定", "共享 Minecraft 资源", "其他实例", "外部服务器文件不受影响" }, modal);
     const cancel = (try Frame.nativeControl("instance-delete-confirm-cancel", true)).rect;
     const submit = (try Frame.nativeControl("instance-delete-confirm-submit", true)).rect;
     _ = try Frame.text("instance-delete-confirm-cancel", "取消删除", 16, null);

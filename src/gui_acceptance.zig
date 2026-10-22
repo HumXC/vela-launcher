@@ -31,6 +31,10 @@ const worlds_view = @import("ui/worlds_view.zig");
 const instances_manager = @import("ui/instances_manager.zig");
 const instances_view = @import("ui/instances_view.zig");
 const content_manager = @import("ui/content_manager.zig");
+const mods_controller = @import("ui/mods_controller.zig");
+const mods_view = @import("ui/mods_view.zig");
+const resource_fixture = @import("ui/resource_download_fixture.zig");
+const resource_navigation = @import("ui/resource_navigation_fixture.zig");
 const accounts_manager = @import("ui/accounts_manager.zig");
 const accounts_view = @import("ui/accounts_view.zig");
 const instance_leases = @import("core/instance_leases.zig");
@@ -66,7 +70,13 @@ pub const main = dvui.App.main;
 pub const panic = dvui.App.panic;
 pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
 
-const Panel = enum { home, versions, more, settings, java, servers, logs, worlds, instances, player, @"account-add", shutdown };
+const Panel = enum { home, versions, more, settings, java, servers, logs, worlds, instances, mods, @"mods-download", @"mods-download-scroll", @"mods-detail-slow", @"mods-detail", @"mods-detail-optional", @"mods-detail-loading", @"mods-confirm", @"mods-task", @"mods-task-complete", @"mods-task-failed", player, @"account-add", shutdown };
+fn isResourcePreview(panel: Panel) bool {
+    return switch (panel) {
+        .@"mods-download", .@"mods-download-scroll", .@"mods-detail-slow", .@"mods-detail", .@"mods-detail-optional", .@"mods-detail-loading", .@"mods-confirm", .@"mods-task", .@"mods-task-complete", .@"mods-task-failed" => true,
+        else => false,
+    };
+}
 var fixture: ?*Fixture = null;
 
 var native_backend_configuration_error: ?anyerror = null;
@@ -204,8 +214,11 @@ pub fn frame() !dvui.App.Result {
         .instances = &f.instance_manager,
         .instances_ui = &f.instances_ui,
         .content = &f.content,
+        .mods = &f.mods,
+        .mods_ui = &f.mods_ui,
     });
     try f.writeLogsReceipt();
+    try f.writeResourceReceipt();
     if (f.shutdown_prompt) {
         if (shutdown_view.draw(activeFixtureTasks(&f.registry))) |choice| switch (choice) {
             .keep_open => f.shutdown_prompt = false,
@@ -318,6 +331,13 @@ const Fixture = struct {
     instance_manager: instances_manager.Manager,
     instances_ui: instances_view.Ui,
     content: content_manager.Manager,
+    mods: mods_controller.Controller,
+    mods_ui: mods_view.Ui,
+    resource_preview: Panel,
+    resource_preview_step: u8 = 0,
+    resource_http_scenario: resource_fixture.Scenario,
+    resource_http_navigation: resource_navigation.Context,
+    resource_metadata_gate: resource_navigation.Gate,
     scene: instance_fixture.Scene,
     instance_data: instance_fixture.Context,
     creation_core: creation_controller.Controller,
@@ -435,6 +455,32 @@ const Fixture = struct {
         } else if (std.mem.eql(u8, action, "tools")) {
             f.model.panel = .more;
         } else return error.InvalidFixtureLogsAction;
+    }
+
+    fn writeResourceReceipt(f: *Fixture) !void {
+        if (f.model.panel != .mods) return;
+        const Tag = struct { name: []const u8, data: ?dvui.TagData };
+        const names = [_][]const u8{ "resource-type-button", "resource-type-menu", "resource-type-mod", "resource-type-resourcepack", "resource-type-shader" };
+        var tags: [names.len]Tag = undefined;
+        for (names, 0..) |name, i| tags[i] = .{ .name = name, .data = dvui.tagGet(name) };
+        const bytes = try std.json.Stringify.valueAlloc(f.allocator, .{
+            .kind = @tagName(f.mods_ui.kind),
+            .route = @tagName(f.mods_ui.acquisition.route),
+            .job = @tagName(f.mods_ui.acquisition.job),
+            .menu_mode = @tagName(f.mods_ui.resource_menu.mode),
+            .focused_widget = dvui.focusedWidgetId(),
+            .menu_focused = f.mods_ui.resource_menu.menu_id != null and f.mods_ui.resource_menu.menu_id == dvui.focusedSubwindowId(),
+            .metadata_started = f.resource_metadata_gate.started.load(.acquire),
+            .metadata_cancel_seen = f.resource_metadata_gate.cancel_seen.load(.acquire),
+            .tags = tags,
+        }, .{});
+        defer f.allocator.free(bytes);
+        var dir = try std.Io.Dir.cwd().openDir(f.io, f.paths.vela, .{});
+        defer dir.close(f.io);
+        const file = try dir.createFile(f.io, "resource-state.tmp", .{});
+        defer file.close(f.io);
+        try file.writeStreamingAll(f.io, bytes);
+        try dir.rename("resource-state.tmp", dir, "resource-state.json", f.io);
     }
 
     fn writeLogsReceipt(f: *Fixture) !void {
@@ -582,8 +628,85 @@ const Fixture = struct {
         for (f.registry.tasks()) |task| {
             if (task.id <= f.fixture_task_last_id and task.canceled()) f.registry.finish(task, .canceled);
         }
+        f.advanceResourcePreview();
     }
 
+    fn advanceResourcePreview(f: *Fixture) void {
+        if (!isResourcePreview(f.resource_preview)) return;
+        const ui = &f.mods_ui.acquisition;
+        if (f.resource_preview == .@"mods-detail-loading" and f.resource_preview_step == 2 and ui.route == .detail and !f.content.isBusy()) {
+            // Freeze presentation metadata only; no worker or transport is held.
+            const detail = ui.frame() orelse return;
+            detail.candidates = &.{};
+            detail.issues = &.{};
+            ui.proposal_current = false;
+            ui.needs_prepare = false;
+            return;
+        }
+        if (f.content.isBusy() or ui.job != .idle or ui.pending != null or f.model.panel != .mods) return;
+        if (f.resource_preview_step == 0 and ui.route == .catalog and ui.failure != null and std.mem.indexOf(u8, @errorName(ui.failure.?), "Busy") != null) {
+            ui.queue(.search);
+            return;
+        }
+        if (f.resource_preview == .@"mods-download" or f.resource_preview == .@"mods-download-scroll") return;
+        if (f.resource_preview_step == 0 and ui.route == .catalog and ui.searched and ui.catalog.len > 0) {
+            ui.queue(.{ .project = ui.catalog[0] });
+            f.resource_preview_step = 1;
+        } else if (f.resource_preview_step == 1 and ui.route == .detail and ui.currentProposal(f.content.snapshot())) {
+            if (f.resource_preview != .@"mods-detail" and f.resource_preview != .@"mods-detail-optional" and f.resource_preview != .@"mods-detail-loading") {
+                const detail = ui.frame().?;
+                const root = detail.version().?;
+                for (root.dependencies, 0..) |dependency, index| {
+                    if (dependency.kind != .required or detail.choice(index) != null) continue;
+                    for (detail.candidates) |candidate| {
+                        if (@import("ui/resource_download_state.zig").matchesDependency(candidate, root, dependency)) {
+                            ui.queue(.{ .choice = .{ .dependency_index = index, .version_id = candidate.id, .include = true } });
+                            return;
+                        }
+                    }
+                }
+                ui.queue(.confirm);
+            }
+            f.resource_preview_step = 2;
+        } else if (f.resource_preview_step == 2 and ui.confirm_open and (f.resource_preview == .@"mods-task-complete" or f.resource_preview == .@"mods-task-failed")) {
+            // Presentation fixtures never commit a real or simulated installation.
+            const succeeded = f.resource_preview == .@"mods-task-complete";
+            ui.confirm_open = false;
+            ui.task_state = if (succeeded) .succeeded else .failed;
+            if (!succeeded) {
+                ui.failure = error.ConnectionResetByPeer;
+            }
+            var reports: @import("core/tasks.zig").Details = .{};
+            const detail = ui.frame().?;
+            for (f.content.snapshot().proposal.?.files) |file| {
+                if (file.selected == false or reports.file_count == reports.files.len) continue;
+                const primary = file.record.provider == detail.project.provider and std.mem.eql(u8, file.record.project_id, detail.project.id);
+                const complete = succeeded or primary;
+                reports.files[reports.file_count] = @import("core/tasks.zig").File.init(file.record.path, if (complete) 100 else 42, 100, 0, if (complete) .complete else .failed, if (complete) null else error.ConnectionResetByPeer);
+                reports.file_count += 1;
+            }
+            ui.task_details = reports;
+            f.resource_preview_step = 3;
+        } else if (f.resource_preview_step == 2 and ui.confirm_open and f.resource_preview == .@"mods-task") {
+            const proposal = f.content.snapshot().proposal.?;
+            if (!proposal.ready) {
+                for (proposal.plan.conflicts) |conflict| {
+                    var decided = false;
+                    for (ui.decisions.items) |decision| if (std.mem.eql(u8, decision.path, conflict.path)) {
+                        decided = true;
+                        break;
+                    };
+                    if (!decided) {
+                        ui.queue(.{ .conflict = .{ .path = conflict.path, .choice = .replace } });
+                        return;
+                    }
+                }
+                return;
+            }
+            ui.queue(.commit);
+            f.resource_preview_step = 3;
+        }
+    }
     fn create(a: std.mem.Allocator, io: std.Io, root: []const u8, panel: Panel, viewport: dvui.Size) !*Fixture {
         return createScene(a, io, root, panel, viewport, .layout);
     }
@@ -606,6 +729,12 @@ const Fixture = struct {
         f.ticks = .{};
         f.catalogue_seeded = false;
         f.shutdown_prompt = panel == .shutdown;
+        f.resource_preview = panel;
+        f.resource_preview_step = 0;
+        f.resource_http_scenario = .{
+            .pause_downloads = panel == .@"mods-task",
+            .preview_optional_dependency = panel == .@"mods-detail-optional" or panel == .@"mods-detail-loading",
+        };
         f.paths = try instances.Paths.init(a, io, root);
         errdefer f.paths.deinit();
         f.instance_data = instance_fixture.Context.init(a);
@@ -616,6 +745,17 @@ const Fixture = struct {
         const initial_document = f.configuration.snapshot();
         const fresh_configuration = initial_document.instances.len == 0 and initial_document.accounts.len == 0 and initial_document.servers.len == 0;
         try seedConfiguration(&f.configuration);
+        if (isResourcePreview(panel)) {
+            var document = f.configuration.snapshot().*;
+            const items = try a.dupe(config.Instance, document.instances);
+            defer a.free(items);
+            for (items) |*item| if (std.mem.eql(u8, item.id, "fixture-primary")) {
+                item.loader = .fabric;
+                item.loader_version = "0.16.14";
+            };
+            document.instances = items;
+            try f.configuration.update(document);
+        }
         f.registry = tasks.Registry.init(a);
         errdefer f.registry.deinit();
         f.cf_vault = .{};
@@ -632,7 +772,6 @@ const Fixture = struct {
         f.library = try games.Controller.initWithOptions(a, io, .{
             .root = f.paths.minecraft,
             .manifest_url = "fixture-disabled://catalogue",
-            .task_registry = &f.registry,
             .cache_root = f.paths.cache,
         });
         errdefer f.library.deinit();
@@ -691,24 +830,40 @@ const Fixture = struct {
         f.instance_manager.setLoaderCatalogue(.{ .context = f, .fetch = fixtureLoaderCatalogue });
         f.instances_ui = instances_view.Ui.init(a);
         errdefer f.instances_ui.deinit();
+        f.resource_metadata_gate = .{ .match = "/project/iris/version" };
+        f.resource_http_navigation = .{ .scenario = &f.resource_http_scenario, .gate = if (panel == .@"mods-detail-slow") &f.resource_metadata_gate else null, .long_catalog = panel == .@"mods-download-scroll" };
         f.content = try content_manager.Manager.initOptions(a, io, &f.paths, &f.registry, .{
             .lease = f.instance_data.contentLease(.{ .context = content_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback }, instance_leases.Mutation.workerRecheckCallback),
             .worker_recheck = instance_fixture.Context.workerRecheck,
-            .transport_options = .{ .fixture_http = instance_fixture.Context.denyHttp, .fixture_context = &f.instance_data, .allow_curseforge = false, .approved_download_hosts = &.{} },
+            .transport_options = if (isResourcePreview(panel)) .{ .fixture_http = resource_navigation.execute, .fixture_context = &f.resource_http_navigation, .approved_download_hosts = &.{"cdn.modrinth.com"} } else .{ .fixture_http = instance_fixture.Context.denyHttp, .fixture_context = &f.instance_data, .allow_curseforge = false, .approved_download_hosts = &.{} },
             .fixture_credential_store = f.cf_vault.store(),
             .fixture_fault = .{ .context = f, .boundary = disabledContentMutation },
-            .allow_manifest_v2 = false,
         });
         errdefer f.content.deinit();
+        f.mods = mods_controller.Controller.init(a, io, &f.paths);
+        errdefer f.mods.deinit();
+        f.mods_ui = try mods_view.Ui.init(a);
+        f.mods_ui.acquisition.icons = @import("ui/resource_icons.zig").Manager.init(a, io);
+        errdefer f.mods_ui.deinit();
+        f.mods_ui.acquisition.picker = &f.picker;
         f.creation_core = try creation_controller.Controller.init(a, io, root, .{ .task_registry = &f.registry, .runner = f.instance_data.runner() });
         errdefer f.creation_core.deinit(f.creationServices());
         f.model = .{
             .players = &.{.{ .id = 1, .name = "FixturePlayer", .initials = "FP", .kind = "Offline" }},
             .versions = &.{.{ .id = 1, .name = "fixture-game", .description = "Minecraft 1.21.4" }},
-            .getting_game = false,
         };
         switch (panel) {
             .home, .shutdown => {},
+            .mods, .@"mods-download", .@"mods-download-scroll", .@"mods-detail-slow", .@"mods-detail", .@"mods-detail-optional", .@"mods-detail-loading", .@"mods-confirm", .@"mods-task", .@"mods-task-complete", .@"mods-task-failed" => {
+                f.model.panel = .mods;
+                const instance = instances.findById(f.configuration.snapshot(), "fixture-primary").?.*;
+                _ = f.model.mods_instance.set(instance.id);
+                if (isResourcePreview(panel)) {
+                    try f.mods.select(instance, .mod, &f.content);
+                    try f.mods_ui.acquisition.bind(instance, .mod);
+                    f.mods_ui.acquisition.open();
+                }
+            },
             .versions => f.model.panel = .versions,
             .more => f.model.panel = .more,
             .settings => {
@@ -748,10 +903,14 @@ const Fixture = struct {
         if (f.native_pickers) f.discardNativePickers();
         f.picker.beginShutdown();
         std.debug.assert(f.picker.isDrained());
+        f.content.cancel();
         f.instance_data.releaseHolds();
         f.creation_core.deinit(f.creationServices());
         f.launcher.deinit();
+        f.mods.deinit();
+        f.mods_ui.deinit();
         f.content.cancelAndJoin();
+        if (isResourcePreview(f.resource_preview)) std.debug.print("resource fixture closed: content_busy={} lease_released={}\n", .{ f.content.isBusy(), f.instance_data.content_released.load(.acquire) });
         f.content.deinit();
         f.instance_manager.deinit();
         f.instances_ui.deinit();
@@ -781,6 +940,7 @@ const Fixture = struct {
 
 fn parseViewport(value: []const u8) !dvui.Size {
     if (std.mem.eql(u8, value, "640x400")) return .{ .w = 640, .h = 400 };
+    if (std.mem.eql(u8, value, "960x720")) return .{ .w = 960, .h = 720 };
     if (std.mem.eql(u8, value, "1280x720")) return .{ .w = 1280, .h = 720 };
     return error.InvalidFixtureViewport;
 }
@@ -859,7 +1019,8 @@ fn seedGames(f: *Fixture) !void {
     try writeFixtureFile(indexes, f.io, "fixture-assets.json", index_bytes);
     const empty: []const std.json.Value = &.{};
     for (f.configuration.snapshot().instances) |instance| {
-        if (instance.loader != .vanilla) return error.NotFixtureConfiguration;
+        const fixture_fabric_instance = instance.loader == .fabric and std.mem.eql(u8, instance.id, "fixture-primary") and std.mem.eql(u8, instance.minecraft_version, "1.21.4") and std.mem.eql(u8, instance.loader_version orelse "", "0.16.14");
+        if (instance.loader != .vanilla and !fixture_fabric_instance) return error.NotFixtureConfiguration;
         const game_path = try f.paths.instanceDirectory(instance.name);
         defer a.free(game_path);
         var dir = try std.Io.Dir.cwd().createDirPathOpen(f.io, game_path, .{});
@@ -871,7 +1032,7 @@ fn seedGames(f: *Fixture) !void {
         const document = try std.json.Stringify.valueAlloc(a, .{
             .id = instance.name,
             .type = "release",
-            .mainClass = "net.minecraft.client.main.Main",
+            .mainClass = if (fixture_fabric_instance) "net.fabricmc.loader.impl.launch.knot.KnotClient" else "net.minecraft.client.main.Main",
             .javaVersion = .{ .component = "java-runtime-delta", .majorVersion = @as(u32, 21) },
             .downloads = .{ .client = .{ .url = "https://fixture.invalid/client.jar", .sha1 = &client_hash, .size = fixture_client.len } },
             .assetIndex = .{ .id = "fixture-assets", .url = "https://fixture.invalid/assets.json", .sha1 = &index_hash, .size = index_bytes.len, .totalSize = @as(u64, 0) },
@@ -888,8 +1049,8 @@ fn seedGames(f: *Fixture) !void {
             .instance_id = instance.id,
             .instance_name = instance.name,
             .minecraft_version = instance.minecraft_version,
-            .loader = "vanilla",
-            .loader_version = @as(?[]const u8, null),
+            .loader = @tagName(instance.loader),
+            .loader_version = instance.loader_version,
             .metadata_sha256 = &metadata_binding,
             .client_sha256 = &client_binding,
             .client_size = @as(u64, fixture_client.len),
@@ -1003,12 +1164,12 @@ fn disabledJavaDownload(_: *anyopaque, _: std.Io, _: *const java_backend.Runtime
 }
 
 const fixture_catalogue = [_]games.CatalogEntry{
-    .{ .id = "1.21.4", .kind = "release", .release_time = "2024-12-03T10:12:57+00:00" },
-    .{ .id = "1.20.1", .kind = "release", .release_time = "2023-06-12T13:25:51+00:00" },
-    .{ .id = "fixture-snapshot", .kind = "snapshot" },
+    .{ .id = "1.21.4", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.21.4.json", .kind = "release", .release_time = "2024-12-03T10:12:57+00:00" },
+    .{ .id = "1.20.1", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.20.1.json", .kind = "release", .release_time = "2023-06-12T13:25:51+00:00" },
+    .{ .id = "fixture-snapshot", .url = "https://piston-meta.mojang.com/v1/packages/fixture/fixture-snapshot.json", .kind = "snapshot" },
 };
 const prepared_fixture_catalogue = [_]games.CatalogEntry{
-    .{ .id = instance_fixture.base_id, .kind = "release", .release_time = "2014-06-26T00:00:00Z" },
+    .{ .id = instance_fixture.base_id, .url = "https://piston-meta.mojang.com/v1/packages/fixture/" ++ instance_fixture.base_id ++ ".json", .kind = "release", .release_time = "2014-06-26T00:00:00Z" },
 };
 
 test "offline fixture loader catalogue is bounded owns strings and honors cancellation" {
@@ -1222,7 +1383,7 @@ fn seedOwnedJava(f: *Fixture) !void {
     try writeFixtureFile(directory, f.io, ".vela-runtime.json", receipt);
     const java_path = try std.fs.path.join(f.allocator, &.{ path, "bin", "java" });
     defer f.allocator.free(java_path);
-    try f.java_manager.addDownloaded(.{ .path = java_path, .major = 21, .vendor = "Synthetic Fixture Owned Java" });
+    try f.java_manager.addDownloaded(.{ .path = java_path, .major = 21, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Synthetic Fixture Owned Java" });
     // Registration is persistent; this independent marker preserves hide/forget/
     // file-delete outcomes even when no corresponding runtime remains registered.
     try writeFixtureFile(seed_dir, f.io, fixture_java_seed, "1");
@@ -1246,6 +1407,93 @@ fn fixtureCloseRequested(events: []const dvui.Event) bool {
         else => {},
     };
     return false;
+}
+
+test "resource GUI preview prepares offline files and joins its held installation on cancel" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const f = Fixture.create(a, io, root, .@"mods-task", .{ .w = 1280, .h = 720 }) catch |err| {
+        std.debug.print("resource fixture create: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer f.destroy();
+    errdefer std.debug.print("resource preview step={d} route={s} task={s} busy={} ready={} blocker={s} failure={s}\n", .{ f.resource_preview_step, @tagName(f.mods_ui.acquisition.route), @tagName(f.mods_ui.acquisition.task_state), f.content.isBusy(), if (f.content.snapshot().proposal) |p| p.ready else false, if (f.content.snapshot().proposal) |p| if (p.blocker) |e| @errorName(e) else "none" else "none", if (f.mods_ui.acquisition.failure) |e| @errorName(e) else "none" });
+    var entered = false;
+    for (0..5000) |_| {
+        try f.tickServices();
+        f.mods.tick(&f.content);
+        f.mods_ui.acquisition.tick(&f.content, true);
+        if (!f.content.isBusy()) f.mods_ui.acquisition.finish(&f.content, true, true);
+        if (f.mods_ui.acquisition.failure) |err| return err;
+        if (f.mods_ui.acquisition.task_state == .running and f.instance_data.content_entered.load(.acquire) and (if (f.mods_ui.acquisition.task_details) |details| details.file_count > 0 else false)) {
+            entered = true;
+            break;
+        }
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(entered and f.content.isBusy());
+    try std.testing.expectEqual(config.Loader.fabric, f.mods_ui.acquisition.instance.?.loader);
+    f.content.cancel();
+    f.instance_data.releaseHolds();
+    f.content.cancelAndJoin();
+    try std.testing.expect(!f.content.isBusy());
+    try std.testing.expect(f.instance_data.content_released.load(.acquire));
+}
+
+test "resource GUI detail previews keep optional and loading metadata isolated from installation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]Panel{ .@"mods-detail-optional", .@"mods-detail-loading" }) |panel| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const f = try Fixture.create(a, io, root, panel, .{ .w = 1280, .h = 720 });
+        defer f.destroy();
+        for (0..5000) |_| {
+            try f.tickServices();
+            f.mods.tick(&f.content);
+            f.mods_ui.acquisition.tick(&f.content, true);
+            if (!f.content.isBusy()) f.mods_ui.acquisition.finish(&f.content, true, true);
+            if (f.mods_ui.acquisition.failure) |err| return err;
+            if (f.resource_preview_step == 2) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(u8, 2), f.resource_preview_step);
+        // Advance again to apply the fixed loading presentation, then ensure
+        // the ordinary page tick cannot turn it into a ready proposal.
+        try f.tickServices();
+        f.mods_ui.acquisition.tick(&f.content, true);
+        const ui = &f.mods_ui.acquisition;
+        const detail = ui.frame().?;
+        try std.testing.expectEqual(@import("ui/resource_download_state.zig").Route.detail, ui.route);
+        try std.testing.expect(!f.content.isBusy() and !ui.confirm_open and ui.pending == null);
+        try std.testing.expectEqual(@import("ui/resource_download_state.zig").TaskState.none, ui.task_state);
+        // Preparing metadata legitimately acquires the instance lease; no
+        // installation report exists and that lease must already be released.
+        try std.testing.expect(f.instance_data.content_released.load(.acquire));
+        try std.testing.expect(f.content.snapshot().report == null);
+        if (panel == .@"mods-detail-optional") {
+            const dependencies = detail.version().?.dependencies;
+            try std.testing.expectEqual(@as(usize, 2), dependencies.len);
+            try std.testing.expectEqual(@import("core/content_providers.zig").DependencyKind.required, dependencies[0].kind);
+            try std.testing.expectEqual(@import("core/content_providers.zig").DependencyKind.optional, dependencies[1].kind);
+            try std.testing.expect(!detail.choice(1).?.include);
+            const found = for (detail.candidates) |candidate| {
+                if (std.mem.eql(u8, candidate.project_id, "open-parties-and-claims"))
+                    break std.mem.eql(u8, candidate.name, "Open Parties and Claims 0.32.7");
+            } else false;
+            try std.testing.expect(found and ui.currentProposal(f.content.snapshot()));
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), detail.candidates.len);
+            try std.testing.expect(!ui.proposal_current and !ui.needs_prepare);
+            try std.testing.expect(!ui.currentProposal(f.content.snapshot()));
+        }
+    }
 }
 
 fn seedWorlds(f: *Fixture, fresh_configuration: bool) !void {
@@ -1356,7 +1604,7 @@ fn pngChunk(a: std.mem.Allocator, output: *std.ArrayList(u8), kind: *const [4]u8
 }
 
 test "acceptance fixture exposes direct pages and dialog scenes" {
-    for ([_][]const u8{ "home", "versions", "more", "settings", "java", "servers", "logs", "worlds", "instances", "player", "account-add", "shutdown" }) |name|
+    for ([_][]const u8{ "home", "versions", "more", "settings", "java", "servers", "logs", "worlds", "instances", "mods", "mods-download", "mods-download-scroll", "mods-detail-slow", "mods-detail", "mods-detail-optional", "mods-detail-loading", "mods-confirm", "mods-task", "mods-task-complete", "mods-task-failed", "player", "account-add", "shutdown" }) |name|
         try std.testing.expect(std.meta.stringToEnum(Panel, name) != null);
     try std.testing.expect(std.meta.stringToEnum(Panel, "preview") == null);
 }
@@ -1832,7 +2080,8 @@ test "acceptance Root ticks each ordinary component once and never globally sele
     try std.testing.expectEqual(before.java + 1, f.ticks.java);
     try std.testing.expectEqual(before.java_download + 1, f.ticks.java_download);
     try std.testing.expectEqual(before.instances + 1, f.ticks.instances);
-    try std.testing.expect(!f.content.options.allow_manifest_v2);
+    const mutation_guard = f.content.options.fixture_fault.?;
+    try std.testing.expectError(error.FixtureInstallationDisabled, mutation_guard.boundary(mutation_guard.context, .before_backup, 0));
     const primary = instances.findById(f.configuration.snapshot(), "fixture-primary").?;
     for ([_][]const u8{ "fixture-survival", "fixture-creative" }, 0..) |folder, index| {
         const relative = try std.fmt.allocPrint(a, "saves/{s}/level.dat", .{folder});

@@ -24,6 +24,17 @@ SCENES = {
     "accounts": ("player", "账户选择"),
     "account-add": ("account-add", "添加账户弹窗"),
     "instances": ("instances", "实例管理"),
+    "mods": ("mods", "资源管理"),
+    "mods-download": ("mods-download", "下载模组"),
+    "mods-download-scroll": ("mods-download-scroll", "下载模组 · 长列表滚动"),
+    "mods-detail-slow": ("mods-detail-slow", "模组详情 · 可取消慢请求"),
+    "mods-detail": ("mods-detail", "模组详情"),
+    "mods-detail-optional": ("mods-detail-optional", "模组详情 · 长名称可选依赖"),
+    "mods-detail-loading": ("mods-detail-loading", "模组详情 · 依赖加载中"),
+    "mods-confirm": ("mods-confirm", "安装确认"),
+    "mods-task": ("mods-task", "下载与安装"),
+    "mods-task-complete": ("mods-task-complete", "下载与安装 · 完成样例"),
+    "mods-task-failed": ("mods-task-failed", "下载与安装 · 失败样例"),
     "worlds": ("worlds", "存档管理"),
     "java": ("java", "Java 下载入口"),
     "servers": ("servers", "服务器管理"),
@@ -122,6 +133,10 @@ class Pointer:
 
     def scroll(self, x, y, delta):
         self.move(x, y)
+        time.sleep(0.15)
+        # Continuous source avoids a zero wheel-discrete/value120 event
+        # overriding the pixel delta in SDL on recent Wayland seats.
+        self.request(5, 5, self.uints(2))
         self.event(3, 0, int(delta * 256) & 0xffffffff)
 
     def close(self):
@@ -136,11 +151,11 @@ def validated_actions(path, width, height):
         if not isinstance(action, dict):
             raise ValueError("Each action must be an object")
         op = action.get("op")
-        fields = {"click": {"op", "x", "y"}, "scroll": {"op", "x", "y", "delta"},
+        fields = {"move": {"op", "x", "y"}, "click": {"op", "x", "y"}, "scroll": {"op", "x", "y", "delta"},
                   "key": {"op", "key"}, "wait": {"op", "seconds"}}
         if op not in fields or set(action) != fields[op]:
             raise ValueError("Invalid action fields: " + str(op))
-        if op in ("click", "scroll"):
+        if op in ("move", "click", "scroll"):
             if (type(action["x"]) is not int or type(action["y"]) is not int or
                     not 0 <= action["x"] < width or not 0 <= action["y"] < height):
                 raise ValueError("Action coordinates are outside fixture bounds")
@@ -209,6 +224,7 @@ def capture(args):
         metadata["data_sha256"] = digest(args.data)
     proc = None
     pointer = None
+    keyboard_guard = None
     remaining = []
     succeeded = False
     with (artifacts / "cage.log").open("w") as log:
@@ -232,12 +248,23 @@ def capture(args):
             metadata["display"] = endpoint.name
             time.sleep(args.settle)
             pointer = Pointer(endpoint)
+            if any(action["op"] == "key" for action in actions):
+                # Keep one keyboard present: removing the last Wayland keyboard
+                # clears SDL focus between separate wtype commands.
+                hold_ms = max(60000, int((30 + len(actions) * 6 + sum(a.get("seconds", 0) for a in actions)) * 1000))
+                keyboard_guard = subprocess.Popen([tools["wtype"], "-s", str(hold_ms)], env=env, stdout=log, stderr=log)
+                metadata["keyboard_guard_pid"] = keyboard_guard.pid
+                time.sleep(0.2)
+                if keyboard_guard.poll() is not None:
+                    raise RuntimeError("Virtual keyboard guard exited before input; inspect cage.log")
             for action in actions:
                 if proc.poll() is not None:
                     raise RuntimeError("UI exited during actions")
                 op = action["op"]
                 if op == "click":
                     pointer.click(action["x"], action["y"])
+                elif op == "move":
+                    pointer.move(action["x"], action["y"])
                 elif op == "scroll":
                     pointer.scroll(action["x"], action["y"], action["delta"])
                 elif op == "key":
@@ -245,7 +272,8 @@ def capture(args):
                 elif op == "wait":
                     time.sleep(action["seconds"])
                 time.sleep(0.3)
-            pointer.move(1, 1)
+            if not args.keep_pointer:
+                pointer.move(1, 1)
             time.sleep(0.5)
             image = artifacts / "screenshot.png"
             subprocess.run([tools["grim"], "-g", "0,0 " + args.size, str(image)], env=env, check=True, timeout=10)
@@ -254,6 +282,9 @@ def capture(args):
                     struct.unpack(">II", header[16:24]) != (width, height)):
                 raise RuntimeError("Screenshot dimensions differ from fixture bounds")
             metadata.update(image=str(image), image_sha256=digest(image))
+            resource_receipt = root / "fixture" / ".vela" / "resource-state.json"
+            if resource_receipt.exists():
+                metadata["resource_state"] = json.loads(resource_receipt.read_text())
             if args.mock:
                 receipt = json.loads((artifacts / "mock-receipt.json").read_text())
                 if (receipt.get("mock") is not True or receipt.get("scene") != args.scene or
@@ -265,6 +296,27 @@ def capture(args):
             metadata["error"] = str(error)
             raise
         finally:
+            if proc and proc.poll() is None and env.get("WAYLAND_DISPLAY"):
+                try:
+                    if pointer:
+                        pointer.click(1, 1)
+                    close_input = subprocess.run([tools["wtype"], "-P", "Alt_L", "-s", "150", "-k", "F4", "-s", "150", "-p", "Alt_L"], env=env,
+                                                 check=False, timeout=5, capture_output=True, text=True)
+                    metadata["close_input_returncode"] = close_input.returncode
+                    metadata["close_input_error"] = close_input.stderr[:500]
+                    proc.wait(timeout=5)
+                    metadata["graceful_exit"] = proc.returncode == 0
+                except (OSError, subprocess.SubprocessError):
+                    metadata["graceful_exit"] = False
+            if keyboard_guard:
+                if keyboard_guard.poll() is None:
+                    keyboard_guard.terminate()
+                    try:
+                        keyboard_guard.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        keyboard_guard.kill()
+                        keyboard_guard.wait(timeout=3)
+                metadata["keyboard_guard_returncode"] = keyboard_guard.returncode
             if pointer:
                 pointer.close()
             if proc:
@@ -307,11 +359,12 @@ def main():
     parser.add_argument("--state", default="default", help="Mock state such as long-text, disabled or failed")
     parser.add_argument("--data", type=Path, help="Read-only JSON mock component data")
     parser.add_argument("--list", action="store_true", help="List supported scenes without compiling")
-    parser.add_argument("--size", choices=("1280x720", "640x400"), default="1280x720")
-    parser.add_argument("--actions", type=Path, help="JSON steps: click, scroll, key, wait")
+    parser.add_argument("--size", choices=("1280x720", "960x720", "640x400"), default="1280x720")
+    parser.add_argument("--actions", type=Path, help="JSON steps: move, click, scroll, key, wait")
     parser.add_argument("--font", type=Path, help="Use a specific Chinese font for repeatable captures")
     parser.add_argument("--output", type=Path, help="Copy PNG to a new filename; existing files are preserved")
     parser.add_argument("--no-build", action="store_true", help="Use existing fixture binary; may show older code")
+    parser.add_argument("--keep-pointer", action="store_true", help="Preserve final pointer position to capture hover states")
     parser.add_argument("--settle", type=float, default=2, help="Wait for initial rendering (0.5–10 seconds)")
     parser.add_argument("--_prepared", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -341,6 +394,8 @@ def main():
                 forwarded.extend(["--" + field, str(getattr(args, field))])
         if args.no_build:
             forwarded.append("--no-build")
+        if args.keep_pointer:
+            forwarded.append("--keep-pointer")
         command = ["nix", "develop", "--command", "nix", "shell", "nixpkgs#cage", "nixpkgs#grim",
                    "nixpkgs#wtype", "nixpkgs#fontconfig", "nixpkgs#procps", "--command", "python3",
                    str(Path(__file__).resolve()), *forwarded, "--_prepared"]

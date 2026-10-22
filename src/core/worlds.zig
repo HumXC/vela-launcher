@@ -1,4 +1,4 @@
-//! World folders live in versions/<instance.name>/saves. renameFolder changes the
+//! World folders live in versions/<instance.name>/saves. rename changes the
 //! directory; renameDisplayName rewrites only LevelName in the full NBT document.
 //! Destructive operations retain immutable verified recovery data and manifests.
 //! Local POSIX filesystems get file and directory fsync ordering, not a hardware
@@ -380,7 +380,6 @@ pub fn copy(a: A, io: std.Io, paths: *const instances.Paths, source: WorldRef, t
 pub fn rename(a: A, io: std.Io, paths: *const instances.Paths, ref: WorldRef, new_folder: []const u8, options: Options) !Outcome {
     return transact(a, io, paths, .rename, ref, .{ .instance = ref.instance, .folder = new_folder }, null, options);
 }
-pub const renameFolder = rename;
 pub fn renameDisplayName(a: A, io: std.Io, paths: *const instances.Paths, ref: WorldRef, new_name: []const u8, options: Options) !Outcome {
     var opts = options;
     opts.display_name = new_name;
@@ -477,8 +476,6 @@ fn transact(a: A, io: std.Io, paths: *const instances.Paths, operation: Operatio
         break :blk try tree.child(io, restore_artifact.?, "payload", false);
     } else live_source.?;
     defer if (restore_id != null) source.close(io);
-    const archived_lock = if (restore_id != null) try world_lock.acquireExisting(io, source, "session.lock") else null;
-    defer if (archived_lock) |held| held.close(io);
     var expected = try tree.snapshot(a, io, source, payload, options.limits, options.hooks);
     defer expected.deinit();
     try verify(a, io, payload, expected, options);
@@ -488,22 +485,7 @@ fn transact(a: A, io: std.Io, paths: *const instances.Paths, operation: Operatio
         const parsed = try std.json.parseFromSlice(Manifest, a, bytes, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         if (parsed.value.format != 1 or !config.validId(parsed.value.source_instance) or !validFolder(parsed.value.source_folder)) return error.InvalidManifest;
-        // Legacy manifests included the transient session.lock. Verify every data
-        // entry while allowing fresh native lock state in the restored candidate.
-        const recorded_entries = try a.alloc(tree.Entry, parsed.value.entries.len);
-        defer a.free(recorded_entries);
-        var recorded_count: usize = 0;
-        var recorded_bytes = parsed.value.bytes;
-        for (parsed.value.entries) |entry| {
-            if (std.mem.eql(u8, entry.path, "session.lock") and !entry.directory) {
-                if (entry.size > recorded_bytes) return error.InvalidManifest;
-                recorded_bytes -= entry.size;
-                continue;
-            }
-            recorded_entries[recorded_count] = entry;
-            recorded_count += 1;
-        }
-        const recorded: tree.Snapshot = .{ .allocator = a, .entries = recorded_entries[0..recorded_count], .bytes = recorded_bytes };
+        const recorded: tree.Snapshot = .{ .allocator = a, .entries = parsed.value.entries, .bytes = parsed.value.bytes };
         if (!tree.equal(expected, recorded)) return error.IntegrityMismatch;
     }
     try writeManifest(a, io, stage, .{ .operation = operation, .source_instance = source_ref.instance.id, .source_folder = source_ref.folder, .target_instance = if (target_ref) |t| t.instance.id else null, .target_folder = if (target_ref) |t| t.folder else null, .bytes = expected.bytes, .entries = expected.entries }, options);
@@ -578,7 +560,6 @@ fn transact(a: A, io: std.Io, paths: *const instances.Paths, operation: Operatio
         try world_lock.sameDirectory(io, target_saves, collision.?, existing_target.?);
         try verify(a, io, existing_target.?, previous_tree.?, options);
     }
-    if (archived_lock) |held| try held.recheck(io);
     if (candidate_lock) |held| try held.recheck(io);
     // No cancellation points after publication. Preallocated outcome needs no fallible allocation.
     const old_protection = io.swapCancelProtection(.blocked);

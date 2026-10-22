@@ -13,9 +13,7 @@ pub const Fingerprint = struct {
     sha512: [128]u8,
 
     pub fn hashes(self: *const Fingerprint) providers.Hashes {
-        var result: providers.Hashes = .{ .sha1 = &self.sha1, .sha512 = &self.sha512 };
-        if (@hasField(providers.Hashes, "sha256")) result.sha256 = &self.sha256;
-        return result;
+        return .{ .sha1 = &self.sha1, .sha256 = &self.sha256, .sha512 = &self.sha512 };
     }
     pub fn eql(self: Fingerprint, other: Fingerprint) bool {
         return self.size == other.size and std.mem.eql(u8, &self.sha1, &other.sha1) and
@@ -25,9 +23,7 @@ pub const Fingerprint = struct {
         try providers.validateHashes(expected);
         if (size) |n| if (self.size != n) return error.SizeMismatch;
         if (expected.sha1) |h| if (!std.ascii.eqlIgnoreCase(h, &self.sha1)) return error.HashMismatch;
-        if (@hasField(providers.Hashes, "sha256")) {
-            if (expected.sha256) |h| if (!std.ascii.eqlIgnoreCase(h, &self.sha256)) return error.HashMismatch;
-        }
+        if (expected.sha256) |h| if (!std.ascii.eqlIgnoreCase(h, &self.sha256)) return error.HashMismatch;
         if (expected.sha512) |h| if (!std.ascii.eqlIgnoreCase(h, &self.sha512)) return error.HashMismatch;
     }
 };
@@ -81,13 +77,12 @@ pub fn child(dir: Dir, io: Io, name: []const u8, create: bool, private: bool) !D
     errdefer result.close(io);
     const opened = try result.stat(io);
     try rejectReparse(opened);
+    if (opened.kind != .directory or opened.inode != stat.?.inode) return error.UnsafeFileType;
     if (private and builtin.os.tag != .windows and opened.permissions.toMode() & 0o077 != 0) return error.UnsafePrivateDirectory;
     return result;
 }
 pub fn openAbsolute(io: Io, path: []const u8) !Dir {
-    if (!std.fs.path.isAbsolute(path)) return error.UnsafePath;
-    const root_len = if (builtin.os.tag == .windows) std.fs.path.diskDesignator(path).len + 1 else 1;
-    if (root_len > path.len) return error.UnsafePath;
+    const root_len = (try @import("native_path.zig").absoluteRoot(path)).len;
     var result = try Dir.openDirAbsolute(io, path[0..root_len], .{ .iterate = true, .follow_symlinks = false });
     errdefer result.close(io);
     try rejectReparse(try result.stat(io));
@@ -125,10 +120,19 @@ pub fn parent(dir: Dir, io: Io, path: []const u8, create: bool) !Parent {
     if (!safeComponent(path)) return error.UnsafePath;
     return .{ .dir = try dir.openDir(io, ".", .{ .iterate = true, .follow_symlinks = false }), .name = path };
 }
+/// Read-only verification never requests data or attribute write access.
 pub fn openRegular(dir: Dir, io: Io, name: []const u8) !File {
+    return openRegularMode(dir, io, name, .read_only);
+}
+/// Sealing changes attributes and flushes data. On Windows GENERIC_WRITE grants
+/// FILE_WRITE_ATTRIBUTES and the write access required by NtFlushBuffersFile.
+pub fn openRegularForSeal(dir: Dir, io: Io, name: []const u8) !File {
+    return openRegularMode(dir, io, name, .read_write);
+}
+fn openRegularMode(dir: Dir, io: Io, name: []const u8, mode: Dir.OpenFileOptions.Mode) !File {
     const entry = (try inspectEntry(dir, io, name)) orelse return error.FileNotFound;
     if (entry.kind != .file or entry.nlink != 1) return error.UnsafeFileType;
-    const file = try dir.openFile(io, name, .{ .follow_symlinks = false });
+    const file = try dir.openFile(io, name, .{ .mode = mode, .follow_symlinks = false });
     errdefer file.close(io);
     const stat = try file.stat(io);
     try rejectReparse(stat);

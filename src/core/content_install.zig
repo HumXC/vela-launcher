@@ -68,8 +68,6 @@ pub const Options = struct {
     manual_files: []const ManualFile = &.{},
     allow_partial: bool = false,
     allow_curseforge_remote: bool = false,
-    /// Caller must finish v2 readback integration before enabling receipt writes.
-    allow_manifest_v2: bool = false,
     cancel: ?*const std.atomic.Value(bool) = null,
     deadline_ns: ?i96 = null,
     fetcher: ?Fetcher = null,
@@ -105,13 +103,12 @@ pub const Report = struct {
 };
 const Entry = struct {
     path: []const u8,
-    kind: enum { install, remove, rename },
-    destination: ?[]const u8 = null,
+    kind: enum { install, remove },
     before: ?Fingerprint,
     after: ?Fingerprint,
 };
 const Journal = struct {
-    schema_version: u32 = 2,
+    schema_version: u32,
     instance_id: []const u8,
     instance_name: []const u8,
     transaction_id: []const u8,
@@ -169,7 +166,7 @@ fn optionalHashEqual(a: ?[]const u8, b: ?[]const u8) bool {
 }
 fn sameHashes(a: providers.Hashes, b: providers.Hashes) bool {
     if (!optionalHashEqual(a.sha1, b.sha1) or !optionalHashEqual(a.sha512, b.sha512)) return false;
-    if (@hasField(providers.Hashes, "sha256")) if (!optionalHashEqual(a.sha256, b.sha256)) return false;
+    if (!optionalHashEqual(a.sha256, b.sha256)) return false;
     return true;
 }
 fn sameRecord(a: manifest.ManagedFile, b: manifest.ManagedFile) bool {
@@ -177,11 +174,6 @@ fn sameRecord(a: manifest.ManagedFile, b: manifest.ManagedFile) bool {
         std.mem.eql(u8, a.project_id, b.project_id) and std.mem.eql(u8, a.version_id, b.version_id) and
         sameHashes(a.hashes, b.hashes) and a.size == b.size and a.role == b.role and a.enabled == b.enabled and
         a.identity_provenance == b.identity_provenance and a.standalone == b.standalone;
-}
-fn sameExceptEnabled(a: manifest.ManagedFile, b: manifest.ManagedFile) bool {
-    var normalized = b;
-    normalized.enabled = a.enabled;
-    return sameRecord(a, normalized);
 }
 fn oppositePath(a: A, file: manifest.ManagedFile) ![]u8 {
     var opposite = file;
@@ -201,16 +193,8 @@ fn requireCounterpartAbsent(a: A, io: Io, game: Dir, file: manifest.ManagedFile)
 }
 fn validateOwnershipTransition(previous: manifest.Manifest, plan: manifest.UpdatePlan) !void {
     const next = plan.next_manifest;
-    if (previous.schema_version == manifest.schema_version and next.schema_version != manifest.schema_version) return error.ReceiptDowngradeRefused;
     for (previous.files) |old| if (findRecord(next.files, old.path)) |current| {
-        if (old.enabled == current.enabled) continue;
-        if (!manifest.toggleable(old) or !sameExceptEnabled(old, current)) return error.InvalidEnabledTransition;
-        var found = false;
-        for (plan.actions) |action| if (action.kind == .toggle and std.mem.eql(u8, action.path, old.path)) {
-            if (action.previous == null or !sameRecord(action.previous.?, old) or action.desired == null or !sameRecord(action.desired.?, current)) return error.InvalidEnabledTransition;
-            found = true;
-        };
-        if (!found) return error.InvalidEnabledTransition;
+        if (old.enabled != current.enabled) return error.InvalidEnabledTransition;
     };
     if (plan.fully_applied) return;
     // Partial application may retain old membership, never claim a new pack/version.
@@ -262,13 +246,39 @@ fn validateOptionPaths(options: Options) !void {
         if (action.desired) |file| try manifest.checkedPathForInstance(file.path, options.instance_name);
     }
     for (options.plan.conflicts) |conflict| try manifest.checkedPathForInstance(conflict.path, options.instance_name);
+    // All supplied views name one filesystem tree. Exact repeated file references
+    // are intentional; alternate spellings of a shared directory are not.
+    for (options.plan.next_manifest.files) |file| try validateInputPath(options, file.path);
+    for (options.files) |file| try validateInputPath(options, file.record.path);
+    for (options.manual_files) |file| try validateInputPath(options, file.path);
+    if (options.pack) |pack| for (pack.files) |file| try validateInputPath(options, file.record.path);
+    for (options.plan.actions) |action| {
+        try validateInputPath(options, action.path);
+        if (action.previous) |file| try validateInputPath(options, file.path);
+        if (action.desired) |file| try validateInputPath(options, file.path);
+    }
+    for (options.plan.conflicts) |conflict| try validateInputPath(options, conflict.path);
+}
+fn requireConsistentPath(path: []const u8, other: []const u8) !void {
+    if (!std.mem.eql(u8, path, other) and manifest.pathsCollide(path, other)) return error.PathCollision;
+}
+fn validateInputPath(options: Options, path: []const u8) !void {
+    for (options.plan.next_manifest.files) |file| try requireConsistentPath(path, file.path);
+    for (options.files) |file| try requireConsistentPath(path, file.record.path);
+    for (options.manual_files) |file| try requireConsistentPath(path, file.path);
+    if (options.pack) |pack| for (pack.files) |file| try requireConsistentPath(path, file.record.path);
+    for (options.plan.actions) |action| {
+        try requireConsistentPath(path, action.path);
+        if (action.previous) |file| try requireConsistentPath(path, file.path);
+        if (action.desired) |file| try requireConsistentPath(path, file.path);
+    }
+    for (options.plan.conflicts) |conflict| try requireConsistentPath(path, conflict.path);
 }
 fn validateOptions(options: Options) !void {
     try validateOptionPaths(options);
     if (!options.plan.ready) return error.UnresolvedConflicts;
     if (!options.plan.fully_applied and !options.allow_partial) return error.PartialPlanNeedsConsent;
     try manifest.validate(options.plan.next_manifest);
-    if (options.plan.next_manifest.schema_version == manifest.schema_version and !options.allow_manifest_v2) return error.ReceiptUpgradeRequired;
     if (!std.mem.eql(u8, options.instance_id, options.plan.next_manifest.instance_id)) return error.InstanceMismatch;
     for (options.files, 0..) |file, index| {
         try manifest.validate(.{ .instance_id = options.instance_id, .pack_version = options.plan.next_manifest.pack_version, .files = &.{file.record} });
@@ -288,13 +298,6 @@ fn validateOptions(options: Options) !void {
         }
         if (action.expected_before != null and (index == 0 or options.plan.actions[index - 1].kind != .backup)) return error.BackupRequired;
         if (action.kind == .remove and (action.expected_before == null or action.desired != null or findRecord(options.plan.next_manifest.files, action.path) != null)) return error.InvalidActionSequence;
-        if (action.kind == .toggle) {
-            const old = action.previous orelse return error.InvalidEnabledTransition;
-            const desired = action.desired orelse return error.InvalidEnabledTransition;
-            const next = findRecord(options.plan.next_manifest.files, action.path) orelse return error.MissingDesiredRecord;
-            if (!manifest.toggleable(old) or old.enabled == desired.enabled or !sameExceptEnabled(old, desired) or
-                !sameRecord(desired, next) or !std.mem.eql(u8, action.path, old.path) or action.expected_before == null) return error.InvalidEnabledTransition;
-        }
         if (action.kind == .install) {
             const desired = action.desired orelse return error.MissingDesiredRecord;
             const record = findRecord(options.plan.next_manifest.files, action.path) orelse return error.MissingDesiredRecord;
@@ -435,11 +438,16 @@ fn stage(a: A, io: Io, options: Options, fetcher: Fetcher, txn: Dir, txn_path: [
             });
         },
     }
-    const result = (try fs.fingerprint(txn, io, stage_name, options.cancel, options.deadline_ns)) orelse return error.MissingStagedFile;
-    try result.verify(file.record.hashes, file.record.size);
-    if (result.size > limit) return error.BodyTooLarge;
-    const staged_file = try fs.openRegular(txn, io, stage_name);
+    const staged_file = fs.openRegularForSeal(txn, io, stage_name) catch |err| switch (err) {
+        error.FileNotFound => return error.MissingStagedFile,
+        else => return err,
+    };
     defer staged_file.close(io);
+    // Verify and seal the same checked inode, using a handle that can write
+    // attributes and flush on Windows. Read-only probes retain their own API.
+    const result = try fs.stream(staged_file, null, io, limit, options.cancel, options.deadline_ns);
+    try result.verify(file.record.hashes, file.record.size);
+    try fs.cancelled(io, options.cancel, options.deadline_ns);
     try staged_file.setPermissions(io, fs.privatePermissions(false));
     try staged_file.sync(io);
     try fs.syncDir(txn, io);
@@ -604,6 +612,7 @@ fn validatePersistedPaths(a: A, io: Io, options: Options) !void {
     var previous = try manifest.parseForInstance(a, bytes, options.instance_name);
     defer previous.deinit();
     if (!std.mem.eql(u8, previous.value.instance_id, options.instance_id)) return error.InstanceMismatch;
+    for (previous.value.files) |file| try validateInputPath(options, file.path);
 }
 
 pub fn execute(a: A, io: Io, options: Options) !Report {
@@ -644,6 +653,7 @@ pub fn execute(a: A, io: Io, options: Options) !Report {
     if (manifest_before) |before| {
         const bytes = try fs.read(aa, roots.metadata, io, "content.json", providers.max_json_bytes);
         previous = try manifest.parseForInstance(aa, bytes, options.instance_name);
+        previous.?.value.files = try @import("content_state.zig").observe(aa, io, roots.game, previous.?.value.files);
         if (!std.mem.eql(u8, previous.?.value.instance_id, options.instance_id)) return error.InstanceMismatch;
         const copied = try copyPath(roots.metadata, "content.json", txn, "manifest-before", io, providers.max_json_bytes, options.cancel, options.deadline_ns);
         if (!copied.eql(before)) return error.LocalFileChanged;
@@ -654,7 +664,7 @@ pub fn execute(a: A, io: Io, options: Options) !Report {
     }
     for (options.plan.next_manifest.files) |file| {
         const old = if (previous) |prior| findRecord(prior.value.files, file.path) else null;
-        if (old == null or old.?.enabled == file.enabled) try requireCounterpartAbsent(aa, io, roots.game, file);
+        try requireCounterpartAbsent(aa, io, roots.game, file);
         var mutated = false;
         for (options.plan.actions) |action| if (action.kind != .backup and std.mem.eql(u8, action.path, file.path)) {
             mutated = true;
@@ -696,11 +706,7 @@ pub fn execute(a: A, io: Io, options: Options) !Report {
         }
         const source_record = persisted orelse action.desired orelse return error.UnmanagedFile;
         const physical = try manifest.physicalPath(aa, source_record);
-        var destination: ?[]const u8 = null;
-        if (action.kind == .toggle) {
-            destination = try manifest.physicalPath(aa, action.desired.?);
-            try requireCurrent(roots.game, io, destination.?, null, options.cancel, options.deadline_ns);
-        } else if (action.desired) |desired| {
+        if (action.desired) |desired| {
             if (!std.mem.eql(u8, physical, try manifest.physicalPath(aa, desired))) return error.InvalidEnabledTransition;
         }
         const before = try fs.fingerprint(roots.game, io, physical, options.cancel, options.deadline_ns);
@@ -708,12 +714,10 @@ pub fn execute(a: A, io: Io, options: Options) !Report {
             const old = before orelse return error.LocalFileChanged;
             if (previous == null or findRecord(previous.?.value.files, action.path) == null) return error.UnmanagedFile;
             try old.verify(expected, action.expected_size);
-            if (action.kind == .toggle) try old.verify(persisted.?.hashes, persisted.?.size);
         } else if (before != null) return error.UnmanagedFile;
         const index = entries.items.len;
         var after: ?Fingerprint = null;
         if (action.kind == .install) after = try stage(aa, io, options, fetcher, txn, backup_path, index, try findInstall(options.files, action.desired.?));
-        if (action.kind == .toggle) after = before;
         if (before) |old| {
             try checkpoint(options.fault, .before_backup, index);
             const backup_name = try numbered(aa, "before", index);
@@ -721,9 +725,10 @@ pub fn execute(a: A, io: Io, options: Options) !Report {
             if (!copied.eql(old)) return error.LocalFileChanged;
             try checkpoint(options.fault, .after_backup, index);
         }
-        try entries.append(aa, .{ .path = physical, .destination = destination, .kind = if (action.kind == .toggle) .rename else if (action.kind == .install) .install else .remove, .before = before, .after = after });
+        try entries.append(aa, .{ .path = physical, .kind = if (action.kind == .install) .install else .remove, .before = before, .after = after });
     }
     const journal: Journal = .{
+        .schema_version = 2,
         .instance_id = options.instance_id,
         .instance_name = options.instance_name,
         .transaction_id = transaction_id,
@@ -763,13 +768,6 @@ fn commit(a: A, io: Io, options: Options, roots: Roots, txn: Dir, journal: Journ
                 if (entry.before == null) try txn.renamePreserve(stage_name, leaf.dir, leaf.name, io) else try txn.rename(stage_name, leaf.dir, leaf.name, io);
             },
             .remove => try leaf.dir.renamePreserve(leaf.name, txn, try numbered(a, "removed", index), io),
-            .rename => {
-                const target = try fs.parent(roots.game, io, entry.destination.?, true);
-                defer target.deinit(io);
-                try requireCurrent(roots.game, io, entry.destination.?, null, options.cancel, options.deadline_ns);
-                try leaf.dir.renamePreserve(leaf.name, target.dir, target.name, io);
-                try fs.syncDir(target.dir, io);
-            },
         }
         try fs.syncDir(leaf.dir, io);
         try fs.syncDir(txn, io);
@@ -785,8 +783,7 @@ fn commit(a: A, io: Io, options: Options, roots: Roots, txn: Dir, journal: Journ
         if (!options.plan.fully_applied) report.completeness.?.complete = false;
     }
     for (journal.entries) |entry| {
-        try requireCurrent(roots.game, io, entry.path, if (entry.kind == .rename) null else entry.after, options.cancel, options.deadline_ns);
-        if (entry.destination) |destination| try requireCurrent(roots.game, io, destination, entry.after, options.cancel, options.deadline_ns);
+        try requireCurrent(roots.game, io, entry.path, entry.after, options.cancel, options.deadline_ns);
     }
     try checkpoint(options.fault, .before_manifest, 0);
     try requireCurrent(roots.metadata, io, "content.json", journal.manifest_before, options.cancel, options.deadline_ns);
@@ -815,23 +812,6 @@ fn rollback(a: A, io: Io, roots: Roots, txn: Dir, journal: Journal, lease: Lease
         try lease.recheck(lease.context, journal.instance_id);
         try checkpoint(fault, .rollback_mutation, index);
         const current = try fs.fingerprint(roots.game, io, entry.path, null, null);
-        if (entry.kind == .rename) {
-            const destination = entry.destination.?;
-            const target_current = try fs.fingerprint(roots.game, io, destination, null, null);
-            if (equalOptional(current, entry.before) and target_current == null) continue;
-            if (current != null or !equalOptional(target_current, entry.after)) return error.RecoveryConflict;
-            const source = try fs.parent(roots.game, io, entry.path, true);
-            defer source.deinit(io);
-            const target = try fs.parent(roots.game, io, destination, false);
-            defer target.deinit(io);
-            try requireCurrent(txn, io, try numbered(a, "before", index), entry.before, null, null);
-            try requireCurrent(roots.game, io, entry.path, null, null, null);
-            try requireCurrent(roots.game, io, destination, entry.after, null, null);
-            try target.dir.renamePreserve(target.name, source.dir, source.name, io);
-            try fs.syncDir(source.dir, io);
-            try fs.syncDir(target.dir, io);
-            continue;
-        }
         if (equalOptional(current, entry.before)) continue;
         if (!equalOptional(current, entry.after)) return error.RecoveryConflict;
         const leaf = try fs.parent(roots.game, io, entry.path, true);
@@ -890,25 +870,36 @@ fn validateJournalPaths(journal: Journal, instance_name: []const u8) !void {
     if (journal.entries.len > providers.max_items) return error.InvalidJournal;
     for (journal.entries) |entry| {
         try manifest.checkedPathForInstance(entry.path, instance_name);
-        if (entry.destination) |destination| try manifest.checkedPathForInstance(destination, instance_name);
     }
 }
 fn validateJournalManifests(a: A, io: Io, txn: Dir, journal: Journal) !void {
     const names = [_][]const u8{ "manifest-before", "manifest-after" };
     const expected = [_]?Fingerprint{ journal.manifest_before, journal.manifest_after };
-    for (names, expected) |name, fingerprint| {
+    var documents: [2]?providers.Owned(manifest.Manifest) = .{ null, null };
+    defer {
+        for (&documents) |*document| if (document.*) |*owned| owned.deinit();
+    }
+    for (names, expected, 0..) |name, fingerprint, index| {
         const value = fingerprint orelse continue;
         const bytes = try fs.read(a, txn, io, name, providers.max_json_bytes);
         defer a.free(bytes);
-        var document = try manifest.parseForInstance(a, bytes, journal.instance_name);
-        defer document.deinit();
-        if (!std.mem.eql(u8, document.value.instance_id, journal.instance_id)) return error.InstanceMismatch;
+        documents[index] = try manifest.parseForInstance(a, bytes, journal.instance_name);
+        const document = documents[index].?.value;
+        if (!std.mem.eql(u8, document.instance_id, journal.instance_id)) return error.InstanceMismatch;
+        for (document.files) |file| for (journal.entries) |entry| {
+            if (!std.mem.eql(u8, file.path, entry.path) and manifest.pathsCollide(file.path, entry.path)) return error.InvalidJournal;
+        };
         try requireCurrent(txn, io, name, value, null, null);
     }
+    if (documents[0]) |before| if (documents[1]) |after| {
+        for (before.value.files) |old| for (after.value.files) |new| {
+            if (!std.mem.eql(u8, old.path, new.path) and manifest.pathsCollide(old.path, new.path)) return error.InvalidJournal;
+        };
+    };
 }
 fn validateJournal(journal: Journal, instance_id: []const u8, instance_name: []const u8, transaction_id: []const u8) !void {
     try validateJournalPaths(journal, instance_name);
-    if (journal.schema_version != 1 and journal.schema_version != 2) return error.UnsupportedJournalVersion;
+    if (journal.schema_version != 2) return error.UnsupportedJournalVersion;
     if (!std.mem.eql(u8, journal.instance_id, instance_id) or !std.mem.eql(u8, journal.instance_name, instance_name) or
         !std.mem.eql(u8, journal.transaction_id, transaction_id)) return error.InstanceMismatch;
     if (journal.entries.len > providers.max_items or !fs.safeComponent(journal.manifest_temp)) return error.InvalidJournal;
@@ -918,24 +909,9 @@ fn validateJournal(journal: Journal, instance_id: []const u8, instance_name: []c
     if (journal.manifest_after.size > providers.max_json_bytes or (journal.manifest_before != null and journal.manifest_before.?.size > providers.max_json_bytes)) return error.InvalidJournal;
     for (journal.entries, 0..) |entry, index| {
         if (!safeManagedPath(entry.path)) return error.InvalidJournal;
-        if (entry.kind == .rename) {
-            if (journal.schema_version != 2) return error.InvalidJournal;
-            const destination = entry.destination orelse return error.InvalidJournal;
-            if (!safeManagedPath(destination) or entry.before == null or entry.after == null or !entry.before.?.eql(entry.after.?)) return error.InvalidJournal;
-            const source_disabled = std.mem.endsWith(u8, entry.path, ".disabled");
-            const canonical = if (source_disabled) entry.path[0 .. entry.path.len - ".disabled".len] else entry.path;
-            if (!std.mem.startsWith(u8, canonical, "mods/") or !std.mem.endsWith(u8, canonical, ".jar") or canonical.len > manifest.max_path_bytes - ".disabled".len) return error.InvalidJournal;
-            var buffer: [manifest.max_path_bytes]u8 = undefined;
-            const disabled = try std.fmt.bufPrint(&buffer, "{s}.disabled", .{canonical});
-            if (!std.mem.eql(u8, destination, if (source_disabled) canonical else disabled)) return error.InvalidJournal;
-        } else if (entry.destination != null or (entry.kind == .install) != (entry.after != null) or (entry.kind == .remove and entry.before == null)) return error.InvalidJournal;
+        if ((entry.kind == .install) != (entry.after != null) or (entry.kind == .remove and entry.before == null)) return error.InvalidJournal;
         for (journal.entries[0..index]) |other| {
             if (manifest.pathsCollide(entry.path, other.path)) return error.InvalidJournal;
-            if (entry.destination) |destination| {
-                if (manifest.pathsCollide(destination, other.path)) return error.InvalidJournal;
-                if (other.destination) |target| if (manifest.pathsCollide(destination, target)) return error.InvalidJournal;
-            }
-            if (other.destination) |target| if (manifest.pathsCollide(entry.path, target)) return error.InvalidJournal;
         }
         if (entry.before) |value| try value.verify(value.hashes(), value.size);
         if (entry.after) |value| try value.verify(value.hashes(), value.size);
@@ -1052,7 +1028,7 @@ test "CF remote requires opt-in and exact transient authorization before any lea
     defer fixture.deinit();
     var lease_state: TestLease = .{};
     var file = testCFInstallFile();
-    var options: Options = .{ .paths = &fixture.paths, .instance_id = "instance", .instance_name = "Test", .plan = emptyTestPlan(.{ .schema_version = 2, .instance_id = "instance", .pack_version = "v2", .files = &.{file.record} }), .files = &.{file}, .lease = lease_state.lease(), .allow_manifest_v2 = true, .approved_download_hosts = test_cf_hosts };
+    var options: Options = .{ .paths = &fixture.paths, .instance_id = "instance", .instance_name = "Test", .plan = emptyTestPlan(.{ .instance_id = "instance", .pack_version = "v2", .files = &.{file.record} }), .files = &.{file}, .lease = lease_state.lease(), .approved_download_hosts = test_cf_hosts };
     const action: manifest.Action = .{ .kind = .install, .path = file.record.path, .desired = file.record };
     options.plan.actions = &.{action};
     try std.testing.expectError(error.CurseForgeManualRequired, execute(std.testing.allocator, std.testing.io, options));
@@ -1066,7 +1042,7 @@ test "CF remote requires opt-in and exact transient authorization before any lea
     options.files = &.{file};
     try validateOptions(options);
     var changed = file;
-    changed.record.identity_provenance = .legacy_unknown;
+    changed.record.identity_provenance = .pack_archive;
     try std.testing.expectError(error.InvalidRemoteAuthorization, validateDownload(options, changed));
     changed = file;
     changed.download = .{ .remote = "https://edge.forgecdn.net/files/34/other.jar" };
@@ -1074,8 +1050,6 @@ test "CF remote requires opt-in and exact transient authorization before any lea
     var other_hosts = options;
     other_hosts.approved_download_hosts = &.{"cdn.modrinth.com"};
     try std.testing.expectError(error.InvalidRemoteAuthorization, validateDownload(other_hosts, file));
-    options.allow_manifest_v2 = false;
-    try std.testing.expectError(error.ReceiptUpgradeRequired, execute(std.testing.allocator, std.testing.io, options));
     try std.testing.expectEqual(@as(usize, 0), lease_state.acquired);
     try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, ".minecraft/versions/Test/.vela-content", .{}));
@@ -1084,12 +1058,12 @@ test "record matching includes provenance and standalone ownership and partial u
     var file = testCFInstallFile().record;
     file.standalone = false;
     var changed = file;
-    changed.identity_provenance = .legacy_unknown;
+    changed.identity_provenance = .pack_archive;
     try std.testing.expect(!sameRecord(file, changed));
     changed = file;
     changed.standalone = true;
     try std.testing.expect(!sameRecord(file, changed));
-    const old: manifest.Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "old", .files = &.{file}, .pack_membership = .{ .identity = .{ .provider = .curseforge, .project_id = "1", .version_id = "2" }, .paths = &.{file.path} } };
+    const old: manifest.Manifest = .{ .instance_id = "instance", .pack_version = "old", .files = &.{file}, .pack_membership = .{ .identity = .{ .provider = .curseforge, .project_id = "1", .version_id = "2" }, .paths = &.{file.path} } };
     var plan = emptyTestPlan(old);
     plan.fully_applied = false;
     try validateOwnershipTransition(old, plan);
@@ -1100,8 +1074,6 @@ test "record matching includes provenance and standalone ownership and partial u
     plan.next_manifest = old;
     plan.next_manifest.files = &.{changed};
     try std.testing.expectError(error.InvalidPackOwnershipTransition, validateOwnershipTransition(old, plan));
-    plan = emptyTestPlan(.{ .instance_id = "instance", .pack_version = "legacy" });
-    try std.testing.expectError(error.ReceiptDowngradeRefused, validateOwnershipTransition(old, plan));
 }
 const ReceiptFixture = struct {
     tmp: std.testing.TmpDir,
@@ -1124,7 +1096,7 @@ const ReceiptFixture = struct {
         self.tmp.cleanup();
     }
     fn options(self: *@This(), plan: manifest.UpdatePlan, files: []const manifest.InstallFile) Options {
-        return .{ .paths = &self.paths, .instance_id = "instance", .instance_name = "Test", .plan = plan, .files = files, .lease = self.guard.lease(), .allow_manifest_v2 = true, .fetcher = .{ .context = self, .fetchToFile = fetch } };
+        return .{ .paths = &self.paths, .instance_id = "instance", .instance_name = "Test", .plan = plan, .files = files, .lease = self.guard.lease(), .fetcher = .{ .context = self, .fetchToFile = fetch } };
     }
     fn fetch(ctx: ?*anyopaque, io: Io, request: FetchRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
@@ -1144,41 +1116,41 @@ const ReceiptCrash = struct {
         if (point == self.point) return error.SimulatedCrash;
     }
 };
-test "journal preserves exact legacy and modern receipt bytes across rollback and durable commit" {
+test "journal preserves exact current receipt bytes across rollback and durable commit" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    for ([_]u32{ 1, 2 }) |old_schema| {
-        for ([_]FaultPoint{ .after_manifest, .after_commit_marker }) |point| {
-            var fixture = try ReceiptFixture.init();
-            defer fixture.deinit();
-            const prior: manifest.Manifest = .{ .schema_version = old_schema, .instance_id = "instance", .pack_version = "old" };
-            const desired: manifest.Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "new" };
-            const before = try manifest.serialize(a, prior);
-            defer a.free(before);
-            const after = try manifest.serialize(a, desired);
-            defer a.free(after);
-            try fixture.tmp.dir.writeFile(io, .{ .sub_path = ".vela/instances/instance/content.json", .data = before });
-            var plan = try manifest.buildUpdatePlan(a, prior, desired, &.{}, &.{}, .{ .instance_id = "instance", .running = false });
-            defer plan.deinit();
-            var crash: ReceiptCrash = .{ .point = point };
-            var options = fixture.options(plan.value, &.{});
-            options.fault = .{ .context = &crash, .boundary = ReceiptCrash.boundary };
-            try std.testing.expectError(error.SimulatedCrash, execute(a, io, options));
-            var transactions = try listTransactions(a, io, &fixture.paths, "instance", "Test");
-            defer transactions.deinit();
-            try std.testing.expectEqual(@as(usize, 1), transactions.value.len);
-            const recovery: RecoverOptions = .{ .paths = &fixture.paths, .instance_id = "instance", .instance_name = "Test", .transaction_id = transactions.value[0], .lease = fixture.guard.lease() };
-            var report = try recover(a, io, recovery);
-            defer report.deinit();
-            try std.testing.expectEqual(point == .after_commit_marker, report.committed);
-            const current = try fixture.readReceipt();
-            defer a.free(current);
-            try std.testing.expectEqualStrings(if (report.committed) after else before, current);
-            var again = try recover(a, io, recovery);
-            defer again.deinit();
-            try std.testing.expectEqual(report.committed, again.committed);
-            try std.testing.expect(!fixture.guard.held and fixture.guard.acquired == fixture.guard.released and fixture.fetches == 0);
-        }
+    for ([_]FaultPoint{ .after_manifest, .after_commit_marker }) |point| {
+        var fixture = try ReceiptFixture.init();
+        defer fixture.deinit();
+        const prior: manifest.Manifest = .{ .instance_id = "instance", .pack_version = "old" };
+        const desired: manifest.Manifest = .{ .instance_id = "instance", .pack_version = "new" };
+        const serialized = try manifest.serialize(a, prior);
+        defer a.free(serialized);
+        const before = try std.fmt.allocPrint(a, "\n{s}\n", .{serialized});
+        defer a.free(before);
+        const after = try manifest.serialize(a, desired);
+        defer a.free(after);
+        try fixture.tmp.dir.writeFile(io, .{ .sub_path = ".vela/instances/instance/content.json", .data = before });
+        var plan = try manifest.buildUpdatePlan(a, prior, desired, &.{}, &.{}, .{ .instance_id = "instance", .running = false });
+        defer plan.deinit();
+        var crash: ReceiptCrash = .{ .point = point };
+        var options = fixture.options(plan.value, &.{});
+        options.fault = .{ .context = &crash, .boundary = ReceiptCrash.boundary };
+        try std.testing.expectError(error.SimulatedCrash, execute(a, io, options));
+        var transactions = try listTransactions(a, io, &fixture.paths, "instance", "Test");
+        defer transactions.deinit();
+        try std.testing.expectEqual(@as(usize, 1), transactions.value.len);
+        const recovery: RecoverOptions = .{ .paths = &fixture.paths, .instance_id = "instance", .instance_name = "Test", .transaction_id = transactions.value[0], .lease = fixture.guard.lease() };
+        var report = try recover(a, io, recovery);
+        defer report.deinit();
+        try std.testing.expectEqual(point == .after_commit_marker, report.committed);
+        const current = try fixture.readReceipt();
+        defer a.free(current);
+        try std.testing.expectEqualStrings(if (report.committed) after else before, current);
+        var again = try recover(a, io, recovery);
+        defer again.deinit();
+        try std.testing.expectEqual(report.committed, again.committed);
+        try std.testing.expect(!fixture.guard.held and fixture.guard.acquired == fixture.guard.released and fixture.fetches == 0);
     }
 }
 test "authorized CF download uses only fake CDN fetcher and persists no authorization" {
@@ -1188,7 +1160,7 @@ test "authorized CF download uses only fake CDN fetcher and persists no authoriz
     defer fixture.deinit();
     const prior: manifest.Manifest = .{ .instance_id = "instance", .pack_version = "old" };
     const file = testCFInstallFile();
-    const desired: manifest.Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "new", .files = &.{file.record} };
+    const desired: manifest.Manifest = .{ .instance_id = "instance", .pack_version = "new", .files = &.{file.record} };
     const before = try manifest.serialize(a, prior);
     defer a.free(before);
     try fixture.tmp.dir.writeFile(io, .{ .sub_path = ".vela/instances/instance/content.json", .data = before });
@@ -1214,6 +1186,7 @@ test "journal path preflight bounds precede uninitialized entries" {
     defer a.free(entries);
     const transaction_id = "txn-" ++ @as([32]u8, @splat('1'));
     const journal: Journal = .{
+        .schema_version = 2,
         .instance_id = "instance",
         .instance_name = "Test",
         .transaction_id = transaction_id,

@@ -10,11 +10,11 @@ const components = @import("components.zig");
 const bento_theme = @import("theme.zig");
 
 const catalogue_entries = [_]library.CatalogEntry{
-    .{ .id = "1.21.1", .kind = "release", .release_time = "2024-08-08T12:24:45+00:00" },
-    .{ .id = "1.20.1", .kind = "release" },
-    .{ .id = "24w14a", .kind = "snapshot" },
-    .{ .id = "1.7.10", .kind = "release" },
-    .{ .id = "1.6.4", .kind = "release" },
+    .{ .id = "1.21.1", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.21.1.json", .kind = "release", .release_time = "2024-08-08T12:24:45+00:00" },
+    .{ .id = "1.20.1", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.20.1.json", .kind = "release" },
+    .{ .id = "24w14a", .url = "https://piston-meta.mojang.com/v1/packages/fixture/24w14a.json", .kind = "snapshot" },
+    .{ .id = "1.7.10", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.7.10.json", .kind = "release" },
+    .{ .id = "1.6.4", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.6.4.json", .kind = "release" },
 };
 const existing = [_]config.Instance{
     .{ .id = "one", .name = "1.21.1", .minecraft_version = "1.21.1" },
@@ -93,9 +93,9 @@ const Frame = struct {
     var loader_date: ?Text = null;
     var forbidden_calls: std.atomic.Value(usize) = .init(0);
     var catalogue_calls: std.atomic.Value(usize) = .init(0);
-    var catalogue: library.Snapshot = .{ .installed = &.{}, .available = &catalogue_entries, .phase = .complete, .failure = null, .completed = 0, .total = 0, .installing_version = null };
+    var catalogue: library.Snapshot = .{ .installed = &.{}, .available = &catalogue_entries, .phase = .complete, .failure = null };
     var loader_render_phase: ?manager_module.Phase = null;
-    var fetch_outcome: enum { populated, empty, failed } = .populated;
+    var fetch_outcome: enum { populated, empty, failed, non_public_address } = .populated;
     var expected_retry: enum { none, version, loader } = .none;
     var retry_count: usize = 0;
 
@@ -120,6 +120,7 @@ const Frame = struct {
     fn fetch(_: ?*anyopaque, a: std.mem.Allocator, _: std.Io, base: []const u8, kind: config.Loader, _: manager_module.Control) !manager_module.LoaderCatalogue {
         _ = catalogue_calls.fetchAdd(1, .monotonic);
         if (fetch_outcome == .failed) return error.TestLoaderCatalogueUnavailable;
+        if (fetch_outcome == .non_public_address) return error.NonPublicAddress;
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const owned = arena.allocator();
@@ -492,7 +493,7 @@ fn atBothSizes(comptime scenario: fn () anyerror!void) !void {
         defer registry.deinit();
         Frame.forbidden_calls.store(0, .monotonic);
         Frame.catalogue_calls.store(0, .monotonic);
-        Frame.catalogue = .{ .installed = &.{}, .available = &catalogue_entries, .phase = .complete, .failure = null, .completed = 0, .total = 0, .installing_version = null };
+        Frame.catalogue = .{ .installed = &.{}, .available = &catalogue_entries, .phase = .complete, .failure = null };
         Frame.loader_render_phase = null;
         Frame.fetch_outcome = .populated;
         Frame.home_clicked = false;
@@ -1240,6 +1241,17 @@ fn loaderMetadataStates() !void {
     try dvui.testing.settle(Frame.draw);
     _ = try loadingFeedback(true, false);
     try std.testing.expect(try renderedMessage("此 Minecraft 版本暂无可用加载器版本，可继续使用原版。"));
+    try Frame.footers("instance-wizard-next", true);
+    Frame.fetch_outcome = .non_public_address;
+    Frame.ui.browse_loader = .neoforge;
+    try Frame.manager.loadLoaders("1.21.1", .neoforge);
+    try dvui.testing.settle(Frame.draw);
+    _ = try loadingFeedback(true, false);
+    try std.testing.expectEqual(error.NonPublicAddress, Frame.manager.loaderSnapshot().failure.?);
+    try std.testing.expect(try renderedMessage("此 Minecraft 版本暂无可用加载器版本，可继续使用原版。"));
+    try std.testing.expect(!try renderedMessage("加载器目录：NonPublicAddress"));
+    try std.testing.expect(!try renderedMessage("NonPublicAddress"));
+    try std.testing.expect(!try renderedMessage("重试"));
     try Frame.footers("instance-wizard-next", true);
     Frame.fetch_outcome = .failed;
     Frame.ui.browse_loader = .forge;

@@ -596,7 +596,7 @@ test "combined rename options publishes one complete config update after JOIN an
         try std.testing.expect(manager.pending == null and !registry.hasActive());
         try std.testing.expect(module.sameInstance(updated, env.store.snapshot().instances[0]));
         try std.testing.expectEqualStrings(editable.id, env.store.snapshot().selected_instance.?);
-        try std.testing.expectEqualStrings(editable.id, env.store.snapshot().servers[0].instance_id);
+        try std.testing.expectEqualStrings(editable.id, env.store.snapshot().servers[0].instance_id.?);
         try std.testing.expectEqualStrings("bound", env.store.snapshot().selected_server.?);
         try std.testing.expectEqualStrings("project", env.store.snapshot().instances[0].origin.?.project_id);
         try std.testing.expectEqual(@as(usize, 1), fault.renames);
@@ -729,18 +729,20 @@ test "instance manager options preserve identity and default Java is cloned into
     try settle(&manager);
     try manager.publish(&env.store);
     try std.testing.expectEqualStrings("/default/java", std.mem.sliceTo(&fixture.observed_java, 0));
-    var updated = env.store.snapshot().instances[0];
+    const original = env.store.snapshot().instances[0];
+    var updated = original;
     updated.java_path = "/override/java";
     updated.min_memory_mb = 1024;
     updated.max_memory_mb = 4096;
     updated.debug_launch = true;
-    try manager.saveOptions(&env.store, updated);
+    try manager.saveOptionsChecked(&env.store, original, updated);
     try std.testing.expectEqual(@as(?u32, 1024), env.store.snapshot().instances[0].min_memory_mb);
     try std.testing.expectEqual(@as(?u32, 4096), env.store.snapshot().instances[0].max_memory_mb);
-    // saveOptions replaces the snapshot arena; refresh borrowed identity strings.
-    updated = env.store.snapshot().instances[0];
+    // saveOptionsChecked replaces the snapshot arena; refresh borrowed identity strings.
+    const refreshed = env.store.snapshot().instances[0];
+    updated = refreshed;
     updated.name = "Different";
-    try std.testing.expectError(error.OptionsCannotChangeIdentity, manager.saveOptions(&env.store, updated));
+    try std.testing.expectError(error.OptionsCannotChangeIdentity, manager.saveOptionsChecked(&env.store, refreshed, updated));
     try manager.select(&env.store, example.id);
     try std.testing.expectError(error.InstanceNotFound, manager.select(&env.store, "absent"));
 }
@@ -1010,8 +1012,6 @@ const PreparedFixture = struct {
         std.crypto.hash.Sha1.hash(prepared_vanilla_json, &checksum, .{});
         self.entries = .{.{ .id = "1.20.1", .kind = "release", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.20.1.json", .time = "", .release_time = "", .sha1 = checksum, .compliance_level = null }};
         var canceled: std.atomic.Value(bool) = .init(false);
-        const minecraft_root = try std.fs.path.join(a, &.{ root, ".minecraft" });
-        defer a.free(minecraft_root);
         return loader_install.prepareMetadata(a, io, .{
             .root = root,
             .instance_id = prepared_example.id,
@@ -1019,18 +1019,18 @@ const PreparedFixture = struct {
             .generation = 7,
             .selection = .{ .kind = .fabric, .base_id = prepared_example.minecraft_version, .loader_id = prepared_example.loader_version.? },
             .environment = try preparedEnvironment(),
-            .vanilla = .{ .root = minecraft_root, .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
+            .vanilla = .{ .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
             .fetcher = .{ .context = self, .fetch = fetchVanilla },
             .transport = .{ .context = self, .get = get },
         }, .{ .cancel = &canceled, .deadline_ms = std.math.maxInt(u64), .now_ms = zeroClock });
     }
-    fn prepareVanilla(self: *PreparedFixture, root: []const u8, minecraft_root: []const u8) !metadata_loader.PreparedVanilla {
+    fn prepareVanilla(self: *PreparedFixture, root: []const u8) !metadata_loader.PreparedVanilla {
         var checksum: metadata.Sha1 = undefined;
         std.crypto.hash.Sha1.hash(prepared_vanilla_json, &checksum, .{});
         self.entries = .{.{ .id = "1.20.1", .kind = "release", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.20.1.json", .time = "", .release_time = "", .sha1 = checksum, .compliance_level = null }};
         return metadata_loader.prepareVanilla(a, io, .{
             .target = .{ .root = root, .instance_id = example.id, .instance_name = example.name, .version_id = example.minecraft_version, .generation = 7, .environment = try preparedEnvironment() },
-            .vanilla = .{ .root = minecraft_root, .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
+            .vanilla = .{ .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
             .fetcher = .{ .context = self, .fetch = fetchVanilla },
         });
     }
@@ -1081,7 +1081,7 @@ test "creation admission blocks every create variant before allocation lease tas
         var source: PreparedFixture = .{};
         var prepared = try source.prepare(env.root);
         defer prepared.deinit();
-        var vanilla = try source.prepareVanilla(env.root, env.paths.minecraft);
+        var vanilla = try source.prepareVanilla(env.root);
         defer vanilla.deinit();
         const vanilla_calls = source.vanilla_calls;
         const loader_calls = source.loader_calls;
@@ -1355,7 +1355,7 @@ test "vanilla prepared create rejects wrong kind identity environment stale tamp
     defer manager.deinit();
     manager.setInstaller(fixture.installer());
     var source: PreparedFixture = .{};
-    var prepared = try source.prepareVanilla(env.root, env.paths.minecraft);
+    var prepared = try source.prepareVanilla(env.root);
     defer prepared.deinit();
     var empty: metadata_loader.PreparedVanilla = undefined;
     empty.target.generation = 0;
@@ -1398,7 +1398,7 @@ test "vanilla prepared create clones final request borrows through JOIN and publ
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var source: PreparedFixture = .{};
-    var prepared = try source.prepareVanilla(env.root, env.paths.minecraft);
+    var prepared = try source.prepareVanilla(env.root);
     var owner_live = true;
     defer if (owner_live) prepared.deinit();
     var fixture: Fixture = .{};
@@ -1445,7 +1445,7 @@ test "vanilla prepared cancellation failure recovery and active teardown JOIN re
     var env = try Environment.init();
     defer env.deinit();
     var source: PreparedFixture = .{};
-    var prepared = try source.prepareVanilla(env.root, env.paths.minecraft);
+    var prepared = try source.prepareVanilla(env.root);
     defer prepared.deinit();
     const failures = [_]anyerror{ error.FixtureFailure, error.RecoveryRequired, error.Canceled };
     for (0..4) |index| {
@@ -1528,7 +1528,7 @@ test "instance cancelAndJoin joins active prepared workers without destroying ca
     var source: PreparedFixture = .{};
     var prepared = try source.prepare(env.root);
     defer prepared.deinit();
-    var vanilla = try source.prepareVanilla(env.root, env.paths.minecraft);
+    var vanilla = try source.prepareVanilla(env.root);
     defer vanilla.deinit();
     for ([_]bool{ false, true }) |use_vanilla| {
         var registry = tasks.Registry.init(a);
@@ -2058,11 +2058,23 @@ fn seedDeleteConfiguration(env: *Environment) !void {
 fn expectDeletedConfiguration(store: *const config.Store) !void {
     try std.testing.expectEqual(@as(usize, 1), store.snapshot().instances.len);
     try std.testing.expect(module.sameInstance(delete_other, store.snapshot().instances[0]));
-    try std.testing.expectEqual(@as(usize, 1), store.snapshot().servers.len);
-    try std.testing.expectEqualStrings("unrelated", store.snapshot().servers[0].id);
+    try std.testing.expectEqual(@as(usize, 3), store.snapshot().servers.len);
+    const first = store.snapshot().servers[0];
+    const second = store.snapshot().servers[1];
+    const unrelated = store.snapshot().servers[2];
+    try std.testing.expectEqualStrings("bound-one", first.id);
+    try std.testing.expectEqualStrings("First", first.name);
+    try std.testing.expectEqualStrings("localhost", first.address);
+    try std.testing.expectEqual(@as(u16, 25565), first.port);
+    try std.testing.expect(first.instance_id == null);
+    try std.testing.expectEqualStrings("bound-two", second.id);
+    try std.testing.expectEqualStrings("Second", second.name);
+    try std.testing.expect(second.instance_id == null);
+    try std.testing.expectEqualStrings("unrelated", unrelated.id);
+    try std.testing.expectEqualStrings(delete_other.id, unrelated.instance_id.?);
 }
 
-test "permanent deletion publishes complete removal of bound servers after JOIN only" {
+test "permanent deletion detaches bound servers only after JOIN and preserves records" {
     for ([_]bool{ false, true }) |select_other| {
         var env = try Environment.init();
         defer env.deinit();
@@ -2097,7 +2109,7 @@ test "permanent deletion publishes complete removal of bound servers after JOIN 
             try std.testing.expectEqualStrings("unrelated", env.store.snapshot().selected_server.?);
         } else {
             try std.testing.expect(env.store.snapshot().selected_instance == null);
-            try std.testing.expect(env.store.snapshot().selected_server == null);
+            try std.testing.expectEqualStrings("bound-two", env.store.snapshot().selected_server.?);
         }
         try std.testing.expectEqual(module.Phase.complete, manager.snapshot().phase);
         try std.testing.expect(manager.pending == null and !registry.hasActive());
@@ -2165,7 +2177,7 @@ test "permanent deletion precommit config fault retries the same joined result" 
     defer fault.stop();
     try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
     try std.testing.expect(job.uncertain_publication_store == &env.store);
-    try std.testing.expectEqual(@as(usize, 2), job.deleted_server_ids.?.len);
+    try std.testing.expectEqual(@as(usize, 2), job.unbound_server_ids.?.len);
     try std.testing.expectEqual(@as(usize, 0), fault.renames);
     try fault.expectPublicationProtected();
     const blocked = fault.counts();
@@ -2263,12 +2275,6 @@ test "permanent deletion reconciled committed save acknowledges without overwrit
         try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
     }
     {
-        const selected = env.store.state.value.selected_server;
-        env.store.state.value.selected_server = "bound-two";
-        defer env.store.state.value.selected_server = selected;
-        try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
-    }
-    {
         const snapshot = @constCast(env.store.snapshot());
         const saved = snapshot.servers;
         defer snapshot.servers = saved;
@@ -2312,7 +2318,7 @@ test "permanent deletion external config absence cannot forge owned publication 
             env.store.publication_uncertain = false;
         }
         try std.testing.expectError(error.InstanceConfigurationChanged, manager.publish(&env.store));
-        try std.testing.expect(job.uncertain_publication_store == null and job.deleted_server_ids == null);
+        try std.testing.expect(job.uncertain_publication_store == null and job.unbound_server_ids == null);
         try std.testing.expect(manager.pending.? == job);
         try expectRetained(&manager, &fixture, &registry);
     }

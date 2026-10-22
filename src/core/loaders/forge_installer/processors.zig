@@ -6,6 +6,8 @@ const j = c.j;
 pub const Output = struct { path: []const u8, sha1: ?c.m.Sha1, runtime: bool = false };
 pub const Processor = struct { jar: []const u8, classpath: []const []const u8, args: []const []const u8, outputs: []const Output };
 const Data = std.StringHashMap([]const u8);
+/// External processors receive a private copy, never another instance or a cache file.
+pub const client_relative_path = ".loader/minecraft.jar";
 pub fn build(a: std.mem.Allocator, raw: std.json.Value, artifacts: *std.ArrayList(r.Artifact), root: []const u8, base: []const u8, side: c.Side, members: *std.ArrayList(r.Member)) ![]const Processor {
     var data = Data.init(a);
     try data.put("SIDE", @tagName(side));
@@ -13,7 +15,7 @@ pub fn build(a: std.mem.Allocator, raw: std.json.Value, artifacts: *std.ArrayLis
     try data.put("MINECRAFT_VERSION", base);
     try data.put("LIBRARY_DIR", try c.join(a, root, "libraries"));
     try data.put("INSTALLER", try c.join(a, root, ".loader/installer.jar"));
-    try data.put("MINECRAFT_JAR", try std.fmt.allocPrint(a, "{s}/versions/{s}/{s}.jar", .{ root, base, base }));
+    try data.put("MINECRAFT_JAR", try c.join(a, root, client_relative_path));
     if (try j.optional(raw, "data")) |values| {
         var it = (try j.object(values)).iterator();
         while (it.next()) |entry| {

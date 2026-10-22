@@ -11,13 +11,12 @@ const installation = @import("../install/root.zig");
 const instances = @import("../instances.zig");
 const namespace = @import("../instance_namespace.zig");
 const fs = @import("../install/safe_fs.zig");
-const builtin = @import("builtin");
 const A = std.mem.Allocator;
 pub const Progress = installation.Progress;
 pub const Config = struct {
     version_id: []const u8,
     root: []const u8 = ".minecraft",
-    instance_name: ?[]const u8 = null,
+    target: @import("layout.zig").Target,
     game_directory: ?[]const u8 = null,
     /// Stage extracted natives separately while root retains shared artifacts.
     natives_directory: ?[]const u8 = null,
@@ -29,14 +28,12 @@ pub const Config = struct {
     namespace_token: ?namespace.Token = null,
     /// Worker admission may wait for the short namespace stamp gate.
     worker_checks: bool = false,
-    cpu_arch: ?[]const u8 = null,
     metadata_path: ?[]const u8 = null,
     metadata_limits: m.version.inheritance.Limits = .{},
     manifest_url: []const u8 = m.version_manifest_url,
     /// Metadata cache directory, owned by the caller and not shared by active services.
     http_cache: ?[]const u8 = null,
     environment: m.rules.Environment,
-    native_arch: ?planner.NativeArch = null,
     proxy: ?[]const u8 = null,
     ca_bundle: ?[]const u8 = null,
     window: usize = 16,
@@ -64,12 +61,16 @@ pub fn run(a: A, io: std.Io, service: *dl.Service, config: Config) !Installed {
     defer if (config.namespace_token == null) token.release();
     var reserved_config = config;
     reserved_config.namespace_token = token;
-    const manifest_bytes = try fetch(a, io, service, config, config.manifest_url, null, null);
-    defer a.free(manifest_bytes);
-    var manifest = try m.manifest.parseSlice(a, manifest_bytes);
-    defer manifest.deinit();
-    var fetch_context: FetchContext = .{ .service = service, .config = config };
-    const loaded = try loader.load(a, io, .{ .root = config.root, .version_id = config.version_id, .manifest = manifest.value, .metadata_path = config.metadata_path, .cancel = config.cancel, .limits = config.metadata_limits }, .{ .context = &fetch_context, .fetch = fetchMetadata });
+    const loaded = if (config.metadata_path) |path|
+        try loader.loadInstalled(a, io, .{ .root = config.root, .version_id = config.version_id, .metadata_path = path, .cancel = config.cancel, .limits = config.metadata_limits })
+    else sources: {
+        const manifest_bytes = try fetch(a, io, service, config, config.manifest_url, null, null);
+        defer a.free(manifest_bytes);
+        var manifest = try m.manifest.parseSlice(a, manifest_bytes);
+        defer manifest.deinit();
+        var fetch_context: FetchContext = .{ .service = service, .config = config };
+        break :sources try loader.fetchSources(a, io, .{ .version_id = config.version_id, .manifest = manifest.value, .cancel = config.cancel, .limits = config.metadata_limits }, .{ .context = &fetch_context, .fetch = fetchMetadata });
+    };
     return runLoaded(a, io, service, reserved_config, loaded, null);
 }
 
@@ -80,7 +81,7 @@ pub fn runVanillaPrepared(a: A, io: std.Io, service: *dl.Service, config: Config
     defer if (config.namespace_token == null) token.release();
     var reserved_config = config;
     reserved_config.namespace_token = token;
-    if (!std.mem.eql(u8, config.version_id, target.version_id)) return error.PreparedMetadataMismatch;
+    if (!std.mem.eql(u8, config.version_id, target.version_id) or !std.mem.eql(u8, config.target.name, target.instance_name)) return error.PreparedMetadataMismatch;
     var expected_paths = try instances.Paths.init(a, io, target.root);
     defer expected_paths.deinit();
     var actual_paths = try instances.Paths.init(a, io, config.root);
@@ -97,7 +98,7 @@ const reserveNamespace = @import("../install/namespace.zig").reserve;
 pub fn validateConfig(config: Config) !void {
     if (config.window == 0 or config.window > 128) return error.InvalidWindow;
     try m.version.validateId(config.version_id);
-    if (config.instance_name) |name| try m.version.validateId(name);
+    try config.target.validate();
     try canceled(config.cancel);
 }
 
@@ -129,15 +130,15 @@ pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
     var assets = try m.asset_index.parseSlice(a, assets_bytes);
     defer assets.deinit();
     try control.check();
-    const cpu_arch = config.cpu_arch orelse @tagName(builtin.cpu.arch);
-    var plan = try planner.build(a, version.value, assets.value, config.environment, .{ .root = config.root, .natives = config.natives_directory, .native_arch = config.native_arch, .cpu_arch = cpu_arch, .instance_name = config.instance_name, .game_directory = config.game_directory });
+    const cpu_arch = config.environment.arch;
+    const client_relative_path = try config.target.clientPath(a);
+    defer a.free(client_relative_path);
+    var plan = try planner.build(a, version.value, assets.value, config.environment, .{ .root = config.root, .client_relative_path = client_relative_path, .natives = config.natives_directory, .instance_name = config.target.directory_name, .game_directory = config.game_directory });
     errdefer plan.deinit();
     try control.check();
     var publication_config = config;
     publication_config.namespace_token = token;
-    publication_config.version_id = version.value.id;
-    publication_config.instance_name = config.instance_name orelse config.version_id;
-    const descriptor: ?Publication = if (config.publish_metadata) try preparePublicationControlled(a, io, publication_config, loaded.sources.value, control) else null;
+    const descriptor: ?Publication = if (config.publish_metadata) try preparePublication(a, io, publication_config, version.value, control) else null;
     defer if (descriptor) |value| {
         a.free(value.bytes);
         a.free(value.path);
@@ -243,7 +244,7 @@ pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
         try materializeControlled(a, io, alias, control);
         try control.check();
     }
-    if (descriptor) |value| try publishMetadataControlled(a, io, publication_config, loaded.sources.value, value, control) else try control.check();
+    if (descriptor) |value| try publishMetadata(a, io, publication_config, value, control) else try control.check();
     return .{ .version = version, .plan = plan, .downloaded = downloaded, .reused = reused };
 }
 const PendingDownload = struct { task: *dl.Task, path: []const u8 };
@@ -441,55 +442,32 @@ fn existingMatchesControlled(a: A, io: std.Io, path: []const u8, bytes: []const 
     if (!std.mem.eql(u8, bytes, existing)) return error.InstanceMetadataCollision;
     return true;
 }
-fn preparePublication(a: A, io: std.Io, config: Config, sources: []const loader.Source) !Publication {
-    return preparePublicationControlled(a, io, config, sources, .{ .cancel = config.cancel });
-}
-fn preparePublicationControlled(a: A, io: std.Io, config: Config, sources: []const loader.Source, control: InstallControl) !Publication {
+fn preparePublication(a: A, io: std.Io, config: Config, version: m.version.Version, control: InstallControl) !Publication {
     const token = try reserveNamespace(io, config.namespace_token, config.worker_checks);
     defer if (config.namespace_token == null) token.release();
     try control.check();
-    const name = config.instance_name orelse config.version_id;
-    try m.version.validateId(name);
-    const path = try loader.docPath(a, config.root, name);
+    try config.target.validate();
+    const relative = try config.target.documentPath(a);
+    defer a.free(relative);
+    const path = try std.fs.path.join(a, &.{ config.root, relative });
     errdefer a.free(path);
-    var leaf: ?[]const u8 = null;
-    for (sources, 0..) |source, i| {
-        try control.check();
-        for (sources[0..i]) |prior| if (std.ascii.eqlIgnoreCase(prior.id, source.id)) return error.InstanceMetadataCollision;
-        if (std.mem.eql(u8, source.id, config.version_id)) leaf = source.bytes;
-        if (std.ascii.eqlIgnoreCase(source.id, name) and (!std.mem.eql(u8, source.id, name) or !std.mem.eql(u8, source.id, config.version_id))) return error.InstanceMetadataCollision;
-        const source_path = try loader.docPath(a, config.root, source.id);
-        defer a.free(source_path);
-        _ = try existingMatchesControlled(a, io, source_path, source.bytes, control);
-    }
-    const bytes = if (std.mem.eql(u8, name, config.version_id)) try a.dupe(u8, leaf orelse return error.MissingVersionMetadata) else try std.json.Stringify.valueAlloc(a, .{ .id = name, .inheritsFrom = config.version_id }, .{});
+    var owned = version;
+    owned.id = config.target.name;
+    owned.jar = null;
+    owned.inherits_from = null;
+    const bytes = try @import("version_serialize.zig").serialize(a, owned);
     errdefer a.free(bytes);
     _ = try existingMatchesControlled(a, io, path, bytes, control);
     try control.check();
     return .{ .path = path, .bytes = bytes };
 }
-fn publishMetadata(a: A, io: std.Io, config: Config, sources: []const loader.Source, descriptor: Publication) !void {
-    return publishMetadataControlled(a, io, config, sources, descriptor, .{ .cancel = config.cancel });
-}
-fn publishMetadataControlled(a: A, io: std.Io, config: Config, sources: []const loader.Source, descriptor: Publication, control: InstallControl) !void {
+fn publishMetadata(a: A, io: std.Io, config: Config, descriptor: Publication, control: InstallControl) !void {
     const token = try reserveNamespace(io, config.namespace_token, config.worker_checks);
     defer if (config.namespace_token == null) token.release();
     try control.check();
     _ = try existingMatchesControlled(a, io, descriptor.path, descriptor.bytes, control);
-    for (sources) |source| {
-        try control.check();
-        const path = try loader.docPath(a, config.root, source.id);
-        defer a.free(path);
-        if (std.mem.eql(u8, path, descriptor.path)) continue;
-        if (!try existingMatchesControlled(a, io, path, source.bytes, control)) {
-            try control.check();
-            try fs.writeAtomic(a, io, path, source.bytes, control.cancel);
-            try control.check();
-        }
-    }
-    // The final rename is the success boundary; never check cancellation afterward.
-    _ = try existingMatchesControlled(a, io, descriptor.path, descriptor.bytes, control);
     try control.check();
+    // Publish only this instance; source metadata never creates parent instances.
     try fs.writeAtomic(a, io, descriptor.path, descriptor.bytes, control.cancel);
 }
 fn materialize(a: A, io: std.Io, alias: planner.AssetMaterialization, cancel: fs.Cancel) !void {
@@ -593,14 +571,34 @@ test {
     _ = native;
     _ = loader;
     _ = fs;
+    // Loader preflight shares this executor and must honor the same source boundary.
+    _ = @import("../loaders/install.zig");
 }
 
 test "executor invalid window fails before metadata IO" {
     var service: dl.Service = undefined;
-    try std.testing.expectError(error.InvalidWindow, run(std.testing.allocator, std.testing.io, &service, .{ .version_id = "fixture", .environment = .{ .os_name = "linux", .arch = "x86_64" }, .window = 0 }));
+    try std.testing.expectError(error.InvalidWindow, run(std.testing.allocator, std.testing.io, &service, .{ .target = .{ .directory_name = "Pack", .name = "Pack" }, .version_id = "fixture", .environment = .{ .os_name = "linux", .arch = "x86_64" }, .window = 0 }));
 }
 
-test "version publication retains sources and rejects metadata collisions" {
+test "explicit metadata documents stay local without manifest transport or source fallback" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "provided.json" });
+    defer a.free(path);
+    var service: dl.Service = undefined;
+    const config: Config = .{ .target = .{ .directory_name = "CLI Instance", .name = "CLI Instance" }, .version_id = "CLI Instance", .root = root, .metadata_path = path, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
+    try std.testing.expectError(error.MissingVersionMetadata, run(a, io, &service, config));
+    try fs.writeAtomic(a, io, path, "{\"id\":\"custom\",\"inheritsFrom\":\"missing-parent\"}", null);
+    try std.testing.expectError(error.MissingVersionMetadata, run(a, io, &service, config));
+    try fs.writeAtomic(a, io, path, "{\"id\":\"custom\"}", null);
+    try std.testing.expectError(error.MissingClientDownload, run(a, io, &service, config));
+}
+
+test "publication owns the target without writing source instances" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -608,44 +606,38 @@ test "version publication retains sources and rejects metadata collisions" {
     var buffer: [4096]u8 = undefined;
     const n = try tmp.dir.realPath(io, &buffer);
     const root = buffer[0..n];
-    const sources = [_]loader.Source{ .{ .id = "base", .bytes = "{\"id\":\"base\"}" }, .{ .id = "forge", .bytes = "{\"id\":\"forge\",\"inheritsFrom\":\"base\"}" } };
-    var config: Config = .{ .version_id = "forge", .instance_name = "My Forge", .root = root, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
-    const descriptor = try preparePublication(a, io, config, &sources);
+    var source = try m.version.parseSlice(a, "{\"id\":\"forge\",\"mainClass\":\"fixture.Main\",\"inheritsFrom\":\"base\",\"jar\":\"base\",\"libraries\":[]}");
+    defer source.deinit();
+    const config: Config = .{ .version_id = "forge", .target = .{ .directory_name = "My Forge", .name = "My Forge" }, .root = root, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
+    const descriptor = try preparePublication(a, io, config, source.value, .{});
     defer a.free(descriptor.path);
     defer a.free(descriptor.bytes);
-    try std.testing.expectError(error.FileNotFound, fs.read(a, io, descriptor.path, 1024, null));
+    try std.testing.expectError(error.FileNotFound, fs.read(a, io, descriptor.path, 4096, null));
     var cancel = std.atomic.Value(bool).init(true);
-    config.cancel = &cancel;
-    try std.testing.expectError(error.Canceled, publishMetadata(a, io, config, &sources, descriptor));
-    try std.testing.expectError(error.FileNotFound, fs.read(a, io, descriptor.path, 1024, null));
-    cancel.store(false, .release);
-    try publishMetadata(a, io, config, &sources, descriptor);
-    const bytes = try fs.read(a, io, descriptor.path, 1024, null);
+    try std.testing.expectError(error.Canceled, publishMetadata(a, io, config, descriptor, .{ .cancel = &cancel }));
+    try std.testing.expectError(error.FileNotFound, fs.read(a, io, descriptor.path, 4096, null));
+    try publishMetadata(a, io, config, descriptor, .{});
+    const bytes = try fs.read(a, io, descriptor.path, 4096, null);
     defer a.free(bytes);
     var document = try m.version.parseSlice(a, bytes);
     defer document.deinit();
     try std.testing.expectEqualStrings("My Forge", document.value.id);
-    try std.testing.expectEqualStrings("forge", document.value.inherits_from.?);
-    const base_path = try loader.docPath(a, root, "base");
-    defer a.free(base_path);
-    const base_bytes = try fs.read(a, io, base_path, 1024, null);
-    defer a.free(base_bytes);
-    try std.testing.expectEqualStrings(sources[0].bytes, base_bytes);
-    const repeated = try preparePublication(a, io, config, &sources);
+    try std.testing.expectEqualStrings("fixture.Main", document.value.main_class.?);
+    try std.testing.expect(document.value.inherits_from == null);
+    try std.testing.expect(document.value.jar == null);
+    for ([_][]const u8{ "base", "forge" }) |name| {
+        const path = try loader.docPath(a, root, name);
+        defer a.free(path);
+        try std.testing.expectError(error.FileNotFound, fs.read(a, io, path, 4096, null));
+    }
+    const repeated = try preparePublication(a, io, config, source.value, .{});
     defer a.free(repeated.path);
     defer a.free(repeated.bytes);
-    config.instance_name = "base";
-    try std.testing.expectError(error.InstanceMetadataCollision, preparePublication(a, io, config, &sources));
-    config.instance_name = "FORGE";
-    try std.testing.expectError(error.InstanceMetadataCollision, preparePublication(a, io, config, &sources));
-    config.instance_name = "My Forge";
-    var changed = sources;
-    changed[1].bytes = "{\"id\":\"forge\",\"mainClass\":\"Other\"}";
-    try std.testing.expectError(error.InstanceMetadataCollision, preparePublication(a, io, config, &changed));
-    try std.testing.expect(try existingMatches(a, io, descriptor.path, descriptor.bytes, null));
+    source.value.main_class = "Other";
+    try std.testing.expectError(error.InstanceMetadataCollision, preparePublication(a, io, config, source.value, .{}));
     try writeAtomic(a, io, descriptor.path, "unrelated user descriptor");
-    try std.testing.expectError(error.InstanceMetadataCollision, publishMetadata(a, io, config, &sources, descriptor));
-    const retained = try fs.read(a, io, descriptor.path, 1024, null);
+    try std.testing.expectError(error.InstanceMetadataCollision, publishMetadata(a, io, config, descriptor, .{}));
+    const retained = try fs.read(a, io, descriptor.path, 4096, null);
     defer a.free(retained);
     try std.testing.expectEqualStrings("unrelated user descriptor", retained);
 }
@@ -691,7 +683,7 @@ const prepared_run_base =
     \\{"id":"1.20.1","mainClass":"vanilla.Main","libraries":[],"javaVersion":{"component":"java-runtime-gamma","majorVersion":17},"downloads":{"client":{"url":"https://piston-data.mojang.com/client.jar","sha1":"0000000000000000000000000000000000000000","size":8}}}
 ;
 fn preparedRunConfig(minecraft: []const u8) Config {
-    return .{ .version_id = "1.20.1", .root = minecraft, .instance_name = "private-stage", .environment = .{ .os_name = "linux", .arch = "x86_64" }, .manifest_url = "https://example.invalid/not-replay", .metadata_path = "missing-prepared-version.json" };
+    return .{ .version_id = "1.20.1", .root = minecraft, .target = .{ .directory_name = "private-stage", .name = "Final Vanilla" }, .environment = .{ .os_name = "linux", .arch = "x86_64" }, .manifest_url = "https://example.invalid/not-replay", .metadata_path = "missing-prepared-version.json" };
 }
 
 test "vanilla prepared executor validates config binding and cancellation before reading owner" {
@@ -709,9 +701,9 @@ test "vanilla prepared executor validates config binding and cancellation before
     config.version_id = "../escape";
     try std.testing.expectError(error.UnsafeVersionId, runVanillaPrepared(a, io, &service, config, &prepared, target));
     config.version_id = "1.20.1";
-    config.instance_name = "../escape";
+    config.target.directory_name = "../escape";
     try std.testing.expectError(error.UnsafeVersionId, runVanillaPrepared(a, io, &service, config, &prepared, target));
-    config.instance_name = "private-stage";
+    config.target = .{ .directory_name = "private-stage", .name = "Final Vanilla" };
     var cancel = std.atomic.Value(bool).init(true);
     config.cancel = &cancel;
     try std.testing.expectError(error.Canceled, runVanillaPrepared(a, io, &service, config, &prepared, target));
@@ -741,14 +733,12 @@ const VanillaRunFixture = struct {
     calls: usize = 0,
 
     fn prepare(self: *VanillaRunFixture, a: A, io: std.Io, root: []const u8) !loader.PreparedVanilla {
-        var paths = try instances.Paths.init(a, io, root);
-        defer paths.deinit();
         var checksum: m.Sha1 = undefined;
         std.crypto.hash.Sha1.hash(prepared_run_base, &checksum, .{});
         self.entries = .{.{ .id = "1.20.1", .kind = "release", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.20.1.json", .time = "", .release_time = "", .sha1 = checksum, .compliance_level = null }};
         return loader.prepareVanilla(a, io, .{
             .target = vanillaRunTarget(root),
-            .vanilla = .{ .root = paths.minecraft, .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
+            .vanilla = .{ .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
             .fetcher = .{ .context = self, .fetch = VanillaRunFixture.fetch },
         });
     }
@@ -882,7 +872,7 @@ test "installer namespace blocker rejects artifacts-only runs before any IO" {
     const token = try namespace.acquire(io);
     defer token.release();
     var service: dl.Service = undefined;
-    const config: Config = .{ .version_id = "1.20.1", .root = root, .publish_metadata = false, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
+    const config: Config = .{ .target = .{ .directory_name = "Pack", .name = "Pack" }, .version_id = "1.20.1", .root = root, .publish_metadata = false, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
     try std.testing.expectError(error.InstanceNamespaceBusy, run(std.testing.allocator, io, &service, config));
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "versions", .{ .follow_symlinks = false }));
     try token.recheck();
@@ -893,7 +883,7 @@ test "installer prepared entry validates namespace stamps and never releases a b
     const a = std.testing.allocator;
     var service: dl.Service = undefined;
     var prepared: loader.PreparedVanilla = undefined;
-    var config: Config = .{ .version_id = "1.20.1", .publish_metadata = false, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
+    var config: Config = .{ .target = .{ .directory_name = "Pack", .name = "Pack" }, .version_id = "1.20.1", .publish_metadata = false, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
     const target: loader.VanillaTarget = .{ .root = ".", .instance_id = "fixture", .instance_name = "Pack", .version_id = "other", .generation = 1, .environment = config.environment };
     try std.testing.expectError(error.PreparedMetadataMismatch, runVanillaPrepared(a, io, &service, config, &prepared, target));
     const token = try namespace.acquire(io);
@@ -917,7 +907,7 @@ test "worker installer admission preserves active namespace busy and stale borro
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     var service: dl.Service = undefined;
-    var config: Config = .{ .version_id = "1.20.1", .root = root, .publish_metadata = false, .worker_checks = true, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
+    var config: Config = .{ .target = .{ .directory_name = "Pack", .name = "Pack" }, .version_id = "1.20.1", .root = root, .publish_metadata = false, .worker_checks = true, .environment = .{ .os_name = "linux", .arch = "x86_64" } };
     const old = try namespace.acquire(io);
     defer old.release();
     try std.testing.expectError(error.InstanceNamespaceBusy, run(a, io, &service, config));

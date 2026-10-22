@@ -44,7 +44,7 @@ const Job = struct {
         job.server.id = try owned.dupe(u8, server.id);
         job.server.name = try owned.dupe(u8, server.name);
         job.server.address = try owned.dupe(u8, server.address);
-        job.server.instance_id = try owned.dupe(u8, server.instance_id);
+        job.server.instance_id = if (server.instance_id) |id| try owned.dupe(u8, id) else null;
         return job;
     }
     fn run(self: *Job) void {
@@ -313,7 +313,7 @@ fn sameQueryTarget(left: config.Server, right: config.Server) bool {
         std.mem.eql(u8, left.id, right.id) and
         std.mem.eql(u8, left.name, right.name) and
         std.mem.eql(u8, left.address, right.address) and
-        std.mem.eql(u8, left.instance_id, right.instance_id);
+        std.mem.eql(u8, left.instance_id orelse "", right.instance_id orelse "");
 }
 
 fn nowMilliseconds(io: Io) i64 {
@@ -332,7 +332,7 @@ const Picker = struct {
         var hash = std.hash.Wyhash.init(0);
         for (configured) |server| {
             if (selected) |value| if (sameQueryTarget(value, server)) continue;
-            for ([_][]const u8{ server.id, server.name, server.address, server.instance_id }) |value| {
+            for ([_][]const u8{ server.id, server.name, server.address, server.instance_id orelse "" }) |value| {
                 hash.update(std.mem.asBytes(&value.len));
                 hash.update(value);
             }
@@ -451,7 +451,7 @@ fn fixtureQuery(a: Allocator, io: Io, server: config.Server, options: servers.Op
         return error.Canceled;
     }
     if (std.mem.eql(u8, server.id, "offline")) return error.ConnectionRefused;
-    if (!std.mem.eql(u8, server.name, "Original") or !std.mem.eql(u8, server.instance_id, "instance")) return error.BorrowedConfig;
+    if (!std.mem.eql(u8, server.name, "Original") or !std.mem.eql(u8, server.instance_id orelse "", "instance")) return error.BorrowedConfig;
     return servers.parseStatus(a, "{\"version\":{\"name\":\"fixture\",\"protocol\":1},\"description\":\"Owned\"}");
 }
 fn awaitSettled(manager: *Manager) !void {
@@ -483,7 +483,7 @@ test "manager worker clones every config string and owns published status" {
     try std.testing.expectEqualStrings("owned", snapshot.server.?.id);
     try std.testing.expectEqualStrings("Original", snapshot.server.?.name);
     try std.testing.expectEqualStrings("127.0.0.1", snapshot.server.?.address);
-    try std.testing.expectEqualStrings("instance", snapshot.server.?.instance_id);
+    try std.testing.expectEqualStrings("instance", snapshot.server.?.instance_id.?);
     try std.testing.expectEqualStrings("Owned", snapshot.status.?.motd);
 }
 test "manager selection queues latest cancels old and clear exposes idle without join" {

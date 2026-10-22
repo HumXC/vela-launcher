@@ -5,10 +5,17 @@ const A = std.mem.Allocator;
 const Version = metadata.version.Version;
 const Owned = metadata.Owned;
 
-pub const Options = struct {
+/// Authenticated official sources. Cache ownership belongs to the fetcher adapter.
+pub const FetchOptions = struct {
+    version_id: []const u8,
+    manifest: metadata.manifest.Manifest,
+    cancel: ?*const std.atomic.Value(bool) = null,
+    limits: metadata.version.inheritance.Limits = .{},
+};
+/// Local instance documents only; absent documents never trigger network access.
+pub const InstalledOptions = struct {
     root: []const u8 = ".minecraft",
     version_id: []const u8,
-    manifest: ?metadata.manifest.Manifest = null,
     metadata_path: ?[]const u8 = null,
     cancel: ?*const std.atomic.Value(bool) = null,
     limits: metadata.version.inheritance.Limits = .{},
@@ -47,7 +54,7 @@ pub const VanillaTarget = struct {
 /// Keep the approved manifest and fetcher context frozen until preparation returns.
 pub const VanillaMetadataOptions = struct {
     target: VanillaTarget,
-    vanilla: Options,
+    vanilla: FetchOptions,
     fetcher: Fetcher = .{},
 };
 pub const VanillaSourceBinding = struct {
@@ -138,13 +145,8 @@ pub fn prepareVanilla(a: A, io: std.Io, options: VanillaMetadataOptions) !Prepar
     if (!std.mem.eql(u8, options.target.version_id, options.vanilla.version_id)) return error.PreparedMetadataMismatch;
     const root = try vanillaRoot(a, io, options.target.root);
     defer a.free(root);
-    const expected_root = try std.fs.path.resolve(a, &.{ root, ".minecraft" });
-    defer a.free(expected_root);
-    const metadata_root = try vanillaRoot(a, io, options.vanilla.root);
-    defer a.free(metadata_root);
-    if (!std.mem.eql(u8, expected_root, metadata_root)) return error.PreparedMetadataMismatch;
     try safe_fs.canceled(options.vanilla.cancel);
-    var loaded = try loadTrusted(a, io, options.vanilla, options.fetcher);
+    var loaded = try fetchSources(a, io, options.vanilla, options.fetcher);
     errdefer loaded.deinit();
     const arena = try a.create(std.heap.ArenaAllocator);
     arena.* = .init(a);
@@ -276,26 +278,61 @@ pub fn docPath(a: A, root: []const u8, id: []const u8) ![]const u8 {
     return std.fs.path.join(a, &.{ root, "versions", id, filename });
 }
 
-pub fn load(a: A, io: std.Io, options: Options, fetcher: Fetcher) !Loaded {
-    return loadMode(a, io, options, fetcher, false);
+/// Never reads installed versions. Every source must match the official manifest.
+pub fn fetchSources(a: A, io: std.Io, options: FetchOptions, fetcher: Fetcher) !Loaded {
+    return resolveDocuments(a, io, options.version_id, options.cancel, options.limits, SourceReader{ .options = options, .fetcher = fetcher });
 }
 
-/// The caller supplies an authenticated official manifest, not pack metadata.
-/// Every source, including cached bytes, must match its manifest checksum.
-pub fn loadTrusted(a: A, io: std.Io, options: Options, fetcher: Fetcher) !Loaded {
-    if (options.metadata_path != null) return error.UntrustedMetadataPath;
-    return loadMode(a, io, options, fetcher, true);
+/// Resolves the explicit leaf and local inheritance/jar documents without refetch.
+pub fn loadInstalled(a: A, io: std.Io, options: InstalledOptions) !Loaded {
+    return resolveDocuments(a, io, options.version_id, options.cancel, options.limits, InstalledReader{ .options = options });
 }
 
-fn loadMode(a: A, io: std.Io, options: Options, fetcher: Fetcher, trusted: bool) !Loaded {
-    const limits = options.limits;
+const SourceReader = struct {
+    options: FetchOptions,
+    fetcher: Fetcher,
+    fn allowsLeafId(_: SourceReader) bool {
+        return false;
+    }
+    fn read(self: SourceReader, a: A, io: std.Io, id: []const u8, _: usize, max_bytes: usize) ![]u8 {
+        const request = try trustedRequest(self.options, id, max_bytes);
+        const callback = self.fetcher.fetch orelse return error.MissingVersionMetadata;
+        const body = try callback(self.fetcher.context, a, io, request);
+        errdefer a.free(body);
+        try safe_fs.canceled(self.options.cancel);
+        try verifyBody(body, request);
+        return body;
+    }
+};
+const InstalledReader = struct {
+    options: InstalledOptions,
+    fn allowsLeafId(self: InstalledReader) bool {
+        return self.options.metadata_path != null;
+    }
+    fn read(self: InstalledReader, a: A, io: std.Io, id: []const u8, depth: usize, max_bytes: usize) ![]u8 {
+        if (depth == 0) if (self.options.metadata_path) |path| {
+            return safe_fs.read(a, io, path, max_bytes, self.options.cancel) catch |err| switch (err) {
+                error.FileNotFound => error.MissingVersionMetadata,
+                else => err,
+            };
+        };
+        const path = try docPath(a, self.options.root, id);
+        defer a.free(path);
+        return safe_fs.read(a, io, path, max_bytes, self.options.cancel) catch |err| switch (err) {
+            error.FileNotFound => error.MissingVersionMetadata,
+            else => err,
+        };
+    }
+};
+
+fn resolveDocuments(a: A, io: std.Io, version_id: []const u8, cancel: ?*const std.atomic.Value(bool), limits: metadata.version.inheritance.Limits, reader: anytype) !Loaded {
     if (limits.max_depth == 0 or limits.max_depth > 64 or limits.max_documents == 0 or limits.max_documents > 256 or limits.max_bytes == 0 or limits.max_bytes > 64 * 1024 * 1024) return error.InvalidInheritanceLimits;
-    try safe_fs.canceled(options.cancel);
-    try metadata.version.validateId(options.version_id);
-    var context: Context = .{ .a = a, .io = io, .options = options, .fetcher = fetcher, .trusted = trusted };
+    try safe_fs.canceled(cancel);
+    try metadata.version.validateId(version_id);
+    var context: Context(@TypeOf(reader)) = .{ .a = a, .io = io, .cancel = cancel, .limits = limits, .reader = reader };
     defer context.deinit();
-    _ = try context.visit(options.version_id, 0);
-    try safe_fs.canceled(options.cancel);
+    _ = try context.visit(version_id, 0);
+    try safe_fs.canceled(cancel);
     var resolved = try metadata.version.inheritance.resolve(a, context.documents[0].id, context.documents[0..context.count], limits);
     errdefer resolved.deinit();
     const arena = try a.create(std.heap.ArenaAllocator);
@@ -307,115 +344,76 @@ fn loadMode(a: A, io: std.Io, options: Options, fetcher: Fetcher, trusted: bool)
     const sa = arena.allocator();
     const sources = try sa.alloc(Source, context.count);
     for (sources, 0..) |*source, i| {
-        try safe_fs.canceled(options.cancel);
+        try safe_fs.canceled(cancel);
         source.* = .{ .id = try sa.dupe(u8, context.documents[i].id), .bytes = try sa.dupe(u8, context.bytes[i]) };
     }
     return .{ .version = resolved, .sources = .{ .value = sources, .arena = arena, .backing = a } };
 }
 
-const Context = struct {
-    a: A,
-    io: std.Io,
-    options: Options,
-    fetcher: Fetcher,
-    trusted: bool = false,
-    documents: [256]Version = undefined,
-    parsed: [256]Owned(Version) = undefined,
-    bytes: [256][]u8 = undefined,
-    done: [256]bool = undefined,
-    heights: [256]usize = undefined,
-    count: usize = 0,
-    raw_bytes: usize = 0,
+fn Context(comptime Reader: type) type {
+    return struct {
+        a: A,
+        io: std.Io,
+        cancel: ?*const std.atomic.Value(bool),
+        limits: metadata.version.inheritance.Limits,
+        reader: Reader,
+        documents: [256]Version = undefined,
+        parsed: [256]Owned(Version) = undefined,
+        bytes: [256][]u8 = undefined,
+        done: [256]bool = undefined,
+        heights: [256]usize = undefined,
+        count: usize = 0,
+        raw_bytes: usize = 0,
 
-    fn deinit(self: *Context) void {
-        for (0..self.count) |i| {
-            self.parsed[i].deinit();
-            self.a.free(self.bytes[i]);
-        }
-    }
-
-    fn visit(self: *Context, id: []const u8, depth: usize) anyerror!usize {
-        try safe_fs.canceled(self.options.cancel);
-        try metadata.version.validateId(id);
-        for (self.documents[0..self.count], 0..) |doc, i| {
-            if (std.mem.eql(u8, id, doc.id)) {
-                if (!self.done[i]) return error.InheritanceCycle;
-                if (depth + self.heights[i] > self.options.limits.max_depth) return error.InheritanceDepthExceeded;
-                return self.heights[i];
+        fn deinit(self: *@This()) void {
+            for (0..self.count) |i| {
+                self.parsed[i].deinit();
+                self.a.free(self.bytes[i]);
             }
         }
-        if (depth >= self.options.limits.max_depth) return error.InheritanceDepthExceeded;
-        if (self.count >= self.options.limits.max_documents) return error.TooManyVersionDocuments;
-        const request = if (self.trusted) try trustedRequest(self.options, id, @min(metadata.version.max_document_bytes, self.options.limits.max_bytes - self.raw_bytes)) else null;
-        const canonical = try docPath(self.a, self.options.root, id);
-        defer self.a.free(canonical);
-        const path = if (depth == 0) self.options.metadata_path orelse canonical else canonical;
-        const max_bytes = @min(metadata.version.max_document_bytes, self.options.limits.max_bytes - self.raw_bytes);
-        var downloaded = false;
-        const body = try self.readSource(id, path, max_bytes, request, &downloaded);
-        var retained = false;
-        defer if (!retained) self.a.free(body);
-        try safe_fs.canceled(self.options.cancel);
-        if (body.len > max_bytes) return error.MetadataTooLarge;
-        var parsed = try metadata.version.parseSlice(self.a, body);
-        errdefer if (!retained) parsed.deinit();
-        try metadata.version.validateId(parsed.value.id);
-        if (!(depth == 0 and self.options.metadata_path != null and !downloaded) and !std.mem.eql(u8, parsed.value.id, id)) return error.VersionIdMismatch;
-        const index = self.count;
-        self.documents[index] = parsed.value;
-        self.parsed[index] = parsed;
-        self.bytes[index] = body;
-        self.done[index] = false;
-        self.count += 1;
-        self.raw_bytes += body.len;
-        retained = true;
-        var height: usize = 1;
-        if (parsed.value.inherits_from) |parent| height = @max(height, 1 + try self.visit(parent, depth + 1));
-        if (parsed.value.jar) |jar| height = @max(height, 1 + try self.visit(jar, depth + 1));
-        self.heights[index] = height;
-        self.done[index] = true;
-        return height;
-    }
 
-    // Installed version documents can be reformatted or superseded by Mojang.
-    // Reuse them only when their raw bytes match the approved manifest; a miss
-    // may fetch a fresh, independently verified source without changing the install.
-    fn readSource(self: *Context, id: []const u8, path: []const u8, max_bytes: usize, request: ?Request, downloaded: *bool) ![]u8 {
-        const cached = safe_fs.read(self.a, self.io, path, max_bytes, self.options.cancel) catch |err| switch (err) {
-            error.FileNotFound => {
-                downloaded.* = true;
-                return self.fetch(id, max_bytes, request);
-            },
-            else => return err,
-        };
-        if (request) |bound| verifyBody(cached, bound) catch |err| {
-            self.a.free(cached);
-            if (err != error.ChecksumMismatch or self.fetcher.fetch == null) return err;
-            if (!@import("builtin").is_test) std.log.scoped(.minecraft_metadata).warn("Local metadata at {s} does not match the approved manifest; fetching version {s} again", .{ path, id });
-            downloaded.* = true;
-            return self.fetch(id, max_bytes, request);
-        };
-        return cached;
-    }
+        fn visit(self: *@This(), id: []const u8, depth: usize) anyerror!usize {
+            try safe_fs.canceled(self.cancel);
+            try metadata.version.validateId(id);
+            for (self.documents[0..self.count], 0..) |doc, i| {
+                if (std.mem.eql(u8, id, doc.id)) {
+                    if (!self.done[i]) return error.InheritanceCycle;
+                    if (depth + self.heights[i] > self.limits.max_depth) return error.InheritanceDepthExceeded;
+                    return self.heights[i];
+                }
+            }
+            if (depth >= self.limits.max_depth) return error.InheritanceDepthExceeded;
+            if (self.count >= self.limits.max_documents) return error.TooManyVersionDocuments;
+            const max_bytes = @min(metadata.version.max_document_bytes, self.limits.max_bytes - self.raw_bytes);
+            const body = try self.reader.read(self.a, self.io, id, depth, max_bytes);
+            var retained = false;
+            defer if (!retained) self.a.free(body);
+            try safe_fs.canceled(self.cancel);
+            if (body.len > max_bytes) return error.MetadataTooLarge;
+            var parsed = try metadata.version.parseSlice(self.a, body);
+            errdefer if (!retained) parsed.deinit();
+            try metadata.version.validateId(parsed.value.id);
+            if (!(depth == 0 and self.reader.allowsLeafId()) and !std.mem.eql(u8, parsed.value.id, id)) return error.VersionIdMismatch;
+            const index = self.count;
+            self.documents[index] = parsed.value;
+            self.parsed[index] = parsed;
+            self.bytes[index] = body;
+            self.done[index] = false;
+            self.count += 1;
+            self.raw_bytes += body.len;
+            retained = true;
+            var height: usize = 1;
+            if (parsed.value.inherits_from) |parent| height = @max(height, 1 + try self.visit(parent, depth + 1));
+            if (parsed.value.jar) |jar| height = @max(height, 1 + try self.visit(jar, depth + 1));
+            self.heights[index] = height;
+            self.done[index] = true;
+            return height;
+        }
+    };
+}
 
-    fn fetch(self: *Context, id: []const u8, max_bytes: usize, approved: ?Request) ![]u8 {
-        try safe_fs.canceled(self.options.cancel);
-        const callback = self.fetcher.fetch orelse return error.MissingVersionMetadata;
-        const request = approved orelse request: {
-            const manifest = self.options.manifest orelse return error.MissingVersionMetadata;
-            const entry = manifest.find(id) orelse return error.MissingVersionMetadata;
-            break :request Request{ .id = id, .url = entry.url, .sha1 = entry.sha1, .max_bytes = max_bytes };
-        };
-        const body = try callback(self.fetcher.context, self.a, self.io, request);
-        errdefer self.a.free(body);
-        try safe_fs.canceled(self.options.cancel);
-        try verifyBody(body, request);
-        return body;
-    }
-};
-
-fn trustedRequest(options: Options, id: []const u8, max_bytes: usize) !Request {
-    const manifest = options.manifest orelse return error.MissingVersionMetadata;
+fn trustedRequest(options: FetchOptions, id: []const u8, max_bytes: usize) !Request {
+    const manifest = options.manifest;
     const entry = manifest.find(id) orelse return error.MissingVersionMetadata;
     const hash = entry.sha1 orelse return error.MissingMetadataChecksum;
     const prefixes = [_][]const u8{ "https://piston-meta.mojang.com/", "https://launchermeta.mojang.com/" };
@@ -467,7 +465,7 @@ test "loader local inheritance and explicit jar own every source independently" 
     try fixtureWrite(a, io, root, "base", fixture_base);
     try fixtureWrite(a, io, root, "leaf", fixture_leaf);
     try fixtureWrite(a, io, root, "jar", fixture_jar);
-    var loaded = try load(a, io, .{ .root = root, .version_id = "leaf" }, .{});
+    var loaded = try loadInstalled(a, io, .{ .root = root, .version_id = "leaf" });
     defer loaded.deinit();
     try std.testing.expectEqual(@as(usize, 3), loaded.sources.value.len);
     try std.testing.expectEqualStrings("Main", loaded.version.value.main_class.?);
@@ -476,9 +474,9 @@ test "loader local inheritance and explicit jar own every source independently" 
     loaded.version.deinit();
     loaded.version = try metadata.version.parseSlice(a, fixture_base);
     try std.testing.expectEqualStrings("leaf", loaded.sources.value[0].id);
-    try std.testing.expectError(error.InheritanceDepthExceeded, load(a, io, .{ .root = root, .version_id = "leaf", .limits = .{ .max_depth = 1 } }, .{}));
-    try std.testing.expectError(error.TooManyVersionDocuments, load(a, io, .{ .root = root, .version_id = "leaf", .limits = .{ .max_documents = 1 } }, .{}));
-    try std.testing.expectError(error.MetadataTooLarge, load(a, io, .{ .root = root, .version_id = "leaf", .limits = .{ .max_bytes = 10 } }, .{}));
+    try std.testing.expectError(error.InheritanceDepthExceeded, loadInstalled(a, io, .{ .root = root, .version_id = "leaf", .limits = .{ .max_depth = 1 } }));
+    try std.testing.expectError(error.TooManyVersionDocuments, loadInstalled(a, io, .{ .root = root, .version_id = "leaf", .limits = .{ .max_documents = 1 } }));
+    try std.testing.expectError(error.MetadataTooLarge, loadInstalled(a, io, .{ .root = root, .version_id = "leaf", .limits = .{ .max_bytes = 10 } }));
 }
 
 test "loader missing metadata cycle mismatched id and custom leaf path" {
@@ -488,94 +486,150 @@ test "loader missing metadata cycle mismatched id and custom leaf path" {
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    try std.testing.expectError(error.MissingVersionMetadata, load(a, io, .{ .root = root, .version_id = "missing" }, .{}));
+    try std.testing.expectError(error.MissingVersionMetadata, loadInstalled(a, io, .{ .root = root, .version_id = "missing" }));
     try fixtureWrite(a, io, root, "leaf", "{\"id\":\"leaf\",\"inheritsFrom\":\"leaf\"}");
-    try std.testing.expectError(error.InheritanceCycle, load(a, io, .{ .root = root, .version_id = "leaf" }, .{}));
+    try std.testing.expectError(error.InheritanceCycle, loadInstalled(a, io, .{ .root = root, .version_id = "leaf" }));
     try fixtureWrite(a, io, root, "leaf", fixture_base);
-    try std.testing.expectError(error.VersionIdMismatch, load(a, io, .{ .root = root, .version_id = "leaf" }, .{}));
+    try std.testing.expectError(error.VersionIdMismatch, loadInstalled(a, io, .{ .root = root, .version_id = "leaf" }));
     const path = try std.fs.path.join(a, &.{ root, "custom.json" });
     defer a.free(path);
     try safe_fs.writeAtomic(a, io, path, fixture_base, null);
-    var loaded = try load(a, io, .{ .root = root, .version_id = "Custom Instance", .metadata_path = path }, .{});
+    var loaded = try loadInstalled(a, io, .{ .root = root, .version_id = "Custom Instance", .metadata_path = path });
     defer loaded.deinit();
     try std.testing.expectEqualStrings("base", loaded.version.value.id);
-    try std.testing.expectError(error.InvalidInheritanceLimits, load(a, io, .{ .root = root, .version_id = "base", .limits = .{ .max_depth = 65 } }, .{}));
+    try std.testing.expectError(error.InvalidInheritanceLimits, loadInstalled(a, io, .{ .root = root, .version_id = "base", .limits = .{ .max_depth = 65 } }));
 }
 
-const FixtureFetcher = struct {
+const SourceFixture = struct {
+    bytes: []const u8 = fixture_base,
     calls: usize = 0,
     cancel: ?*std.atomic.Value(bool) = null,
-    fn fetch(pointer: ?*anyopaque, a: A, _: std.Io, request: Request) ![]u8 {
-        const self: *FixtureFetcher = @ptrCast(@alignCast(pointer.?));
+    failure: ?anyerror = null,
+    fn fetch(raw: ?*anyopaque, a: A, _: std.Io, request: Request) ![]u8 {
+        const self: *SourceFixture = @ptrCast(@alignCast(raw.?));
         self.calls += 1;
-        try std.testing.expectEqualStrings("base", request.id);
-        try std.testing.expectEqualStrings("https://example.invalid/base.json", request.url);
+        try std.testing.expect(request.sha1 != null);
         if (self.cancel) |flag| flag.store(true, .release);
-        return a.dupe(u8, fixture_base);
+        if (self.failure) |err| return err;
+        return a.dupe(u8, self.bytes);
     }
 };
-fn fixtureManifest(sha1: ?metadata.Sha1, entries: *[1]metadata.manifest.Entry) metadata.manifest.Manifest {
-    entries.* = .{.{ .id = "base", .kind = "release", .url = "https://example.invalid/base.json", .time = "", .release_time = "", .sha1 = sha1, .compliance_level = null }};
+fn sourceFixtureManifest(entries: *[1]metadata.manifest.Entry) metadata.manifest.Manifest {
+    var hash: metadata.Sha1 = undefined;
+    std.crypto.hash.Sha1.hash(fixture_base, &hash, .{});
+    entries.* = .{.{ .id = "base", .kind = "release", .url = "https://piston-meta.mojang.com/v1/packages/fixture/base.json", .time = "", .release_time = "", .sha1 = hash, .compliance_level = null }};
     return .{ .latest = .{ .release = "base", .snapshot = "base" }, .versions = entries };
 }
 
-test "loader only fetches manifest known documents and independently checks checksum cancellation" {
+test "source fetch ignores same-name installed instances including unreadable documents" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    var callback: FixtureFetcher = .{};
-    const fetcher: Fetcher = .{ .context = &callback, .fetch = FixtureFetcher.fetch };
-    try std.testing.expectError(error.MissingVersionMetadata, load(a, io, .{ .root = root, .version_id = "base" }, fetcher));
-    try std.testing.expectEqual(@as(usize, 0), callback.calls);
-    var sha1: metadata.Sha1 = undefined;
-    std.crypto.hash.Sha1.hash(fixture_base, &sha1, .{});
+    const minecraft_root = try std.fs.path.join(a, &.{ root, ".minecraft" });
+    defer a.free(minecraft_root);
+    // This instance happens to share the requested source ID but runs another MC version.
+    const installed_bytes = "{\"id\":\"base\",\"mainClass\":\"WrongMinecraftVersion\",\"downloads\":{\"client\":{\"url\":\"https://example.invalid/other-minecraft.jar\"}}}";
+    try fixtureWrite(a, io, minecraft_root, "base", installed_bytes);
     var entries: [1]metadata.manifest.Entry = undefined;
-    const manifest = fixtureManifest(sha1, &entries);
-    var loaded = try load(a, io, .{ .root = root, .version_id = "base", .manifest = manifest }, fetcher);
-    defer loaded.deinit();
-    try std.testing.expectEqual(@as(usize, 1), callback.calls);
-    const path = try docPath(a, root, "base");
+    const options: FetchOptions = .{ .version_id = "base", .manifest = sourceFixtureManifest(&entries) };
+    var callback: SourceFixture = .{};
+    const fetcher: Fetcher = .{ .context = &callback, .fetch = SourceFixture.fetch };
+    var source = try fetchSources(a, io, options, fetcher);
+    defer source.deinit();
+    try std.testing.expectEqualStrings(fixture_base, source.sources.value[0].bytes);
+    try std.testing.expectEqualStrings("Main", source.version.value.main_class.?);
+    var installed = try loadInstalled(a, io, .{ .root = minecraft_root, .version_id = "base" });
+    defer installed.deinit();
+    try std.testing.expectEqualStrings("WrongMinecraftVersion", installed.version.value.main_class.?);
+    try std.testing.expectError(error.MissingVersionMetadata, fetchSources(a, io, options, .{}));
+    // Exercise the target-bound preparation while the colliding instance file exists.
+    var fixture: VanillaFixture = .{};
+    var prepared_options = fixture.options(root);
+    prepared_options.target.version_id = "base";
+    prepared_options.vanilla.version_id = "base";
+    var prepared_file = try prepareVanilla(a, io, prepared_options);
+    defer prepared_file.deinit();
+    try std.testing.expectEqualStrings(fixture_base, prepared_file.sources[0].bytes);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    // A directory at the document path must not block source fetching either.
+    const path = try docPath(a, minecraft_root, "base");
     defer a.free(path);
-    try std.testing.expectError(error.FileNotFound, safe_fs.openFile(io, path));
-    entries[0].sha1 = @as([20]u8, @splat(0));
-    try std.testing.expectError(error.ChecksumMismatch, load(a, io, .{ .root = root, .version_id = "base", .manifest = manifest }, fetcher));
-    entries[0].sha1 = sha1;
-    var cancel = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.Canceled, load(a, io, .{ .root = root, .version_id = "base", .cancel = &cancel }, fetcher));
+    try std.Io.Dir.cwd().deleteFile(io, path);
+    try std.Io.Dir.cwd().createDir(io, path, .default_dir);
+    var second = try fetchSources(a, io, options, fetcher);
+    defer second.deinit();
+    try std.testing.expectEqualStrings(fixture_base, second.sources.value[0].bytes);
+    try std.testing.expectEqual(@as(usize, 2), callback.calls);
+    var prepared_directory = try prepareVanilla(a, io, prepared_options);
+    defer prepared_directory.deinit();
+    try std.testing.expectEqualStrings(fixture_base, prepared_directory.sources[0].bytes);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "source fetch requires official provenance for every document and validates returned bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var entries: [1]metadata.manifest.Entry = undefined;
+    var options: FetchOptions = .{ .version_id = "base", .manifest = sourceFixtureManifest(&entries) };
+    var callback: SourceFixture = .{};
+    const fetcher: Fetcher = .{ .context = &callback, .fetch = SourceFixture.fetch };
+    options.version_id = "unknown";
+    try std.testing.expectError(error.MissingVersionMetadata, fetchSources(a, io, options, fetcher));
+    options.version_id = "base";
+    const hash = entries[0].sha1;
+    entries[0].sha1 = null;
+    try std.testing.expectError(error.MissingMetadataChecksum, fetchSources(a, io, options, fetcher));
+    entries[0].sha1 = hash;
+    const url = entries[0].url;
+    for ([_][]const u8{ "https://example.invalid/base.json", "https://piston-meta.mojang.com.evil/base.json", "https://piston-meta.mojang.com/../base.json", "https://piston-meta.mojang.com/base.json?redirect=1" }) |bad_url| {
+        entries[0].url = bad_url;
+        try std.testing.expectError(error.UntrustedMetadataUrl, fetchSources(a, io, options, fetcher));
+    }
+    entries[0].url = url;
+    try std.testing.expectEqual(@as(usize, 0), callback.calls);
+    callback.bytes = "not-json";
+    try std.testing.expectError(error.ChecksumMismatch, fetchSources(a, io, options, fetcher));
+    callback.bytes = "{\"id\":\"other\"}";
+    var other_hash: metadata.Sha1 = undefined;
+    std.crypto.hash.Sha1.hash(callback.bytes, &other_hash, .{});
+    entries[0].sha1 = other_hash;
+    try std.testing.expectError(error.VersionIdMismatch, fetchSources(a, io, options, fetcher));
+    callback.bytes = "{\"id\":\"base\",\"inheritsFrom\":\"unknown\"}";
+    std.crypto.hash.Sha1.hash(callback.bytes, &other_hash, .{});
+    entries[0].sha1 = other_hash;
+    try std.testing.expectError(error.MissingVersionMetadata, fetchSources(a, io, options, fetcher));
+    try std.testing.expectEqual(@as(usize, 3), callback.calls);
+}
+
+test "source fetch preserves cancellation transport failures and byte limits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var entries: [1]metadata.manifest.Entry = undefined;
+    var options: FetchOptions = .{ .version_id = "base", .manifest = sourceFixtureManifest(&entries) };
+    var callback: SourceFixture = .{};
+    const fetcher: Fetcher = .{ .context = &callback, .fetch = SourceFixture.fetch };
+    var cancel: std.atomic.Value(bool) = .init(true);
+    options.cancel = &cancel;
+    try std.testing.expectError(error.Canceled, fetchSources(a, io, options, fetcher));
+    try std.testing.expectEqual(@as(usize, 0), callback.calls);
     cancel.store(false, .release);
     callback.cancel = &cancel;
-    try std.testing.expectError(error.Canceled, load(a, io, .{ .root = root, .version_id = "base", .manifest = manifest, .cancel = &cancel }, fetcher));
+    try std.testing.expectError(error.Canceled, fetchSources(a, io, options, fetcher));
+    cancel.store(false, .release);
+    callback.cancel = null;
+    callback.failure = error.MetadataHttpFailure;
+    try std.testing.expectError(error.MetadataHttpFailure, fetchSources(a, io, options, fetcher));
+    callback.failure = null;
+    options.limits.max_bytes = fixture_base.len - 1;
+    try std.testing.expectError(error.MetadataTooLarge, fetchSources(a, io, options, fetcher));
+    const request: Request = .{ .id = "base", .url = entries[0].url, .sha1 = entries[0].sha1, .size = fixture_base.len + 1, .max_bytes = fixture_base.len };
+    try std.testing.expectError(error.SizeMismatch, verifyBody(fixture_base, request));
 }
 
-fn allocationFixture(a: A, root: []const u8) !void {
-    var callback: FixtureFetcher = .{};
-    var entries: [1]metadata.manifest.Entry = undefined;
-    var loaded = try load(a, std.testing.io, .{ .root = root, .version_id = "base", .manifest = fixtureManifest(null, &entries) }, .{ .context = &callback, .fetch = FixtureFetcher.fetch });
-    defer loaded.deinit();
-}
-test "loader all owned allocations clean up on failure" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{root});
-}
-
-test "loader verifies provided size and download byte bounds" {
-    const request: Request = .{ .id = "base", .url = "https://example.invalid", .sha1 = null, .size = fixture_base.len, .max_bytes = fixture_base.len };
-    try verifyBody(fixture_base, request);
-    var wrong = request;
-    wrong.size = fixture_base.len + 1;
-    try std.testing.expectError(error.SizeMismatch, verifyBody(fixture_base, wrong));
-    wrong = request;
-    wrong.max_bytes = fixture_base.len - 1;
-    try std.testing.expectError(error.MetadataTooLarge, verifyBody(fixture_base, wrong));
-}
-
-test "loader bounds every path through cached shared documents" {
+test "installed loader bounds every path through shared local documents" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -586,186 +640,34 @@ test "loader bounds every path through cached shared documents" {
     try fixtureWrite(a, io, root, "shared", "{\"id\":\"shared\",\"inheritsFrom\":\"base\"}");
     try fixtureWrite(a, io, root, "branch", "{\"id\":\"branch\",\"inheritsFrom\":\"shared\"}");
     try fixtureWrite(a, io, root, "leaf", "{\"id\":\"leaf\",\"inheritsFrom\":\"shared\",\"jar\":\"branch\"}");
-    try std.testing.expectError(error.InheritanceDepthExceeded, load(a, io, .{ .root = root, .version_id = "leaf", .limits = .{ .max_depth = 3 } }, .{}));
-    var loaded = try load(a, io, .{ .root = root, .version_id = "leaf", .limits = .{ .max_depth = 4 } }, .{});
+    try std.testing.expectError(error.InheritanceDepthExceeded, loadInstalled(a, io, .{ .root = root, .version_id = "leaf", .limits = .{ .max_depth = 3 } }));
+    var loaded = try loadInstalled(a, io, .{ .root = root, .version_id = "leaf", .limits = .{ .max_depth = 4 } });
     defer loaded.deinit();
     try std.testing.expectEqual(@as(usize, 4), loaded.sources.value.len);
 }
 
-const TrustedFixture = struct {
-    bytes: []const u8 = fixture_base,
-    calls: usize = 0,
-    cancel_during_fetch: ?*std.atomic.Value(bool) = null,
-    failure: ?anyerror = null,
-    fn fetch(raw: ?*anyopaque, a: A, _: std.Io, request: Request) ![]u8 {
-        const self: *TrustedFixture = @ptrCast(@alignCast(raw.?));
-        self.calls += 1;
-        try std.testing.expect(request.sha1 != null);
-        if (self.cancel_during_fetch) |cancel| cancel.store(true, .release);
-        if (self.failure) |err| return err;
-        return a.dupe(u8, self.bytes);
-    }
-};
-fn trustedFixtureManifest(entries: *[1]metadata.manifest.Entry) metadata.manifest.Manifest {
-    var hash: metadata.Sha1 = undefined;
-    std.crypto.hash.Sha1.hash(fixture_base, &hash, .{});
-    const manifest = fixtureManifest(hash, entries);
-    entries[0].url = "https://piston-meta.mojang.com/v1/packages/fixture/base.json";
-    return manifest;
+fn sourceAllocationFixture(a: A) !void {
+    var entries: [1]metadata.manifest.Entry = undefined;
+    var callback: SourceFixture = .{};
+    var loaded = try fetchSources(a, std.testing.io, .{ .version_id = "base", .manifest = sourceFixtureManifest(&entries) }, .{ .context = &callback, .fetch = SourceFixture.fetch });
+    defer loaded.deinit();
 }
-test "trusted loader refreshes mismatched local bytes without changing ordinary local loading" {
+fn installedAllocationFixture(a: A, root: []const u8) !void {
+    var loaded = try loadInstalled(a, std.testing.io, .{ .root = root, .version_id = "leaf" });
+    defer loaded.deinit();
+}
+test "source and installed loaders release every allocation on failure" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    var entries: [1]metadata.manifest.Entry = undefined;
-    const manifest = trustedFixtureManifest(&entries);
-    const options: Options = .{ .root = root, .version_id = "base", .manifest = manifest };
-    var callback: TrustedFixture = .{};
-    const fetcher: Fetcher = .{ .context = &callback, .fetch = TrustedFixture.fetch };
-    try fixtureWrite(a, io, root, "base", "not-json");
-    try std.testing.expectError(error.ChecksumMismatch, loadTrusted(a, io, options, .{}));
-    var refreshed = try loadTrusted(a, io, options, fetcher);
-    defer refreshed.deinit();
-    try std.testing.expectEqualStrings(fixture_base, refreshed.sources.value[0].bytes);
-    try std.testing.expectEqual(@as(usize, 1), callback.calls);
-    const path = try docPath(a, root, "base");
-    defer a.free(path);
-    const unchanged = try safe_fs.read(a, io, path, 1024, null);
-    defer a.free(unchanged);
-    try std.testing.expectEqualStrings("not-json", unchanged);
+    try fixtureWrite(a, io, root, "leaf", fixture_leaf);
     try fixtureWrite(a, io, root, "base", fixture_base);
-    var loaded = try loadTrusted(a, io, options, fetcher);
-    defer loaded.deinit();
-    try std.testing.expectEqualStrings(fixture_base, loaded.sources.value[0].bytes);
-    try std.testing.expectEqual(@as(usize, 1), callback.calls);
-    entries[0].sha1 = null;
-    try std.testing.expectError(error.MissingMetadataChecksum, loadTrusted(a, io, options, fetcher));
-    var ordinary = try load(a, io, .{ .root = root, .version_id = "base" }, .{});
-    defer ordinary.deinit();
-    entries[0].url = "https://example.invalid/base.json";
-    entries[0].sha1 = @as([20]u8, @splat(0));
-    try std.testing.expectError(error.UntrustedMetadataUrl, loadTrusted(a, io, options, fetcher));
-    var custom = options;
-    custom.metadata_path = "arbitrary.json";
-    try std.testing.expectError(error.UntrustedMetadataPath, loadTrusted(a, io, custom, fetcher));
-    try std.testing.expectEqual(@as(usize, 1), callback.calls);
-}
-test "trusted refresh rejects invalid remote bytes and preserves cancellation and limits" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    const local_bytes = "{\"id\":\"base\",\"mainClass\":\"Local\"}";
-    try fixtureWrite(a, io, root, "base", local_bytes);
-    var entries: [1]metadata.manifest.Entry = undefined;
-    var options: Options = .{ .root = root, .version_id = "base", .manifest = trustedFixtureManifest(&entries) };
-    var callback: TrustedFixture = .{ .bytes = "not-json" };
-    const fetcher: Fetcher = .{ .context = &callback, .fetch = TrustedFixture.fetch };
-    try std.testing.expectError(error.ChecksumMismatch, loadTrusted(a, io, options, fetcher));
-    try std.testing.expectEqual(@as(usize, 1), callback.calls);
-    const path = try docPath(a, root, "base");
-    defer a.free(path);
-    const unchanged = try safe_fs.read(a, io, path, 1024, null);
-    defer a.free(unchanged);
-    try std.testing.expectEqualStrings(local_bytes, unchanged);
-    var cancel: std.atomic.Value(bool) = .init(true);
-    options.cancel = &cancel;
-    try std.testing.expectError(error.Canceled, loadTrusted(a, io, options, fetcher));
-    try std.testing.expectEqual(@as(usize, 1), callback.calls);
-    cancel.store(false, .release);
-    callback.bytes = fixture_base;
-    callback.cancel_during_fetch = &cancel;
-    try std.testing.expectError(error.Canceled, loadTrusted(a, io, options, fetcher));
-    try std.testing.expectEqual(@as(usize, 2), callback.calls);
-    cancel.store(false, .release);
-    callback.cancel_during_fetch = null;
-    callback.failure = error.MetadataHttpFailure;
-    try std.testing.expectError(error.MetadataHttpFailure, loadTrusted(a, io, options, fetcher));
-    try std.testing.expectEqual(@as(usize, 3), callback.calls);
-    callback.failure = null;
-    options.limits.max_bytes = 4;
-    try std.testing.expectError(error.MetadataTooLarge, loadTrusted(a, io, options, fetcher));
-    try std.testing.expectEqual(@as(usize, 3), callback.calls);
-    options.limits = .{};
-    callback.bytes = "{\"id\":\"other\"}";
-    var other_sha: metadata.Sha1 = undefined;
-    std.crypto.hash.Sha1.hash(callback.bytes, &other_sha, .{});
-    entries[0].sha1 = other_sha;
-    try std.testing.expectError(error.VersionIdMismatch, loadTrusted(a, io, options, fetcher));
-    try std.testing.expectEqual(@as(usize, 4), callback.calls);
-}
-
-const formatted_fixture_base = "{\"id\": \"base\", \"mainClass\": \"Main\", \"downloads\": {\"client\": {\"url\": \"https://example.invalid/base.jar\"}}}";
-
-fn trustedRefreshAllocationFixture(a: A, root: []const u8) !void {
-    var entries: [1]metadata.manifest.Entry = undefined;
-    const manifest = trustedFixtureManifest(&entries);
-    var hash: metadata.Sha1 = undefined;
-    std.crypto.hash.Sha1.hash(formatted_fixture_base, &hash, .{});
-    entries[0].sha1 = hash;
-    var callback: TrustedFixture = .{ .bytes = formatted_fixture_base };
-    var loaded = try loadTrusted(a, std.testing.io, .{ .root = root, .version_id = "base", .manifest = manifest }, .{ .context = &callback, .fetch = TrustedFixture.fetch });
-    defer loaded.deinit();
-    try std.testing.expectEqualStrings(formatted_fixture_base, loaded.sources.value[0].bytes);
-    try std.testing.expectEqual(@as(usize, 1), callback.calls);
-}
-
-test "trusted refresh handles serialized installed metadata and every allocation failure" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    var parsed = try metadata.version.parseSlice(a, formatted_fixture_base);
-    defer parsed.deinit();
-    const serialized = try @import("version_serialize.zig").serialize(a, parsed.value);
-    defer a.free(serialized);
-    try std.testing.expect(!std.mem.eql(u8, formatted_fixture_base, serialized));
-    try fixtureWrite(a, io, root, "base", serialized);
-    try @import("test_allocations").checkAllAllocationFailures(a, trustedRefreshAllocationFixture, .{root});
-}
-
-test "trusted loader verifies fetched bytes and fails before fetch for missing provenance" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    defer a.free(root);
-    var entries: [1]metadata.manifest.Entry = undefined;
-    const manifest = trustedFixtureManifest(&entries);
-    var callback: TrustedFixture = .{ .bytes = "not-json" };
-    const fetcher: Fetcher = .{ .context = &callback, .fetch = TrustedFixture.fetch };
-    const options: Options = .{ .root = root, .version_id = "base", .manifest = manifest };
-    try std.testing.expectError(error.ChecksumMismatch, loadTrusted(a, std.testing.io, options, fetcher));
-    try std.testing.expectEqual(@as(usize, 1), callback.calls);
-    callback.bytes = fixture_base;
-    var loaded = try loadTrusted(a, std.testing.io, options, fetcher);
-    defer loaded.deinit();
-    const path = try docPath(a, root, "base");
-    defer a.free(path);
-    try std.testing.expectError(error.FileNotFound, safe_fs.openFile(std.testing.io, path));
-    entries[0].sha1 = null;
-    try std.testing.expectError(error.MissingMetadataChecksum, loadTrusted(a, std.testing.io, options, fetcher));
-    try std.testing.expectEqual(@as(usize, 2), callback.calls);
-}
-fn trustedAllocationFixture(a: A, root: []const u8) !void {
-    var entries: [1]metadata.manifest.Entry = undefined;
-    var callback: TrustedFixture = .{};
-    var loaded = try loadTrusted(a, std.testing.io, .{ .root = root, .version_id = "base", .manifest = trustedFixtureManifest(&entries) }, .{ .context = &callback, .fetch = TrustedFixture.fetch });
-    defer loaded.deinit();
-}
-test "trusted loader allocation failures release every source and resolved document" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, trustedAllocationFixture, .{root});
+    try fixtureWrite(a, io, root, "jar", fixture_jar);
+    try @import("test_allocations").checkAllAllocationFailures(a, sourceAllocationFixture, .{});
+    try @import("test_allocations").checkAllAllocationFailures(a, installedAllocationFixture, .{root});
 }
 
 const vanilla_fixture_leaf = "{\"id\":\"leaf\",\"inheritsFrom\":\"base\",\"javaVersion\":{\"component\":\"java-runtime-delta\",\"majorVersion\":21}}";
@@ -774,7 +676,7 @@ const VanillaFixture = struct {
     calls: usize = 0,
     base_bytes: []const u8 = fixture_base,
     cancel_during_fetch: ?*std.atomic.Value(bool) = null,
-    fn options(self: *VanillaFixture, root: []const u8, metadata_root: []const u8) VanillaMetadataOptions {
+    fn options(self: *VanillaFixture, root: []const u8) VanillaMetadataOptions {
         self.entries = .{
             .{ .id = "leaf", .kind = "release", .url = "https://piston-meta.mojang.com/v1/packages/fixture/leaf.json", .time = "", .release_time = "", .sha1 = undefined, .compliance_level = null },
             .{ .id = "base", .kind = "release", .url = "https://launchermeta.mojang.com/v1/packages/fixture/base.json", .time = "", .release_time = "", .sha1 = undefined, .compliance_level = null },
@@ -787,7 +689,7 @@ const VanillaFixture = struct {
         self.entries[1].sha1 = base_sha;
         return .{
             .target = .{ .root = root, .instance_id = "vanilla-id", .instance_name = "vanilla-game", .version_id = "leaf", .generation = 17, .environment = .{ .os_name = "linux", .arch = "x86_64" } },
-            .vanilla = .{ .root = metadata_root, .version_id = "leaf", .manifest = .{ .latest = .{ .release = "leaf", .snapshot = "leaf" }, .versions = &self.entries } },
+            .vanilla = .{ .version_id = "leaf", .manifest = .{ .latest = .{ .release = "leaf", .snapshot = "leaf" }, .versions = &self.entries } },
             .fetcher = .{ .context = self, .fetch = fetch },
         };
     }
@@ -809,7 +711,7 @@ test "vanilla prepared inherited metadata owns bindings and replay survives owne
     const metadata_root = try std.fs.path.join(a, &.{ root, ".minecraft" });
     defer a.free(metadata_root);
     var fixture: VanillaFixture = .{};
-    var options = fixture.options(root, metadata_root);
+    var options = fixture.options(root);
     var feature_name = [_]u8{ 'q', 'u', 'i', 'c', 'k' };
     var features = [_]metadata.rules.Feature{.{ .name = &feature_name, .enabled = true }};
     options.target.environment.features = &features;
@@ -848,7 +750,7 @@ test "vanilla prepared inherited metadata owns bindings and replay survives owne
     const path = try docPath(a, metadata_root, "leaf");
     defer a.free(path);
     try std.testing.expectError(error.FileNotFound, safe_fs.openFile(io, path));
-    options = fixture.options(root, metadata_root);
+    options = fixture.options(root);
     options.target.version_id = "base";
     options.vanilla.version_id = "base";
     var baseline = try prepareVanilla(a, io, options);
@@ -872,13 +774,13 @@ test "vanilla preparation rejects wrong identity corrupt provenance tampering an
     const metadata_root = try std.fs.path.join(a, &.{ root, ".minecraft" });
     defer a.free(metadata_root);
     var fixture: VanillaFixture = .{};
-    const options = fixture.options(root, metadata_root);
+    const options = fixture.options(root);
     var wrong = options;
     wrong.target.generation = 0;
     try std.testing.expectError(error.InvalidPreparationGeneration, prepareVanilla(a, io, wrong));
     wrong = options;
-    wrong.vanilla.root = root;
-    try std.testing.expectError(error.PreparedMetadataMismatch, prepareVanilla(a, io, wrong));
+    wrong.target.root = "";
+    try std.testing.expectError(error.InvalidLauncherRoot, prepareVanilla(a, io, wrong));
     wrong = options;
     wrong.vanilla.version_id = "other";
     try std.testing.expectError(error.PreparedMetadataMismatch, prepareVanilla(a, io, wrong));
@@ -895,7 +797,7 @@ test "vanilla preparation rejects wrong identity corrupt provenance tampering an
     fixture.entries[1].sha1 = null;
     const parent_calls = fixture.calls;
     try std.testing.expectError(error.MissingMetadataChecksum, prepareVanilla(a, io, options));
-    try std.testing.expectEqual(parent_calls, fixture.calls);
+    try std.testing.expectEqual(parent_calls + 1, fixture.calls);
     fixture.entries[1].sha1 = parent_sha;
     var prepared = try prepareVanilla(a, io, options);
     defer prepared.deinit();
@@ -959,10 +861,8 @@ test "vanilla preparation rejects wrong identity corrupt provenance tampering an
 }
 
 fn vanillaAllocationFixture(a: A, root: []const u8) !void {
-    const metadata_root = try std.fs.path.join(a, &.{ root, ".minecraft" });
-    defer a.free(metadata_root);
     var fixture: VanillaFixture = .{};
-    var prepared = try prepareVanilla(a, std.testing.io, fixture.options(root, metadata_root));
+    var prepared = try prepareVanilla(a, std.testing.io, fixture.options(root));
     defer prepared.deinit();
     var loaded = try prepared.replayBase(a, std.testing.io, prepared.target, null);
     defer loaded.deinit();

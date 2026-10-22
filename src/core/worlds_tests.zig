@@ -343,7 +343,7 @@ test "rename failures rollback or explicitly retain uncertain committed state" {
         table.dirRenamePreserve = Fault.rename;
         table.fileSync = Fault.sync;
         const injected: std.Io = .{ .userdata = io.userdata, .vtable = &table };
-        var result = try w.renameFolder(a, injected, &paths, .{ .instance = one, .folder = "World" }, "New", .{ .scope = coordinator.worldScope(3) });
+        var result = try w.rename(a, injected, &paths, .{ .instance = one, .folder = "World" }, "New", .{ .scope = coordinator.worldScope(3) });
         defer result.deinit();
         try std.testing.expectEqual(if (Fault.mode == .candidate_fail) @TypeOf(result.state).rolled_back else @TypeOf(result.state).uncertain, result.state);
         try std.testing.expect(result.cause != null);
@@ -458,7 +458,6 @@ fn expectDeniedBeforeFilesystem(expected: anyerror, injected: std.Io, paths: *in
     try std.testing.expectError(expected, w.copy(a, injected, paths, source, target, options));
     try std.testing.expectError(expected, w.restore(a, injected, paths, .{ .instance = one, .id = "00000000000000000000000000000000" }, target, options));
     try std.testing.expectError(expected, w.rename(a, injected, paths, source, "Renamed", options));
-    try std.testing.expectError(expected, w.renameFolder(a, injected, paths, source, "Renamed", options));
     try std.testing.expectError(expected, w.renameDisplayName(a, injected, paths, source, "New name", options));
     try std.testing.expectError(expected, w.delete(a, injected, paths, source, options));
 }
@@ -746,7 +745,7 @@ test "Java locked source blocks every world data operation and locked overwrite 
         defer player.stop();
         try std.testing.expectError(error.WorldLocked, w.backup(a, io, &paths, source, options));
         try std.testing.expectError(error.WorldLocked, w.copy(a, io, &paths, source, target, options));
-        try std.testing.expectError(error.WorldLocked, w.renameFolder(a, io, &paths, source, "Renamed", options));
+        try std.testing.expectError(error.WorldLocked, w.rename(a, io, &paths, source, "Renamed", options));
         try std.testing.expectError(error.WorldLocked, w.renameDisplayName(a, io, &paths, source, "New name", options));
         try std.testing.expectError(error.WorldLocked, w.delete(a, io, &paths, source, options));
     }
@@ -855,8 +854,7 @@ test "source target and candidate remain natively locked through committed notif
     try std.testing.expectEqual(w.WorldAccess.available, world_lock.probe(io, target, "session.lock"));
 }
 
-test "legacy recovery session token is excluded from integrity data but held during restore" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+test "restore rejects manifests that include transient session tokens" {
     const tree = @import("worlds_tree.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -889,14 +887,14 @@ test "legacy recovery session token is excluded from integrity data but held dur
     defer a.free(document);
     try write(record, "manifest.json", document);
     const target: w.WorldRef = .{ .instance = two, .folder = "Restored" };
-    {
-        const player = try JavaLockProcess.start(payload, "session.lock");
-        defer player.stop();
-        try std.testing.expectError(error.WorldLocked, w.restore(a, io, &paths, .{ .instance = one, .id = backed.recovery_id }, target, options));
-    }
-    var restored = try w.restore(a, io, &paths, .{ .instance = one, .id = backed.recovery_id }, target, options);
-    defer restored.deinit();
-    try std.testing.expectEqual(@as(u64, 0), (try tmp.dir.statFile(io, ".minecraft/versions/Two/saves/Restored/session.lock", .{})).size);
+    try std.testing.expectError(error.IntegrityMismatch, w.restore(a, io, &paths, .{ .instance = one, .id = backed.recovery_id }, target, options));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/Two/saves/Restored", .{}));
+    const unchanged_manifest = try tree.readBounded(a, io, record, "manifest.json", 1024 * 1024);
+    defer a.free(unchanged_manifest);
+    try std.testing.expectEqualStrings(document, unchanged_manifest);
+    const unchanged_token = try tree.readBounded(a, io, payload, "session.lock", 1024);
+    defer a.free(unchanged_token);
+    try std.testing.expectEqualStrings(token, unchanged_token);
 }
 
 test "overwrite rechecks target data after candidate preparation" {
@@ -972,7 +970,7 @@ test "read-only world providers and held scopes cannot authorize mutations" {
     const target: w.WorldRef = .{ .instance = two, .folder = "Target" };
     try std.testing.expectError(error.ReadOnlyWorldScope, w.backup(a, io, &paths, source, options));
     try std.testing.expectError(error.ReadOnlyWorldScope, w.copy(a, io, &paths, source, target, options));
-    try std.testing.expectError(error.ReadOnlyWorldScope, w.renameFolder(a, io, &paths, source, "Renamed", options));
+    try std.testing.expectError(error.ReadOnlyWorldScope, w.rename(a, io, &paths, source, "Renamed", options));
     try std.testing.expectError(error.ReadOnlyWorldScope, w.renameDisplayName(a, io, &paths, source, "New name", options));
     try std.testing.expectError(error.ReadOnlyWorldScope, w.delete(a, io, &paths, source, options));
     try std.testing.expectError(error.ReadOnlyWorldScope, w.restore(a, io, &paths, .{ .instance = one, .id = "00112233445566778899aabbccddeeff" }, target, options));

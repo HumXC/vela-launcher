@@ -81,7 +81,6 @@ const HomeFrame = struct {
     var manager: *java.Manager = undefined;
     var services: view.Services = undefined;
     var pending: ?model.Msg = null;
-    var library_phase: games.Phase = .loading;
     var process_phase: launch.Phase = .idle;
     var page: enum { home, games, accounts } = .home;
     var rendered_texts: usize = 0;
@@ -105,13 +104,12 @@ const HomeFrame = struct {
         _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 276 } });
         const pane = dvui.box(@src(), .{}, .{ .expand = .both, .padding = dvui.Rect.all(if (dvui.windowRect().h < 520) 12 else 32) });
         defer pane.deinit();
-        const library: games.Snapshot = .{ .installed = &.{}, .available = &.{}, .phase = library_phase, .failure = null, .completed = 0, .total = 0, .installing_version = null };
         const process: launch.Snapshot = .{ .phase = process_phase, .failure = null, .exit_code = null, .version = null, .version_id = null, .debug = false, .attempt_id = 0 };
         switch (page) {
-            .home => try view.drawHome(&state, library, manager, process, &pending, services),
-            .games => view.drawGameSelection(&state, library, process, &pending, services),
+            .home => try view.drawHome(&state, process, &pending, services),
+            .games => view.drawGameSelection(&state, process, &pending, services),
             .accounts => {
-                view.drawAccountSelection(&state, library, process, &pending, services);
+                view.drawAccountSelection(&state, process, &pending, services);
                 @import("ui/accounts_view.zig").finish(services.accounts_ui.?, services.configuration, services.accounts.?);
             },
         }
@@ -223,7 +221,6 @@ test "UI layout Home Choose Game and Choose Account reserve Start and preserve n
         theme.font_title = theme.font_body.withSize(24);
         window.window.themeSet(theme);
         HomeFrame.services.task_viewport_height = size.h;
-        HomeFrame.library_phase = .loading;
         HomeFrame.process_phase = .idle;
         HomeFrame.pending = null;
         try std.testing.expectEqual(@as(usize, if (fixture.page == .accounts) 1 else 0), store.snapshot().accounts.len);
@@ -354,15 +351,13 @@ test "UI layout Home Choose Game and Choose Account reserve Start and preserve n
             try std.testing.expectEqualStrings("Player_A", store.snapshot().accounts[0].name);
             try std.testing.expectEqual(start.rect, (try dvui.testing.tagGet(start_tag)).rect);
         }
-        for ([_]struct { library: games.Phase, process: launch.Phase, allow_mutations: bool = true, creation_phase: @import("ui/instance_creation_controller.zig").Phase = .idle }{
-            .{ .library = .loading, .process = .preparing },
-            .{ .library = .loading, .process = .running },
-            .{ .library = .installing, .process = .idle },
-            .{ .library = .loading, .process = .idle, .allow_mutations = false },
-            .{ .library = .loading, .process = .idle, .creation_phase = .preparing },
-            .{ .library = .loading, .process = .idle, .creation_phase = .awaiting_publication },
+        for ([_]struct { process: launch.Phase, allow_mutations: bool = true, creation_phase: @import("ui/instance_creation_controller.zig").Phase = .idle }{
+            .{ .process = .preparing },
+            .{ .process = .running },
+            .{ .process = .idle, .allow_mutations = false },
+            .{ .process = .idle, .creation_phase = .preparing },
+            .{ .process = .idle, .creation_phase = .awaiting_publication },
         }) |busy| {
-            HomeFrame.library_phase = busy.library;
             HomeFrame.process_phase = busy.process;
             HomeFrame.services.allow_mutations = busy.allow_mutations;
             // Model task snapshots without starting workers, native Java, or network requests.
@@ -697,7 +692,7 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
     defer registry.deinit();
     var manager = try java.Manager.init(a, std.testing.io, root);
     defer manager.deinit();
-    var library = try games.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
+    var library = try games.Controller.initWithOptions(a, std.testing.io, .{ .root = root });
     defer library.deinit();
     var launcher = try launch.Controller.init(a, std.testing.io, root);
     defer launcher.deinit();
@@ -954,7 +949,7 @@ const EditorsFrame = struct {
         server_pane.deinit();
         const instance_pane = dvui.box(@src(), .{}, .{ .expand = .both, .padding = dvui.Rect.all(12) });
         const instance_rect = instance_pane.data().contentRectScale().r;
-        instances_view.draw(instance_ui, store, instance_service, .{ .installed = &.{}, .available = &.{}, .phase = .idle, .failure = null, .completed = 0, .total = 0, .installing_version = null }, &.{});
+        instances_view.draw(instance_ui, store, instance_service, .{ .installed = &.{}, .available = &.{}, .phase = .idle, .failure = null }, &.{});
         instance_pane.deinit();
         for (commands.items) |command| switch (command.cmd) {
             .text => |text| {
@@ -1818,8 +1813,8 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
     defer a.free(root);
     const visible_path = "/fixture/registered-runtime-with-a-long-directory-name/another-long-directory/bin/java";
     const hidden_path = "/fixture/hidden-runtime-with-a-long-directory-name/another-long-directory/bin/java";
-    const visible: java.Runtime = .{ .path = visible_path, .major = 21, .vendor = "Fixture Visible" };
-    const hidden: java.Runtime = .{ .path = hidden_path, .major = 17, .vendor = "Fixture Hidden" };
+    const visible: java.Runtime = .{ .path = visible_path, .major = 21, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Visible" };
+    const hidden: java.Runtime = .{ .path = hidden_path, .major = 17, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Hidden" };
     const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 1), .runtimes = &[_]java.Runtime{ visible, hidden }, .hidden = &[_]java.Runtime{hidden} }, .{});
     defer a.free(fixture);
     try tmp.dir.createDirPath(std.testing.io, ".vela");
@@ -1968,8 +1963,8 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
     defer a.free(visible_path);
     const hidden_path = try std.fs.path.join(a, &.{ root, "hidden", "bin", "java" });
     defer a.free(hidden_path);
-    const visible: java.Runtime = .{ .path = visible_path, .major = 21, .vendor = "Fixture Visible" };
-    const hidden: java.Runtime = .{ .path = hidden_path, .major = 17, .vendor = "Fixture Hidden" };
+    const visible: java.Runtime = .{ .path = visible_path, .major = 21, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Visible" };
+    const hidden: java.Runtime = .{ .path = hidden_path, .major = 17, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Hidden" };
     const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 1), .runtimes = &[_]java.Runtime{ visible, hidden }, .hidden = &[_]java.Runtime{hidden} }, .{});
     defer a.free(fixture);
     try tmp.dir.createDirPath(std.testing.io, ".vela");
@@ -2153,7 +2148,7 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
         // A refreshed result of the same length must invalidate the old selection
         // before the fixed footer handles an already-visible Add button click.
         manager.state.search_visible.clearRetainingCapacity();
-        try manager.state.search_visible.append(manager.state.arena.allocator(), .{ .path = "/fixture/search-previous", .vendor = "Fixture Search", .major = 21 });
+        try manager.state.search_visible.append(manager.state.arena.allocator(), .{ .path = "/fixture/search-previous", .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Search", .major = 21 });
         try dvui.testing.settle(JavaFrame.draw);
         try std.testing.expectEqual(@as(usize, 1), ui.search_selection.len);
         ui.search_selection[0] = true;
@@ -2192,7 +2187,7 @@ test "UI layout Java removing all registered runtimes keeps a new scan in local 
     defer a.free(root);
     var manager = try java.Manager.init(a, std.testing.io, root);
     defer manager.deinit();
-    const runtime: java.Runtime = .{ .path = "/fixture/rescanned/bin/java", .vendor = "Rescanned Java", .major = 21 };
+    const runtime: java.Runtime = .{ .path = "/fixture/rescanned/bin/java", .architecture = @import("core/java_runtime.zig").host(), .vendor = "Rescanned Java", .major = 21 };
     try manager.addDownloaded(runtime);
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
@@ -2332,7 +2327,7 @@ test "UI layout Java folder browse queues after draft edits and blocks stale com
     try std.testing.expect(ui.picker_ticket == null);
     try std.testing.expect(!service.isBusy());
     _ = try JavaFrame.clickTag("java-acquire-local");
-    try manager.state.search_visible.append(manager.state.arena.allocator(), .{ .path = "/fixture/previous/java", .vendor = "Previous", .major = 21 });
+    try manager.state.search_visible.append(manager.state.arena.allocator(), .{ .path = "/fixture/previous/java", .architecture = @import("core/java_runtime.zig").host(), .vendor = "Previous", .major = 21 });
     try dvui.testing.settle(JavaFrame.draw);
     ui.search_selection[0] = true;
     _ = try JavaFrame.clickTag("java-search-browse");
@@ -2790,7 +2785,7 @@ const EditorTextFrame = struct {
             if (server) {
                 servers_view.draw(EditorsFrame.server_ui, EditorsFrame.store, EditorsFrame.server_service);
             } else {
-                instances_view.draw(EditorsFrame.instance_ui, EditorsFrame.store, EditorsFrame.instance_service, .{ .installed = &.{}, .available = &.{}, .phase = .idle, .failure = null, .completed = 0, .total = 0, .installing_version = null }, &.{});
+                instances_view.draw(EditorsFrame.instance_ui, EditorsFrame.store, EditorsFrame.instance_service, .{ .installed = &.{}, .available = &.{}, .phase = .idle, .failure = null }, &.{});
             }
         }
         // Observe real text-layout render commands and their effective scissor,

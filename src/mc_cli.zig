@@ -94,10 +94,10 @@ fn run(init: std.process.Init) !void {
     std.debug.print("Installing {s} into {s}\n", .{ args[2], absolute_root });
     var installed = try install.run(a, io, service, .{
         .version_id = args[2],
+        .target = .{ .directory_name = args[2], .name = args[2] },
         .root = absolute_root,
         .manifest_url = manifest_url,
         .environment = environment,
-        .native_arch = if (@sizeOf(usize) == 8) .bits64 else .bits32,
         .proxy = proxy,
         .ca_bundle = ca_bundle,
         .progress = reportProgress,

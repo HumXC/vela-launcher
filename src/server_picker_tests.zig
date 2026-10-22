@@ -69,7 +69,7 @@ const Fixture = struct {
         // ownership test checks worker inputs as well as snapshot metadata.
         status.motd = try owned.dupe(u8, server.name);
         status.version = try owned.dupe(u8, server.address);
-        status.description = .{ .string = try owned.dupe(u8, server.instance_id) };
+        status.description = .{ .string = try owned.dupe(u8, server.instance_id orelse "unbound") };
         status.latency_ms = server.port;
         return status;
     }
@@ -127,7 +127,7 @@ fn expectTarget(snapshot: server_manager.Snapshot, id: []const u8, name: []const
     try testing.expectEqualStrings(name, server.name);
     try testing.expectEqualStrings(address, server.address);
     try testing.expectEqual(port, server.port);
-    try testing.expectEqualStrings(instance, server.instance_id);
+    try testing.expectEqualStrings(instance, server.instance_id.?);
     try testing.expectEqualStrings(name, status.motd);
     try testing.expectEqualStrings(address, status.version);
     try testing.expectEqual(@as(u64, port), status.latency_ms);

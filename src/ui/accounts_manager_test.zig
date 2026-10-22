@@ -1079,7 +1079,7 @@ test "accounts uncertain config blocks new work and cleanup recovers latest prot
     try tmp.dir.rename(".vela/previous.json", tmp.dir, ".vela/config.json", io);
     // A second writer is excluded; recovery still reloads valid disk evidence.
     try t.expectError(error.LauncherRootInUse, config.Store.init(a, io, root));
-    const recovered_bytes = try config.serialize(a, .{ .settings = .{ .microsoft_client_id = "fixture-public-client" }, .accounts = &.{.{ .id = "saved-online", .name = "FixturePlayer", .uuid = "00112233445566778899aabbccddeeff", .kind = .microsoft, .credential_ref = &saved_ref }}, .selected_account = "saved-online" });
+    const recovered_bytes = try std.json.Stringify.valueAlloc(a, @as(config.Document, .{ .settings = .{ .microsoft_client_id = "fixture-public-client" }, .accounts = &.{.{ .id = "saved-online", .name = "FixturePlayer", .uuid = "00112233445566778899aabbccddeeff", .kind = .microsoft, .credential_ref = &saved_ref }}, .selected_account = "saved-online" }), .{ .emit_null_optional_fields = false });
     defer a.free(recovered_bytes);
     try tmp.dir.writeFile(io, .{ .sub_path = ".vela/config.json", .data = recovered_bytes });
     try t.expectEqual(@as(usize, 0), store.snapshot().accounts.len);

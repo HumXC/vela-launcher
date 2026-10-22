@@ -210,8 +210,8 @@ const Job = struct {
     installed: ?Installed = null,
     catalogue: ?LoaderCatalogue = null,
     uncertain_publication_store: ?*const config.Store = null,
-    /// Owned server IDs removed by this job's uncertain delete publication.
-    deleted_server_ids: ?[]const []const u8 = null,
+    /// Owned server IDs detached by this job's uncertain delete publication.
+    unbound_server_ids: ?[]const []const u8 = null,
     failure: ?anyerror = null,
 
     fn flag(self: *Job) *const std.atomic.Value(bool) {
@@ -739,9 +739,9 @@ pub const Manager = struct {
         defer servers.deinit(a);
         if (job.operation == .deleting) {
             for (doc.servers) |server| {
-                if (std.mem.eql(u8, server.instance_id, job.request.id)) {
-                    if (sameOptional(updated.selected_server, server.id)) updated.selected_server = null;
-                } else try servers.append(a, server);
+                var retained = server;
+                if (sameOptional(server.instance_id, job.request.id)) retained.instance_id = null;
+                try servers.append(a, retained);
             }
             updated.servers = servers.items;
             if (sameOptional(updated.selected_instance, job.request.id)) updated.selected_instance = null;
@@ -751,24 +751,24 @@ pub const Manager = struct {
         if (job.result) |*result| try result.recheckPublication(self.root);
         // Prepare the deletion witness before Store.update can commit. Only a save
         // failure with publication uncertainty transfers this witness to the job.
-        var deleted_server_ids: ?[]const []const u8 = null;
+        var unbound_server_ids: ?[]const []const u8 = null;
         if (job.operation == .deleting) {
             var count: usize = 0;
-            for (doc.servers) |server| if (std.mem.eql(u8, server.instance_id, job.request.id)) {
+            for (doc.servers) |server| if (sameOptional(server.instance_id, job.request.id)) {
                 count += 1;
             };
             const ids = try job.arena.allocator().alloc([]const u8, count);
             var index: usize = 0;
-            for (doc.servers) |server| if (std.mem.eql(u8, server.instance_id, job.request.id)) {
+            for (doc.servers) |server| if (sameOptional(server.instance_id, job.request.id)) {
                 ids[index] = try job.arena.allocator().dupe(u8, server.id);
                 index += 1;
             };
-            deleted_server_ids = ids;
+            unbound_server_ids = ids;
         }
         store.update(updated) catch |err| {
             if (store.publicationUncertain()) {
                 if (job.operation == .creating or job.operation == .deleting) job.uncertain_publication_store = store;
-                if (job.operation == .deleting) job.deleted_server_ids = deleted_server_ids;
+                if (job.operation == .deleting) job.unbound_server_ids = unbound_server_ids;
             }
             return err;
         };
@@ -779,26 +779,27 @@ pub const Manager = struct {
     fn reconciledDeletion(self: *const Manager, job: *const Job, doc: *const config.Document) !bool {
         _ = self;
         if (job.operation != .deleting or job.uncertain_publication_store == null) return false;
-        const removed_ids = job.deleted_server_ids orelse return error.InvalidCompletedPublication;
+        const detached_ids = job.unbound_server_ids orelse return error.InvalidCompletedPublication;
         const result = job.result orelse return error.InvalidCompletedPublication;
         if (result.operation != .deleted or !sameInstance(result.instance, job.request) or result.recovery_directory != null) return error.InvalidCompletedPublication;
         for (doc.instances) |entry| if (std.mem.eql(u8, entry.id, job.request.id)) return false;
         if (sameOptional(doc.selected_instance, job.request.id)) return error.InstanceConfigurationChanged;
         for (doc.servers) |server| {
-            if (std.mem.eql(u8, server.instance_id, job.request.id)) return error.InstanceConfigurationChanged;
-            for (removed_ids) |id| if (std.mem.eql(u8, server.id, id)) return error.InstanceConfigurationChanged;
+            if (sameOptional(server.instance_id, job.request.id)) return error.InstanceConfigurationChanged;
         }
-        for (removed_ids) |id| if (sameOptional(doc.selected_server, id)) return error.InstanceConfigurationChanged;
+        for (detached_ids) |id| {
+            const retained = for (doc.servers) |server| {
+                if (std.mem.eql(u8, server.id, id)) break server;
+            } else return error.InstanceConfigurationChanged;
+            if (retained.instance_id != null) return error.InstanceConfigurationChanged;
+        }
         return true;
-    }
-    pub fn saveOptions(self: *Manager, store: *config.Store, updated: config.Instance) !void {
-        try self.saveOptionsInner(store, null, updated);
     }
     /// Reject external edits against the form's owned baseline before publication.
     pub fn saveOptionsChecked(self: *Manager, store: *config.Store, original: config.Instance, updated: config.Instance) !void {
         try self.saveOptionsInner(store, original, updated);
     }
-    fn saveOptionsInner(self: *Manager, store: *config.Store, original: ?config.Instance, updated: config.Instance) !void {
+    fn saveOptionsInner(self: *Manager, store: *config.Store, original: config.Instance, updated: config.Instance) !void {
         if (self.isBusy()) return error.Busy;
         if (store.publicationUncertain()) return error.ConfigPublicationUncertain;
         try validateRequest(updated);
@@ -808,7 +809,7 @@ pub const Manager = struct {
         var found = false;
         for (entries) |*entry| if (std.mem.eql(u8, entry.id, updated.id)) {
             if (!sameIdentity(entry.*, updated)) return error.OptionsCannotChangeIdentity;
-            if (original) |baseline| if (!sameInstance(entry.*, baseline)) return error.InstanceConfigurationChanged;
+            if (!sameInstance(entry.*, original)) return error.InstanceConfigurationChanged;
             entry.* = updated;
             found = true;
             break;
@@ -856,7 +857,7 @@ fn metadataTarget(root: []const u8, instance: config.Instance, generation: u64, 
     return .{ .root = root, .instance_id = instance.id, .instance_name = instance.name, .generation = generation, .selection = .{ .kind = kind, .base_id = instance.minecraft_version, .loader_id = instance.loader_version orelse return error.InvalidLoaderVersion }, .environment = env };
 }
 /// Read-only authenticated preparation for registered-instance preflight.
-/// Fetches only the bounded official manifest; local version JSON is never replaced.
+/// Fetches bounded official manifest and source metadata without changing instance files.
 pub fn prepareExistingVanilla(a: A, io: Io, target: metadata_loader.VanillaTarget, control: Control) !metadata_loader.PreparedVanilla {
     return productionPrepareVanilla(null, a, io, target, control);
 }
@@ -886,9 +887,25 @@ fn prepareVanillaInner(a: A, io: Io, target: metadata_loader.VanillaTarget, cont
     if (response.status != 200) return error.MetadataHttpFailure;
     var manifest = try metadata.manifest.parseSlice(a, response.body);
     defer manifest.deinit();
-    const minecraft_root = try std.fs.path.join(a, &.{ target.root, ".minecraft" });
-    defer a.free(minecraft_root);
-    var proof = try metadata_loader.prepareVanilla(a, io, .{ .target = target, .vanilla = .{ .root = minecraft_root, .version_id = target.version_id, .manifest = manifest.value, .cancel = control.cancel }, .fetcher = .{} });
+    const Source = struct {
+        client: *@import("../core/http_transport.zig").Client,
+        control: Control,
+        fn fetch(raw: ?*anyopaque, allocator: A, _: Io, request: metadata_loader.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.control.check();
+            var detail: @import("../core/install/download_details.zig").HttpObserver = .{ .task = self.control.task, .path = request.url };
+            var result = self.client.execute(.{ .url = request.url, .cancel = self.control.cancel, .max_response_bytes = request.max_bytes, .require_public_address = true, .observer = if (self.control.task != null) detail.observer() else null }) catch |err| {
+                detail.fail(err);
+                return err;
+            };
+            defer result.deinit();
+            try self.control.check();
+            if (result.status != 200) return error.MetadataHttpFailure;
+            return allocator.dupe(u8, result.body);
+        }
+    };
+    var source: Source = .{ .client = client, .control = control };
+    var proof = try metadata_loader.prepareVanilla(a, io, .{ .target = target, .vanilla = .{ .version_id = target.version_id, .manifest = manifest.value, .cancel = control.cancel }, .fetcher = .{ .context = &source, .fetch = Source.fetch } });
     errdefer proof.deinit();
     try control.check();
     return proof;
@@ -1017,7 +1034,7 @@ fn productionStage(a: A, io: Io, request: CreateRequest, control: Control, g: A,
     defer service.deinit();
     control.report(.metadata, 0, null);
     const prepared_control: ?loaders.Control = if (request.prepared != null) loaderControl(&io, control, 30 * 60 * 1000) else null;
-    const base_config: minecraft.Config = .{ .root = minecraft_root, .version_id = request.instance.minecraft_version, .instance_name = stage_name, .game_directory = stage_path, .natives_directory = natives, .publish_metadata = false, .namespace_token = namespace_token, .worker_checks = true, .environment = if (prepared_target) |target| target.environment else if (vanilla_target) |target| target.environment else try environment(), .window = request.download_connections, .cancel = control.cancel, .task = control.task };
+    const base_config: minecraft.Config = .{ .root = minecraft_root, .version_id = request.instance.minecraft_version, .target = .{ .directory_name = stage_name, .name = request.instance.name }, .game_directory = stage_path, .natives_directory = natives, .publish_metadata = false, .namespace_token = namespace_token, .worker_checks = true, .environment = if (prepared_target) |target| target.environment else if (vanilla_target) |target| target.environment else try environment(), .window = request.download_connections, .cancel = control.cancel, .task = control.task };
     var base = if (request.prepared) |owner|
         try loader_base_install.runPrepared(a, io, service, base_config, owner, prepared_target.?, prepared_control.?)
     else if (request.vanilla_prepared) |owner|
@@ -1058,7 +1075,9 @@ fn productionStage(a: A, io: Io, request: CreateRequest, control: Control, g: A,
     defer source_parent.close(io);
     const source_stat = try source_parent.statFile(io, std.fs.path.basename(client.path), .{ .follow_symlinks = false });
     if (source_stat.kind != .file or source_stat.nlink != 1) return error.HardLinkAlias;
-    try files.copy(io, client.path, jar_path, 512 * 1024 * 1024, load_control);
+    const client_target = try std.fs.path.resolve(g, &.{client.path});
+    const expected_target = try std.fs.path.resolve(g, &.{jar_path});
+    if (!std.mem.eql(u8, client_target, expected_target)) return error.ClientOwnershipMismatch;
     try files.verify(io, jar_path, client.sha1 orelse return error.MissingClientHash, client.size, 512 * 1024 * 1024, load_control);
     var descriptor = base.version.value;
     descriptor.id = request.instance.name;

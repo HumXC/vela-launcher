@@ -44,8 +44,6 @@ pub const Proposal = struct {
     root: ?providers.VersionKey = null,
     kind: Kind = .mod,
     choices: []const providers.DependencyChoice = &.{},
-    legacy_identity: ?manifest.PackIdentity = null,
-    legacy_approvals: []const manifest.LegacyApproval = &.{},
 };
 pub const Snapshot = struct {
     instance: ?config.Instance = null,
@@ -80,7 +78,6 @@ pub const Options = struct {
     curseforge: CurseForgePolicy = .{},
     fixture_credential_store: ?credentials.Store = null,
     allow_curseforge_remote: bool = false,
-    allow_manifest_v2: bool = false,
     /// Keep the adapter context frozen until the worker has canceled and joined.
     vanilla_preparation: instance_preparation.VanillaPreparationAdapter = .{},
     fixture_spawn_failure: ?anyerror = null,
@@ -100,12 +97,12 @@ const Request = union(enum) {
     prepare: struct { version: providers.Version, kind: Kind, choices: []const providers.DependencyChoice },
     import_pack: struct { absolute_path: []const u8, identity: manifest.PackIdentity },
     inspected_pack: manifest.PackIdentity,
-    update: struct { provider: providers.Provider, project_id: []const u8, version_id: []const u8, kind: Kind, legacy_identity: ?manifest.PackIdentity = null, legacy_approvals: []const manifest.LegacyApproval = &.{} },
+    update: struct { provider: providers.Provider, project_id: []const u8, version_id: []const u8, kind: Kind },
     resolve: ResolveRequest,
     resolve_pack_references: ResolveRequest,
     commit: Proposal,
     remove: []const u8,
-    enabled_state: struct { path: []const u8, enabled: bool },
+    enabled_toggle: struct { path: []const u8, enabled: bool },
     recover: []const u8,
 };
 
@@ -174,8 +171,6 @@ const Job = struct {
     request: Request,
     options: Options,
     connections: u16,
-    legacy_identity: ?manifest.PackIdentity = null,
-    legacy_approvals: []const manifest.LegacyApproval = &.{},
     task: ?*tasks.Task = null,
     held: bool = false,
     borrowed_hold: bool = false,
@@ -456,6 +451,19 @@ pub const Manager = struct {
             _ = self.registry.cancel(task.id);
         };
     }
+    /// Stop page-owned discovery without waiting on network I/O. tick retains
+    /// worker ownership and recovery checks, but never publishes abandoned data.
+    pub fn cancelMetadata(self: *Manager) void {
+        const job = self.active orelse return;
+        switch (job.request) {
+            .search, .versions, .prepare, .resolve => {},
+            else => return,
+        }
+        job.current = false;
+        const refresh_pending = self.pending_refresh;
+        self.cancel();
+        self.pending_refresh = refresh_pending;
+    }
     /// Shutdown only: join the owned worker and publish its outcome through tick.
     pub fn cancelAndJoin(self: *Manager) void {
         self.cancel();
@@ -492,11 +500,6 @@ pub const Manager = struct {
         if (!providers.validToken(project_id) or !providers.validToken(version_id)) return error.InvalidId;
         if (provider == .curseforge and !self.canResolvePackReferences()) return error.ProviderDisabled;
         try self.start(.{ .update = .{ .provider = provider, .project_id = project_id, .version_id = version_id, .kind = kind } });
-    }
-    pub fn prepareLegacyUpdate(self: *Manager, recorded_identity: manifest.PackIdentity, approvals: []const manifest.LegacyApproval, version_id: []const u8, kind: Kind) !void {
-        if (!providers.validToken(recorded_identity.project_id) or !providers.validToken(recorded_identity.version_id) or !providers.validToken(version_id) or approvals.len == 0) return error.InvalidChoice;
-        if (recorded_identity.provider == .curseforge and !self.canResolvePackReferences()) return error.ProviderDisabled;
-        try self.start(.{ .update = .{ .provider = recorded_identity.provider, .project_id = recorded_identity.project_id, .version_id = version_id, .kind = kind, .legacy_identity = recorded_identity, .legacy_approvals = approvals } });
     }
     pub fn selectProvider(self: *Manager, provider: providers.Provider) !void {
         if (self.provider == provider) return;
@@ -570,9 +573,9 @@ pub const Manager = struct {
         if (!proposal.ready) return error.IncompleteContent;
         try self.start(.{ .commit = proposal.* });
     }
-    pub fn prepareEnabled(self: *Manager, path: []const u8, enabled: bool) !void {
-        if (!manifest.safeRelativePath(path) or manifest.protectedPath(path)) return error.UnsafePath;
-        try self.start(.{ .enabled_state = .{ .path = path, .enabled = enabled } });
+    pub fn toggleEnabled(self: *Manager, path: []const u8, enabled: bool) !void {
+        if (!manifest.safeRelativePath(path) or !std.mem.startsWith(u8, path, "mods/") or self.snapshot().recovery_required) return error.ContentControlsLocked;
+        try self.start(.{ .enabled_toggle = .{ .path = path, .enabled = enabled } });
     }
     pub fn prepareRemove(self: *Manager, path: []const u8) !void {
         if (!manifest.safeRelativePath(path) or manifest.protectedPath(path)) return error.UnsafePath;
@@ -591,6 +594,10 @@ pub const Manager = struct {
         const instance = if (self.pinned) |pinned| pinned.instance else if (self.selected) |selected| selected.instance else return error.NoSelectedInstance;
         const job = try Job.create(self.allocator, self.io, self.paths, instance, request, self.options, self.connections);
         errdefer job.destroy();
+        if (request == .enabled_toggle) if (self.local_job) |published| {
+            if (published.result.installed) |installed| job.result.installed = try clone(manifest.Manifest, job.result.arena.allocator(), installed);
+            job.result.transactions = try clone([]const []const u8, job.result.arena.allocator(), published.result.transactions orelse &.{});
+        };
         const needs_lease = request != .search and request != .versions;
         if (self.pinned != null) {
             try self.options.lease.recheck(self.options.lease.context, instance.id);
@@ -603,7 +610,7 @@ pub const Manager = struct {
         errdefer self.release(job);
         if (job.held) {
             job.cleanup_retired = self.retired_stages;
-            if (request == .prepare or request == .update or request == .import_pack or request == .inspected_pack or request == .remove or request == .enabled_state or request == .commit or request == .recover) job.cleanup_preview = self.proposal_job;
+            if (request == .prepare or request == .update or request == .import_pack or request == .inspected_pack or request == .remove or request == .commit or request == .recover) job.cleanup_preview = self.proposal_job;
         }
         const kind: tasks.Kind = if (request == .import_pack or request == .inspected_pack or request == .resolve_pack_references or (request == .prepare and request.prepare.kind == .modpack) or (request == .update and request.update.kind == .modpack)) .modpack_install else .mod_install;
         const task = try self.registry.create(kind, title(request));
@@ -674,7 +681,7 @@ pub const Manager = struct {
                 job.borrowed_hold = false;
             }
             self.release(job);
-            if (!job.current) job.destroy() else {
+            if (!job.current) self.retireOwned(job, if (self.proposal_job) |old| old.stage() else null) else {
                 const committed = if (job.result.report) |report| report.committed or report.recovered else false;
                 if (job.failure != null and !committed) {
                     self.failure = job.failure;
@@ -684,9 +691,9 @@ pub const Manager = struct {
                     const field: []const u8 = switch (job.request) {
                         .search => "catalog_job",
                         .versions => "versions_job",
-                        .prepare, .update, .import_pack, .inspected_pack, .resolve, .resolve_pack_references, .remove, .enabled_state => "proposal_job",
+                        .prepare, .update, .import_pack, .inspected_pack, .resolve, .resolve_pack_references, .remove => "proposal_job",
                         .commit, .recover => "report_job",
-                        .refresh => "local_job",
+                        .refresh, .enabled_toggle => "local_job",
                     };
                     inline for (.{ "catalog_job", "versions_job", "proposal_job", "local_job", "report_job" }) |name| if (std.mem.eql(u8, field, name)) {
                         if (comptime std.mem.eql(u8, name, "proposal_job")) self.retirePreview(job.stage()) else if (@field(self, name)) |old| old.destroy();
@@ -694,7 +701,7 @@ pub const Manager = struct {
                     };
                     if (committed) {
                         self.retirePreview(null);
-                        self.pending_refresh = self.selected != null;
+                        self.pending_refresh = self.selected != null and job.request != .enabled_toggle;
                     }
                 }
             }
@@ -732,7 +739,7 @@ fn title(request: Request) []const u8 {
         .import_pack, .inspected_pack => "Import modpack",
         .commit => "Install content",
         .remove => "Review removal",
-        .enabled_state => |request_state| if (request_state.enabled) "Review enabling mod" else "Review disabling mod",
+        .enabled_toggle => |request_state| if (request_state.enabled) "Enable mod" else "Disable mod",
         .recover => "Recover content",
         .refresh => "Installed content",
     };
@@ -782,7 +789,11 @@ fn readManifest(job: *Job, a: A) !manifest.Manifest {
     var parsed = try manifest.parse(a, bytes);
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.instance_id, job.instance.id)) return error.InstanceMismatch;
-    return try clone(manifest.Manifest, a, parsed.value);
+    var observed = try clone(manifest.Manifest, a, parsed.value);
+    const game = try gameDirectory(job);
+    defer if (game) |dir| dir.close(job.io);
+    observed.files = try @import("../core/content_state.zig").observe(a, job.io, game, observed.files);
+    return observed;
 }
 fn localSnapshot(job: *Job) !void {
     const a = job.result.arena.allocator();
@@ -833,17 +844,13 @@ fn observe(job: *Job, a: A, previous: manifest.Manifest, desired: manifest.Manif
     };
     return try records.toOwnedSlice(a);
 }
-fn desiredFor(a: A, previous: manifest.Manifest, files: []const manifest.InstallFile, pack: ?manifest.PackPlan, legacy_paths: []const []const u8) !manifest.Manifest {
+fn desiredFor(a: A, previous: manifest.Manifest, files: []const manifest.InstallFile, pack: ?manifest.PackPlan) !manifest.Manifest {
     var records: std.ArrayList(manifest.ManagedFile) = .empty;
     var replacement: ?providers.Owned([]const []const u8) = null;
     defer if (replacement) |*owned| owned.deinit();
     if (pack) |value| replacement = try manifest.packReplacementPaths(a, previous, value.identity);
     for (previous.files) |old| {
         var replaced = false;
-        for (legacy_paths) |path| if (std.mem.eql(u8, path, old.path)) {
-            replaced = true;
-            break;
-        };
         if (replacement) |owned| for (owned.value) |path| {
             if (std.mem.eql(u8, path, old.path)) {
                 replaced = true;
@@ -878,7 +885,7 @@ fn desiredFor(a: A, previous: manifest.Manifest, files: []const manifest.Install
         };
         membership = .{ .identity = value.identity, .paths = try paths.toOwnedSlice(a) };
     }
-    const desired: manifest.Manifest = .{ .schema_version = 2, .instance_id = previous.instance_id, .pack_version = if (pack) |value| value.identity.version_id else previous.pack_version, .files = try records.toOwnedSlice(a), .pack_membership = membership };
+    const desired: manifest.Manifest = .{ .schema_version = manifest.schema_version, .instance_id = previous.instance_id, .pack_version = if (pack) |value| value.identity.version_id else previous.pack_version, .files = try records.toOwnedSlice(a), .pack_membership = membership };
     try manifest.validate(desired);
     const bytes = try manifest.serialize(a, desired);
     defer a.free(bytes);
@@ -986,12 +993,13 @@ fn gameReady(job: *Job) !bool {
         else => return error.UnsupportedGamePlatform,
     };
     const game_path = try job.paths.instanceDirectory(job.instance.name);
+    const client_relative_path = try @import("../core/minecraft/layout.zig").installedClient(a, version.value);
+    defer a.free(client_relative_path);
     var plan = try game_plan.buildInstalled(a, version.value, assets.value, .{ .os_name = os_name, .arch = @tagName(builtin.cpu.arch) }, .{
         .root = job.paths.minecraft,
+        .client_relative_path = client_relative_path,
         .instance_name = job.instance.name,
         .game_directory = game_path,
-        .cpu_arch = @tagName(builtin.cpu.arch),
-        .native_arch = if (@bitSizeOf(usize) == 64) .bits64 else .bits32,
     });
     defer plan.deinit();
     for (plan.value.files) |file| {
@@ -1282,14 +1290,9 @@ fn memberPath(previous: manifest.Manifest, path: []const u8) bool {
     for (membership.paths) |owned| if (std.mem.eql(u8, owned, path)) return true;
     return false;
 }
-fn approvedPath(paths: []const []const u8, path: []const u8) bool {
-    for (paths) |owned| if (std.mem.eql(u8, owned, path)) return true;
-    return false;
-}
-fn choiceScope(previous: manifest.Manifest, old: manifest.ManagedFile, new: manifest.ManagedFile, pack: ?manifest.PackPlan, legacy_paths: []const []const u8) bool {
+fn choiceScope(previous: manifest.Manifest, old: manifest.ManagedFile, new: manifest.ManagedFile, pack: ?manifest.PackPlan) bool {
     if (pack) |next| {
         if (new.standalone) return false;
-        if (approvedPath(legacy_paths, old.path) and std.mem.eql(u8, old.path, new.path)) return true;
         const prior = previous.pack_membership orelse return false;
         return !old.standalone and memberPath(previous, old.path) and prior.identity.provider == next.identity.provider and
             std.mem.eql(u8, prior.identity.project_id, next.identity.project_id);
@@ -1300,14 +1303,13 @@ fn officialProject(old: manifest.ManagedFile, new: manifest.ManagedFile) bool {
     return old.identity_provenance == .official_file and new.identity_provenance == .official_file and
         old.provider == new.provider and std.mem.eql(u8, old.project_id, new.project_id);
 }
-fn exactChoice(old: manifest.ManagedFile, new: manifest.ManagedFile, legacy_paths: []const []const u8) bool {
+fn exactChoice(old: manifest.ManagedFile, new: manifest.ManagedFile) bool {
     if (!std.mem.eql(u8, old.path, new.path) or old.role != new.role) return false;
-    if (approvedPath(legacy_paths, old.path)) return true;
     if (old.provider != new.provider or old.identity_provenance != new.identity_provenance) return false;
     return if (old.identity_provenance == .official_file) officialProject(old, new) else true;
 }
 const NormalizedChoices = struct { files: []const manifest.InstallFile, pack: ?manifest.PackPlan, blocker: ?anyerror = null };
-fn normalizeChoices(a: A, previous: manifest.Manifest, input: []const manifest.InstallFile, pack_input: ?manifest.PackPlan, legacy_paths: []const []const u8) !NormalizedChoices {
+fn normalizeChoices(a: A, previous: manifest.Manifest, input: []const manifest.InstallFile, pack_input: ?manifest.PackPlan) !NormalizedChoices {
     const files = try a.dupe(manifest.InstallFile, input);
     const matched = try a.alloc(bool, previous.files.len);
     @memset(matched, false);
@@ -1318,8 +1320,8 @@ fn normalizeChoices(a: A, previous: manifest.Manifest, input: []const manifest.I
         var candidate: ?usize = null;
         var old_count: usize = 0;
         for (previous.files, 0..) |old, index| {
-            if (!choiceScope(previous, old, file.record, pack_input, legacy_paths)) continue;
-            if (exactChoice(old, file.record, legacy_paths)) exact = index;
+            if (!choiceScope(previous, old, file.record, pack_input)) continue;
+            if (exactChoice(old, file.record)) exact = index;
             if (officialProject(old, file.record)) {
                 candidate = index;
                 old_count += 1;
@@ -1331,7 +1333,7 @@ fn normalizeChoices(a: A, previous: manifest.Manifest, input: []const manifest.I
                 new_count += 1;
             };
             if (old_count == 1 and new_count == 1) exact = candidate else {
-                for (previous.files) |old| if (!old.enabled and choiceScope(previous, old, file.record, pack_input, legacy_paths) and officialProject(old, file.record)) {
+                for (previous.files) |old| if (!old.enabled and choiceScope(previous, old, file.record, pack_input) and officialProject(old, file.record)) {
                     blocker = error.DisabledIdentityUnresolved;
                 };
             }
@@ -1345,7 +1347,7 @@ fn normalizeChoices(a: A, previous: manifest.Manifest, input: []const manifest.I
         const same_pack = if (previous.pack_membership) |prior| prior.identity.provider == pack.identity.provider and std.mem.eql(u8, prior.identity.project_id, pack.identity.project_id) else false;
         for (previous.files, 0..) |old, index| {
             if (old.enabled or !manifest.toggleable(old) or matched[index]) continue;
-            if ((same_pack and !old.standalone and memberPath(previous, old.path)) or approvedPath(legacy_paths, old.path)) blocker = error.DisabledIdentityUnresolved;
+            if (same_pack and !old.standalone and memberPath(previous, old.path)) blocker = error.DisabledIdentityUnresolved;
         }
     }
     var normalized_pack = pack_input;
@@ -1386,13 +1388,10 @@ fn disabledRequiredDependency(versions: []const providers.Version, desired: mani
 }
 fn makeProposal(job: *Job, input_files: []const manifest.InstallFile, input_pack: ?manifest.PackPlan, previous: manifest.Manifest, decisions: []const manifest.ConflictDecision, manual: []const install.ManualFile, dependencies_ready: bool, stage_path: ?[]const u8, kind: Kind, root: ?providers.VersionKey, choices: []const providers.DependencyChoice) !void {
     const a = job.result.arena.allocator();
-    var legacy: ?providers.Owned([]const []const u8) = null;
-    defer if (legacy) |*owned| owned.deinit();
-    if (job.legacy_identity) |identity| legacy = try manifest.legacyReplacementPaths(a, previous, identity, job.legacy_approvals);
-    const normalized = try normalizeChoices(a, previous, input_files, input_pack, if (legacy) |owned| owned.value else &.{});
+    const normalized = try normalizeChoices(a, previous, input_files, input_pack);
     const files = normalized.files;
     const pack = normalized.pack;
-    const desired = try desiredFor(a, previous, files, pack, if (legacy) |owned| owned.value else &.{});
+    const desired = try desiredFor(a, previous, files, pack);
     const choice_blocker: ?anyerror = normalized.blocker orelse @as(?anyerror, if (disabledRequiredDependency(job.result.candidates, desired)) error.DisabledRequiredDependency else null);
     const active_dependencies_ready = dependencies_ready and choice_blocker == null;
     const observed = try observe(job, a, previous, desired);
@@ -1450,15 +1449,13 @@ fn makeProposal(job: *Job, input_files: []const manifest.InstallFile, input_pack
         .desired = try clone(manifest.Manifest, a, desired),
         .prerequisites = prerequisites,
         .stage_path = try clone(?[]const u8, a, stage_path),
-        .ready = job.options.allow_manifest_v2 and plan.value.ready and missing == 0 and undecided == 0 and active_dependencies_ready and complete_pack and loader_ready,
+        .ready = plan.value.ready and missing == 0 and undecided == 0 and active_dependencies_ready and complete_pack and loader_ready,
         .dependencies_ready = active_dependencies_ready,
         .missing_manual = missing,
-        .blocker = if (!job.options.allow_manifest_v2) error.ReceiptUpgradeRequired else choice_blocker orelse if (loader_ready) null else readiness_error orelse error.MissingGamePrerequisite,
+        .blocker = choice_blocker orelse if (loader_ready) null else readiness_error orelse error.MissingGamePrerequisite,
         .root = try clone(?providers.VersionKey, a, root),
         .kind = kind,
         .choices = try clone([]const providers.DependencyChoice, a, choices),
-        .legacy_identity = try clone(?manifest.PackIdentity, a, job.legacy_identity),
-        .legacy_approvals = try clone([]const manifest.LegacyApproval, a, job.legacy_approvals),
     };
 }
 fn beforeMetadata(context: ?*anyopaque) anyerror!void {
@@ -1759,8 +1756,8 @@ fn publishPrepared(job: *Job, prepared: *const packs.Prepared, identity: manifes
     const records = try clone([]const manifest.InstallFile, a, prepared.files);
     for (@constCast(records)) |*file| {
         file.record.standalone = false;
-        // Only extracted override mappings establish archive ownership for legacy importer records.
-        if (file.record.identity_provenance == .legacy_unknown) {
+        // Archive overrides require a verified extracted source mapping.
+        if (file.record.identity_provenance == .pack_override) {
             if (file.record.role != .override or file.download != .manual_required or file.record.hashes.sha256 == null or file.record.size == null) return error.UnverifiedPackMember;
             var extracted_override = false;
             for (prepared.manual_files) |mapping| if (std.mem.eql(u8, mapping.path, file.record.path)) {
@@ -1768,7 +1765,6 @@ fn publishPrepared(job: *Job, prepared: *const packs.Prepared, identity: manifes
                 break;
             };
             if (!extracted_override) return error.UnverifiedPackMember;
-            file.record.identity_provenance = .pack_override;
         }
         if (file.record.identity_provenance == .pack_archive or file.record.identity_provenance == .pack_override) {
             file.record.provider = identity.provider;
@@ -1799,7 +1795,6 @@ fn downloadArchive(job: *Job, adapter: *transport.Adapter, version: providers.Ve
     const file = try primaryFile(version);
     if (file.download != .remote) return error.ManualArchiveRequired;
     if (version.provider == .curseforge) {
-        if (!job.options.allow_manifest_v2) return error.ReceiptUpgradeRequired;
         try providers.validateRemoteAuthorization(version.provider, version.project_id, version.id, file, remotePolicy(job));
     }
     const root = try fs.openAbsolute(job.io, job.paths.root);
@@ -1824,8 +1819,6 @@ fn downloadArchive(job: *Job, adapter: *transport.Adapter, version: providers.Ve
     try prepareArchive(job, absolute, .{ .provider = version.provider, .project_id = version.project_id, .version_id = version.id });
 }
 fn resolveProposal(job: *Job, adapter: *transport.Adapter, request: @FieldType(Request, "resolve")) !void {
-    job.legacy_identity = request.proposal.legacy_identity;
-    job.legacy_approvals = request.proposal.legacy_approvals;
     const a = job.result.arena.allocator();
     const previous = try readManifest(job, a);
     if (request.proposal.root == null and request.proposal.pack == null and request.proposal.files.len == 0) {
@@ -1980,13 +1973,26 @@ fn resolvePackReferences(job: *Job, adapter: *transport.Adapter, request: Resolv
     }
 }
 
-fn prepareState(job: *Job, path: []const u8, enabled: bool) !void {
+fn toggleLocal(job: *Job, path: []const u8, enabled: bool) !void {
     const a = job.result.arena.allocator();
-    const previous = try readManifest(job, a);
-    const observed = try observe(job, a, previous, previous);
-    var plan = try manifest.buildEnabledPlan(a, previous, path, enabled, observed, .{ .instance_id = job.instance.id, .instance_name = job.instance.name, .running = false });
-    defer plan.deinit();
-    job.result.proposal = .{ .plan = try clone(manifest.UpdatePlan, a, plan.value), .desired = try clone(manifest.Manifest, a, plan.value.next_manifest), .ready = plan.value.ready, .dependencies_ready = true };
+    var document = if (job.result.installed) |cached| cached else try readManifest(job, a);
+    const records = try a.dupe(manifest.ManagedFile, document.files);
+    const logical = @import("../core/mod_path.zig").logical(path);
+    for (records) |*record| if (std.mem.eql(u8, record.path, logical)) {
+        record.enabled = enabled;
+    };
+    document.files = records;
+    const game = try gameDirectory(job) orelse return error.FileNotFound;
+    defer game.close(job.io);
+    const backup = try std.heap.page_allocator.dupe(u8, "");
+    errdefer std.heap.page_allocator.free(backup);
+    try job.check();
+    const renamed = try @import("../core/mod_enabled.zig").setEnabled(a, job.io, game, path, enabled);
+    // The filename is authoritative. No ownership receipt changes during a toggle.
+    // Publish a committed rename even if cancellation arrives after it.
+    job.result.installed = document;
+    if (job.result.transactions == null) job.result.transactions = &.{};
+    job.result.report = .{ .allocator = std.heap.page_allocator, .backup_directory = backup, .transaction_id = "", .applied_files = @intFromBool(renamed.changed), .fully_applied = true, .complete = true, .committed = true };
 }
 fn removalManifest(a: A, previous: manifest.Manifest, removed_path: []const u8, records: []const manifest.ManagedFile) !manifest.Manifest {
     var membership = previous.pack_membership;
@@ -2025,11 +2031,13 @@ fn runBackend(job: *Job) !void {
     try job.check();
     var adapter = try transport.Adapter.initWithOptions(std.heap.page_allocator, job.io, job.cancelToken(), job.connections, job.options.transport_options);
     defer adapter.deinit();
+    adapter.telemetry = job.task;
     if (job.held and job.request != .recover) {
         if (@hasDecl(install, "requireRecoveryClear")) try install.requireRecoveryClear(std.heap.page_allocator, job.io, &job.paths, job.instance.id, job.instance.name);
     }
     switch (job.request) {
         .refresh => try localSnapshot(job),
+        .enabled_toggle => |value| try toggleLocal(job, value.path, value.enabled),
         .search => |request| try searchContent(job, &adapter, request.query, request.kind, request.offset),
         .versions => |request| job.result.versions = .{ .versions = try fetchProviderVersions(job, &adapter, request.project.provider, request.project.id, null, request.kind) },
         .prepare => |request| {
@@ -2041,8 +2049,6 @@ fn runBackend(job: *Job) !void {
             try prepareSelected(job, &adapter, version, request.kind, request.choices);
         },
         .update => |request| {
-            job.legacy_identity = request.legacy_identity;
-            job.legacy_approvals = request.legacy_approvals;
             const found = try fetchProviderVersions(job, &adapter, request.provider, request.project_id, request.version_id, request.kind);
             if (found.len != 1) return error.UnknownVersion;
             try prepareSelected(job, &adapter, found[0], request.kind, &.{});
@@ -2052,16 +2058,14 @@ fn runBackend(job: *Job) !void {
         .resolve => |request| try resolveProposal(job, &adapter, request),
         .resolve_pack_references => |request| try resolvePackReferences(job, &adapter, request),
         .remove => |path| try prepareRemoval(job, &adapter, path),
-        .enabled_state => |state| try prepareState(job, state.path, state.enabled),
         .commit => |proposal| {
             if (!proposal.ready or !proposal.dependencies_ready) return error.IncompleteContent;
             try Job.nestedAcquire(job, job.instance.id);
             if (proposal.pack != null and !(try gameReady(job))) return error.MissingGamePrerequisite;
-            if (!job.options.allow_manifest_v2) return error.ReceiptUpgradeRequired;
             for (proposal.files) |file| if (file.record.provider == .curseforge and file.download == .remote and file.selected != false) {
                 try providers.validateRemoteAuthorization(file.record.provider, file.record.project_id, file.record.version_id, .{ .filename = std.fs.path.basename(file.record.path), .hashes = file.record.hashes, .size = file.record.size, .download = file.download, .authorization = file.authorization }, remotePolicy(job));
             };
-            job.result.report = try install.execute(std.heap.page_allocator, job.io, .{ .paths = &job.paths, .instance_id = job.instance.id, .instance_name = job.instance.name, .plan = proposal.plan, .files = proposal.files, .lease = job.nestedLease(), .pack = proposal.pack, .prerequisites = proposal.prerequisites, .manual_files = proposal.manual_files, .allow_partial = !proposal.plan.fully_applied, .cancel = job.cancelToken(), .fetcher = adapter.fetcher(), .fault = job.options.fixture_fault, .allow_curseforge_remote = job.options.allow_curseforge_remote, .allow_manifest_v2 = job.options.allow_manifest_v2, .approved_download_hosts = job.options.transport_options.approved_download_hosts });
+            job.result.report = try install.execute(std.heap.page_allocator, job.io, .{ .paths = &job.paths, .instance_id = job.instance.id, .instance_name = job.instance.name, .plan = proposal.plan, .files = proposal.files, .lease = job.nestedLease(), .pack = proposal.pack, .prerequisites = proposal.prerequisites, .manual_files = proposal.manual_files, .allow_partial = !proposal.plan.fully_applied, .cancel = job.cancelToken(), .fetcher = adapter.fetcher(), .fault = job.options.fixture_fault, .allow_curseforge_remote = job.options.allow_curseforge_remote, .approved_download_hosts = job.options.transport_options.approved_download_hosts });
             // After the durable commit, a late cancellation cannot revoke success.
             if (job.result.report.?.committed) {
                 if (proposal.stage_path) |path| packs.cleanup(job.io, path) catch {};
@@ -2109,7 +2113,7 @@ test "standalone official update preserves matching pack-owned child and members
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const previous: manifest.Manifest = .{
-        .schema_version = 2,
+        .schema_version = manifest.schema_version,
         .instance_id = "stable-id",
         .pack_version = "200",
         .pack_membership = .{ .identity = .{ .provider = .curseforge, .project_id = "100", .version_id = "200" }, .paths = &.{"mods/owned.jar"} },
@@ -2137,8 +2141,8 @@ test "standalone official update preserves matching pack-owned child and members
         },
         .download = .{ .manual_required = .{ .official_page = "https://www.curseforge.com/minecraft/mc-mods/example/files/44", .reason = .distribution_disabled } },
     }};
-    const desired = try desiredFor(arena.allocator(), previous, &files, null, &.{});
-    try std.testing.expectEqual(@as(u32, 2), desired.schema_version);
+    const desired = try desiredFor(arena.allocator(), previous, &files, null);
+    try std.testing.expectEqual(manifest.schema_version, desired.schema_version);
     try std.testing.expectEqual(@as(usize, 2), desired.files.len);
     try std.testing.expectEqualStrings("mods/owned.jar", desired.files[0].path);
     try std.testing.expect(!desired.files[0].standalone);
@@ -2332,10 +2336,10 @@ test "removal retains unrelated pack ownership and filters only the removed memb
     var addon = pack_file;
     addon.path = "mods/addon.jar";
     addon.standalone = true;
-    const previous: manifest.Manifest = .{ .schema_version = 2, .instance_id = "instance", .pack_version = "pack-v1", .files = &.{ pack_file, addon }, .pack_membership = .{ .identity = .{ .provider = .modrinth, .project_id = "pack", .version_id = "pack-v1" }, .paths = &.{pack_file.path} } };
+    const previous: manifest.Manifest = .{ .schema_version = manifest.schema_version, .instance_id = "instance", .pack_version = "pack-v1", .files = &.{ pack_file, addon }, .pack_membership = .{ .identity = .{ .provider = .modrinth, .project_id = "pack", .version_id = "pack-v1" }, .paths = &.{pack_file.path} } };
     const desired = try removalManifest(arena.allocator(), previous, addon.path, &.{pack_file});
     try manifest.validate(desired);
-    try std.testing.expectEqual(@as(u32, 2), desired.schema_version);
+    try std.testing.expectEqual(manifest.schema_version, desired.schema_version);
     try std.testing.expectEqualStrings("pack-v1", desired.pack_version);
     try std.testing.expectEqualStrings("pack", desired.pack_membership.?.identity.project_id);
     try std.testing.expectEqualStrings(pack_file.path, desired.pack_membership.?.paths[0]);
@@ -2347,9 +2351,4 @@ test "removal retains unrelated pack ownership and filters only the removed memb
     const removed_member = try removalManifest(arena.allocator(), previous, pack_file.path, &.{addon});
     try manifest.validate(removed_member);
     try std.testing.expect(removed_member.pack_membership == null);
-    var legacy = previous;
-    legacy.schema_version = 1;
-    legacy.pack_membership = null;
-    const old = try removalManifest(arena.allocator(), legacy, addon.path, &.{pack_file});
-    try std.testing.expectEqual(@as(u32, 1), old.schema_version);
 }

@@ -63,7 +63,7 @@ pub fn sidebarItem(src: std.builtin.SourceLocation, key: []const u8, name: []con
         defer lines.deinit();
         dvui.labelNoFmt(@src(), name, .{}, control.style().override(.{
             .expand = .horizontal,
-            .gravity_y = 0.5,
+            .gravity_y = if (options.subtitle == null) 0.5 else 0,
             .max_size_content = .width(0),
             .background = false,
             .padding = R.all(0),
@@ -854,16 +854,6 @@ fn formButton(src: std.builtin.SourceLocation, name: []const u8, enabled: bool, 
     return button(src, name, .{ .enabled = enabled, .primary = primary, .gravity_x = if (right) 1 else 0, .placement = .footer, .min_width = width });
 }
 
-/// Compatibility aliases; shared dimensions are defined by the theme.
-pub const metrics = struct {
-    pub const control_padding = theme.sizing.control_padding_y;
-    pub const control_radius = theme.sizing.control_radius;
-    pub const icon_size = theme.sizing.icon;
-    pub const field_gap = theme.spacing.field_gap;
-    pub const label_gap = theme.spacing.field_label_gap;
-    pub const sidebar_padding = theme.spacing.sidebar_padding;
-};
-
 pub fn title(src: std.builtin.SourceLocation, name: []const u8) void {
     const layout = dvui.textLayout(src, .{}, .{ .font = theme.titleFont(), .expand = .horizontal, .max_size_content = .width(0), .background = false, .padding = R.all(0), .margin = R.all(0) });
     layout.addText(name, .{});
@@ -881,7 +871,7 @@ pub fn fieldLabel(src: std.builtin.SourceLocation, name: []const u8) void {
 }
 
 fn fieldLabelStyled(src: std.builtin.SourceLocation, name: []const u8, prominent: bool) void {
-    const layout = dvui.textLayout(src, .{}, .{ .font = if (prominent) theme.headingFont() else null, .expand = .horizontal, .max_size_content = .width(0), .background = false, .padding = R.all(0), .margin = .{ .h = metrics.label_gap } });
+    const layout = dvui.textLayout(src, .{}, .{ .font = if (prominent) theme.headingFont() else null, .expand = .horizontal, .max_size_content = .width(0), .background = false, .padding = R.all(0), .margin = .{ .h = theme.spacing.field_label_gap } });
     layout.addText(name, .{});
     layout.deinit();
 }
@@ -928,7 +918,7 @@ pub fn button(src: std.builtin.SourceLocation, name: []const u8, options: Button
         .min_size_content = geometry.content,
         .padding = geometry.padding,
         .margin = if (options.placement == .footer) R.all(0) else .{ .w = theme.spacing.action_gap, .h = theme.spacing.action_gap },
-        .corners = .all(metrics.control_radius),
+        .corners = .all(theme.sizing.control_radius),
         .style = if (options.primary and options.enabled) .highlight else .control,
         .color_border = if (options.destructive) .{ .color = style.colors.danger } else null,
         .color_fill = if (!options.enabled) .{ .color = theme.surface } else null,
@@ -939,7 +929,7 @@ pub fn button(src: std.builtin.SourceLocation, name: []const u8, options: Button
     {
         const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = options.label_alignment, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .background = false });
         defer row.deinit();
-        if (options.icon) |asset| dvui.icon(@src(), name, asset, .{}, control.style().override(.{ .min_size_content = dvui.Size.all(metrics.icon_size), .max_size_content = .{ .w = metrics.icon_size, .h = metrics.icon_size }, .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.row_gap }, .role = .none }));
+        if (options.icon) |asset| dvui.icon(@src(), name, asset, .{}, control.style().override(.{ .min_size_content = dvui.Size.all(theme.sizing.icon), .max_size_content = .{ .w = theme.sizing.icon, .h = theme.sizing.icon }, .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.row_gap }, .role = .none }));
         dvui.labelNoFmt(@src(), name, .{ .align_y = 0.5 }, control.style().override(.{ .color_text = if (!options.enabled) .{ .color = theme.muted } else null, .background = false, .padding = R.all(0), .margin = R.all(0), .gravity_y = 0.5 }));
     }
     if (options.enabled) control.drawFocus();
@@ -960,20 +950,20 @@ pub const IconOptions = struct {
 pub fn iconButton(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8, options: IconOptions) bool {
     var control: dvui.ButtonWidget = undefined;
     const side = if (options.rect) |rect| @min(rect.w, rect.h) else options.size;
-    const geometry = theme.controlGeometry(metrics.icon_size, side, side, @max(0, (side - 2 * theme.sizing.control_border - metrics.icon_size) / 2), theme.sizing.control_border);
-    control.init(src, .{ .grayed = !options.enabled, .draw_focus = options.enabled }, theme.controlOptions(metrics.icon_size).override(.{
+    const geometry = theme.controlGeometry(theme.sizing.icon, side, side, @max(0, (side - 2 * theme.sizing.control_border - theme.sizing.icon) / 2), theme.sizing.control_border);
+    control.init(src, .{ .grayed = !options.enabled, .draw_focus = options.enabled }, theme.controlOptions(theme.sizing.icon).override(.{
         .tag = options.tag,
         .label = .{ .text = name },
         .rect = options.rect,
         .min_size_content = geometry.content,
         .padding = geometry.padding,
         .margin = if (options.rect != null) R.all(0) else .{ .w = theme.sizing.sidebar_action_gap },
-        .corners = .all(metrics.control_radius),
+        .corners = .all(theme.sizing.control_radius),
         .color_text = if (!options.enabled) .{ .color = theme.muted } else if (options.selected) .{ .color = theme.accent } else null,
         .tab_index = if (options.enabled) null else 0,
     }));
     buttonState(&control, options.enabled);
-    dvui.icon(@src(), name, asset, .{}, control.style().override(.{ .min_size_content = dvui.Size.all(metrics.icon_size), .max_size_content = .size(dvui.Size.all(metrics.icon_size)), .gravity_x = 0.5, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .role = .none }));
+    dvui.icon(@src(), name, asset, .{}, control.style().override(.{ .min_size_content = dvui.Size.all(theme.sizing.icon), .max_size_content = .size(dvui.Size.all(theme.sizing.icon)), .gravity_x = 0.5, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .role = .none }));
     if (options.enabled) control.drawFocus();
     const clicked = options.enabled and control.clicked();
     const id = control.data().id;
@@ -1053,7 +1043,7 @@ fn dropdownOptions(name: []const u8, entries: []const []const u8, tag: ?[]const 
         .expand = .horizontal,
         .min_size_content = .{ .h = theme.sizing.control_height },
         .max_size_content = .width(0),
-        .margin = .{ .h = metrics.field_gap },
+        .margin = .{ .h = theme.spacing.field_gap },
     });
 }
 
@@ -1079,7 +1069,7 @@ pub const CheckboxOptions = struct {
 
 /// Semantic options keep indicator geometry and colors independent of the label.
 pub fn checkboxOptions(name: []const u8, options: CheckboxOptions) dvui.Options {
-    return dvui.checkbox_defaults.override(.{ .tag = options.tag, .id_extra = options.id_extra, .label = .{ .text = name }, .font = theme.bodyFont(), .padding = R.all(0), .margin = .{ .h = metrics.field_gap } });
+    return dvui.checkbox_defaults.override(.{ .tag = options.tag, .id_extra = options.id_extra, .label = .{ .text = name }, .font = theme.bodyFont(), .padding = R.all(0), .margin = .{ .h = theme.spacing.field_gap } });
 }
 
 /// Match DVUI checkbox interaction and indicator painting, with label-only color.
@@ -1121,7 +1111,7 @@ pub fn checkbox(src: std.builtin.SourceLocation, value: *bool, name: []const u8,
 }
 
 pub fn toggle(src: std.builtin.SourceLocation, value: *bool, name: []const u8, enabled: bool) bool {
-    const row = dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = metrics.field_gap }, .background = false });
+    const row = dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = theme.spacing.field_gap }, .background = false });
     defer row.deinit();
     dvui.labelNoFmt(@src(), name, .{}, .{ .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .color_text = if (enabled) null else .{ .color = theme.muted } });
     var control: dvui.ButtonWidget = undefined;
@@ -1143,13 +1133,13 @@ pub fn sidebarTitle(src: std.builtin.SourceLocation, name: []const u8, compact: 
 }
 
 pub fn sidebarPanel(src: std.builtin.SourceLocation) *dvui.BoxWidget {
-    return dvui.box(src, .{}, .{ .expand = .both, .padding = R.all(metrics.sidebar_padding), .margin = .{ .x = theme.spacing.page_margin, .y = theme.spacing.page_margin, .h = theme.spacing.page_margin }, .corners = .all(theme.sizing.sidebar_radius), .background = true, .color_fill = .{ .color = theme.surface }, .border = R.all(1), .color_border = .{ .color = theme.outline } });
+    return dvui.box(src, .{}, .{ .expand = .both, .padding = R.all(theme.spacing.sidebar_padding), .margin = .{ .x = theme.spacing.page_margin, .y = theme.spacing.page_margin, .h = theme.spacing.page_margin }, .corners = .all(theme.sizing.sidebar_radius), .background = true, .color_fill = .{ .color = theme.surface }, .border = R.all(1), .color_border = .{ .color = theme.outline } });
 }
 
 /// Reserve the navigation footer before the expanding sidebar list.
 pub fn sidebarNavigationButton(src: std.builtin.SourceLocation, key: []const u8, name: []const u8, enabled: bool) bool {
     const font = theme.fontSized(theme.typography.body);
-    const geometry = theme.controlGeometry(@max(font.lineHeight(), font.textSize(name).h), theme.sizing.control_height, 0, theme.sizing.control_padding_x, 0);
+    const geometry = theme.controlGeometry(@max(font.lineHeight(), font.textSize(name).h), theme.sizing.control_height, 0, theme.sizing.control_padding_x, theme.sizing.control_border);
     const transparent = theme.style.colors.transparent;
     var control: dvui.ButtonWidget = undefined;
     control.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, .{
@@ -1161,11 +1151,13 @@ pub fn sidebarNavigationButton(src: std.builtin.SourceLocation, key: []const u8,
         .min_size_content = geometry.content,
         .padding = geometry.padding,
         .margin = R.all(0),
-        .border = R.all(0),
-        .background = false,
-        .color_fill = .{ .color = transparent },
-        .color_fill_hover = .{ .color = transparent },
-        .color_fill_press = .{ .color = transparent },
+        .border = R.all(theme.sizing.control_border),
+        .corners = .all(theme.sizing.control_radius),
+        .background = true,
+        .color_border = .{ .color = theme.outline },
+        .color_fill = .{ .color = theme.sidebar },
+        .color_fill_hover = .{ .color = theme.selected_surface },
+        .color_fill_press = .{ .color = style.colors.pressed_surface },
         .tab_index = if (enabled) null else 0,
     });
     defer control.deinit();
@@ -1268,7 +1260,7 @@ fn fixedModalPanel(src: std.builtin.SourceLocation, name: []const u8, requested_
     // Allocate in the frame arena because deinit writes back to this pointer.
     const rect = dvui.widgetAlloc(R);
     rect.* = .{ .x = viewport.x + (viewport.w - width) / 2, .y = viewport.y + (viewport.h - height) / 2, .w = width, .h = height };
-    const window = dvui.floatingWindow(src, .{ .rect = rect, .modal = true, .open_flag = open_flag, .resize = .none, .window_avoid = .none }, .{
+    const window = dvui.floatingWindow(src, .{ .rect = rect, .modal = true, .modal_alpha = 120, .open_flag = open_flag, .resize = .none, .window_avoid = .none }, .{
         .id_extra = id_extra,
         .min_size_content = .{ .w = @max(0, width - 2 * inset), .h = @max(0, height - 2 * inset) },
         .max_size_content = .{ .w = @max(0, width - 2 * inset), .h = @max(0, height - 2 * inset) },
@@ -1277,6 +1269,7 @@ fn fixedModalPanel(src: std.builtin.SourceLocation, name: []const u8, requested_
         .border = R.all(1),
         .corners = .all(theme.sizing.modal_radius),
         .color_fill = .{ .color = theme.surface },
+        .color_text = .{ .color = dvui.Color.black },
         .color_border = .{ .color = theme.control_outline },
         .label = .{ .text = name },
     });

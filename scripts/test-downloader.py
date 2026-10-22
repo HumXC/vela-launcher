@@ -67,8 +67,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with self.server.count_lock:
                 body = json.dumps(dict(self.server.counts)).encode()
             self.reply(200, body, {"Content-Type": "application/json"})
-        elif path == "/bytes":
+        elif path in ("/bytes", "/instance-client/jar"):
             self.reply(200, BODY)
+        elif path == "/instance-client/index":
+            self.reply(200, b'{"objects":{}}', {"Content-Type": "application/json"})
         elif path == "/json":
             self.reply(200, JSON_BODY, {"Content-Type": "application/json"})
         elif path == "/invalid-json":

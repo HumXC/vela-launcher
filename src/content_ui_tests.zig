@@ -67,7 +67,7 @@ test "content manager requires stable real lease and retains owned selection" {
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var leases: LeaseState = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease() });
     defer service.deinit();
     try std.testing.expectError(error.InvalidConnections, service.setDownloadConnections(0));
     try service.setDownloadConnections(64);
@@ -114,7 +114,7 @@ test "content manager manual hash validation commit backups conflict keep and re
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var leases: LeaseState = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease() });
     defer service.deinit();
     try service.select(selected);
     try drain(&service);
@@ -310,7 +310,7 @@ test "content manager crash pin survives selection cancel failed repair and rest
     defer registry.deinit();
     var leases: LeaseState = .{};
     var crash: CrashFixture = .{};
-    const options: manager.Options = .{ .lease = leases.lease(), .allow_manifest_v2 = true, .fixture_fault = .{ .context = &crash, .boundary = CrashFixture.boundary } };
+    const options: manager.Options = .{ .lease = leases.lease(), .fixture_fault = .{ .context = &crash, .boundary = CrashFixture.boundary } };
     var version = try versionFixture(a, .modrinth, "1", "2", "sample.jar", "payload");
     defer version.deinit();
     try tmp.dir.writeFile(io, .{ .sub_path = "supplied.jar", .data = "payload" });
@@ -461,7 +461,7 @@ test "content manager real archive game receipt dependencies asset tamper and co
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var leases: LeaseState = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease() });
     defer service.deinit();
     const client = "client";
     const library = "library";
@@ -582,7 +582,7 @@ test "content manager real archive game receipt dependencies asset tamper and co
     var shutdown_stage: ?[]u8 = null;
     defer if (shutdown_stage) |path| a.free(path);
     {
-        var secondary = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true });
+        var secondary = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease() });
         defer secondary.deinit();
         try secondary.select(selected);
         try drain(&secondary);
@@ -645,7 +645,7 @@ test "content manager uses only exact authoritative loader artifact bindings" {
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var leases: LeaseState = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease() });
     defer service.deinit();
     const instance: config.Instance = .{ .id = "stable-id", .name = "Display Name", .minecraft_version = "1.20.1", .loader = .fabric, .loader_version = "0.16.10" };
     const client = "client";
@@ -728,7 +728,7 @@ test "content manager inspects actual native CPU for opaque modern classifier" {
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var leases: LeaseState = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease() });
     defer service.deinit();
     const client = "client";
     const index = try std.json.Stringify.valueAlloc(a, .{ .objects = std.json.Value{ .object = .empty } }, .{});
@@ -805,7 +805,7 @@ test "content manager verifies legacy 1.7 native sources without touching launch
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var leases: LeaseState = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease() });
     defer service.deinit();
     var instance = selected;
     instance.minecraft_version = "1.7.10";
@@ -906,7 +906,7 @@ test "content manager retired stage cleanup uses its owning stable ID lease" {
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var leases: LeaseState = .{ .allow_other = true };
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease() });
     defer service.deinit();
     const index = try std.json.Stringify.valueAlloc(a, .{
         .formatVersion = @as(u32, 1),
@@ -1158,7 +1158,7 @@ test "content CF explicit authorization gates before fake vault and HTTP" {
     var leases: LeaseState = .{};
     var vault: CfVault = .{};
     var fixture: CfHttp = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
     defer service.deinit();
     try writeCfGame(tmp.dir);
     try writeCfPack(tmp.dir, false, "overrides/config/pack.cfg");
@@ -1211,10 +1211,10 @@ test "content CF partial retry preserves stage overrides manual optional and con
     var leases: LeaseState = .{};
     var vault: CfVault = .{};
     var fixture: CfHttp = .{ .fail_second = true };
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
     defer service.deinit();
     try writeCfGame(tmp.dir);
-    const previous = try manifest.serialize(a, .{ .schema_version = 2, .instance_id = selected.id, .pack_version = "v0", .pack_membership = .{ .identity = .{ .provider = .curseforge, .project_id = "pack", .version_id = "v0" }, .paths = &.{"config/pack.cfg"} }, .files = &.{.{ .path = "config/pack.cfg", .provider = .curseforge, .project_id = "pack", .version_id = "v0", .identity_provenance = .pack_override, .standalone = false, .hashes = .{ .sha256 = &sha256("original") }, .size = "original".len, .role = .override }} });
+    const previous = try manifest.serialize(a, .{ .schema_version = manifest.schema_version, .instance_id = selected.id, .pack_version = "v0", .pack_membership = .{ .identity = .{ .provider = .curseforge, .project_id = "pack", .version_id = "v0" }, .paths = &.{"config/pack.cfg"} }, .files = &.{.{ .path = "config/pack.cfg", .provider = .curseforge, .project_id = "pack", .version_id = "v0", .identity_provenance = .pack_override, .standalone = false, .hashes = .{ .sha256 = &sha256("original") }, .size = "original".len, .role = .override }} });
     defer a.free(previous);
     try tmp.dir.createDirPath(io, ".vela/instances/stable-id");
     try tmp.dir.writeFile(io, .{ .sub_path = ".vela/instances/stable-id/content.json", .data = previous });
@@ -1292,7 +1292,7 @@ test "content CF malformed metadata collisions and remote records preserve incom
         var leases: LeaseState = .{};
         var vault: CfVault = .{};
         var fixture = item;
-        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
         defer service.deinit();
         try writeCfGame(tmp.dir);
         try writeCfPack(tmp.dir, false, if (item.mode == .collision) "overrides/resourcepacks/pack.cfg" else if (item.mode == .case_collision) "overrides/resourcepacks/example.jar" else "overrides/config/pack.cfg");
@@ -1322,7 +1322,7 @@ test "content CF required dependency cannot be omitted and cancellation joins re
     var leases: LeaseState = .{};
     var vault: CfVault = .{};
     var fixture: CfHttp = .{ .mode = .dependency };
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
     defer service.deinit();
     try writeCfGame(tmp.dir);
     try writeCfPack(tmp.dir, false, "overrides/config/pack.cfg");
@@ -1390,7 +1390,7 @@ test "content CF duplicate archive references fail before vault and HTTP" {
     var leases: LeaseState = .{};
     var vault: CfVault = .{};
     var fixture: CfHttp = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
     defer service.deinit();
     const json = "{\"manifestVersion\":1,\"manifestType\":\"minecraftModpack\",\"name\":\"Fixture\",\"version\":\"v1\",\"minecraft\":{\"version\":\"1.20.1\",\"modLoaders\":[]},\"files\":[{\"projectID\":12,\"fileID\":34,\"required\":true},{\"projectID\":12,\"fileID\":35,\"required\":true}],\"overrides\":\"overrides\"}";
     try storedZip(tmp.dir, "duplicate.zip", &.{.{ .path = "manifest.json", .bytes = json }});
@@ -1434,7 +1434,7 @@ fn inspectionRollbackAllocations(allocator: std.mem.Allocator) !void {
     var registry = tasks.Registry.init(allocator);
     defer registry.deinit();
     var leases: LeaseState = .{};
-    var service = manager.Manager.initOptions(allocator, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true }) catch |err| {
+    var service = manager.Manager.initOptions(allocator, io, &paths, &registry, .{ .lease = leases.lease() }) catch |err| {
         try expectInspectionRetained(&inspected);
         return err;
     };
@@ -1484,7 +1484,7 @@ test "content inspected adoption uses private bytes and removes owned stages on 
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var leases: LeaseState = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease() });
     var service_live = true;
     defer if (service_live) service.deinit();
     try service.select(selected);
@@ -1522,7 +1522,7 @@ test "content CF remote file approval uses fresh exact metadata and unkeyed CDN"
     var vault: CfVault = .{};
     var fixture: CfHttp = .{ .mode = .remote };
     var host = "edge.forgecdn.net".*;
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .allow_curseforge_remote = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .approved_download_hosts = &.{&host}, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_curseforge_remote = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .approved_download_hosts = &.{&host}, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
     defer service.deinit();
     try writeCfGame(tmp.dir);
     try service.select(selected);
@@ -1538,7 +1538,7 @@ test "content CF remote file approval uses fresh exact metadata and unkeyed CDN"
     try std.testing.expectEqual(@as(usize, 0), fixture.cdn_calls);
     try std.testing.expectEqualStrings("resourcepacks/example.jar", proposal.files[0].record.path);
     try std.testing.expectEqual(manifest.IdentityProvenance.official_file, proposal.files[0].record.identity_provenance);
-    try std.testing.expectEqual(@as(u32, 2), proposal.plan.next_manifest.schema_version);
+    try std.testing.expectEqual(manifest.schema_version, proposal.plan.next_manifest.schema_version);
     try std.testing.expect(proposal.files[0].authorization != null);
     host[0] = 'e';
     try service.commit();
@@ -1563,7 +1563,7 @@ test "content CF exact file mismatch rejects before any CDN fetch" {
     var leases: LeaseState = .{};
     var vault: CfVault = .{};
     var fixture: CfHttp = .{ .mode = .wrong_file };
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .allow_curseforge_remote = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_curseforge_remote = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
     defer service.deinit();
     try service.select(selected);
     try drain(&service);
@@ -1587,7 +1587,7 @@ test "content CF counts every actual metadata HTTP request against 64 budget" {
     var leases: LeaseState = .{};
     var vault: CfVault = .{};
     var fixture: CfHttp = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
     defer service.deinit();
     try writeCfGame(tmp.dir);
     const Ref = struct { projectID: u32, fileID: u32, required: bool };
@@ -1616,7 +1616,7 @@ test "content CF counts every actual metadata HTTP request against 64 budget" {
     try std.testing.expectEqual(leases.acquired, leases.released);
 }
 
-test "content CF manual mode downgrades remote metadata and receipt opt-in is job-local" {
+test "content CF manual mode requires verified manual source for remote metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
@@ -1633,11 +1633,11 @@ test "content CF manual mode downgrades remote metadata and receipt opt-in is jo
     try service.select(selected);
     try drain(&service);
     try service.prepareUpdate(.curseforge, "12", "34", .resourcepack);
-    service.options.allow_manifest_v2 = true;
     try drain(&service);
     const proposal = try expectProposal(&service);
     try std.testing.expect(service.snapshot().failure == null);
-    try std.testing.expectEqual(error.ReceiptUpgradeRequired, proposal.blocker.?);
+    try std.testing.expect(proposal.blocker == null);
+    try std.testing.expect(proposal.missing_manual != 0);
     try std.testing.expect(!proposal.ready);
     try std.testing.expect(proposal.files[0].download == .manual_required);
     try std.testing.expect(proposal.files[0].authorization == null);
@@ -1659,7 +1659,7 @@ test "content CF retained pack authorizations refresh and HTTP outage stays unre
     var leases: LeaseState = .{};
     var vault: CfVault = .{};
     var fixture: CfHttp = .{ .mode = .remote };
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .allow_curseforge_remote = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_curseforge_remote = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
     defer service.deinit();
     try writeCfGame(tmp.dir);
     try writeCfPack(tmp.dir, false, "overrides/config/pack.cfg");
@@ -1699,63 +1699,6 @@ test "content CF retained pack authorizations refresh and HTTP outage stays unre
     try std.testing.expectEqual(leases.acquired, leases.released);
 }
 
-test "content CF legacy replacement requires pinned old receipt approval" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    var paths = try instances.Paths.init(a, io, root);
-    defer paths.deinit();
-    var registry = tasks.Registry.init(a);
-    defer registry.deinit();
-    var leases: LeaseState = .{};
-    var vault: CfVault = .{};
-    var fixture: CfHttp = .{};
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
-    defer service.deinit();
-    const old_hash = sha1("old");
-    const old_path = "mods/legacy.jar";
-    const old = try manifest.serialize(a, .{ .instance_id = selected.id, .pack_version = "old", .files = &.{.{ .path = old_path, .provider = .curseforge, .project_id = "12", .version_id = "34", .hashes = .{ .sha1 = &old_hash }, .size = 3 }} });
-    defer a.free(old);
-    try tmp.dir.createDirPath(io, ".vela/instances/stable-id");
-    try tmp.dir.writeFile(io, .{ .sub_path = ".vela/instances/stable-id/content.json", .data = old });
-    try tmp.dir.createDirPath(io, ".minecraft/versions/Display Name/mods");
-    try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Display Name/mods/legacy.jar", .data = "old" });
-    try service.select(selected);
-    try drain(&service);
-    try service.prepareUpdate(.curseforge, "12", "44", .resourcepack);
-    try drain(&service);
-    try std.testing.expect(service.snapshot().failure == null);
-    var retained = false;
-    for ((try expectDesired(&service)).files) |file| if (std.mem.eql(u8, file.path, old_path)) {
-        retained = true;
-        try std.testing.expectEqual(manifest.IdentityProvenance.legacy_unknown, file.identity_provenance);
-    };
-    try std.testing.expect(retained);
-    const identity: manifest.PackIdentity = .{ .provider = .curseforge, .project_id = "12", .version_id = "34" };
-    const approval: manifest.LegacyApproval = .{ .path = old_path, .expected_hashes = .{ .sha1 = &old_hash }, .expected_size = 3 };
-    var stale = approval;
-    stale.expected_size = 4;
-    try service.prepareLegacyUpdate(identity, &.{stale}, "44", .resourcepack);
-    try drain(&service);
-    try expectFailure(&service, error.StaleLegacyApproval);
-    try service.prepareLegacyUpdate(identity, &.{approval}, "44", .resourcepack);
-    try drain(&service);
-    try std.testing.expect(service.snapshot().failure == null);
-    const desired = try expectDesired(&service);
-    try std.testing.expectEqual(@as(u32, 2), desired.schema_version);
-    try std.testing.expectEqual(@as(usize, 1), desired.files.len);
-    try std.testing.expectEqualStrings("resourcepacks/example.jar", desired.files[0].path);
-    try std.testing.expectEqualStrings("44", desired.files[0].version_id);
-    try std.testing.expectEqual(manifest.IdentityProvenance.official_file, desired.files[0].identity_provenance);
-    try std.testing.expectEqual(@as(usize, 1), (try expectProposal(&service)).legacy_approvals.len);
-    const unchanged = try tmp.dir.readFileAlloc(io, ".vela/instances/stable-id/content.json", a, .limited(8192));
-    defer a.free(unchanged);
-    try std.testing.expectEqualStrings(old, unchanged);
-    try std.testing.expectEqual(@as(usize, 0), fixture.cdn_calls);
-    try std.testing.expectEqual(leases.acquired, leases.released);
-}
-
 test "content CF candidate lists reject 129 entries but admit the 128 boundary" {
     for ([_]usize{ 128, 129 }) |count| {
         var tmp = std.testing.tmpDir(.{});
@@ -1769,7 +1712,7 @@ test "content CF candidate lists reject 129 entries but admit the 128 boundary" 
         var leases: LeaseState = .{};
         var vault: CfVault = .{};
         var fixture: CfHttp = .{ .list_count = count };
-        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
         defer service.deinit();
         try service.select(selected);
         try drain(&service);
@@ -1806,7 +1749,7 @@ test "content CF manual tagless modpack browsing refetches confirmed project wit
     var leases: LeaseState = .{};
     var vault: CfVault = .{};
     var fixture: CfHttp = .{ .mode = .remote, .project_class = 4471, .official_page = "https://www.curseforge.com/minecraft/modpacks/example", .primary_filename = "pack.zip", .remote_url = "https://edge.forgecdn.net/files/0/34/pack.zip" };
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
     defer service.deinit();
     try service.select(selected);
     try drain(&service);
@@ -1871,7 +1814,7 @@ test "content CF confirmed archive is authoritative for tagless modpack loader a
         defer a.free(payload);
         var fixture: CfHttp = .{ .mode = .remote, .project_class = 4471, .official_page = "https://www.curseforge.com/minecraft/modpacks/example", .primary_filename = "pack.zip", .remote_url = "https://edge.forgecdn.net/files/0/34/pack.zip", .payload = payload, .game_versions = case.tags };
         const hosts = [_][]const u8{"edge.forgecdn.net"};
-        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .allow_curseforge_remote = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .approved_download_hosts = &hosts, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
+        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_curseforge_remote = true, .curseforge = cf_policy, .fixture_credential_store = vault.store(), .transport_options = .{ .allow_curseforge = true, .approved_download_hosts = &hosts, .fixture_http = CfHttp.execute, .fixture_context = &fixture } });
         defer service.deinit();
         try writeCfGame(tmp.dir);
         var target = selected;
@@ -1903,7 +1846,7 @@ test "content CF confirmed archive is authoritative for tagless modpack loader a
             if (target.loader_version) |version| try std.testing.expectEqualStrings(version, pack.loader_version.?);
             try std.testing.expectEqualStrings("12", pack.identity.project_id);
             try std.testing.expectEqualStrings("34", pack.identity.version_id);
-            try std.testing.expectEqual(@as(u32, 2), desired.schema_version);
+            try std.testing.expectEqual(manifest.schema_version, desired.schema_version);
             const override = desired.files[0];
             try std.testing.expectEqualStrings("config/pack.cfg", override.path);
             try std.testing.expectEqual(manifest.IdentityProvenance.pack_override, override.identity_provenance);
@@ -1968,7 +1911,7 @@ fn seedToggleReceipt(dir: std.Io.Dir, records: []const manifest.ManagedFile, byt
         defer a.free(path);
         try dir.writeFile(io, .{ .sub_path = path, .data = bytes });
     }
-    const receipt = try manifest.serialize(a, .{ .schema_version = 2, .instance_id = selected.id, .pack_version = if (membership) |pack| pack.identity.version_id else "local", .files = records, .pack_membership = membership });
+    const receipt = try manifest.serialize(a, .{ .schema_version = manifest.schema_version, .instance_id = selected.id, .pack_version = if (membership) |pack| pack.identity.version_id else "local", .files = records, .pack_membership = membership });
     defer a.free(receipt);
     try dir.writeFile(io, .{ .sub_path = ".vela/instances/stable-id/content.json", .data = receipt });
 }
@@ -1978,6 +1921,12 @@ fn expectToggleReceipt(dir: std.Io.Dir, enabled: bool, bytes: []const u8) !void 
     defer a.free(receipt);
     var document = try manifest.parse(a, receipt);
     defer document.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, receipt, "\"enabled\"") == null);
+    const game = try dir.openDir(io, ".minecraft/versions/Display Name", .{ .iterate = true });
+    defer game.close(io);
+    const observed = try @import("core/content_state.zig").observe(a, io, game, document.value.files);
+    defer a.free(observed);
+    document.value.files = observed;
     try std.testing.expectEqual(enabled, document.value.files[0].enabled);
     const physical = try manifest.physicalPath(a, document.value.files[0]);
     defer a.free(physical);
@@ -2010,10 +1959,8 @@ fn drainToggle(service: *manager.Manager, coordinator: *ToggleCoordinator.Coordi
     coordinator.tick();
 }
 
-test "owned mod state UI request is local for standalone and pack children with real leases" {
+test "fast mod toggles enforce real leases and preserve standalone and pack ownership" {
     for ([_]manifest.IdentityProvenance{ .official_file, .pack_archive, .pack_override }) |provenance| {
-        var phase: enum { setup, launch_guard, mutation_guard, owned_request, disable_review, disable_commit, refresh_handoff, enable_review, enable_commit } = .setup;
-        errdefer std.debug.print("mod state fixture {s}/{s}\n", .{ @tagName(provenance), @tagName(phase) });
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try tmp.dir.realPathFileAlloc(io, ".", a);
@@ -2030,81 +1977,30 @@ test "owned mod state UI request is local for standalone and pack children with 
         var counters: ToggleNoRemote = .{};
         var registry = tasks.Registry.init(a);
         defer registry.deinit();
-        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback, .allow_manifest_v2 = true, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters }, .vanilla_preparation = .{ .context = &counters, .prepare = ToggleNoRemote.prepare } });
+        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters }, .vanilla_preparation = .{ .context = &counters, .prepare = ToggleNoRemote.prepare } });
         defer service.deinit();
         try service.select(selected);
         try drainToggle(&service, &coordinator);
         try expectSuccess(&service);
-        phase = .launch_guard;
         try coordinator.reserveLaunch(selected.id);
-        try std.testing.expectError(error.InstanceRunning, service.prepareEnabled(record.path, false));
+        try std.testing.expectError(error.InstanceRunning, service.toggleEnabled(record.path, false));
         coordinator.releaseLaunch();
         coordinator.tick();
-        phase = .mutation_guard;
         const competing = coordinator.mutation(1);
         try competing.acquire(selected.id);
-        try std.testing.expectError(error.InstanceBusy, service.prepareEnabled(record.path, false));
+        try std.testing.expectError(error.InstanceBusy, service.toggleEnabled(record.path, false));
         competing.release(selected.id);
         coordinator.tick();
-        phase = .owned_request;
         var requested_path = "mods/state.jar".*;
-        try service.prepareEnabled(&requested_path, false);
-        requested_path[5] = 'X';
-        try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(selected.id));
-        phase = .disable_review;
-        try drainToggle(&service, &coordinator);
-        const proposal = try expectProposal(&service);
-        try std.testing.expect(proposal.plan.ready);
-        try std.testing.expectEqual(manifest.ActionKind.toggle, proposal.plan.actions[1].kind);
-        var expected = record;
-        expected.enabled = false;
-        try std.testing.expectEqualDeep(expected, proposal.plan.next_manifest.files[0]);
-        try std.testing.expectEqualDeep(membership, proposal.plan.next_manifest.pack_membership);
-        // Review alone leaves the receipt and payload unchanged.
-        try expectToggleReceipt(tmp.dir, true, "old");
-        phase = .disable_commit;
-        try service.commit();
-        try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(selected.id));
-        const completion_deadline = std.Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
-        while (service.active != null) {
-            service.tick();
-            if (std.Io.Clock.awake.now(io).nanoseconds > completion_deadline) return error.TestTimeout;
-            if (service.active != null) try io.sleep(.fromMilliseconds(1), .awake);
-        }
-        phase = .refresh_handoff;
-        try std.testing.expect(service.snapshot().report.?.committed);
-        try std.testing.expect(service.pending_refresh and service.snapshot().failure == null);
-        // Admission can start the refresh before the next coordinator tick.
-        service.tick();
-        service.tick();
-        const handoff = service.snapshot();
-        try std.testing.expect(handoff.failure == null);
-        if (service.active) |job| {
-            try std.testing.expect(job.request == .refresh and job.held and handoff.busy and !service.pending_refresh);
-            try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(selected.id));
-        } else if (service.pending_refresh) {
-            try std.testing.expect(handoff.busy);
-        } else {
-            try std.testing.expect(!handoff.busy);
-            try std.testing.expect(!handoff.installed[0].enabled);
-        }
+        try service.toggleEnabled(&requested_path, false);
+        @memset(&requested_path, 'x');
         try drainToggle(&service, &coordinator);
         try expectSuccess(&service);
-        try std.testing.expect(!service.snapshot().installed[0].enabled);
         try expectToggleReceipt(tmp.dir, false, "old");
-        try coordinator.reserveLaunch(selected.id);
-        coordinator.releaseLaunch();
-        coordinator.tick();
-        phase = .enable_review;
-        try service.prepareEnabled(record.path, true);
-        try drainToggle(&service, &coordinator);
-        try std.testing.expect((try expectProposal(&service)).plan.ready);
-        phase = .enable_commit;
-        try service.commit();
+        try service.toggleEnabled("mods/state.jar.disabled", true);
         try drainToggle(&service, &coordinator);
         try expectSuccess(&service);
         try expectToggleReceipt(tmp.dir, true, "old");
-        try std.testing.expect(service.snapshot().installed[0].enabled);
         try counters.expectUnused();
     }
 }
@@ -2124,7 +2020,7 @@ test "disabled official standalone choice survives an owned version update and f
     var counters: ToggleNoRemote = .{};
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback, .allow_manifest_v2 = true, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
     defer service.deinit();
     try service.select(selected);
     try drainToggle(&service, &coordinator);
@@ -2149,49 +2045,6 @@ test "disabled official standalone choice survives an owned version update and f
     try expectToggleReceipt(tmp.dir, false, "new");
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/Display Name/mods/state.jar.disabled", .{}));
     try std.testing.expectEqualStrings("mods/renamed.jar", service.snapshot().installed[0].path);
-    try counters.expectUnused();
-}
-
-test "failed mod rename recovery keeps real launch and mutation reservations until proven repair" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    var paths = try instances.Paths.init(a, io, root);
-    defer paths.deinit();
-    var version = try versionFixture(a, .modrinth, "project", "old", "state.jar", "old");
-    defer version.deinit();
-    const record: manifest.ManagedFile = .{ .path = "mods/state.jar", .provider = .modrinth, .project_id = "project", .version_id = "old", .hashes = version.value.files[0].hashes, .size = 3, .identity_provenance = .official_file };
-    try seedToggleReceipt(tmp.dir, &.{record}, "old", null);
-    var coordinator = ToggleCoordinator.Coordinator.init(io);
-    var counters: ToggleNoRemote = .{};
-    var crash: CrashFixture = .{};
-    var registry = tasks.Registry.init(a);
-    defer registry.deinit();
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback, .allow_manifest_v2 = true, .fixture_fault = .{ .context = &crash, .boundary = CrashFixture.boundary }, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
-    defer service.deinit();
-    try service.select(selected);
-    try drainToggle(&service, &coordinator);
-    try service.prepareEnabled(record.path, false);
-    try drainToggle(&service, &coordinator);
-    try service.commit();
-    try drainToggle(&service, &coordinator);
-    try std.testing.expect(service.snapshot().recovery_required);
-    try std.testing.expectEqual(error.RecoveryRequired, service.snapshot().failure.?);
-    try std.testing.expectError(error.InstanceBusy, coordinator.reserveLaunch(selected.id));
-    try std.testing.expectError(error.InstanceBusy, coordinator.mutation(1).acquire(selected.id));
-    try std.testing.expectError(error.RecoveryRequired, service.prepareEnabled(record.path, true));
-    const transaction = try a.dupe(u8, service.snapshot().transactions[0]);
-    defer a.free(transaction);
-    crash.interrupt = false;
-    try service.recover(transaction);
-    try drainToggle(&service, &coordinator);
-    try expectSuccess(&service);
-    try std.testing.expect(!service.snapshot().recovery_required);
-    try expectToggleReceipt(tmp.dir, true, "old");
-    try coordinator.reserveLaunch(selected.id);
-    coordinator.releaseLaunch();
-    coordinator.tick();
     try counters.expectUnused();
 }
 
@@ -2234,7 +2087,7 @@ test "disabled archive and override pack choices survive same path updates but a
         var leases: LeaseState = .{};
         var registry = tasks.Registry.init(a);
         defer registry.deinit();
-        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
+        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
         defer service.deinit();
         try service.select(selected);
         try drain(&service);
@@ -2271,7 +2124,7 @@ test "disabled archive and override pack choices survive same path updates but a
     var counters: ToggleNoRemote = .{};
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters } });
     defer service.deinit();
     try service.select(selected);
     try drain(&service);
@@ -2311,7 +2164,7 @@ test "a disabled verified required dependency keeps the proposed root unready" {
     var leases: LeaseState = .{};
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .allow_manifest_v2 = true, .transport_options = .{ .fixture_http = HttpFixture.execute, .fixture_context = &fixture } });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = leases.lease(), .transport_options = .{ .fixture_http = HttpFixture.execute, .fixture_context = &fixture } });
     defer service.deinit();
     try service.select(selected);
     try drain(&service);
@@ -2430,6 +2283,10 @@ const PreflightFixture = struct {
     fn adapter(self: *PreflightFixture) instance_preparation.VanillaPreparationAdapter {
         return .{ .context = self, .prepare = prepare };
     }
+    fn fetchSource(context: ?*anyopaque, allocator: std.mem.Allocator, _: std.Io, _: metadata_loader.Request) ![]u8 {
+        const self: *PreflightFixture = @ptrCast(@alignCast(context.?));
+        return allocator.dupe(u8, self.descriptor);
+    }
     fn prepare(context: ?*anyopaque, allocator: std.mem.Allocator, worker_io: std.Io, target: metadata_loader.VanillaTarget, control: instance_preparation.Control) !metadata_loader.PreparedVanilla {
         const self: *PreflightFixture = @ptrCast(@alignCast(context.?));
         _ = self.calls.fetchAdd(1, .monotonic);
@@ -2437,11 +2294,10 @@ const PreflightFixture = struct {
         self.generation.store(target.generation, .release);
         try control.check();
         const entries = [_]game_metadata.manifest.Entry{.{ .id = target.version_id, .kind = "release", .url = "https://piston-meta.mojang.com/v1/packages/fixture/version.json", .time = "", .release_time = "", .sha1 = self.pin, .compliance_level = null }};
-        const minecraft_root = try std.fs.path.join(allocator, &.{ target.root, ".minecraft" });
-        defer allocator.free(minecraft_root);
         var prepared = try metadata_loader.prepareVanilla(allocator, worker_io, .{
             .target = target,
-            .vanilla = .{ .root = minecraft_root, .version_id = target.version_id, .cancel = control.cancel, .manifest = .{ .latest = .{ .release = target.version_id, .snapshot = target.version_id }, .versions = &entries } },
+            .vanilla = .{ .version_id = target.version_id, .cancel = control.cancel, .manifest = .{ .latest = .{ .release = target.version_id, .snapshot = target.version_id }, .versions = &entries } },
+            .fetcher = .{ .context = self, .fetch = fetchSource },
         });
         errdefer prepared.deinit();
         if (self.poison) |flag| flag.store(true, .release);
@@ -2532,7 +2388,7 @@ test "canonical vanilla content preflight authenticates the real factory without
         var counters: ToggleNoRemote = .{};
         var registry = tasks.Registry.init(a);
         defer registry.deinit();
-        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = guard.lease(), .allow_manifest_v2 = true, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters }, .vanilla_preparation = fixture.adapter() });
+        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = guard.lease(), .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters }, .vanilla_preparation = fixture.adapter() });
         defer service.deinit();
         try service.select(instance);
         try drainToggle(&service, &coordinator);
@@ -2575,7 +2431,7 @@ test "canonical vanilla content preflight authenticates the real factory without
                 break :blk proposal.blocker orelse return error.MissingPreflightBlocker;
             } else snapshot.failure orelse return error.MissingPreflightBlocker;
             const expected: ?anyerror = switch (mode) {
-                .metadata_tamper => error.ChecksumMismatch,
+                .metadata_tamper => error.PreparedMetadataChanged,
                 .client_hash => error.ClientHashMismatch,
                 .client_size => error.ClientSizeMismatch,
                 .invalid_receipt => error.InvalidInstallReceipt,
@@ -2614,7 +2470,7 @@ test "canceling canonical vanilla content preparation joins the owned factory an
     var counters: ToggleNoRemote = .{};
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .allow_manifest_v2 = true, .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters }, .vanilla_preparation = fixture.adapter() });
+    var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .fixture_credential_store = counters.store(), .transport_options = .{ .fixture_http = ToggleNoRemote.execute, .fixture_context = &counters }, .vanilla_preparation = fixture.adapter() });
     defer service.deinit();
     try service.select(instance);
     try drainToggle(&service, &coordinator);
@@ -2639,4 +2495,82 @@ test "canceling canonical vanilla content preparation joins the owned factory an
     const installed_path = try PreflightFixture.gamePath(instance, "config/preflight.cfg");
     defer a.free(installed_path);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, installed_path, .{}));
+}
+
+test "fast mod toggles preserve receipt bytes and reload physical disabled state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var paths = try instances.Paths.init(a, io, root);
+    defer paths.deinit();
+    var version = try versionFixture(a, .modrinth, "project", "old", "Example.JAR", "old");
+    defer version.deinit();
+    const record: manifest.ManagedFile = .{ .path = "mods/Example.JAR", .provider = .modrinth, .project_id = "project", .version_id = "old", .hashes = version.value.files[0].hashes, .size = 3, .identity_provenance = .official_file };
+    try seedToggleReceipt(tmp.dir, &.{record}, "old", null);
+    const receipt_path = ".vela/instances/stable-id/content.json";
+    const before = try tmp.dir.readFileAlloc(io, receipt_path, a, .limited(1024 * 1024));
+    defer a.free(before);
+    const before_stat = try tmp.dir.statFile(io, receipt_path, .{});
+    var coordinator = ToggleCoordinator.Coordinator.init(io);
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    {
+        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback });
+        defer service.deinit();
+        try service.select(selected);
+        try drainToggle(&service, &coordinator);
+        try expectSuccess(&service);
+        try service.toggleEnabled(record.path, false);
+        try drainToggle(&service, &coordinator);
+        try expectSuccess(&service);
+        try std.testing.expect(!service.snapshot().installed[0].enabled);
+        try expectToggleReceipt(tmp.dir, false, "old");
+    }
+    {
+        var reloaded = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback });
+        defer reloaded.deinit();
+        try reloaded.select(selected);
+        try drainToggle(&reloaded, &coordinator);
+        try expectSuccess(&reloaded);
+        try std.testing.expect(!reloaded.snapshot().installed[0].enabled);
+        try reloaded.toggleEnabled("mods/Example.JAR.disabled", true);
+        try drainToggle(&reloaded, &coordinator);
+        try expectSuccess(&reloaded);
+        try std.testing.expect(reloaded.snapshot().installed[0].enabled);
+        try expectToggleReceipt(tmp.dir, true, "old");
+    }
+    const after = try tmp.dir.readFileAlloc(io, receipt_path, a, .limited(1024 * 1024));
+    defer a.free(after);
+    const after_stat = try tmp.dir.statFile(io, receipt_path, .{});
+    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expectEqual(before_stat.inode, after_stat.inode);
+    try std.testing.expectEqual(before_stat.mtime.nanoseconds, after_stat.mtime.nanoseconds);
+}
+
+test "content manager rejects old receipt versions without rewriting source" {
+    for ([_]u32{ 1, 2 }) |version| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var paths = try instances.Paths.init(a, io, root);
+        defer paths.deinit();
+        try seedToggleReceipt(tmp.dir, &.{}, "old", null);
+        const receipt = try std.fmt.allocPrint(a, "{{\"schema_version\":{d},\"instance_id\":\"stable-id\",\"pack_version\":\"local\",\"files\":[]}}", .{version});
+        defer a.free(receipt);
+        const receipt_path = ".vela/instances/stable-id/content.json";
+        try tmp.dir.writeFile(io, .{ .sub_path = receipt_path, .data = receipt });
+        var coordinator = ToggleCoordinator.Coordinator.init(io);
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var service = try manager.Manager.initOptions(a, io, &paths, &registry, .{ .lease = toggleLease(&coordinator), .worker_recheck = ToggleCoordinator.Mutation.workerRecheckCallback });
+        defer service.deinit();
+        try service.select(selected);
+        try drainToggle(&service, &coordinator);
+        try std.testing.expectEqual(error.UnsupportedSchema, service.snapshot().failure.?);
+        const actual = try tmp.dir.readFileAlloc(io, receipt_path, a, .limited(1024 * 1024));
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(receipt, actual);
+    }
 }

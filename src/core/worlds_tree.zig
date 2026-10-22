@@ -27,7 +27,7 @@ pub const Hooks = struct {
 pub const Entry = struct { path: []const u8, directory: bool, size: u64 = 0, sha256: [32]u8 = @splat(0) };
 pub const Snapshot = struct {
     allocator: A,
-    entries: []Entry,
+    entries: []const Entry,
     bytes: u64,
     pub fn deinit(self: *Snapshot) void {
         for (self.entries) |e| self.allocator.free(e.path);
@@ -39,8 +39,7 @@ pub const Snapshot = struct {
 /// Every absolute path component is opened independently; no parent symlink is followed.
 /// The launcher root must already exist. Child creation is relative to these handles.
 pub fn openAbsolute(io: std.Io, path: []const u8) !Dir {
-    if (!std.fs.path.isAbsolute(path)) return error.UnsafePath;
-    const root = if (@import("builtin").os.tag == .windows) path[0 .. std.fs.path.diskDesignator(path).len + 1] else "/";
+    const root = try @import("native_path.zig").absoluteRoot(path);
     var dir = try Dir.openDirAbsolute(io, root, .{ .iterate = true, .follow_symlinks = false });
     errdefer dir.close(io);
     var parts = std.mem.tokenizeAny(u8, path[root.len..], "/\\");

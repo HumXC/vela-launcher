@@ -17,3 +17,8 @@ result
 .minecraft
 .ulpi
 .vela
+.dsh
+outputs/
+.vela-writer.lock
+design
+docs

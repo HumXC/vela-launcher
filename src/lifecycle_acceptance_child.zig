@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
         // Always retain identity until the driver owns a pidfd; close_preparing
         // additionally keeps this real probe held across compositor close.
         while (!(try released(a, io, ipc, "probe-release", nonce))) try io.sleep(.fromMilliseconds(10), .awake);
-        try Io.File.stderr().writeStreamingAll(io, "openjdk version \"21\"\n    java.version = 21\n    java.vendor = Vela Lifecycle Fixture\n");
+        try Io.File.stderr().writeStreamingAll(io, "openjdk version \"21\"\n    java.version = 21\n    java.vendor = Vela Lifecycle Fixture\n    os.arch = " ++ @tagName(builtin.cpu.arch) ++ "\n");
         return;
     }
     const main_index = for (args, 0..) |arg, index| {

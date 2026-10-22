@@ -4,32 +4,26 @@ const builtin = @import("builtin");
 const curl = @import("curl");
 const dl = @import("../core/downloader.zig");
 const metadata = @import("../core/minecraft/metadata/root.zig");
-const install = @import("../core/minecraft/install.zig");
 const native = @import("../core/minecraft/native_extract.zig");
-const tasks = @import("../core/tasks.zig");
 const metadata_loader = @import("../core/minecraft/metadata_loader.zig");
 const loaders = @import("../core/loaders/root.zig");
 
 pub const InstalledEntry = struct { id: []const u8, java_major: u32 = 8 };
-pub const CatalogEntry = struct { id: []const u8, kind: []const u8, release_time: []const u8 = "", url: []const u8 = "", sha1: ?metadata.Sha1 = null };
+pub const CatalogEntry = struct { id: []const u8, kind: []const u8, release_time: []const u8 = "", url: []const u8, sha1: ?metadata.Sha1 = null };
 /// Preview is metadata-only: it never downloads artifacts or installs Java.
 pub const PreviewPhase = @import("version_preview_types.zig").Phase;
 pub const PreviewSnapshot = @import("version_preview_types.zig").Snapshot;
-pub const Phase = enum { idle, loading, installing, complete, failed };
+pub const Phase = enum { idle, loading, complete, failed };
 pub const Snapshot = struct {
     installed: []const InstalledEntry,
     installed_generation: u64 = 0,
     available: []const CatalogEntry,
     phase: Phase,
     failure: ?anyerror,
-    completed: usize,
-    total: usize,
-    installing_version: ?[]const u8,
 };
 pub const Options = struct {
     root: []const u8 = ".minecraft",
     manifest_url: []const u8 = metadata.version_manifest_url,
-    task_registry: ?*tasks.Registry = null,
     cache_root: ?[]const u8 = null,
     download_connections: u16 = 8,
     /// Borrowed immutable adapter context must outlive the controller and joins.
@@ -37,22 +31,18 @@ pub const Options = struct {
 };
 
 const worker_allocator = std.heap.page_allocator;
-const Operation = enum { catalogue, install_version, refresh_installed };
+const Operation = enum { catalogue, refresh_installed };
 const Job = struct {
     arena: std.heap.ArenaAllocator = .init(worker_allocator),
     io: std.Io,
     operation: Operation,
     root: []const u8,
     manifest_url: []const u8,
-    version_id: ?[]const u8,
     cache_root: ?[]const u8 = null,
     download_connections: u16 = 8,
-    task: ?*tasks.Task = null,
     thread: ?std.Thread = null,
     canceled: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
-    completed: std.atomic.Value(usize) = .init(0),
-    total: std.atomic.Value(usize) = .init(0),
     installed: []const InstalledEntry = &.{},
     installed_refreshed: bool = false,
     available: []const CatalogEntry = &.{},
@@ -62,11 +52,8 @@ const Job = struct {
         self.arena.deinit();
         worker_allocator.destroy(self);
     }
-    fn cancelFlag(self: *Job) *const std.atomic.Value(bool) {
-        return if (self.task) |task| &task.cancellation else &self.canceled;
-    }
     fn checkCancel(self: *Job) !void {
-        if (self.cancelFlag().load(.acquire)) return error.Canceled;
+        if (self.canceled.load(.acquire)) return error.Canceled;
     }
 };
 
@@ -74,7 +61,6 @@ const PreviewCacheEntry = struct { version: []u8, java_major: u32 };
 const PreviewJob = struct {
     arena: std.heap.ArenaAllocator = .init(worker_allocator),
     io: std.Io,
-    root: []const u8,
     manifest_url: []const u8,
     version_id: []const u8,
     generation: u64,
@@ -128,8 +114,7 @@ const PreviewJob = struct {
             break :blk fetched_manifest.?.value;
         };
         try self.control().check();
-        var loaded = try metadata_loader.loadTrusted(worker_allocator, self.io, .{
-            .root = self.root,
+        var loaded = try metadata_loader.fetchSources(worker_allocator, self.io, .{
             .version_id = self.version_id,
             .manifest = manifest,
             .cancel = &self.canceled,
@@ -210,27 +195,14 @@ fn cloneCatalogEntry(a: std.mem.Allocator, source: CatalogEntry) !CatalogEntry {
     return .{ .id = try a.dupe(u8, source.id), .kind = try a.dupe(u8, source.kind), .release_time = try a.dupe(u8, source.release_time), .url = try a.dupe(u8, source.url), .sha1 = source.sha1 };
 }
 
-// The install API's callback has no context parameter. Each installer runs on
-// its own OS thread, so this pointer is never shared between controllers.
-threadlocal var reporting_job: ?*Job = null;
-fn report(progress: install.Progress) void {
-    const job = reporting_job orelse return;
-    job.total.store(progress.total, .release);
-    job.completed.store(progress.completed, .release);
-    if (job.task) |task| task.report(.downloading, @intCast(progress.completed), @intCast(progress.total));
-}
-
 /// Methods, except the worker's atomics, belong exclusively to the UI thread.
 /// Returned strings/arrays remain valid until the next tick/start/deinit.
 /// The supplied Io must support concurrent OS threads (as App.main_init.io does).
-/// A supplied task registry must outlive the controller; tick/deinit join before
-/// finishing tasks, and published jobs release task pointers before pruning.
 pub const Controller = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
     manifest_url: []const u8,
-    task_registry: ?*tasks.Registry = null,
     cache_root: ?[]const u8 = null,
     download_connections: u16 = 8,
     active: ?*Job = null,
@@ -266,7 +238,7 @@ pub const Controller = struct {
         } else null;
         errdefer if (cache_root) |path| a.free(path);
         try curl.globalInit();
-        return .{ .allocator = a, .io = io, .root = root, .manifest_url = manifest_url, .task_registry = options.task_registry, .cache_root = cache_root, .download_connections = options.download_connections, .preview_transport = options.preview_transport };
+        return .{ .allocator = a, .io = io, .root = root, .manifest_url = manifest_url, .cache_root = cache_root, .download_connections = options.download_connections, .preview_transport = options.preview_transport };
     }
     pub fn deinit(self: *Controller) void {
         self.cancel();
@@ -280,7 +252,6 @@ pub const Controller = struct {
         if (self.active) |job| {
             job.thread.?.join();
             job.thread = null;
-            self.finishTask(job);
             job.destroy();
         }
         if (self.published) |job| job.destroy();
@@ -296,7 +267,6 @@ pub const Controller = struct {
         if (!job.done.load(.acquire)) return;
         job.thread.?.join();
         job.thread = null;
-        self.finishTask(job);
         if (self.published) |old| old.destroy();
         self.published = job;
         self.active = null;
@@ -306,16 +276,12 @@ pub const Controller = struct {
     }
     pub fn snapshot(self: *const Controller) Snapshot {
         const data = self.published;
-        const progress = self.active orelse data;
         return .{
             .installed = if (data) |job| job.installed else &.{},
             .installed_generation = self.installed_generation,
             .available = if (data) |job| job.available else &.{},
             .phase = self.phase,
             .failure = self.failure,
-            .completed = if (progress) |job| job.completed.load(.acquire) else 0,
-            .total = if (progress) |job| job.total.load(.acquire) else 0,
-            .installing_version = if (progress) |job| job.version_id else null,
         };
     }
     /// Idempotent for a frame-by-frame selection. Failure stays visible until the
@@ -389,74 +355,58 @@ pub const Controller = struct {
     fn startPreviewJob(self: *Controller) !void {
         std.debug.assert(self.preview_active == null);
         const job = try worker_allocator.create(PreviewJob);
-        job.* = .{ .io = self.io, .root = undefined, .manifest_url = undefined, .version_id = undefined, .generation = self.preview_generation, .transport = self.preview_transport };
+        job.* = .{ .io = self.io, .manifest_url = undefined, .version_id = undefined, .generation = self.preview_generation, .transport = self.preview_transport };
         errdefer job.destroy();
         const a = job.arena.allocator();
-        job.root = try a.dupe(u8, self.root);
         job.manifest_url = try a.dupe(u8, self.manifest_url);
         job.version_id = try a.dupe(u8, self.preview_version.?);
         if (self.cache_root) |root| job.cache_root = try a.dupe(u8, root);
         if (self.published) |published| {
             // Copy every source before spawning, including inherited metadata.
             const sources = try a.alloc(metadata.manifest.Entry, published.available.len);
-            var count: usize = 0;
-            for (published.available) |entry| {
-                if (entry.url.len == 0) continue;
+            for (published.available, sources) |entry, *source| {
                 const copy = try cloneCatalogEntry(a, entry);
-                sources[count] = .{ .id = copy.id, .kind = copy.kind, .url = copy.url, .time = "", .release_time = copy.release_time, .sha1 = copy.sha1, .compliance_level = null };
-                count += 1;
+                source.* = .{ .id = copy.id, .kind = copy.kind, .url = copy.url, .time = "", .release_time = copy.release_time, .sha1 = copy.sha1, .compliance_level = null };
             }
-            // Older literal fixtures may not contain sources; use official fallback.
-            const catalogue: metadata.manifest.Manifest = .{ .latest = .{ .release = "", .snapshot = "" }, .versions = sources[0..count] };
+            const catalogue: metadata.manifest.Manifest = .{ .latest = .{ .release = "", .snapshot = "" }, .versions = sources };
             if (catalogue.find(job.version_id) != null) job.catalogue = catalogue.versions;
         }
         job.thread = try std.Thread.spawn(.{}, PreviewJob.work, .{job});
         self.preview_active = job;
     }
     pub fn refreshInstalled(self: *Controller) !void {
-        try self.start(.refresh_installed, null);
+        try self.start(.refresh_installed);
     }
     pub fn loadCatalogue(self: *Controller) !void {
-        try self.start(.catalogue, null);
+        try self.start(.catalogue);
     }
     pub fn setDownloadConnections(self: *Controller, connections: u16) !void {
         if (connections == 0 or connections > 64) return error.InvalidDownloadConnections;
         self.download_connections = connections;
     }
 
-    pub fn installVersion(self: *Controller, id: []const u8) !void {
-        if (self.active != null) return error.Busy;
-        component(id) catch |err| {
-            self.failure = err;
-            self.phase = .failed;
-            return err;
-        };
-        try self.start(.install_version, id);
-    }
     pub fn cancel(self: *Controller) void {
         if (self.active) |job| {
-            if (job.task) |task| _ = self.task_registry.?.cancel(task.id);
             job.canceled.store(true, .release);
         }
     }
-    fn start(self: *Controller, operation: Operation, id: ?[]const u8) !void {
+    fn start(self: *Controller, operation: Operation) !void {
         if (self.active != null) return error.Busy;
-        self.startJob(operation, id) catch |err| {
+        self.startJob(operation) catch |err| {
             self.failure = err;
             self.phase = .failed;
             return err;
         };
         self.failure = null;
-        self.phase = if (operation == .install_version) .installing else .loading;
+        self.phase = .loading;
     }
-    fn startJob(self: *Controller, operation: Operation, id: ?[]const u8) !void {
+    fn startJob(self: *Controller, operation: Operation) !void {
         const job = try worker_allocator.create(Job);
-        job.* = .{ .io = self.io, .operation = operation, .root = undefined, .manifest_url = undefined, .version_id = null, .download_connections = self.download_connections };
+        job.* = .{ .io = self.io, .operation = operation, .root = undefined, .manifest_url = undefined, .download_connections = self.download_connections };
         errdefer job.destroy();
         const a = job.arena.allocator();
         job.root = try a.dupe(u8, self.root);
         job.manifest_url = try a.dupe(u8, self.manifest_url);
-        if (id) |value| job.version_id = try a.dupe(u8, value);
         if (self.cache_root) |path| job.cache_root = try a.dupe(u8, path);
         if (self.published) |data| {
             const installed = try a.alloc(InstalledEntry, data.installed.len);
@@ -466,35 +416,8 @@ pub const Controller = struct {
             for (available, data.available) |*target, source| target.* = try cloneCatalogEntry(a, source);
             job.available = available;
         }
-        self.startTaskJob(job) catch |err| {
-            if (job.task) |task| self.task_registry.?.finish(task, .{ .failed = err });
-            return err;
-        };
-    }
-
-    fn startTaskJob(self: *Controller, job: *Job) !void {
-        const operation = job.operation;
-        const a = job.arena.allocator();
-        if (operation == .install_version) {
-            if (self.task_registry) |registry| {
-                const title = try std.fmt.allocPrint(a, "Install Minecraft {s}", .{job.version_id.?});
-                job.task = try registry.create(.game_install, title);
-                try registry.start(job.task.?);
-            }
-        }
         job.thread = try std.Thread.spawn(.{}, work, .{job});
         self.active = job;
-    }
-    fn finishTask(self: *Controller, job: *Job) void {
-        std.debug.assert(job.thread == null);
-        const task = job.task orelse return;
-        const outcome: tasks.Outcome = if (job.failure) |err|
-            (if (err == error.Canceled) .canceled else .{ .failed = err })
-        else
-            .succeeded;
-        self.task_registry.?.finish(task, outcome);
-        // Published data must not retain a pointer the registry may prune.
-        job.task = null;
     }
 };
 
@@ -506,52 +429,18 @@ fn work(job: *Job) void {
 }
 fn perform(job: *Job) !void {
     try job.checkCancel();
-    if (job.task) |task| task.report(.scanning, 0, null);
-    job.installed = try scanInstalled(job.arena.allocator(), job.io, job.root, job.cancelFlag());
+    job.installed = try scanInstalled(job.arena.allocator(), job.io, job.root, &job.canceled);
     try job.checkCancel();
     job.installed_refreshed = true;
-    if (job.operation == .refresh_installed) return;
-    const service = try dl.Service.init(worker_allocator, job.io, job.download_connections);
-    defer service.deinit();
     switch (job.operation) {
-        .refresh_installed => unreachable,
+        .refresh_installed => return,
         .catalogue => {
+            const service = try dl.Service.init(worker_allocator, job.io, job.download_connections);
+            defer service.deinit();
             const bytes = try fetchManifest(job, service);
             defer worker_allocator.free(bytes);
             job.available = try parseCatalogue(job.arena.allocator(), bytes);
             try job.checkCancel();
-        },
-        .install_version => {
-            if (job.task) |task| task.report(.metadata, 0, null);
-            reporting_job = job;
-            defer reporting_job = null;
-            const http_cache = try httpCacheRoot(job);
-            defer if (http_cache) |path| worker_allocator.free(path);
-            var installed = try install.run(worker_allocator, job.io, service, .{
-                .version_id = job.version_id.?,
-                .root = job.root,
-                .http_cache = http_cache,
-                .manifest_url = job.manifest_url,
-                .environment = try hostEnvironment(),
-                .native_arch = if (@sizeOf(usize) == 8) .bits64 else .bits32,
-                .cancel = job.cancelFlag(),
-                .progress = report,
-            });
-            defer installed.deinit();
-            if (job.task) |task| task.report(.verifying, 0, null);
-            // run() committed the complete install. Validate/publish it even if
-            // cancellation arrived after commit; the token alone is not outcome.
-            var committed: std.atomic.Value(bool) = .init(false);
-            job.installed = try scanInstalled(job.arena.allocator(), job.io, job.root, &committed);
-            var found = false;
-            for (job.installed) |entry| {
-                if (std.mem.eql(u8, entry.id, job.version_id.?)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return error.IncompleteInstall;
-            if (job.task) |task| task.report(.finalizing, 1, 1);
         },
     }
 }
@@ -820,7 +709,9 @@ fn completePlan(io: std.Io, root_dir: std.Io.Dir, root: []const u8, version: met
     };
     defer assets.deinit();
     const planner = @import("../core/minecraft/install_plan.zig");
-    var plan = planner.buildInstalled(worker_allocator, version, assets.value, try hostEnvironment(), .{ .root = root, .native_arch = if (@sizeOf(usize) == 8) .bits64 else .bits32, .cpu_arch = @tagName(builtin.cpu.arch) }) catch |err| switch (err) {
+    const client_relative_path = try @import("../core/minecraft/layout.zig").installedClient(worker_allocator, version);
+    defer worker_allocator.free(client_relative_path);
+    var plan = planner.buildInstalled(worker_allocator, version, assets.value, try hostEnvironment(), .{ .root = root, .client_relative_path = client_relative_path }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return false,
     };
@@ -929,9 +820,7 @@ test "local legacy native sources remain installed without extracted outputs" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "versions/Legacy Native/natives", .{}));
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    var registry = tasks.Registry.init(a);
-    defer registry.deinit();
-    var controller = try Controller.initWithOptions(a, io, .{ .root = root, .manifest_url = "invalid://no-http", .task_registry = &registry });
+    var controller = try Controller.initWithOptions(a, io, .{ .root = root, .manifest_url = "invalid://no-http" });
     defer controller.deinit();
     try controller.refreshInstalled();
     try waitForTest(&controller);
@@ -949,8 +838,6 @@ test "local legacy native sources remain installed without extracted outputs" {
     try waitForTest(&controller);
     try std.testing.expectEqual(Phase.complete, controller.snapshot().phase);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().installed.len);
-    try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
-    try std.testing.expect(!registry.hasActive());
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "versions/Legacy Native/natives", .{}));
 }
 
@@ -1010,16 +897,14 @@ test "local installed refresh observes flattened custom folders and retains cata
     try writeVersionFixtureWithJava(tmp.dir, "My World", "My World", true, 21);
     var path: [4096]u8 = undefined;
     const len = try tmp.dir.realPath(io, &path);
-    var registry = tasks.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    var controller = try Controller.initWithOptions(std.testing.allocator, io, .{ .root = path[0..len], .manifest_url = "invalid://local-only", .task_registry = &registry });
+    var controller = try Controller.initWithOptions(std.testing.allocator, io, .{ .root = path[0..len], .manifest_url = "invalid://local-only" });
     defer controller.deinit();
     const previous = try worker_allocator.create(Job);
-    previous.* = .{ .io = io, .operation = .catalogue, .root = controller.root, .manifest_url = controller.manifest_url, .version_id = null };
+    previous.* = .{ .io = io, .operation = .catalogue, .root = controller.root, .manifest_url = controller.manifest_url };
     controller.published = previous;
     const a = previous.arena.allocator();
     const catalogue = try a.alloc(CatalogEntry, 1);
-    catalogue[0] = .{ .id = try a.dupe(u8, "1.21.5"), .kind = try a.dupe(u8, "release") };
+    catalogue[0] = .{ .id = try a.dupe(u8, "1.21.5"), .kind = try a.dupe(u8, "release"), .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.21.5.json" };
     previous.available = catalogue;
     try controller.refreshInstalled();
     try std.testing.expectError(error.Busy, controller.refreshInstalled());
@@ -1062,8 +947,6 @@ test "local installed refresh observes flattened custom folders and retains cata
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().installed.len);
     try std.testing.expectEqual(@as(u64, 3), controller.snapshot().installed_generation);
     try std.testing.expectEqualStrings("1.21.5", controller.snapshot().available[0].id);
-    try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
-    try std.testing.expect(!registry.hasActive());
 }
 
 test "canceled local refresh preserves owned Java requirements and generation" {
@@ -1074,7 +957,7 @@ test "canceled local refresh preserves owned Java requirements and generation" {
     var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = path[0..len], .manifest_url = "invalid://local-only" });
     defer controller.deinit();
     const job = try worker_allocator.create(Job);
-    job.* = .{ .io = std.testing.io, .operation = .refresh_installed, .root = controller.root, .manifest_url = controller.manifest_url, .version_id = null, .canceled = .init(true) };
+    job.* = .{ .io = std.testing.io, .operation = .refresh_installed, .root = controller.root, .manifest_url = controller.manifest_url, .canceled = .init(true) };
     controller.active = job;
     controller.phase = .loading;
     const a = job.arena.allocator();
@@ -1101,7 +984,7 @@ test "controller busy cancellation joined shutdown and retry without network" {
     try std.testing.expectEqual(Phase.idle, controller.snapshot().phase);
     try controller.loadCatalogue();
     try std.testing.expectError(error.Busy, controller.loadCatalogue());
-    try std.testing.expectError(error.Busy, controller.installVersion("1.0"));
+    try std.testing.expectError(error.Busy, controller.refreshInstalled());
     controller.cancel();
     try waitForTest(&controller);
     try std.testing.expectEqual(Phase.failed, controller.snapshot().phase);
@@ -1109,7 +992,6 @@ test "controller busy cancellation joined shutdown and retry without network" {
     try controller.loadCatalogue();
     try waitForTest(&controller);
     try std.testing.expectEqual(error.InvalidUrl, controller.snapshot().failure.?);
-    try std.testing.expectError(error.UnsafePath, controller.installVersion("../outside"));
     try controller.loadCatalogue();
     controller.cancel();
     // Deferred deinit must join even when tick has not published the last job.
@@ -1183,30 +1065,6 @@ fn writeVersionFixtureWithJava(root: std.Io.Dir, folder: []const u8, document_id
     }
 }
 
-test "failed install retains its terminal version and permits safe retry" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [4096]u8 = undefined;
-    const len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = path_buffer[0..len], .manifest_url = "invalid://fixture" });
-    defer controller.deinit();
-    var id = [_]u8{ '1', '.', '2', '1', '.', '1' };
-    try controller.installVersion(&id);
-    id[0] = 'x';
-    try std.testing.expectEqualStrings("1.21.1", controller.snapshot().installing_version.?);
-    try std.testing.expectError(error.Busy, controller.installVersion("1.21.2"));
-    try std.testing.expectError(error.Busy, controller.loadCatalogue());
-    try waitForTest(&controller);
-    try std.testing.expectEqual(Phase.failed, controller.snapshot().phase);
-    try std.testing.expectEqual(error.InvalidUrl, controller.snapshot().failure.?);
-    try std.testing.expectEqualStrings("1.21.1", controller.snapshot().installing_version.?);
-    try controller.installVersion("1.21.2");
-    controller.cancel();
-    try waitForTest(&controller);
-    try std.testing.expect(controller.snapshot().failure != null);
-    try std.testing.expectEqualStrings("1.21.2", controller.snapshot().installing_version.?);
-}
-
 test "loopback catalogue results publish only after tick joins the worker" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1235,8 +1093,12 @@ test "loopback catalogue results publish only after tick joins the worker" {
     }
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().available.len);
     try std.testing.expectEqual(Phase.loading, controller.snapshot().phase);
+    // A token set after successful completion cannot change the joined outcome.
+    controller.cancel();
     controller.tick();
+    try std.testing.expect(controller.published.?.thread == null);
     try std.testing.expectEqual(Phase.complete, controller.snapshot().phase);
+    try std.testing.expect(controller.snapshot().failure == null);
     try std.testing.expectEqual(@as(usize, 1), controller.snapshot().available.len);
     try std.testing.expectEqualStrings("fixture", controller.snapshot().available[0].id);
     const previous = controller.snapshot().available;
@@ -1244,6 +1106,11 @@ test "loopback catalogue results publish only after tick joins the worker" {
     try std.testing.expectEqualStrings("fixture", previous[0].id);
     controller.cancel();
     try waitForTest(&controller);
+    try std.testing.expectEqualStrings("fixture", controller.snapshot().available[0].id);
+    try controller.refreshInstalled();
+    try waitForTest(&controller);
+    try std.testing.expectEqual(Phase.complete, controller.snapshot().phase);
+    try std.testing.expect(controller.snapshot().failure == null);
     try std.testing.expectEqualStrings("fixture", controller.snapshot().available[0].id);
 }
 const CatalogueFixture = struct {
@@ -1299,150 +1166,84 @@ test "installed entries derive Java major only from validated local metadata" {
     try std.testing.expectEqual(@as(u32, 21), entries[1].java_major);
 }
 
-test "registry installation owns title, fails after join, and catalogue stays unregistered" {
-    const io = std.testing.io;
+test "catalogue cache configuration is owned independently of caller memory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path: [4096]u8 = undefined;
-    const len = try tmp.dir.realPath(io, &path);
-    var registry = tasks.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    const cache = try std.testing.allocator.dupe(u8, path[0..len]);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const cache = try std.testing.allocator.dupe(u8, root);
     defer std.testing.allocator.free(cache);
-    var controller = try Controller.initWithOptions(std.testing.allocator, io, .{
-        .root = path[0..len],
-        .manifest_url = "invalid://fixture",
-        .task_registry = &registry,
-        .cache_root = cache,
-    });
+    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .cache_root = cache });
     defer controller.deinit();
     cache[0] = 'x';
-    try std.testing.expectEqualStrings(path[0..len], controller.cache_root.?);
-    try controller.loadCatalogue();
-    try waitForTest(&controller);
-    try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
-    var id = [_]u8{ '1', '.', '2', '1' };
-    try controller.installVersion(&id);
-    id[0] = 'x';
-    const task = registry.tasks()[0];
-    try std.testing.expectEqual(tasks.Kind.game_install, task.kind);
-    try std.testing.expectEqualStrings("Install Minecraft 1.21", task.title);
-    try std.testing.expectEqual(tasks.State.running, task.state);
-    const start = std.Io.Clock.awake.now(io).nanoseconds;
-    while (!controller.active.?.done.load(.acquire)) {
-        if (std.Io.Clock.awake.now(io).nanoseconds - start > 10_000_000_000) return error.TestTimeout;
-        io.sleep(.fromMilliseconds(1), .awake) catch {};
-    }
-    // Worker completion alone cannot publish a terminal registry state.
-    try std.testing.expectEqual(tasks.State.running, task.state);
-    controller.tick();
-    try std.testing.expectEqual(tasks.State.failed, task.state);
-    try std.testing.expectEqual(error.InvalidUrl, task.failure.?);
-    try std.testing.expect(task.progress().stage != .finalizing);
-    try std.testing.expect(!registry.hasActive());
-    try std.testing.expect(controller.published.?.task == null);
-    registry.pruneFinished(0);
-    try std.testing.expectEqualStrings("1.21", controller.snapshot().installing_version.?);
+    try std.testing.expectEqualStrings(root, controller.cache_root.?);
 }
 
 // Test-only workers make cancellation/join races deterministic without network.
-fn startWaitingTestJob(controller: *Controller) !*tasks.Task {
+fn startWaitingTestJob(controller: *Controller, operation: Operation, stopped: *std.atomic.Value(bool)) !void {
+    std.debug.assert(controller.active == null);
     const job = try worker_allocator.create(Job);
-    job.* = .{ .io = controller.io, .operation = .install_version, .root = controller.root, .manifest_url = controller.manifest_url, .version_id = "fixture" };
+    job.* = .{ .io = controller.io, .operation = operation, .root = controller.root, .manifest_url = controller.manifest_url };
     errdefer job.destroy();
-    const registry = controller.task_registry.?;
-    const task = try registry.create(.game_install, "Install fixture");
-    job.task = task;
-    return startWaitingTestJobInner(controller, job, task) catch |err| {
-        registry.finish(task, .{ .failed = err });
-        return err;
-    };
-}
-
-fn startWaitingTestJobInner(controller: *Controller, job: *Job, task: *tasks.Task) !*tasks.Task {
-    try controller.task_registry.?.start(task);
     const Worker = struct {
-        fn run(current: *Job) void {
-            while (!current.cancelFlag().load(.acquire)) std.atomic.spinLoopHint();
+        fn run(current: *Job, returned: *std.atomic.Value(bool)) void {
+            while (!current.canceled.load(.acquire)) std.atomic.spinLoopHint();
             current.failure = error.Canceled;
+            returned.store(true, .release);
             current.done.store(true, .release);
         }
     };
-    job.thread = try std.Thread.spawn(.{}, Worker.run, .{job});
+    job.thread = try std.Thread.spawn(.{}, Worker.run, .{ job, stopped });
     controller.active = job;
-    controller.phase = .installing;
-    return task;
+    controller.phase = .loading;
 }
 
-test "registry and controller cancellation share worker token and finish after join" {
+test "catalogue and refresh cancellation publish only after tick joins" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path: [4096]u8 = undefined;
-    const len = try tmp.dir.realPath(std.testing.io, &path);
-    var registry = tasks.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    for ([_]bool{ false, true }) |via_controller| {
-        var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = path[0..len], .task_registry = &registry });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    for ([_]Operation{ .catalogue, .refresh_installed }) |operation| {
+        var stopped: std.atomic.Value(bool) = .init(false);
+        var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root });
         defer controller.deinit();
-        const task = try startWaitingTestJob(&controller);
-        if (via_controller) controller.cancel() else try std.testing.expect(registry.cancel(task.id));
-        try std.testing.expectEqual(tasks.State.canceling, task.state);
-        try std.testing.expect(task.canceled());
-        try std.testing.expectEqual(via_controller, controller.active.?.canceled.load(.acquire));
-        try waitForTest(&controller);
-        try std.testing.expectEqual(tasks.State.canceled, task.state);
-        try std.testing.expectEqual(@as(?anyerror, null), task.failure);
+        try startWaitingTestJob(&controller, operation, &stopped);
+        const job = controller.active.?;
+        controller.cancel();
+        try std.testing.expect(job.canceled.load(.acquire));
+        try waitPreviewFlag(controller.io, &job.done);
+        try std.testing.expect(stopped.load(.acquire));
+        try std.testing.expectEqual(Phase.loading, controller.snapshot().phase);
+        try std.testing.expect(controller.snapshot().failure == null);
+        try std.testing.expect(job.thread != null);
+        try std.testing.expect(controller.published == null);
+        controller.tick();
+        try std.testing.expect(controller.active == null);
+        try std.testing.expect(controller.published.?.thread == null);
+        try std.testing.expectEqual(Phase.failed, controller.snapshot().phase);
         try std.testing.expectEqual(error.Canceled, controller.snapshot().failure.?);
-        try std.testing.expect(controller.published.?.task == null);
-        registry.pruneFinished(0);
-        try std.testing.expectEqualStrings("fixture", controller.snapshot().installing_version.?);
+        try controller.refreshInstalled();
+        try std.testing.expect(controller.snapshot().failure == null);
+        try waitForTest(&controller);
+        try std.testing.expectEqual(Phase.complete, controller.snapshot().phase);
     }
 }
 
-test "deinit joins cancellation workers before finishing registry task" {
+test "deinit cancels and joins catalogue and refresh workers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path: [4096]u8 = undefined;
-    const len = try tmp.dir.realPath(std.testing.io, &path);
-    var registry = tasks.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = path[0..len], .task_registry = &registry });
-    const task = startWaitingTestJob(&controller) catch |err| {
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    for ([_]Operation{ .catalogue, .refresh_installed }) |operation| {
+        var stopped: std.atomic.Value(bool) = .init(false);
+        var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root });
+        startWaitingTestJob(&controller, operation, &stopped) catch |err| {
+            controller.deinit();
+            return err;
+        };
         controller.deinit();
-        return err;
-    };
-    controller.deinit();
-    try std.testing.expectEqual(tasks.State.canceled, task.state);
-    try std.testing.expect(!registry.hasActive());
-    registry.pruneFinished(0);
-}
-
-test "joined committed result remains succeeded after late cancellation" {
-    var registry = tasks.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    const task = try registry.create(.game_install, "Committed");
-    try registry.start(task);
-    var controller: Controller = .{ .allocator = std.testing.allocator, .io = std.testing.io, .root = "unused", .manifest_url = "unused", .task_registry = &registry };
-    var job: Job = .{ .io = std.testing.io, .operation = .install_version, .root = "unused", .manifest_url = "unused", .version_id = "fixture", .task = task };
-    // No worker remains: finishTask is called only after join in tick/deinit.
-    try std.testing.expect(registry.cancel(task.id));
-    controller.finishTask(&job);
-    try std.testing.expectEqual(tasks.State.succeeded, task.state);
-    try std.testing.expect(task.canceled());
-    try std.testing.expect(job.task == null);
-}
-
-test "installer progress reports a coherent registry snapshot" {
-    var registry = tasks.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    const task = try registry.create(.game_install, "Progress");
-    var job: Job = .{ .io = std.testing.io, .operation = .install_version, .root = "unused", .manifest_url = "unused", .version_id = "fixture", .task = task };
-    reporting_job = &job;
-    defer reporting_job = null;
-    report(.{ .completed = 3, .total = 5, .downloaded = 2, .reused = 1 });
-    try std.testing.expectEqualDeep(tasks.Progress{ .stage = .downloading, .completed = 3, .total = 5 }, task.progress());
-    try std.testing.expectEqual(@as(usize, 3), job.completed.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 5), job.total.load(.acquire));
+        try std.testing.expect(stopped.load(.acquire));
+    }
 }
 
 test "manifest cache paths are contained and keyed by URL" {
@@ -1451,7 +1252,7 @@ test "manifest cache paths are contained and keyed by URL" {
     defer tmp.cleanup();
     var path: [4096]u8 = undefined;
     const len = try tmp.dir.realPath(io, &path);
-    var job: Job = .{ .io = io, .operation = .catalogue, .root = path[0..len], .manifest_url = "http://fixture/manifest?one", .version_id = null, .cache_root = path[0..len] };
+    var job: Job = .{ .io = io, .operation = .catalogue, .root = path[0..len], .manifest_url = "http://fixture/manifest?one", .cache_root = path[0..len] };
     const first = (try manifestCachePath(&job)).?;
     defer worker_allocator.free(first);
     job.manifest_url = "http://fixture/manifest?two";
@@ -1471,7 +1272,7 @@ test "download limits validate and leave an active job unchanged" {
     try std.testing.expectError(error.InvalidDownloadConnections, controller.setDownloadConnections(0));
     try std.testing.expectError(error.InvalidDownloadConnections, controller.setDownloadConnections(65));
     try std.testing.expectEqual(@as(u16, 8), controller.download_connections);
-    var job: Job = .{ .io = std.testing.io, .operation = .catalogue, .root = "", .manifest_url = "", .version_id = null, .download_connections = 3 };
+    var job: Job = .{ .io = std.testing.io, .operation = .catalogue, .root = "", .manifest_url = "", .download_connections = 3 };
     controller.active = &job;
     try controller.setDownloadConnections(64);
     try std.testing.expectEqual(@as(u16, 64), controller.download_connections);
@@ -1528,7 +1329,7 @@ const PreviewFixture = struct {
         const bytes = try self.manifest(std.testing.allocator);
         defer std.testing.allocator.free(bytes);
         const job = try worker_allocator.create(Job);
-        job.* = .{ .io = controller.io, .operation = .catalogue, .root = controller.root, .manifest_url = controller.manifest_url, .version_id = null };
+        job.* = .{ .io = controller.io, .operation = .catalogue, .root = controller.root, .manifest_url = controller.manifest_url };
         errdefer job.destroy();
         job.available = try parseCatalogue(job.arena.allocator(), bytes);
         if (controller.published) |old| old.destroy();
@@ -1596,7 +1397,7 @@ test "catalogue releaseTime is copied independently of time and retained by clon
     try std.testing.expectEqualStrings(entries[0].url, copy.url);
     try std.testing.expectEqual(entries[0].sha1, copy.sha1);
     try std.testing.expect(entries[0].release_time.ptr != copy.release_time.ptr);
-    try std.testing.expectEqualStrings("", (CatalogEntry{ .id = "fixture", .kind = "release" }).release_time);
+    try std.testing.expectEqualStrings("", (CatalogEntry{ .id = "fixture", .kind = "release", .url = "https://piston-meta.mojang.com/v1/packages/fixture/fixture.json" }).release_time);
 }
 
 test "preview downloads only trusted metadata and follows declared inherited Java requirements" {
@@ -1701,25 +1502,24 @@ test "preview replacement queues one worker and ignores canceled late completion
     try waitPreviewTest(&controller);
 }
 
-test "preview deinit cancels and joins independently of a live installer worker" {
+test "preview deinit cancels and joins independently of a live catalogue worker" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     var fixture: PreviewFixture = .{ .pause = true };
-    var registry = tasks.Registry.init(std.testing.allocator);
-    defer registry.deinit();
-    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .preview_transport = fixture.transport(), .task_registry = &registry });
+    var stopped: std.atomic.Value(bool) = .init(false);
+    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .preview_transport = fixture.transport() });
     var needs_deinit = true;
     defer if (needs_deinit) controller.deinit();
-    const task = try startWaitingTestJob(&controller);
+    try startWaitingTestJob(&controller, .catalogue, &stopped);
     try controller.previewVersion("future");
     try waitPreviewFlag(std.testing.io, &fixture.entered);
-    try std.testing.expectEqual(tasks.State.running, task.state);
+    try std.testing.expect(!stopped.load(.acquire));
     controller.deinit();
     needs_deinit = false;
     try std.testing.expect(fixture.returned.load(.acquire));
-    try std.testing.expectEqual(tasks.State.canceled, task.state);
+    try std.testing.expect(stopped.load(.acquire));
 }
 
 test "preview preserves metadata trust and rejects malformed Java instead of guessing" {
@@ -1778,10 +1578,10 @@ test "preview result cache is bounded and HTTP paths are separate from installer
         try std.testing.expect(!std.mem.eql(u8, cached.version, "fixture-1"));
     };
     try std.testing.expectEqual(@as(usize, 8), occupied);
-    var preview: PreviewJob = .{ .io = std.testing.io, .root = root, .manifest_url = metadata.version_manifest_url, .version_id = "future", .generation = 1, .cache_root = root, .deadline_ms = std.math.maxInt(u64) };
+    var preview: PreviewJob = .{ .io = std.testing.io, .manifest_url = metadata.version_manifest_url, .version_id = "future", .generation = 1, .cache_root = root, .deadline_ms = std.math.maxInt(u64) };
     const preview_path = (try preview.cachePath(std.testing.allocator, metadata.version_manifest_url)).?;
     defer std.testing.allocator.free(preview_path);
-    var catalogue: Job = .{ .io = std.testing.io, .operation = .catalogue, .root = root, .manifest_url = metadata.version_manifest_url, .version_id = null, .cache_root = root };
+    var catalogue: Job = .{ .io = std.testing.io, .operation = .catalogue, .root = root, .manifest_url = metadata.version_manifest_url, .cache_root = root };
     const catalogue_path = (try manifestCachePath(&catalogue)).?;
     defer worker_allocator.free(catalogue_path);
     try std.testing.expect(!std.mem.eql(u8, preview_path, catalogue_path));

@@ -31,6 +31,8 @@ const accounts_view = @import("ui/accounts_view.zig");
 const instances_manager = @import("ui/instances_manager.zig");
 const instances_view = @import("ui/instances_view.zig");
 const content_manager = @import("ui/content_manager.zig");
+const mods_controller = @import("ui/mods_controller.zig");
+const mods_view = @import("ui/mods_view.zig");
 const instance_creation_controller = @import("ui/instance_creation_controller.zig");
 const cf_credentials_controller = @import("ui/curseforge_credentials_controller.zig");
 const worlds_manager = @import("ui/worlds_manager.zig");
@@ -90,6 +92,8 @@ var accounts_ui: accounts_view.Ui = undefined;
 var instance_manager: instances_manager.Manager = undefined;
 var instances_ui: instances_view.Ui = undefined;
 var content: content_manager.Manager = undefined;
+var mods: mods_controller.Controller = undefined;
+var mods_ui: mods_view.Ui = undefined;
 var ordinary_creation: instance_creation_controller.Controller = undefined;
 var fatal_frame_error: ?anyerror = null;
 var cf_credentials: ?cf_credentials_controller.Controller = null;
@@ -120,6 +124,45 @@ fn instanceFingerprint(document: *const config.Document) u64 {
         hash.update(&[_]u8{0});
     }
     return hash.final();
+}
+
+fn launcherDataRoot(args: []const [:0]const u8, environment_root: ?[]const u8) !?[]const u8 {
+    var explicit_root: ?[]const u8 = null;
+    var default_root: ?[]const u8 = null;
+    var index: usize = 1;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--")) break;
+        const destination: *?[]const u8 = if (std.mem.eql(u8, arg, "--data-dir"))
+            &explicit_root
+        else if (std.mem.eql(u8, arg, "--default-data-dir"))
+            &default_root
+        else
+            continue;
+        index += 1;
+        if (index == args.len or args[index].len == 0) return error.MissingLauncherDataDirectory;
+        destination.* = args[index];
+    }
+    return explicit_root orelse environment_root orelse default_root;
+}
+
+test "launcher data root follows current runtime environment" {
+    const args = &.{ "vela", "--default-data-dir", "." };
+    try std.testing.expectEqualStrings("environment-a", (try launcherDataRoot(args, "environment-a")).?);
+    try std.testing.expectEqualStrings("environment-b", (try launcherDataRoot(args, "environment-b")).?);
+    try std.testing.expectEqualStrings(".", (try launcherDataRoot(args, null)).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try launcherDataRoot(&.{"vela"}, null));
+}
+
+test "launcher data root explicit argument overrides environment and development default" {
+    const args = &.{ "vela", "--default-data-dir", ".", "--data-dir", "实例 directory" };
+    try std.testing.expectEqualStrings("实例 directory", (try launcherDataRoot(args, "environment-root")).?);
+    try std.testing.expectEqualStrings("environment-root", (try launcherDataRoot(&.{ "vela", "--", "--data-dir", "ignored" }, "environment-root")).?);
+}
+
+test "launcher data root rejects missing and empty directory arguments" {
+    try std.testing.expectError(error.MissingLauncherDataDirectory, launcherDataRoot(&.{ "vela", "--data-dir" }, null));
+    try std.testing.expectError(error.MissingLauncherDataDirectory, launcherDataRoot(&.{ "vela", "--default-data-dir", "" }, null));
 }
 
 fn prepareRootStore(a: std.mem.Allocator, io: std.Io, root: []const u8) !config.Store {
@@ -160,7 +203,8 @@ pub fn init(win: *dvui.Window) !void {
     errdefer if (acceptance_enabled) acceptance.destroy();
     leases = instance_leases.Coordinator.init(main_init.io);
     _ = leases.mutation(0);
-    const base = if (main_init.environ_map.get("VELA_DATA_DIR")) |override|
+    const startup_args = try main_init.minimal.args.toSlice(main_init.arena.allocator());
+    const base = if (try launcherDataRoot(startup_args, main_init.environ_map.get("VELA_DATA_DIR"))) |override|
         try main_init.gpa.dupe(u8, override)
     else
         try std.process.executableDirPathAlloc(main_init.io, main_init.gpa);
@@ -202,7 +246,6 @@ pub fn init(win: *dvui.Window) !void {
     }
     var library_options: game_library.Options = .{
         .root = paths.minecraft,
-        .task_registry = &tasks,
         .cache_root = paths.cache,
     };
     if (acceptance_enabled) {
@@ -249,11 +292,15 @@ pub fn init(win: *dvui.Window) !void {
         .lease = .{ .context = content_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback },
         .worker_recheck = instance_leases.Mutation.workerRecheckCallback,
         .transport_options = .{ .allow_curseforge = true },
-        .allow_manifest_v2 = true,
         .allow_curseforge_remote = true,
     };
     content = try content_manager.Manager.initOptions(main_init.gpa, main_init.io, &paths, &tasks, if (acceptance_enabled) acceptance.contentOptions(content_options) else content_options);
     errdefer content.deinit();
+    mods = mods_controller.Controller.init(main_init.gpa, main_init.io, &paths);
+    errdefer mods.deinit();
+    mods_ui = try mods_view.Ui.init(main_init.gpa);
+    errdefer mods_ui.deinit();
+    mods_ui.acquisition.picker = &picker;
     ordinary_creation = try instance_creation_controller.Controller.init(main_init.gpa, main_init.io, paths.root, .{ .task_registry = &tasks });
     errdefer ordinary_creation.deinit(creationServices());
     try window.init(win);
@@ -276,6 +323,8 @@ pub fn deinit(win: *dvui.Window) void {
         ordinary_creation.deinit(creationServices());
         window.deinit();
         launcher.deinit();
+        mods.deinit();
+        mods_ui.deinit();
         content.deinit();
         instances_ui.deinit();
         instance_manager.deinit();
@@ -382,7 +431,7 @@ fn frameActive() !dvui.App.Result {
     if (cf_credentials) |*controller| controller.tick(&configuration);
     const fingerprint = instanceFingerprint(configuration.snapshot());
     const library_phase = library.snapshot().phase;
-    if (fingerprint != observed_instances and library_phase != .loading and library_phase != .installing) {
+    if (fingerprint != observed_instances and library_phase != .loading) {
         if (library.refreshInstalled()) |_| {
             observed_instances = fingerprint;
         } else |err| {
@@ -435,6 +484,8 @@ fn frameActive() !dvui.App.Result {
         .instances = &instance_manager,
         .instances_ui = &instances_ui,
         .content = &content,
+        .mods = &mods,
+        .mods_ui = &mods_ui,
     });
     const phase = library.snapshot().phase;
     const launch_phase = launcher.snapshot().phase;
@@ -470,7 +521,7 @@ fn frameActive() !dvui.App.Result {
         return .close;
     }
     dvui.currentWindow().backend.impl.log_events = false;
-    if (phase == .loading or phase == .installing or java.isSearching() or java_download.isBusy() or servers.isBusy() or world_manager.snapshot().worker_active or accounts.snapshot().busy or instance_manager.isBusy() or content.isBusy() or cfCredentialsBusy() or view.ordinaryCreationPinned(&ordinary_creation) or launch_phase == .preparing or launch_phase == .running or policy.shutdown != .none) dvui.refresh(null, @src(), null);
+    if (phase == .loading or java.isSearching() or java_download.isBusy() or servers.isBusy() or world_manager.snapshot().worker_active or accounts.snapshot().busy or instance_manager.isBusy() or content.isBusy() or cfCredentialsBusy() or view.ordinaryCreationPinned(&ordinary_creation) or launch_phase == .preparing or launch_phase == .running or policy.shutdown != .none) dvui.refresh(null, @src(), null);
     if (acceptance_enabled and !tasks.hasActive()) tasks.pruneFinished(0);
     if (acceptance_enabled) try acceptance.afterFrame(.{
         .startup_idle = model.panel == .home and active == 0 and tasks.tasks().len == 0 and phase == .complete and !java.isSearching() and !java_download.isBusy() and !servers.isBusy() and !world_manager.snapshot().worker_active and world_manager.snapshot().failure == null and !accounts.snapshot().busy and !instance_manager.isBusy() and !content.isBusy() and content.snapshot().failure == null and !cfCredentialsBusy() and !view.ordinaryCreationPinned(&ordinary_creation),

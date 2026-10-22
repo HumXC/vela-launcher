@@ -7,6 +7,7 @@ const providers = @import("content_providers.zig");
 const install = @import("content_install.zig");
 const downloader = @import("downloader.zig");
 const fs = @import("content_fs.zig");
+const task_metrics = @import("tasks.zig");
 const Allocator = std.mem.Allocator;
 
 pub const CancelToken = std.atomic.Value(bool);
@@ -36,6 +37,11 @@ pub const Adapter = struct {
     fixture_context: ?*anyopaque,
     approved_download_hosts: [][]const u8,
     service: ?*downloader.Service = null,
+    /// Borrowed until the owning worker joins; publication copies bounded data.
+    telemetry: ?*task_metrics.Task = null,
+    transfer_details: task_metrics.Details = .{},
+    transfer_base_received: u64 = 0,
+    transfer_index: usize = 0,
 
     pub fn init(a: Allocator, io: std.Io, cancel: ?*const CancelToken, connections: u16) !Adapter {
         return initWithOptions(a, io, cancel, connections, .{});
@@ -101,17 +107,15 @@ pub const Adapter = struct {
             headers[2] = .{ .name = header.name, .value = header.value };
             header_count += 1;
         }
-        var bounded: http.Request = .{
+        const bounded: http.Request = .{
             .url = request.url,
             .headers = headers[0..header_count],
             .max_response_bytes = request.max_body_bytes,
             .timeout_ms = request.timeout_ms,
             .cancel = self.cancel,
             .follow_redirects = false,
+            .require_public_address = true,
         };
-        if (comptime @hasField(http.Request, "require_public_address")) {
-            bounded.require_public_address = true;
-        } else if (self.fixture_http == null) return error.PublicAddressGuardUnavailable;
         var response = if (self.fixture_http) |execute|
             try execute(self.fixture_context, a, self.io, bounded)
         else
@@ -132,8 +136,26 @@ pub const Adapter = struct {
         if (!fs.safeComponent(request.name) or !std.fs.path.isAbsolute(request.absolute_path)) return error.UnsafePath;
         if (request.max_bytes == 0 or request.max_bytes > providers.max_file_bytes) return error.InvalidLimit;
         if (request.expected_size) |size| if (size > request.max_bytes) return error.InvalidLimit;
-        if (self.fixture_http) |execute| return self.fetchFixture(io, request, execute);
-        var download: downloader.Request = .{
+        self.beginTransfer(request);
+        self.fetchTransfer(io, request) catch |err| {
+            if (self.telemetry != null) {
+                const current = self.transfer_details.files[self.transfer_index];
+                self.publishTransfer(current.received, current.total, 0, if (err == error.Canceled) .canceled else .failed, err);
+            }
+            return err;
+        };
+    }
+
+    fn fetchTransfer(self: *Adapter, io: std.Io, request: install.FetchRequest) !void {
+        if (self.fixture_http) |execute| {
+            try self.fetchFixture(io, request, execute);
+            if (self.telemetry != null) {
+                const current = self.transfer_details.files[self.transfer_index];
+                self.publishTransfer(current.received, current.total, 0, .complete, null);
+            }
+            return;
+        }
+        const download: downloader.Request = .{
             .url = request.url,
             .output = .{ .file = request.absolute_path },
             .expected_sha1 = request.expected_sha1,
@@ -144,15 +166,20 @@ pub const Adapter = struct {
             .timeout_ms = 120_000,
             .https_only = true,
             .follow_redirects = false,
+            .require_public_address = true,
         };
-        if (comptime @hasField(downloader.Request, "require_public_address")) {
-            download.require_public_address = true;
-        } else return error.PublicAddressGuardUnavailable;
         if (self.service == null) self.service = try downloader.Service.init(self.allocator, self.io, self.connections);
         const task = try self.service.?.submit(download);
         var cancellation: ?anyerror = null;
         while (true) {
             const snapshot = task.snapshot();
+            self.publishTransfer(snapshot.progress.received, snapshot.progress.total orelse request.expected_size, snapshot.progress.bytes_per_second, switch (snapshot.progress.phase) {
+                .complete => .complete,
+                .failed => .failed,
+                .canceled => .canceled,
+                .processing, .parsing, .committing => .verifying,
+                else => .downloading,
+            }, snapshot.failure);
             if (downloader.terminal(snapshot.progress.phase)) {
                 defer task.release() catch unreachable;
                 if (cancellation) |err| return err;
@@ -207,6 +234,7 @@ pub const Adapter = struct {
             try file.writePositionalAll(io, bytes, @intCast(offset));
             if (request.expected_sha1 != null) hash.update(bytes);
             offset = end;
+            self.publishTransfer(@intCast(offset), @intCast(response.body.len), 0, .downloading, null);
         }
         try self.checkFetch(io, request);
         if (request.expected_sha1) |expected| {
@@ -217,6 +245,35 @@ pub const Adapter = struct {
         try file.sync(io);
         try fs.syncDir(request.directory, io);
         try self.checkFetch(io, request);
+    }
+
+    fn beginTransfer(self: *Adapter, request: install.FetchRequest) void {
+        if (self.telemetry == null) return;
+        self.transfer_base_received = self.transfer_details.received;
+        self.transfer_index = @min(self.transfer_details.file_count, self.transfer_details.files.len - 1);
+        const row = task_metrics.File.init(request.url, 0, request.expected_size, 0, .downloading, null);
+        if (self.transfer_details.file_count < self.transfer_details.files.len) self.transfer_details.addFile(row) else {
+            self.transfer_details.omitted_files += 1;
+            self.transfer_details.files[self.transfer_index] = row;
+        }
+        self.publishTransfer(0, request.expected_size, 0, .downloading, null);
+    }
+
+    fn publishTransfer(self: *Adapter, received: u64, total: ?u64, speed: f64, file_state: task_metrics.FileState, failure: ?anyerror) void {
+        const destination = self.telemetry orelse return;
+        const row = &self.transfer_details.files[self.transfer_index];
+        row.received = received;
+        row.total = total;
+        row.bytes_per_second = speed;
+        row.state = file_state;
+        row.failure = failure;
+        self.transfer_details.stage = .downloading;
+        self.transfer_details.received = self.transfer_base_received +| received;
+        self.transfer_details.total_bytes = if (total) |limit| self.transfer_base_received +| limit else null;
+        self.transfer_details.completed = self.transfer_details.received;
+        self.transfer_details.total = self.transfer_details.total_bytes;
+        self.transfer_details.bytes_per_second = speed;
+        destination.reportDetails(self.transfer_details);
     }
 
     fn checkFetch(self: *const Adapter, io: std.Io, request: install.FetchRequest) !void {
@@ -492,7 +549,7 @@ const Fixture = struct {
         try std.testing.expectEqual(http.Method.get, request.method);
         try std.testing.expect(!request.follow_redirects and !request.allow_http_loopback);
         try std.testing.expect(request.body == null);
-        if (comptime @hasField(http.Request, "require_public_address")) try std.testing.expect(request.require_public_address);
+        try std.testing.expect(request.require_public_address);
         try std.testing.expectEqualStrings(user_agent, request.headers[0].value);
         try std.testing.expectEqualStrings("application/json", request.headers[1].value);
         try std.testing.expect(request.max_response_bytes <= providers.max_json_bytes);
@@ -578,7 +635,6 @@ test "fetcher rejects unsafe targets and cancellation before staging or HTTP" {
     request.max_bytes = 0;
     try std.testing.expectError(error.InvalidLimit, fetch.fetchToFile(fetch.context, std.testing.io, request));
     request.max_bytes = 1024;
-    if (comptime !@hasField(downloader.Request, "require_public_address")) try std.testing.expectError(error.PublicAddressGuardUnavailable, fetch.fetchToFile(fetch.context, std.testing.io, request));
     var request_cancel: CancelToken = .init(true);
     request.cancel = &request_cancel;
     try std.testing.expectError(error.Canceled, fetch.fetchToFile(fetch.context, std.testing.io, request));
@@ -591,17 +647,6 @@ test "fetcher rejects unsafe targets and cancellation before staging or HTTP" {
     try std.testing.expect(adapter.service == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "stage", .{}));
-}
-
-test "production provider fails closed when shared address guard is unavailable" {
-    if (comptime @hasField(http.Request, "require_public_address")) return error.SkipZigTest;
-    var adapter = try Adapter.init(std.testing.allocator, std.testing.io, null, 1);
-    defer adapter.deinit();
-    const transport = adapter.providerTransport();
-    try std.testing.expectError(error.PublicAddressGuardUnavailable, transport.get(transport.context, std.testing.allocator, .{
-        .url = "https://api.modrinth.com/v2/search",
-        .user_agent = user_agent,
-    }));
 }
 
 test "fixture response allocator and cancellation after HTTP are independent" {

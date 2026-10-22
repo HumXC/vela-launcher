@@ -194,9 +194,13 @@ const Job = struct {
             if (err != error.Canceled and err != error.OutOfMemory) self.installed.?.status = .unusable;
             return;
         };
-        if (runtime.major != self.request.major or !vendorMatches(self.request.vendor, runtime.vendor)) {
+        const architecture_matches = runtime.architecture == switch (self.platform.arch) {
+            .x64 => @import("../core/java_runtime.zig").Architecture.x86_64,
+            .aarch64 => @import("../core/java_runtime.zig").Architecture.aarch64,
+        };
+        if (runtime.major != self.request.major or !vendorMatches(self.request.vendor, runtime.vendor) or !architecture_matches) {
             java.freeRuntime(a, runtime);
-            self.probe_failure = if (runtime.major != self.request.major) error.JavaMajorMismatch else error.JavaVendorMismatch;
+            self.probe_failure = if (runtime.major != self.request.major) error.JavaMajorMismatch else if (!architecture_matches) error.JavaArchitectureMismatch else error.JavaVendorMismatch;
             self.installed.?.status = .unusable;
             return;
         }
@@ -515,7 +519,7 @@ test "host platform is typed and publisher identities match only explicit aliase
 }
 
 const Fixture = struct {
-    const Mode = enum { good, unusable, wrong_major, wrong_vendor, wait_metadata, wait_probe, wait_download, fail_download };
+    const Mode = enum { good, unusable, wrong_major, wrong_vendor, wrong_architecture, wait_metadata, wait_probe, wait_download, fail_download };
     mode: Mode = .good,
     entered: std.atomic.Value(bool) = .init(false),
     requests: std.atomic.Value(usize) = .init(0),
@@ -616,7 +620,9 @@ const Fixture = struct {
         }
         const owned_path = try a.dupe(u8, path);
         errdefer a.free(owned_path);
-        return .{ .path = owned_path, .major = if (self.mode == .wrong_major) 17 else 21, .vendor = try a.dupe(u8, if (self.mode == .wrong_vendor) "Fake Microsoft" else "Microsoft") };
+        const host = @import("../core/java_runtime.zig").host();
+        const actual: @import("../core/java_runtime.zig").Architecture = if (self.mode == .wrong_architecture) (if (host == .aarch64) .x86_64 else .aarch64) else host;
+        return .{ .path = owned_path, .major = if (self.mode == .wrong_major) 17 else 21, .architecture = actual, .vendor = try a.dupe(u8, if (self.mode == .wrong_vendor) "Fake Microsoft" else "Microsoft") };
     }
 };
 fn fixtureRoot(tmp: *std.testing.TmpDir) ![:0]u8 {
@@ -798,7 +804,7 @@ test "archive failure and cancellation retain measured file details after join a
 test "joined downloaded results register only verified identity and survive registry pruning" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    for ([_]Fixture.Mode{ .good, .unusable, .wrong_major, .wrong_vendor }) |mode| {
+    for ([_]Fixture.Mode{ .good, .unusable, .wrong_major, .wrong_vendor, .wrong_architecture }) |mode| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try fixtureRoot(&tmp);
@@ -941,11 +947,11 @@ test "registration persistence failure preserves usable installation and manager
     const file = try Io.Dir.cwd().openFile(io, snapshot.installed.?.java_path, .{});
     file.close(io);
     try tmp.dir.deleteDir(io, ".vela/java.json");
-    const runtime: java.Runtime = .{ .path = snapshot.installed.?.java_path, .major = 21, .vendor = "Microsoft" };
+    const runtime: java.Runtime = .{ .path = snapshot.installed.?.java_path, .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Microsoft" };
     try manager.addDownloaded(runtime);
     try manager.addDownloaded(runtime);
     try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
-    try manager.addDownloaded(.{ .path = runtime.path, .major = 17, .vendor = "Azul Systems, Inc." });
+    try manager.addDownloaded(.{ .path = runtime.path, .major = 17, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Azul Systems, Inc." });
     try std.testing.expectEqual(@as(u32, 17), manager.entries()[0].major);
     try std.testing.expectEqualStrings("Azul Systems, Inc.", manager.entries()[0].vendor);
     var reloaded = try java.Manager.init(a, io, root);

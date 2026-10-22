@@ -133,6 +133,7 @@ pub const Project = struct {
     summary: []const u8 = "",
     official_page: []const u8,
     distribution_allowed: bool = false,
+    icon_url: ?[]const u8 = null,
 };
 pub const Catalog = struct { projects: []const Project, total: u64 };
 pub const Version = struct {
@@ -151,7 +152,10 @@ pub const VersionSet = struct { versions: []const Version };
 pub const Json = struct {
     pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(std.json.Value) {
         if (bytes.len > max_json_bytes) return error.ResponseTooLarge;
-        return std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always, .max_value_len = max_string_bytes });
+        // Ignored provider fields (such as changelogs) can exceed the semantic
+        // field limit. The complete response stays bounded; accessors below
+        // retain strict limits for every field that enters our model.
+        return std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always, .max_value_len = max_json_bytes });
     }
     pub fn field(v: std.json.Value, key: []const u8) !std.json.Value {
         if (v != .object) return error.InvalidResponse;
@@ -299,7 +303,7 @@ fn modrinthProject(a: std.mem.Allocator, v: std.json.Value, search: bool) !Proje
     const id = try token(try Json.text(v, if (search) "project_id" else "id"));
     const kind = try token(try Json.text(v, "project_type"));
     if (!contains(&.{ "mod", "modpack", "resourcepack", "shader", "datapack", "plugin" }, kind)) return error.UnsupportedProjectType;
-    return .{ .provider = .modrinth, .id = id, .name = try Json.text(v, "title"), .summary = try Json.text(v, "description"), .official_page = try std.fmt.allocPrint(a, "https://modrinth.com/{s}/{s}", .{ kind, id }), .distribution_allowed = true };
+    return .{ .provider = .modrinth, .id = id, .name = try Json.text(v, "title"), .summary = try Json.text(v, "description"), .official_page = try std.fmt.allocPrint(a, "https://modrinth.com/{s}/{s}", .{ kind, id }), .distribution_allowed = true, .icon_url = if (try Json.optional(v, "icon_url")) |icon| if (icon == .string and safeHttpsUrl(icon.string)) icon.string else null else null };
 }
 pub fn parseModrinthCatalog(a: std.mem.Allocator, bytes: []const u8, search: bool) !Owned(Catalog) {
     var arena = std.heap.ArenaAllocator.init(a);
@@ -351,7 +355,7 @@ pub fn parseModrinthVersions(a: std.mem.Allocator, bytes: []const u8, single: bo
     errdefer arena.deinit();
     const aa = arena.allocator();
     const parsed = try Json.parse(aa, bytes);
-    const items = if (single) &.{parsed.value} else try Json.array(parsed.value);
+    const items = try newestVersions(aa, if (single) &.{parsed.value} else try Json.array(parsed.value), "date_published");
     var versions: std.ArrayList(Version) = .empty;
     for (items) |v| {
         const version = try modrinthVersion(aa, v);
@@ -361,6 +365,20 @@ pub fn parseModrinthVersions(a: std.mem.Allocator, bytes: []const u8, single: bo
     try uniqueVersions(versions.items);
     const value: VersionSet = .{ .versions = try versions.toOwnedSlice(aa) };
     return .{ .arena = arena, .value = value };
+}
+fn newestVersions(a: std.mem.Allocator, items: []const std.json.Value, date_key: []const u8) ![]const std.json.Value {
+    const ordered = try a.dupe(std.json.Value, items);
+    for (ordered) |value| _ = try Json.optText(value, date_key);
+    std.mem.sort(std.json.Value, ordered, date_key, struct {
+        fn date(value: std.json.Value, key: []const u8) []const u8 {
+            const field = value.object.get(key) orelse return "";
+            return if (field == .string) field.string else "";
+        }
+        fn less(key: []const u8, left: std.json.Value, right: std.json.Value) bool {
+            return std.mem.order(u8, date(left, key), date(right, key)) == .gt;
+        }
+    }.less);
+    return ordered;
 }
 fn uniqueProjects(projects: []const Project) !void {
     for (projects, 0..) |p, i| for (projects[0..i]) |other| if (std.mem.eql(u8, p.id, other.id)) return error.DuplicateId;
@@ -375,7 +393,9 @@ fn uniqueFiles(files: []const File) !void {
 fn curseforgeProject(a: std.mem.Allocator, v: std.json.Value) !Project {
     const page = try Json.text(try Json.field(v, "links"), "websiteUrl");
     if (!officialCurseForgePage(page)) return error.UnsafeOfficialPage;
-    return .{ .provider = .curseforge, .id = try numericId(a, try Json.field(v, "id")), .name = try Json.text(v, "name"), .summary = try Json.text(v, "summary"), .official_page = page, .distribution_allowed = if (try Json.optional(v, "allowModDistribution")) |allowed| try Json.boolean(allowed) else false };
+    const logo = try Json.optional(v, "logo");
+    const icon = if (logo) |value| if (value == .object) try Json.optional(value, "thumbnailUrl") orelse try Json.optional(value, "url") else null else null;
+    return .{ .provider = .curseforge, .id = try numericId(a, try Json.field(v, "id")), .name = try Json.text(v, "name"), .summary = try Json.text(v, "summary"), .official_page = page, .distribution_allowed = if (try Json.optional(v, "allowModDistribution")) |allowed| try Json.boolean(allowed) else false, .icon_url = if (icon) |value| if (value == .string and safeHttpsUrl(value.string)) value.string else null else null };
 }
 /// Bounded metadata parser; never performs transport or handles credentials.
 pub fn parseCurseForgeCatalog(a: std.mem.Allocator, bytes: []const u8, single: bool) !Owned(Catalog) {
@@ -453,7 +473,7 @@ fn parseCurseForgeVersionsMode(a: std.mem.Allocator, bytes: []const u8, single: 
     const aa = arena.allocator();
     const parsed = try Json.parse(aa, bytes);
     const data = try Json.field(parsed.value, "data");
-    const items = if (single) &.{data} else try Json.array(data);
+    const items = try newestVersions(aa, if (single) &.{data} else try Json.array(data), "fileDate");
     var versions: std.ArrayList(Version) = .empty;
     for (items) |v| {
         const version = try curseforgeVersion(aa, v, project, allow_remote);
@@ -1553,4 +1573,22 @@ test "CF modpack candidate pagination observer and fresh distribution remain enf
     try testing.expectError(error.TooManyRequests, client.authorizedModpackCandidates("12", "1.20.1", authorized_fixture_policy));
     try testing.expectEqual(@as(usize, 1), fixture.calls);
     try testing.expectEqual(@as(usize, 1), budget.count);
+}
+
+test "provider ignores long changelogs while preserving used field limits" {
+    const a = std.testing.allocator;
+    const changelog = try a.alloc(u8, max_string_bytes * 4);
+    defer a.free(changelog);
+    @memset(changelog, 'x');
+    const bytes = try std.fmt.allocPrint(a, "{{\"changelog\":\"{s}\",{s}", .{ changelog, mr_version_fixture[1..] });
+    defer a.free(bytes);
+    var result = try parseModrinthVersions(a, bytes, true, test_filter);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.value.versions.len);
+    const project_bytes = try std.fmt.allocPrint(a, "{{\"id\":\"sodium\",\"title\":\"Sodium\",\"project_type\":\"mod\",\"description\":\"Renderer\",\"body\":\"{s}\"}}", .{changelog});
+    defer a.free(project_bytes);
+    var catalog = try parseModrinthCatalog(a, project_bytes, false);
+    defer catalog.deinit();
+    try std.testing.expectEqualStrings("Sodium", catalog.value.projects[0].name);
+    try std.testing.expectError(error.InvalidString, Json.string(.{ .string = changelog }));
 }

@@ -37,8 +37,8 @@ pub const Options = struct {
     /// A successfully installed, independently resolved and verified vanilla base.
     base: ?m.version.Version = null,
     base_plan: ?plan_module.Plan = null,
-    /// Optional private vanilla stage, contained under launcher root and opened nofollow.
-    base_directory: ?[]const u8 = null,
+    /// Explicit source instance/stage root; client and natives must belong to it.
+    base_directory: []const u8,
     environment: m.rules.Environment,
     java: ?[]const u8 = null,
     lease: Lease,
@@ -67,7 +67,7 @@ pub const MetadataOptions = struct {
     generation: u64,
     selection: loaders.Selection,
     environment: m.rules.Environment,
-    vanilla: metadata_loader.Options,
+    vanilla: metadata_loader.FetchOptions,
     fetcher: metadata_loader.Fetcher = .{},
     namespace_token: ?namespace.Token = null,
     worker_checks: bool = false,
@@ -172,14 +172,11 @@ pub fn prepareMetadata(a: A, io: std.Io, options: MetadataOptions, control: load
     if (!std.mem.eql(u8, options.vanilla.version_id, options.selection.base_id)) return error.BaseVersionMismatch;
     var paths = try instances.Paths.init(a, io, options.root);
     defer paths.deinit();
-    var vanilla_paths = try instances.Paths.init(a, io, options.vanilla.root);
-    defer vanilla_paths.deinit();
-    if (!std.mem.eql(u8, vanilla_paths.root, paths.minecraft)) return error.PreparedMetadataMismatch;
     const minecraft = try normalized(a, paths.minecraft);
     defer a.free(minecraft);
     try control.check();
     var fetch: VanillaFetch = .{ .fetcher = options.fetcher, .control = control };
-    var loaded = try metadata_loader.loadTrusted(a, io, options.vanilla, .{ .context = &fetch, .fetch = VanillaFetch.get });
+    var loaded = try metadata_loader.fetchSources(a, io, options.vanilla, .{ .context = &fetch, .fetch = VanillaFetch.get });
     defer loaded.deinit();
     try control.check();
     const versions = try c.join(a, minecraft, "versions");
@@ -219,7 +216,7 @@ fn prepareStage(a: A, io: std.Io, options: MetadataOptions, root: []const u8, lo
     prepared.generation = options.generation;
     const g = prepared.arena.allocator();
     const bindings = try g.alloc(SourceBinding, loaded.sources.value.len);
-    const manifest = options.vanilla.manifest orelse return error.MissingVersionMetadata;
+    const manifest = options.vanilla.manifest;
     for (loaded.sources.value, bindings) |source, *binding| {
         try control.check();
         const entry = manifest.find(source.id) orelse return error.MissingVersionMetadata;
@@ -449,7 +446,7 @@ fn installCore(a: A, io: std.Io, options: Options, supplied: ?*const PreparedMet
     const paths = try instances.Paths.init(g, io, options.root);
     const minecraft = try normalized(g, paths.minecraft);
     const versions = try c.join(g, minecraft, "versions");
-    const base_directory = if (options.base_directory) |directory| try normalized(g, directory) else try c.join(g, versions, base.id);
+    const base_directory = try normalized(g, options.base_directory);
     _ = try within(base_directory, try normalized(g, paths.root));
     const base_dir = try files.directory(io, base_directory, false);
     base_dir.close(io);
@@ -539,7 +536,7 @@ fn within(path: []const u8, root: []const u8) ![]const u8 {
 }
 fn verifyBase(io: std.Io, minecraft: []const u8, base_directory: []const u8, base: m.version.Version, plan: plan_module.Plan, control: loaders.Control) !void {
     const client = try clientDownload(base);
-    try baseFile(plan.client_path, minecraft, base_directory);
+    _ = try within(plan.client_path, base_directory);
     files.verify(io, plan.client_path, client.sha1 orelse return error.BaseNotInstalled, client.size, max_file, control) catch |err| switch (err) {
         error.FileNotFound => return error.BaseNotInstalled,
         else => return err,
@@ -603,12 +600,14 @@ const Context = struct {
     fn vanilla(raw: ?*anyopaque, recipe: loaders.recipes.Recipe, control: loaders.Control) !void {
         const ctx = self(raw);
         const base = ctx.options.base.?;
-        const processor_client = try std.fmt.allocPrint(ctx.g, "{s}/versions/{s}/{s}.jar", .{ ctx.stage, base.id, base.id });
-        const final_client = try std.fmt.allocPrint(ctx.g, "{s}/{s}.jar", .{ ctx.stage, recipe.instance_name });
-        try files.copy(ctx.io, ctx.base_plan.client_path, processor_client, max_file, control);
-        try files.copy(ctx.io, ctx.base_plan.client_path, final_client, max_file, control);
         const client = try clientDownload(base);
-        try files.verify(ctx.io, processor_client, client.sha1.?, client.size, max_file, control);
+        if (recipe.processors.len != 0) {
+            const processor_client = try c.join(ctx.g, ctx.stage, @import("forge_installer/processors.zig").client_relative_path);
+            try files.copy(ctx.io, ctx.base_plan.client_path, processor_client, max_file, control);
+            try files.verify(ctx.io, processor_client, client.sha1.?, client.size, max_file, control);
+        }
+        const final_client = try std.fmt.allocPrint(ctx.g, "{s}/{s}.jar", .{ ctx.stage, recipe.instance_name });
+        try files.copy(ctx.io, ctx.base_plan.client_path, final_client, max_file, control);
         try files.verify(ctx.io, final_client, client.sha1.?, client.size, max_file, control);
         const natives = try files.directory(ctx.io, try c.join(ctx.g, ctx.stage, "natives"), true);
         defer natives.close(ctx.io);
@@ -1047,7 +1046,6 @@ const metadata_fixture_version =
 ;
 const MetadataFixture = struct {
     entries: [1]m.manifest.Entry = undefined,
-    metadata_root: [4096]u8 = undefined,
     installer: ?[]const u8 = null,
     bad_checksum: bool = false,
     redirect: bool = false,
@@ -1078,7 +1076,7 @@ const MetadataFixture = struct {
             .generation = 7,
             .selection = .{ .kind = if (self.installer != null) .forge else .fabric, .base_id = "1.20.1", .loader_id = if (self.installer != null) "1.20.1-47.2.0" else "0.16.0" },
             .environment = .{ .os_name = "linux", .arch = "x86_64" },
-            .vanilla = .{ .root = std.fmt.bufPrint(&self.metadata_root, "{s}{s}.minecraft", .{ root, std.fs.path.sep_str }) catch unreachable, .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
+            .vanilla = .{ .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
             .fetcher = .{ .context = self, .fetch = vanilla },
             .transport = .{ .context = self, .get = get },
         };
@@ -1130,7 +1128,7 @@ const MetadataFixture = struct {
     }
     fn release(_: ?*anyopaque, _: []const u8) void {}
     fn installOptions(self: *MetadataFixture, prepared: *const PreparedMetadata) Options {
-        return .{ .root = prepared.root, .instance_id = prepared.instance_id, .instance_name = prepared.instance_name, .selection = prepared.selection, .environment = prepared.environment, .base = prepared.base.value, .base_plan = .{ .files = &.{}, .native_extractions = &.{}, .classpath = &.{}, .client_path = "/fixture-not-installed" }, .lease = .{ .context = self, .acquire = acquire, .recheck = recheck, .release = release }, .transport = .{ .context = self, .get = get } };
+        return .{ .root = prepared.root, .instance_id = prepared.instance_id, .instance_name = prepared.instance_name, .selection = prepared.selection, .environment = prepared.environment, .base_directory = prepared.root, .base = prepared.base.value, .base_plan = .{ .files = &.{}, .native_extractions = &.{}, .classpath = &.{}, .client_path = "/fixture-not-installed" }, .lease = .{ .context = self, .acquire = acquire, .recheck = recheck, .release = release }, .transport = .{ .context = self, .get = get } };
     }
 };
 fn metadataFixtureTarget(prepared: *const PreparedMetadata) MetadataTarget {
@@ -1192,6 +1190,11 @@ test "metadata preflight owns sources without JVM lease or final game publicatio
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
+    const collision_root = try c.join(a, root, ".minecraft");
+    defer a.free(collision_root);
+    const collision = try metadata_loader.docPath(a, collision_root, "1.20.1");
+    defer a.free(collision);
+    try @import("../install/safe_fs.zig").writeAtomic(a, io, collision, "{\"id\":\"1.20.1\",\"mainClass\":\"AnotherMinecraftVersion\"}", null);
     var fixture: MetadataFixture = .{};
     var prepared = try prepareMetadata(a, io, fixture.options(root), metadata_fixture_control);
     defer prepared.deinit();
@@ -1271,7 +1274,7 @@ test "verified installer preflight rebuilds processor paths for actual stage and
     defer recipe.deinit();
     try std.testing.expectEqual(@as(usize, 1), recipe.value.processors.len);
     try std.testing.expectEqualStrings(actual_stage, recipe.value.processors[0].args[0]);
-    const actual_jar = try std.fmt.allocPrint(a, "{s}/versions/1.20.1/1.20.1.jar", .{actual_stage});
+    const actual_jar = try c.join(a, actual_stage, @import("forge_installer/processors.zig").client_relative_path);
     defer a.free(actual_jar);
     try std.testing.expectEqualStrings(actual_jar, recipe.value.processors[0].args[1]);
     try std.testing.expect(std.mem.startsWith(u8, recipe.value.processors[0].args[2], actual_stage));
@@ -1375,7 +1378,7 @@ test "metadata preflight copies caller feature storage before validating replay"
     try std.testing.expectError(error.PreparedMetadataMismatch, prepared.replayBase(a, io, changed, metadata_fixture_control));
 }
 
-test "metadata preparation rejects unsafe and mismatched roots before any fetch" {
+test "metadata preparation rejects unsafe roots and mismatched source identity before any fetch" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1389,12 +1392,8 @@ test "metadata preparation rejects unsafe and mismatched roots before any fetch"
     options.root = "bad\x00root";
     try std.testing.expectError(error.UnsafeDataRoot, prepareMetadata(a, io, options, metadata_fixture_control));
     options = fixture.options(root);
-    options.vanilla.root = root;
-    try std.testing.expectError(error.PreparedMetadataMismatch, prepareMetadata(a, io, options, metadata_fixture_control));
-    options.vanilla.root = "";
-    try std.testing.expectError(error.UnsafeDataRoot, prepareMetadata(a, io, options, metadata_fixture_control));
-    options.vanilla.root = "bad\x00root";
-    try std.testing.expectError(error.UnsafeDataRoot, prepareMetadata(a, io, options, metadata_fixture_control));
+    options.vanilla.version_id = "other";
+    try std.testing.expectError(error.BaseVersionMismatch, prepareMetadata(a, io, options, metadata_fixture_control));
     try std.testing.expectEqual(@as(usize, 0), fixture.vanilla_calls);
     try std.testing.expectEqual(@as(usize, 0), fixture.loader_calls);
     try std.testing.expectEqual(@as(usize, 0), fixture.lease_calls);
@@ -1543,7 +1542,7 @@ test "worker loader and metadata admission reject active namespace and stale bor
     var fixture: MetadataFixture = .{};
     var metadata_options = fixture.options(root);
     metadata_options.worker_checks = true;
-    var options: Options = .{ .root = root, .instance_id = "pack-fixture", .instance_name = "Pack", .selection = metadata_options.selection, .environment = metadata_options.environment, .lease = undefined, .worker_checks = true };
+    var options: Options = .{ .root = root, .instance_id = "pack-fixture", .instance_name = "Pack", .base_directory = root, .selection = metadata_options.selection, .environment = metadata_options.environment, .lease = undefined, .worker_checks = true };
     const old = try namespace.acquire(io);
     defer old.release();
     try std.testing.expectError(error.InstanceNamespaceBusy, prepareMetadata(a, io, metadata_options, metadata_fixture_control));

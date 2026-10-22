@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
     const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3 });
     const dvui = dvui_dep.module("dvui_sdl3");
     dvui.linkLibrary(sdl.artifact("SDL3"));
+    @import("build-support/webp.zig").link(b, target, optimize, dvui);
     const curl_dep = b.dependency("curl", .{
         .target = target,
         .optimize = optimize,
@@ -123,10 +124,14 @@ pub fn build(b: *std.Build) void {
     compile_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     b.getInstallStep().dependOn(compile_step);
     const run_cmd = b.addRunArtifact(exe);
-    const data_dir = b.option([]const u8, "data-dir", "Launcher data root for the run step") orelse
-        b.graph.environ_map.get("VELA_DATA_DIR") orelse ".";
+    // Keep the Run environment unset so cached build graphs inherit the current session.
+    // Pass only the explicit data-root choice as argv; VELA_DATA_DIR is read at runtime.
+    if (b.option([]const u8, "data-dir", "Launcher data root for the run step")) |data_dir| {
+        run_cmd.addArgs(&.{ "--data-dir", data_dir });
+    } else {
+        run_cmd.addArgs(&.{ "--default-data-dir", "." });
+    }
     run_cmd.setCwd(b.path("."));
-    run_cmd.setEnvironmentVariable("VELA_DATA_DIR", data_dir);
     run_cmd.step.dependOn(compile_step);
     run_cmd.addPassthruArgs();
     b.step("run", "Run App").dependOn(&run_cmd.step);
@@ -159,6 +164,11 @@ pub fn build(b: *std.Build) void {
     const game_selection_run = runTestWithFixture(b, java_process_fixture_install, game_selection_tests);
     b.step("test-game-selection", "Test exact instance and server selection").dependOn(&game_selection_run.step);
     test_step.dependOn(&game_selection_run.step);
+    const mods_tests = b.addTest(.{ .name = "test-mods", .root_module = cloneAppModule(b, app_mod, b.path("src/mods_view_tests.zig")), .filters = if (b.option([]const u8, "mods-test-filter", "Run a focused resource UI test group")) |filter| &.{filter} else &.{} });
+    mods_tests.root_module.addImport("test_allocations", test_allocations);
+    const mods_run = runTestWithFixture(b, java_process_fixture_install, mods_tests);
+    b.step("test-mods", "Test local inventory and mod view/controller").dependOn(&mods_run.step);
+    test_step.dependOn(&mods_run.step);
     const app_test_filter = b.option([]const u8, "test-filter", "Run a focused application test group");
     const app_tests = b.addTest(.{ .root_module = app_mod, .name = "test-app", .filters = if (app_test_filter) |filter| &.{filter} else &.{} });
     const app_test_run = runTestWithFixture(b, java_process_fixture_install, app_tests);
@@ -185,6 +195,33 @@ pub fn build(b: *std.Build) void {
             }),
         });
         windows_durable_check.dependOn(&check.step);
+    }
+    const install_platform_check = b.step("check-install-platforms", "Compile installation, recovery, native planning and JVM APIs for Linux/Windows/macOS x64 and ARM64");
+    inline for (.{ std.Target.Os.Tag.linux, std.Target.Os.Tag.windows, std.Target.Os.Tag.macos }) |os| {
+        inline for (.{ std.Target.Cpu.Arch.x86_64, std.Target.Cpu.Arch.aarch64 }) |arch| {
+            const platform = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = os, .abi = if (os == .macos) .none else .gnu });
+            const platform_curl = b.dependency("curl", .{ .target = platform, .optimize = optimize, .link_vendor = true, .mbedtls_pthreads = os.isDarwin() });
+            // Objects validate target ABI declarations without resolving a target libcurl binary.
+            const curl_source = platform_curl.module("curl");
+            const curl_bindings = b.createModule(.{ .root_source_file = curl_source.root_source_file, .target = platform, .optimize = optimize, .link_libc = true });
+            for (curl_source.import_table.keys(), curl_source.import_table.values()) |name, imported| curl_bindings.addImport(name, imported);
+            if (os == .windows) disableWindowsTranslationFortify(platform_curl.module("curl").import_table.get("c").?);
+            const platform_nbt = b.dependency("nbt", .{ .target = platform, .optimize = optimize });
+            const platform_module = b.createModule(.{
+                .root_source_file = b.path("src/install_platform_checks.zig"),
+                .target = platform,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "curl", .module = curl_bindings },
+                    .{ .name = "nbt", .module = platform_nbt.module("nbt") },
+                    .{ .name = "nbt_compression", .module = b.createModule(.{ .root_source_file = b.path("src/core/worlds_gzip.zig"), .target = platform, .optimize = optimize }) },
+                },
+            });
+            if (os == .linux) platform_module.addImport("linux_c", linux_c.create(b, platform, optimize));
+            const check = b.addObject(.{ .name = "install-" ++ @tagName(os) ++ "-" ++ @tagName(arch), .root_module = platform_module });
+            install_platform_check.dependOn(&check.step);
+        }
     }
     const nbt_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = nbt_dep.path("tests/tests.zig"),
@@ -274,8 +311,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/core/downloader_test.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "curl", .module = curl_dep.module("curl") }},
+        .imports = &.{
+            .{ .name = "curl", .module = curl_dep.module("curl") },
+            .{ .name = "nbt", .module = nbt_module },
+            .{ .name = "nbt_compression", .module = nbt_compression },
+        },
     }) });
+    if (linux_bindings) |bindings| downloader_tests.root_module.addImport("linux_c", bindings);
     b.step("test-downloader", "Test downloader against local HTTP fixture").dependOn(&runTestWithFixture(b, java_process_fixture_install, downloader_tests).step);
     const http_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/core/http_transport.zig"),
@@ -385,6 +427,7 @@ pub fn build(b: *std.Build) void {
     const gui_fixture_tests = b.addTest(.{
         .name = "test-gui-fixture",
         .root_module = cloneAppModule(b, app_mod, b.path("src/gui_acceptance.zig")),
+        .filters = if (b.option([]const u8, "gui-test-filter", "Run a focused GUI fixture test group")) |filter| &.{filter} else &.{},
     });
     b.step("test-gui-fixture", "Test deterministic GUI fixture data").dependOn(&runTestWithFixture(b, java_process_fixture_install, gui_fixture_tests).step);
     // Independently rooted test modules share deterministic exhaustive OOM injection.

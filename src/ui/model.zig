@@ -1,8 +1,7 @@
 const std = @import("std");
 
-pub const Panel = enum { home, players, versions, more, library, java, servers, logs, instances, worlds };
+pub const Panel = enum { home, players, versions, more, java, servers, logs, instances, worlds, mods };
 pub const Category = enum { game, settings };
-pub const VersionFilter = enum { release, snapshot, all };
 
 pub const GameName = struct {
     bytes: [256]u8 = undefined,
@@ -27,23 +26,19 @@ pub const Msg = union(enum) {
     open_players,
     open_versions,
     open_more,
-    open_library,
-    library_back,
+    instances_back,
     open_java,
     java_back,
     open_servers,
     open_logs,
     open_instances,
     open_worlds,
+    open_mods,
     utility_back,
     select_category: Category,
-    get_game,
-    inspect_game: []const u8,
     use_game: []const u8,
     select_instance: []const u8,
     select_server: []const u8,
-    choose_download: []const u8,
-    filter_versions: VersionFilter,
     back,
     select_player: u32,
     select_version: u32,
@@ -64,18 +59,14 @@ pub const Model = struct {
     selected_version: u32 = 1,
     launch_notice: bool = false,
     category: Category = .game,
-    getting_game: bool = true,
-    version_filter: VersionFilter = .release,
     game_instances_expanded: bool = true,
     game_servers_expanded: bool = true,
-    library_game: GameName = .{},
-    download_game: GameName = .{},
+    mods_instance: GameName = .{},
     active_game: GameName = .{},
-    search: [64]u8 = @splat(0),
     library_error: ?anyerror = null,
 
     fn enterInstances(model: *Model) void {
-        if (model.panel != .instances and model.panel != .library) model.instance_parent = model.panel;
+        if (model.panel != .instances) model.instance_parent = model.panel;
         model.panel = .instances;
         model.launch_notice = false;
     }
@@ -88,7 +79,7 @@ pub const Model = struct {
     pub fn parentPanel(model: *const Model) Panel {
         return switch (model.panel) {
             .home, .players, .versions, .more => .home,
-            .instances, .library => model.instance_parent,
+            .instances => model.instance_parent,
             else => model.panel_parents[@backingInt(model.panel)],
         };
     }
@@ -99,19 +90,20 @@ pub const Model = struct {
             .more => "返回更多",
             .players => "返回选择玩家",
             .versions => "返回选择游戏",
-            .instances, .library => "返回实例管理",
+            .instances => "返回实例管理",
             .java => "返回 Java 管理",
             .servers => "返回服务器",
             .logs => "返回游戏日志",
             .worlds => "返回存档",
+            .mods => "返回资源管理",
         };
     }
 
     pub fn parentMessage(model: *const Model) Msg {
         return switch (model.panel) {
             .java => .java_back,
-            .instances, .library => .library_back,
-            .servers, .logs, .worlds => .utility_back,
+            .instances => .instances_back,
+            .servers, .logs, .worlds, .mods => .utility_back,
             else => .back,
         };
     }
@@ -175,7 +167,7 @@ pub fn transition(model: *Model, msg: Msg) void {
             model.panel = .more;
             model.launch_notice = false;
         },
-        .open_library, .open_instances, .get_game, .inspect_game, .choose_download, .filter_versions => model.enterInstances(),
+        .open_instances => model.enterInstances(),
         .open_java => {
             model.enterPanel(.java);
             model.launch_notice = false;
@@ -183,13 +175,15 @@ pub fn transition(model: *Model, msg: Msg) void {
         .java_back => {
             if (model.panel == .java) model.panel = model.parentPanel();
         },
-        .library_back => {
-            if (model.panel == .instances) {
-                model.panel = model.instance_parent;
-            } else if (model.panel == .library) model.panel = .more;
+        .instances_back => {
+            if (model.panel == .instances) model.panel = model.instance_parent;
         },
         .open_servers => {
             model.enterPanel(.servers);
+            model.launch_notice = false;
+        },
+        .open_mods => {
+            model.enterPanel(.mods);
             model.launch_notice = false;
         },
         .open_worlds => {
@@ -201,7 +195,7 @@ pub fn transition(model: *Model, msg: Msg) void {
             model.launch_notice = false;
         },
         .utility_back => {
-            if (model.panel == .servers or model.panel == .logs or model.panel == .instances or model.panel == .worlds) {
+            if (model.panel == .servers or model.panel == .logs or model.panel == .instances or model.panel == .worlds or model.panel == .mods) {
                 model.panel = model.parentPanel();
                 model.category = .game;
             }
@@ -298,16 +292,14 @@ test "launch feedback clears in more and returning retains selections" {
     try std.testing.expectEqual(@as(u32, 1), model.selected_version);
 }
 
-test "legacy directory aliases route to instance management without a second catalogue" {
+test "instance navigation preserves the active game" {
     var model: Model = .{};
     _ = model.active_game.set("1.21.1");
-    for ([_]Msg{ .open_library, .get_game, .{ .inspect_game = "1.21.1" }, .{ .choose_download = "1.20.1" }, .{ .filter_versions = .snapshot } }) |message| {
-        transition(&model, message);
-        try std.testing.expectEqual(Panel.instances, model.panel);
-        try std.testing.expectEqualStrings("1.21.1", model.active_game.get());
-        transition(&model, .library_back);
-        try std.testing.expectEqual(Panel.home, model.panel);
-    }
+    transition(&model, .open_instances);
+    try std.testing.expectEqual(Panel.instances, model.panel);
+    try std.testing.expectEqualStrings("1.21.1", model.active_game.get());
+    transition(&model, .instances_back);
+    try std.testing.expectEqual(Panel.home, model.panel);
 }
 
 test "game name owns validated path component" {
@@ -351,14 +343,12 @@ test "independent archives and instance management return to game without changi
     for ([_]Msg{ .open_worlds, .open_instances }) |message| {
         var model: Model = .{ .panel = .more, .category = .settings };
         _ = model.active_game.set("1.21.1");
-        _ = model.library_game.set("1.20.1");
         transition(&model, message);
         try std.testing.expect(model.panel == if (message == .open_worlds) Panel.worlds else Panel.instances);
         transition(&model, .utility_back);
         try std.testing.expectEqual(Panel.more, model.panel);
         try std.testing.expectEqual(Category.game, model.category);
         try std.testing.expectEqualStrings("1.21.1", model.active_game.get());
-        try std.testing.expectEqualStrings("1.20.1", model.library_game.get());
         try std.testing.expectEqual(@as(u32, 1), model.selected_player);
         transition(&model, message);
         transition(&model, .back);
@@ -375,15 +365,15 @@ test "instance management returns to its entry panel across repeated visits" {
     try std.testing.expectEqual(Panel.home, model.panel);
     transition(&model, .open_more);
     transition(&model, .open_instances);
-    transition(&model, .{ .inspect_game = "1.21.1" });
+    transition(&model, .open_instances);
     transition(&model, .utility_back);
     try std.testing.expectEqual(Panel.more, model.panel);
     transition(&model, .back);
-    transition(&model, .open_library);
-    transition(&model, .library_back);
+    transition(&model, .open_instances);
+    transition(&model, .instances_back);
     try std.testing.expectEqual(Panel.home, model.panel);
-    transition(&model, .get_game);
-    transition(&model, .{ .filter_versions = .snapshot });
+    transition(&model, .open_instances);
+    transition(&model, .open_instances);
     transition(&model, .utility_back);
     try std.testing.expectEqual(Panel.home, model.panel);
     try std.testing.expectEqualStrings("1.21.1", model.active_game.get());

@@ -346,3 +346,120 @@ test "null and empty proxy disable inherited proxies and explicit proxy ignores 
     defer proxied.release() catch unreachable;
     try std.testing.expectEqualStrings("hello minecraft\n", (try success(proxied)).result.?.bytes);
 }
+
+fn installFixtureFile(tmp: *std.testing.TmpDir, relative: []const u8, bytes: []const u8) !void {
+    const path = try pathIn(tmp, relative);
+    defer a.free(path);
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+    try put(path, bytes);
+}
+
+fn expectInstallFixtureFile(tmp: *std.testing.TmpDir, relative: []const u8, expected: []const u8) !void {
+    const bytes = try tmp.dir.readFileAlloc(io, relative, a, .limited(8192));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings(expected, bytes);
+}
+
+test "client installation stays in its stage across source and instance name collisions" {
+    const installer = @import("minecraft/install.zig");
+    const metadata = @import("minecraft/metadata/root.zig");
+    const base = try baseUrl();
+    defer a.free(base);
+    const client_url = try url(base, "/instance-client/jar");
+    defer a.free(client_url);
+    const index_url = try url(base, "/instance-client/index");
+    defer a.free(index_url);
+    const index_bytes = "{\"objects\":{}}";
+    const client_bytes = "hello minecraft\n";
+    var client_sha: [20]u8 = undefined;
+    var index_sha: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(client_bytes, &client_sha, .{});
+    std.crypto.hash.Sha1.hash(index_bytes, &index_sha, .{});
+    const client_hex = std.fmt.bytesToHex(client_sha, .lower);
+    const index_hex = std.fmt.bytesToHex(index_sha, .lower);
+    const source = try std.json.Stringify.valueAlloc(a, .{
+        .id = "1.20.1",
+        .mainClass = "fixture.Main",
+        .libraries = [_]struct {}{},
+        .downloads = .{ .client = .{ .url = client_url, .sha1 = client_hex[0..], .size = client_bytes.len } },
+        .assetIndex = .{ .id = "client-fixture", .url = index_url, .sha1 = index_hex[0..], .size = index_bytes.len },
+    }, .{});
+    defer a.free(source);
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    const service = try dl.Service.init(a, io, 2);
+    defer service.deinit();
+    const preserved = [_]struct { path: []const u8, bytes: []const u8 }{
+        .{ .path = "assets/objects/shared-marker", .bytes = "shared assets" },
+        .{ .path = "libraries/shared/marker.jar", .bytes = "shared libraries" },
+        .{ .path = "versions/Unrelated/Unrelated.jar", .bytes = "unrelated client" },
+        .{ .path = "versions/Unrelated/saves/world/level.dat", .bytes = "unrelated world" },
+    };
+    for ([_][]const u8{ "Survival", "1.20.1" }) |name| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        for (preserved) |entry| try installFixtureFile(&tmp, entry.path, entry.bytes);
+        const collision = !std.mem.eql(u8, name, "1.20.1");
+        if (collision) {
+            try installFixtureFile(&tmp, "versions/1.20.1/1.20.1.jar", "another Minecraft version");
+            try installFixtureFile(&tmp, "versions/1.20.1/1.20.1.json", "another instance descriptor");
+            try installFixtureFile(&tmp, "versions/1.20.1/saves/world/level.dat", "preserved world");
+        }
+        try installFixtureFile(&tmp, "source.json", source);
+        const source_path = try pathIn(&tmp, "source.json");
+        defer a.free(source_path);
+        const stage_name = ".vela-instance-client-fixture";
+        const stage = try std.fs.path.join(a, &.{ root, "versions", stage_name });
+        defer a.free(stage);
+        var installed = try installer.run(a, io, service, .{
+            .root = root,
+            .version_id = "1.20.1",
+            .target = .{ .directory_name = stage_name, .name = name },
+            .game_directory = stage,
+            .metadata_path = source_path,
+            .environment = .{ .os_name = "linux", .arch = "x86_64" },
+        });
+        defer installed.deinit();
+        const expected_client = try std.fmt.allocPrint(a, "{s}/{s}.jar", .{ stage, name });
+        defer a.free(expected_client);
+        const expected_target = try std.fs.path.resolve(a, &.{expected_client});
+        defer a.free(expected_target);
+        const planned_target = try std.fs.path.resolve(a, &.{installed.plan.value.client_path});
+        defer a.free(planned_target);
+        try std.testing.expectEqualStrings(expected_target, planned_target);
+        try std.testing.expectEqualStrings(installed.plan.value.client_path, installed.plan.value.classpath[installed.plan.value.classpath.len - 1]);
+        const staged_jar = try std.fmt.allocPrint(a, "versions/{s}/{s}.jar", .{ stage_name, name });
+        defer a.free(staged_jar);
+        try expectInstallFixtureFile(&tmp, staged_jar, client_bytes);
+        const staged_json = try std.fmt.allocPrint(a, "versions/{s}/{s}.json", .{ stage_name, name });
+        defer a.free(staged_json);
+        const document = try tmp.dir.readFileAlloc(io, staged_json, a, .limited(8192));
+        defer a.free(document);
+        var parsed = try metadata.version.parseSlice(a, document);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(name, parsed.value.id);
+        try std.testing.expect(parsed.value.jar == null and parsed.value.inherits_from == null);
+        if (!collision) try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "versions/1.20.1", .{ .follow_symlinks = false }));
+        var versions = try tmp.dir.openDir(io, "versions", .{});
+        defer versions.close(io);
+        try std.Io.Dir.renamePreserve(versions, stage_name, versions, name, io);
+        const final_jar = try std.fmt.allocPrint(a, "versions/{s}/{s}.jar", .{ name, name });
+        defer a.free(final_jar);
+        try expectInstallFixtureFile(&tmp, final_jar, client_bytes);
+        for (preserved) |entry| try expectInstallFixtureFile(&tmp, entry.path, entry.bytes);
+        if (collision) {
+            try expectInstallFixtureFile(&tmp, "versions/1.20.1/1.20.1.jar", "another Minecraft version");
+            try expectInstallFixtureFile(&tmp, "versions/1.20.1/1.20.1.json", "another instance descriptor");
+            try expectInstallFixtureFile(&tmp, "versions/1.20.1/saves/world/level.dat", "preserved world");
+        }
+    }
+    const stats_url = try url(base, "/stats");
+    defer a.free(stats_url);
+    const task = try service.submit(.{ .url = stats_url, .output = .json });
+    defer task.release() catch unreachable;
+    const counts = (try success(task)).result.?.json.object;
+    try eq(@as(i64, 2), counts.get("/instance-client/jar").?.integer);
+    try eq(@as(i64, 2), counts.get("/instance-client/index").?.integer);
+}

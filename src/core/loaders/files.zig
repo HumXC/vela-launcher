@@ -10,10 +10,10 @@ const Dir = std.Io.Dir;
 pub fn directory(io: std.Io, path: []const u8, create: bool) !Dir {
     try c.stageRoot(path);
     if (!create) return tree.openAbsolute(io, path);
-    const root_len: usize = if (@import("builtin").os.tag == .windows) std.fs.path.diskDesignator(path).len + 1 else 1;
+    const root_len = (try @import("../native_path.zig").absoluteRoot(path)).len;
     var dir = try tree.openAbsolute(io, path[0..root_len]);
     errdefer dir.close(io);
-    var parts = std.mem.splitScalar(u8, path[root_len..], '/');
+    var parts = std.mem.tokenizeScalar(u8, path[root_len..], '/');
     while (parts.next()) |part| {
         const next = try tree.child(io, dir, part, true);
         dir.close(io);

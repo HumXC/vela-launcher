@@ -3,11 +3,8 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    zig-overlay.url = "github:mitchellh/zig-overlay";
-    zig-overlay.inputs.nixpkgs.follows = "nixpkgs";
-    # ZLS has no 0.17 stable tag yet; pin the matching development revision.
+    zig-overlay.url = "github:mitchellh/zig-overlay/f0acd78ef01f2d5e3471cc01b08022ab4e665898";
     zls-overlay.url = "github:zigtools/zls/eab2be0fd74443a27662da809b771c4ad0d2afcf";
-    zls-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = {

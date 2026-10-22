@@ -259,7 +259,7 @@ const Job = struct {
                 defer catalog.deinit();
                 const fetcher: vanilla.Fetcher = .{ .context = &fetch_context, .fetch = fetchVersion };
                 const row = self.request.instance;
-                const base: vanilla.Options = .{ .root = self.paths.minecraft, .version_id = row.minecraft_version, .manifest = catalog.value, .cancel = &self.cancellation };
+                const base: vanilla.FetchOptions = .{ .version_id = row.minecraft_version, .manifest = catalog.value, .cancel = &self.cancellation };
                 if (row.loader == .vanilla) {
                     const prepared = vanilla.prepareVanilla(self.a, self.io, .{ .target = self.vanillaTarget(), .vanilla = base, .fetcher = fetcher }) catch |err| {
                         try self.checkMetadata();
@@ -283,6 +283,7 @@ const Job = struct {
                 const runtime = try self.options.runner.probe(self.options.runner.context, self.a, self.io, self.probe_path, &self.cancellation);
                 defer java_manager.freeRuntime(self.a, runtime);
                 if (runtime.major != self.probe_major) return error.JavaMajorMismatch;
+                try runtime.architecture.requireHost();
                 if (!textEqual(runtime.path, self.probe_path)) return error.JavaPathChanged;
                 try self.checkCanceled();
             },
@@ -540,6 +541,7 @@ const Core = struct {
         if (role == .runtime) if (row.java_path) |path| {
             for (services.java.entries()) |runtime| if (textEqual(runtime.path, path)) {
                 if (runtime.major != required) return error.IncompatibleJava;
+                try runtime.architecture.requireHost();
                 return runtime;
             };
             return null;
@@ -591,8 +593,7 @@ const Core = struct {
         try job.validateProof();
         try self.exactSelection(.runtime, job.runtime_path.?);
         if (job.installer_major != null) try self.exactSelection(.installer, job.installer_path.?);
-        var row = job.request.instance;
-        row.java_path = job.runtime_path.?;
+        const row = job.request.instance;
         const proof = if (job.proof) |*owned| owned else return error.MissingPreparedMetadata;
         switch (proof.*) {
             .vanilla => |*owner| try services.instances.startCreateVanillaPrepared(row, owner, job.request.preparation_generation),
@@ -605,8 +606,7 @@ const Core = struct {
     fn captureCreated(self: *Core) !void {
         const job = self.job.?;
         const actual = self.services.?.instances.snapshot().instance orelse return error.MissingCreatedInstance;
-        var expected = job.request.instance;
-        expected.java_path = job.runtime_path;
+        const expected = job.request.instance;
         if (!sameRow(actual, expected)) return error.InstanceConfigurationChanged;
         const owned_row = try clone(config.Instance, job.arena.allocator(), actual);
         job.actual_row = owned_row;
@@ -939,6 +939,7 @@ const Fixture = struct {
     probe_count: usize = 0,
     create_count: usize = 0,
     probe_major: u32 = 17,
+    probe_architecture: @import("../core/java_runtime.zig").Architecture = @import("../core/java_runtime.zig").host(),
 
     fn init() !*Fixture {
         const a = std.testing.allocator;
@@ -1018,7 +1019,7 @@ const Fixture = struct {
         self.probe_count += 1;
         const owned_path = try a.dupe(u8, path);
         errdefer a.free(owned_path);
-        return .{ .path = owned_path, .major = self.probe_major, .vendor = try a.dupe(u8, "Fixture") };
+        return .{ .path = owned_path, .major = self.probe_major, .architecture = self.probe_architecture, .vendor = try a.dupe(u8, "Fixture") };
     }
     fn install(raw: ?*anyopaque, a: A, io: Io, install_request: instances_manager.CreateRequest, _: instances_manager.Control) !instances_manager.Installed {
         const self: *Fixture = @ptrCast(@alignCast(raw.?));
@@ -1034,7 +1035,7 @@ const Fixture = struct {
     fn registerRuntime(self: *Fixture, major_number: u32) !void {
         const path = try std.fmt.allocPrint(self.a, "/fixture/java-{d}", .{major_number});
         defer self.a.free(path);
-        try self.java.addDownloaded(.{ .path = path, .major = major_number, .vendor = "Fixture" });
+        try self.java.addDownloaded(.{ .path = path, .major = major_number, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Fixture" });
     }
     fn joinPrivate(controller_value: *Controller) void {
         if (controller_value.core.job) |job| if (job.thread) |thread| {
@@ -1211,13 +1212,14 @@ test "ordinary creation prepares exact runtime without pack policy or content ad
     try std.testing.expectEqual(@as(usize, 0), fixture.store.snapshot().instances.len);
     try std.testing.expectEqual(@as(usize, 1), fixture.probe_count);
     try std.testing.expectEqual(task_id, value.creationSnapshot().task_id.?);
-    try std.testing.expectEqualStrings("/fixture/java-17", value.creationSnapshot().instance.?.java_path.?);
+    try std.testing.expect(value.creationSnapshot().instance.?.java_path == null);
     try std.testing.expectError(error.MutationsDisabled, value.publishOrdinary(fixture.services(), false));
     try value.publishOrdinary(fixture.services(), true);
     try fixture.until(&value, .complete);
     try std.testing.expectEqual(@as(usize, 1), fixture.create_count);
     try std.testing.expect(fixture.store.snapshot().instances[0].origin == null);
-    try std.testing.expectEqualStrings("/fixture/java-17", fixture.store.snapshot().instances[0].java_path.?);
+    try fixture.store.reconcile();
+    try std.testing.expect(fixture.store.snapshot().instances[0].java_path == null);
     try std.testing.expect(!fixture.leased and !fixture.registry.hasActive());
 }
 
@@ -1250,7 +1252,7 @@ test "ordinary Fabric and Quilt creation uses registered Java 21 without an inst
             try std.testing.expectEqual(@as(u64, 21), proof.requirements.runtime_major);
             try std.testing.expectEqual(@as(u64, 0), proof.requirements.installer_major);
             try std.testing.expect(request.installer_java == null);
-            try std.testing.expectEqualStrings("/fixture/java-21", request.instance.java_path.?);
+            try std.testing.expect(request.instance.java_path == null);
             fixture.create_count += 1;
             try fixture.tmp.dir.createDirPath(io, ".minecraft/versions/Display Name");
             try fixture.tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Display Name/committed.marker", .data = "committed" });
@@ -1284,7 +1286,8 @@ test "ordinary Fabric and Quilt creation uses registered Java 21 without an inst
         try std.testing.expect(!value.core.discovered);
         try value.publishOrdinary(fixture.services(), true);
         try fixture.until(&value, .complete);
-        try std.testing.expectEqualStrings("/fixture/java-21", fixture.store.snapshot().instances[0].java_path.?);
+        try fixture.store.reconcile();
+        try std.testing.expect(fixture.store.snapshot().instances[0].java_path == null);
         try std.testing.expect(!fixture.leased and !fixture.registry.hasActive());
     }
 }
@@ -1693,7 +1696,7 @@ const AutoJavaFixture = struct {
     fn probe(_: ?*anyopaque, a: A, _: Io, path: []const u8, _: ?*const CancelToken) !java_manager.Runtime {
         const owned_path = try a.dupe(u8, path);
         errdefer a.free(owned_path);
-        return .{ .path = owned_path, .major = 17, .vendor = try a.dupe(u8, "Microsoft") };
+        return .{ .path = owned_path, .major = 17, .architecture = @import("../core/java_runtime.zig").host(), .vendor = try a.dupe(u8, "Microsoft") };
     }
     fn joinDownload(fixture: *Fixture) void {
         if (fixture.download.active) |job| if (job.thread) |thread| {
@@ -1944,4 +1947,31 @@ test "ordinary inherited metadata beyond file cap retains the failed request and
     try std.testing.expectEqual(@as(usize, 0), fixture.create_count);
     fixture.registry.pruneFinished(0);
     try std.testing.expectEqualDeep(details, value.creationSnapshot().details);
+}
+
+test "creation rejects foreign selected and re-probed JVM architectures before install" {
+    const architecture = @import("../core/java_runtime.zig");
+    const foreign: architecture.Architecture = if (architecture.host() == .aarch64) .x86_64 else .aarch64;
+    for ([_]bool{ false, true }) |cached_foreign| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        try fixture.registerRuntime(17);
+        if (cached_foreign) {
+            var runtime = fixture.java.entries()[0];
+            runtime.architecture = foreign;
+            try fixture.java.addDownloaded(runtime);
+        } else fixture.probe_architecture = foreign;
+        var value = try fixture.controller();
+        defer value.deinit(fixture.services());
+        var row = fixture.row;
+        row.java_path = fixture.java.entries()[0].path;
+        try value.startOrdinary(row, fixture.services());
+        for (0..8) |_| fixture.advance(&value);
+        try std.testing.expectEqual(Phase.failed, value.snapshot().phase);
+        try std.testing.expectEqual(error.JavaArchitectureMismatch, value.snapshot().failure.?);
+        try std.testing.expectEqual(@as(usize, if (cached_foreign) 0 else 1), fixture.probe_count);
+        try std.testing.expectEqual(@as(usize, 0), fixture.create_count);
+        try std.testing.expectEqual(@as(usize, 0), fixture.store.snapshot().instances.len);
+        try std.testing.expect(!fixture.registry.hasActive());
+    }
 }

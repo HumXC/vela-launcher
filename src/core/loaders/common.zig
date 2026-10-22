@@ -24,15 +24,106 @@ pub fn relative(path: []const u8) !void {
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| try m.version.validateId(part);
 }
-/// The stage is absolute and normalized; child paths always use portable '/'.
+/// Absolute, slash-normalized stage path: Unix '/', drive 'C:/', or UNC '//host/share'.
+/// A volume/share root may stand alone; descendants must be normalized safe components.
+/// Windows device namespaces and drive-relative paths are never stage roots.
 pub fn stageRoot(root: []const u8) !void {
     if (root.len == 0 or root.len > 4096 or std.mem.indexOfAny(u8, root, "\\\x00;\r\n") != null) return error.UnsafeStageRoot;
-    const prefix: usize = if (root[0] == '/') 1 else if (root.len >= 3 and std.ascii.isAlphabetic(root[0]) and root[1] == ':' and root[2] == '/') 3 else return error.UnsafeStageRoot;
-    relative(root[prefix..]) catch return error.UnsafeStageRoot;
+    const prefix = try stageRootPrefix(root);
+    if (prefix < root.len) relative(root[prefix..]) catch return error.UnsafeStageRoot;
+}
+
+fn stageRootPrefix(root: []const u8) !usize {
+    if (std.mem.startsWith(u8, root, "//")) {
+        // A UNC volume comprises both a server and a share, not just the leading '//'.
+        const server_end = std.mem.indexOfScalarPos(u8, root, 2, '/') orelse return error.UnsafeStageRoot;
+        m.version.validateId(root[2..server_end]) catch return error.UnsafeStageRoot;
+        const share_start = server_end + 1;
+        const share_end = std.mem.indexOfScalarPos(u8, root, share_start, '/') orelse root.len;
+        m.version.validateId(root[share_start..share_end]) catch return error.UnsafeStageRoot;
+        return if (share_end == root.len) share_end else share_end + 1;
+    }
+    if (root[0] == '/') return 1;
+    if (root.len >= 3 and std.ascii.isAlphabetic(root[0]) and root[1] == ':' and root[2] == '/') return 3;
+    return error.UnsafeStageRoot;
+}
+
+test "stage roots accept complete Unix drive and UNC volumes on every host" {
+    for ([_][]const u8{
+        "/",
+        "/tmp/stage fixture",
+        "C:/",
+        "c:/stage/Synthetic Fixture",
+        "Z:/Games/游戏",
+        "//NAS/Games",
+        "//NAS/Games/",
+        "//NAS/Games/Vela",
+        "//nas.example/Games$/stage fixture",
+        "//192.168.1.10/share/Vela",
+    }) |root| try stageRoot(root);
+
+    // Drive letters are parsed as Windows syntax even when these tests run on POSIX.
+    var drive = [_]u8{ 'A', ':', '/' };
+    for (0..26) |index| {
+        drive[0] = 'A' + @as(u8, @intCast(index));
+        try stageRoot(&drive);
+        drive[0] = std.ascii.toLower(drive[0]);
+        try stageRoot(&drive);
+    }
+}
+
+test "stage roots reject malformed volumes namespaces and unsafe components on every host" {
+    for ([_][]const u8{
+        "",                        "relative",            "C:",                   "C:stage",           "1:/stage",          "CC:/stage",
+        "//",                      "//NAS",               "//NAS/",               "///Games",          "///NAS/Games",      "//NAS//Games",
+        "//./Games",               "//../Games",          "//NAS/.",              "//NAS/..",          "//?/C:/stage",      "//./C:/stage",
+        "/??/C:/stage",            "C:\\stage",           "\\\\NAS\\Games\\Vela", "//NAS/Games\\Vela", "/stage/",           "C:/stage/",
+        "//NAS/Games/Vela/",       "/stage//nested",      "C://stage",            "//NAS/Games//Vela", "//NAS/Games//",     "/stage/../live",
+        "C:/stage/./live",         "//NAS/Games/../live", "/stage/CON",           "C:/stage/LPT1.txt", "//NAS/Games/NUL",   "/stage/trailing.",
+        "C:/stage/trailing ",      "//NAS/Games./Vela",   "//NAS./Games",         "//NAS /Games",      "//NAS/Games /Vela", "/stage/stream:data",
+        "//NAS/Games:stream/Vela", "//NAS:445/Games",     "/stage/a;b",           "C:/stage/a*b",      "//NAS/Games/a?b",   "/stage/a\x00b",
+        "C:/stage/a\nb",           "//NAS/Games/a\rb",    "/stage/a\x1fb",        "//NAS/Games/\x7f",  "//NAS/\xff",
+    }) |root| try std.testing.expectError(error.UnsafeStageRoot, stageRoot(root));
+}
+
+test "stage roots enforce total and component bounds without touching the filesystem" {
+    var root: [4097]u8 = @splat('a');
+    root[0] = '/';
+    var separator: usize = 200;
+    while (separator < root.len) : (separator += 200) root[separator] = '/';
+    try stageRoot(root[0..4096]);
+    try std.testing.expectError(error.UnsafeStageRoot, stageRoot(&root));
+
+    var component: [202]u8 = @splat('a');
+    component[0] = '/';
+    try stageRoot(component[0..201]);
+    try std.testing.expectError(error.UnsafeStageRoot, stageRoot(&component));
 }
 pub fn join(a: std.mem.Allocator, root: []const u8, path: []const u8) ![]const u8 {
     try relative(path);
-    return std.fmt.allocPrint(a, "{s}/{s}", .{ root, path });
+    const separator: []const u8 = if (std.mem.endsWith(u8, root, "/")) "" else "/";
+    return std.fmt.allocPrint(a, "{s}{s}{s}", .{ root, separator, path });
+}
+
+test "stage root joins retain one separator at Unix drive and UNC boundaries" {
+    const a = std.testing.allocator;
+    for ([_]struct { root: []const u8, expected: []const u8 }{
+        .{ .root = "/", .expected = "/child/file.json" },
+        .{ .root = "C:/", .expected = "C:/child/file.json" },
+        .{ .root = "//NAS/Games", .expected = "//NAS/Games/child/file.json" },
+        .{ .root = "//NAS/Games/", .expected = "//NAS/Games/child/file.json" },
+        .{ .root = "/tmp/stage", .expected = "/tmp/stage/child/file.json" },
+    }) |case| {
+        const joined = try join(a, case.root, "child/file.json");
+        defer a.free(joined);
+        try std.testing.expectEqualStrings(case.expected, joined);
+        try stageRoot(joined);
+    }
+    // This helper also builds safe relative artifact paths.
+    const artifact = try join(a, "libraries", "org/example/fixture.jar");
+    defer a.free(artifact);
+    try std.testing.expectEqualStrings("libraries/org/example/fixture.jar", artifact);
+    try std.testing.expectError(error.UnsafeVersionId, join(a, "/", "../outside"));
 }
 /// HTTPS authority and decoded path are deliberately restricted. Redirect targets
 /// must be revalidated by transports, never accepted just because the first URL was.

@@ -271,14 +271,14 @@ fn expectedBytes(total: *u64, size: ?u64) !void {
 }
 
 fn auditGame(a: std.mem.Allocator, io: std.Io, paths: *const instances.Paths, report: *Report, cancel: safe.Cancel, deadline: i96) !void {
-    var loaded = try loader.load(a, io, .{
+    var loaded = try loader.loadInstalled(a, io, .{
         .root = paths.minecraft,
         .version_id = version,
         .cancel = cancel,
         // This budget also bounds the resolved model, not only raw JSON bytes.
         // pinMetadata still requires the exact 44992-byte authenticated snapshot.
         .limits = .{ .max_depth = 1, .max_documents = 1, .max_bytes = metadata.version.max_document_bytes },
-    }, .{});
+    });
     defer loaded.deinit();
     const source_sha1 = try pinMetadata(&loaded);
     const metadata_path = try paths.versionDocument(version);
@@ -310,12 +310,13 @@ fn auditGame(a: std.mem.Allocator, io: std.Io, paths: *const instances.Paths, re
 
     const game_directory = try paths.instanceDirectory(version);
     defer a.free(game_directory);
+    const client_relative_path = try @import("core/minecraft/layout.zig").installedClient(a, loaded.version.value);
+    defer a.free(client_relative_path);
     var plan = try planner.buildInstalled(a, loaded.version.value, assets.value, try library.hostEnvironment(), .{
         .root = paths.minecraft,
+        .client_relative_path = client_relative_path,
         .instance_name = version,
         .game_directory = game_directory,
-        .native_arch = if (@bitSizeOf(usize) == 64) .bits64 else .bits32,
-        .cpu_arch = @tagName(builtin.cpu.arch),
     });
     defer plan.deinit();
     if (plan.value.files.len == 0) return error.EmptyAuditPlan;

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const install = @import("content_install.zig");
 const fs = @import("content_fs.zig");
 const manifest = @import("content_manifest.zig");
+const state = @import("content_state.zig");
 const providers = @import("content_providers.zig");
 const instances = @import("instances.zig");
 const a = std.testing.allocator;
@@ -18,7 +19,7 @@ fn fingerprint(bytes: []const u8) fs.Fingerprint {
     return .{ .size = bytes.len, .sha1 = std.fmt.bytesToHex(sha1, .lower), .sha256 = std.fmt.bytesToHex(sha256, .lower), .sha512 = std.fmt.bytesToHex(sha512, .lower) };
 }
 fn record(hash: *const fs.Fingerprint, path: []const u8, version: []const u8) manifest.ManagedFile {
-    return .{ .path = path, .provider = .modrinth, .project_id = "project", .version_id = version, .hashes = hash.hashes(), .size = hash.size };
+    return .{ .path = path, .provider = .modrinth, .project_id = "project", .version_id = version, .hashes = hash.hashes(), .size = hash.size, .identity_provenance = .official_file };
 }
 const Guard = struct {
     held: bool = false,
@@ -363,11 +364,9 @@ test "incremental copy verifies all digests size limit and cancellation" {
     var bad = expected;
     bad.sha512[0] = if (bad.sha512[0] == '0') '1' else '0';
     try std.testing.expectError(error.HashMismatch, copied.verify(bad.hashes(), bad.size));
-    if (@hasField(providers.Hashes, "sha256")) {
-        bad = expected;
-        bad.sha256[0] = if (bad.sha256[0] == '0') '1' else '0';
-        try std.testing.expectError(error.HashMismatch, copied.verify(bad.hashes(), bad.size));
-    }
+    bad = expected;
+    bad.sha256[0] = if (bad.sha256[0] == '0') '1' else '0';
+    try std.testing.expectError(error.HashMismatch, copied.verify(bad.hashes(), bad.size));
     try std.testing.expectError(error.SizeMismatch, copied.verify(expected.hashes(), data.len + 1));
     try std.testing.expectError(error.BodyTooLarge, fs.copy(source, tmp.dir, io, "too-big", data.len - 1, null, null));
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "too-big", .{}));
@@ -605,6 +604,22 @@ test "read-only recovery enumeration never hides malformed terminal journals and
         try fs.write(txn, io, "journal.json", invalid);
         try expectRecoveryBlocked(&fixture);
     }
+    for ([_]enum { old_schema, missing_schema, rename_action, destination_field }{ .old_schema, .missing_schema, .rename_action, .destination_field }) |mode| {
+        var invalid = try std.json.parseFromSlice(std.json.Value, a, original, .{ .allocate = .alloc_always });
+        defer invalid.deinit();
+        const entry = &invalid.value.object.getPtr("entries").?.array.items[0];
+        switch (mode) {
+            .old_schema => invalid.value.object.getPtr("schema_version").?.* = .{ .integer = 1 },
+            .missing_schema => _ = invalid.value.object.swapRemove("schema_version"),
+            .rename_action => entry.object.getPtr("kind").?.* = .{ .string = "rename" },
+            .destination_field => try entry.object.put(a, "destination", .{ .string = "mods/replace.jar.disabled" }),
+        }
+        const bytes = try std.json.Stringify.valueAlloc(a, invalid.value, .{});
+        defer a.free(bytes);
+        try txn.deleteFile(io, "journal.json");
+        try fs.write(txn, io, "journal.json", bytes);
+        try expectRecoveryBlocked(&fixture);
+    }
     var parsed = try std.json.parseFromSlice(std.json.Value, a, original, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     parsed.value.object.getPtr("instance_id").?.* = .{ .string = "other-instance" };
@@ -655,196 +670,19 @@ test "read-only recovery gate enforces private directories nofollow and journal 
     }
 }
 
-fn statePlan(fixture: *Fixture, path: []const u8, enabled: bool) !providers.Owned(manifest.UpdatePlan) {
-    const bytes = try fixture.read(".vela/instances/instance/content.json");
-    defer a.free(bytes);
-    var previous = try manifest.parse(a, bytes);
-    defer previous.deinit();
-    const game_path = try std.fs.path.join(a, &.{ fixture.paths.root, ".minecraft", "versions", "Test" });
-    defer a.free(game_path);
-    const game = try fs.openAbsolute(io, game_path);
-    defer game.close(io);
-    const fingerprints = try a.alloc(fs.Fingerprint, previous.value.files.len);
-    defer a.free(fingerprints);
-    const observed = try a.alloc(manifest.ObservedFile, previous.value.files.len);
-    defer a.free(observed);
-    var count: usize = 0;
-    for (previous.value.files, 0..) |file, index| {
-        const physical = try manifest.physicalPath(a, file);
-        defer a.free(physical);
-        fingerprints[index] = (try fs.fingerprint(game, io, physical, null, null)) orelse continue;
-        observed[count] = .{ .path = file.path, .hashes = fingerprints[index].hashes(), .size = fingerprints[index].size };
-        count += 1;
-    }
-    return manifest.buildEnabledPlan(a, previous.value, path, enabled, observed[0..count], .{ .instance_id = "instance", .running = fixture.guard.running });
-}
-fn expectState(fixture: *Fixture, enabled: bool, payload: []const u8) !void {
-    const physical = if (enabled) ".minecraft/versions/Test/mods/replace.jar" else ".minecraft/versions/Test/mods/replace.jar.disabled";
-    const absent = if (enabled) ".minecraft/versions/Test/mods/replace.jar.disabled" else ".minecraft/versions/Test/mods/replace.jar";
-    const bytes = try fixture.read(physical);
-    defer a.free(bytes);
-    try std.testing.expectEqualStrings(payload, bytes);
-    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, absent, .{}));
-    const receipt = try fixture.read(".vela/instances/instance/content.json");
-    defer a.free(receipt);
-    var parsed = try manifest.parse(a, receipt);
-    defer parsed.deinit();
-    try std.testing.expectEqual(enabled, parsed.value.files[0].enabled);
-    try std.testing.expectEqualStrings("mods/replace.jar", parsed.value.files[0].path);
-    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
-    try std.testing.expect(!fixture.guard.held);
-    try std.testing.expectEqual(fixture.guard.acquired, fixture.guard.released);
-}
-
-test "managed mod state round trips standalone official pack archive and override without fetch" {
-    for ([_]manifest.IdentityProvenance{ .official_file, .pack_archive, .pack_override }) |provenance| {
-        for ([_]bool{ true, false }) |standalone| {
-            if (standalone and provenance != .official_file) continue;
-            errdefer std.debug.print("mod state disk fixture {s}/standalone={}\n", .{ @tagName(provenance), standalone });
-            var fixture = try Fixture.init();
-            defer fixture.deinit();
-            try fixture.seed();
-            fixture.old_records[0].identity_provenance = provenance;
-            fixture.old_records[0].role = if (provenance == .pack_override) .override else .content;
-            if (provenance != .official_file) fixture.old_records[0].project_id = "pack";
-            fixture.old_records[0].standalone = standalone;
-            fixture.old_records[1].standalone = standalone;
-            fixture.old_records[1].identity_provenance = .official_file;
-            var receipt = fixture.oldManifest();
-            receipt.schema_version = manifest.schema_version;
-            if (!standalone) receipt.pack_membership = .{ .identity = .{ .provider = .modrinth, .project_id = "pack", .version_id = "old" }, .paths = &.{ "mods/replace.jar", "mods/remove.jar" } };
-            const updated_receipt = try manifest.serialize(a, receipt);
-            a.free(fixture.original_manifest.?);
-            fixture.original_manifest = updated_receipt;
-            try fixture.write(".vela/instances/instance/content.json", fixture.original_manifest.?);
-            var disable = try statePlan(&fixture, "mods/replace.jar", false);
-            defer disable.deinit();
-            const expected = try manifest.serialize(a, disable.value.next_manifest);
-            defer a.free(expected);
-            var toggle_options = fixture.options(disable.value, &.{});
-            toggle_options.allow_manifest_v2 = true;
-            var report = try install.execute(a, io, toggle_options);
-            defer report.deinit();
-            try std.testing.expect(report.committed);
-            try expectState(&fixture, false, "old");
-            const actual = try fixture.read(".vela/instances/instance/content.json");
-            defer a.free(actual);
-            try std.testing.expectEqualStrings(expected, actual);
-            // Freshly parsed persisted state makes a repeated request idempotent.
-            var repeated = try statePlan(&fixture, "mods/replace.jar", false);
-            defer repeated.deinit();
-            try std.testing.expectEqual(@as(usize, 0), repeated.value.actions.len);
-            toggle_options.plan = repeated.value;
-            var unchanged = try install.execute(a, io, toggle_options);
-            defer unchanged.deinit();
-            try expectState(&fixture, false, "old");
-            var enable = try statePlan(&fixture, "mods/replace.jar", true);
-            defer enable.deinit();
-            toggle_options.plan = enable.value;
-            var restored = try install.execute(a, io, toggle_options);
-            defer restored.deinit();
-            try expectState(&fixture, true, "old");
-            const final_receipt = try fixture.read(".vela/instances/instance/content.json");
-            defer a.free(final_receipt);
-            try std.testing.expectEqualStrings(fixture.original_manifest.?, final_receipt);
-        }
-    }
-}
-
-test "mod state fault cancellation crash and durable marker boundaries preserve the pair" {
-    for ([_]install.FaultPoint{ .before_backup, .after_backup, .before_journal, .after_journal, .before_mutation, .after_mutation, .before_manifest, .after_manifest, .before_commit_marker, .after_commit_marker }) |point| {
-        for ([_]enum { fail, cancel, crash }{ .fail, .cancel, .crash }) |mode| {
-            var fixture = try Fixture.init();
-            defer fixture.deinit();
-            try fixture.seed();
-            var plan = try statePlan(&fixture, "mods/replace.jar", false);
-            defer plan.deinit();
-            var inject: Inject = .{ .point = point, .crash = mode == .crash, .cancel = if (mode == .cancel) &fixture.cancel else null };
-            var options = fixture.options(plan.value, &.{});
-            options.fault = .{ .context = &inject, .boundary = Inject.boundary };
-            if (mode == .crash) {
-                try std.testing.expectError(error.SimulatedCrash, install.execute(a, io, options));
-            } else if (point == .after_commit_marker) {
-                var report = try install.execute(a, io, options);
-                defer report.deinit();
-                try std.testing.expect(report.committed);
-            } else {
-                const outcome = install.execute(a, io, options);
-                if (mode == .cancel) try std.testing.expectError(error.Canceled, outcome) else try std.testing.expectError(error.InjectedFailure, outcome);
-            }
-            var transactions = try install.listTransactions(a, io, &fixture.paths, "instance", "Test");
-            defer transactions.deinit();
-            for (transactions.value) |id| {
-                var recovered = try install.recover(a, io, fixture.recovery(id));
-                defer recovered.deinit();
-                var again = try install.recover(a, io, fixture.recovery(id));
-                defer again.deinit();
-            }
-            try expectState(&fixture, point != .after_commit_marker, "old");
-            try install.requireRecoveryClear(a, io, &fixture.paths, "instance", "Test");
-        }
-    }
-}
-
-test "mod state destination and ownership conflicts never overwrite local bytes" {
-    for ([_]enum { destination, modified_source, both_after_crash, modified_target, hardlink, symlink, case_alias }{ .destination, .modified_source, .both_after_crash, .modified_target, .hardlink, .symlink, .case_alias }) |mode| {
-        if (builtin.os.tag == .windows and (mode == .hardlink or mode == .symlink)) continue;
-        var fixture = try Fixture.init();
-        defer fixture.deinit();
-        try fixture.seed();
-        var plan = try statePlan(&fixture, "mods/replace.jar", false);
-        defer plan.deinit();
-        const destination = ".minecraft/versions/Test/mods/replace.jar.disabled";
-        if (mode == .destination) {
-            try fixture.write(destination, "user-owned");
-            try std.testing.expectError(error.PathAlreadyExists, install.execute(a, io, fixture.options(plan.value, &.{})));
-            const bytes = try fixture.read(destination);
-            defer a.free(bytes);
-            try std.testing.expectEqualStrings("user-owned", bytes);
-        } else if (mode == .modified_source) {
-            try fixture.write(".minecraft/versions/Test/mods/replace.jar", "edited");
-            try std.testing.expectError(error.SizeMismatch, install.execute(a, io, fixture.options(plan.value, &.{})));
-        } else if (mode == .symlink or mode == .hardlink or mode == .case_alias) {
-            if (mode == .symlink) try fixture.tmp.dir.symLink(io, "replace.jar", destination, .{}) else if (mode == .hardlink) try fixture.tmp.dir.hardLink(".minecraft/versions/Test/mods/replace.jar", fixture.tmp.dir, destination, io, .{}) else try fixture.write(".minecraft/versions/Test/mods/REPLACE.JAR.DISABLED", "user-owned");
-            const outcome = install.execute(a, io, fixture.options(plan.value, &.{}));
-            if (outcome) |report_value| {
-                var report = report_value;
-                report.deinit();
-                return error.ExpectedAliasRejection;
-            } else |_| {}
-        } else {
-            var inject: Inject = .{ .point = .after_mutation, .crash = true };
-            var options = fixture.options(plan.value, &.{});
-            options.fault = .{ .context = &inject, .boundary = Inject.boundary };
-            try std.testing.expectError(error.SimulatedCrash, install.execute(a, io, options));
-            if (mode == .both_after_crash) try fixture.write(".minecraft/versions/Test/mods/replace.jar", "user-owned") else try fixture.write(destination, "edited-target");
-            var transactions = try install.listTransactions(a, io, &fixture.paths, "instance", "Test");
-            defer transactions.deinit();
-            try std.testing.expectEqual(@as(usize, 1), transactions.value.len);
-            try std.testing.expectError(error.RecoveryConflict, install.recover(a, io, fixture.recovery(transactions.value[0])));
-            try std.testing.expectError(error.RecoveryRequired, install.requireRecoveryClear(a, io, &fixture.paths, "instance", "Test"));
-            const bytes = try fixture.read(if (mode == .both_after_crash) ".minecraft/versions/Test/mods/replace.jar" else destination);
-            defer a.free(bytes);
-            try std.testing.expectEqualStrings(if (mode == .both_after_crash) "user-owned" else "edited-target", bytes);
-        }
-        try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
-        try std.testing.expect(!fixture.guard.held);
-        try std.testing.expectEqual(fixture.guard.acquired, fixture.guard.released);
-    }
-}
-
 test "disabled mod bytes update and remove at physical disabled path" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     try fixture.seed();
-    var disable = try statePlan(&fixture, "mods/replace.jar", false);
-    defer disable.deinit();
-    var disabled = try install.execute(a, io, fixture.options(disable.value, &.{}));
-    defer disabled.deinit();
+    try fixture.tmp.dir.rename(".minecraft/versions/Test/mods/replace.jar", fixture.tmp.dir, ".minecraft/versions/Test/mods/replace.jar.disabled", io);
     const old_bytes = try fixture.read(".vela/instances/instance/content.json");
     defer a.free(old_bytes);
     var previous = try manifest.parse(a, old_bytes);
     defer previous.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, old_bytes, "\"enabled\"") == null);
+    const game = try fixture.tmp.dir.openDir(io, ".minecraft/versions/Test", .{});
+    defer game.close(io);
+    previous.value.files = try state.observe(previous.arena.allocator(), io, game, previous.value.files);
     var desired_records = fixture.new_records;
     desired_records[0].enabled = false;
     const observed = [_]manifest.ObservedFile{
@@ -867,6 +705,8 @@ test "disabled mod bytes update and remove at physical disabled path" {
     defer a.free(new_bytes);
     var current = try manifest.parse(a, new_bytes);
     defer current.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, new_bytes, "\"enabled\"") == null);
+    current.value.files = try state.observe(current.arena.allocator(), io, game, current.value.files);
     const remaining: manifest.Manifest = .{ .instance_id = "instance", .pack_version = "new", .files = current.value.files[1..] };
     const actual = [_]manifest.ObservedFile{
         .{ .path = "mods/replace.jar", .hashes = fixture.new_hash.hashes(), .size = fixture.new_hash.size },
@@ -876,6 +716,9 @@ test "disabled mod bytes update and remove at physical disabled path" {
     defer remove.deinit();
     var removed = try install.execute(a, io, fixture.options(remove.value, &.{}));
     defer removed.deinit();
+    const final_receipt = try fixture.read(".vela/instances/instance/content.json");
+    defer a.free(final_receipt);
+    try std.testing.expect(std.mem.indexOf(u8, final_receipt, "\"enabled\"") == null);
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft/versions/Test/mods/replace.jar.disabled", .{}));
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft/versions/Test/mods/replace.jar", .{}));
     const backed_up = try std.fs.path.join(a, &.{ removed.backup_directory, "before-0" });
@@ -883,6 +726,10 @@ test "disabled mod bytes update and remove at physical disabled path" {
     const backup = try std.Io.Dir.cwd().readFileAlloc(io, backed_up, a, .limited(32));
     defer a.free(backup);
     try std.testing.expectEqualStrings("new", backup);
+}
+
+fn uncheckedReceipt(file: manifest.ManagedFile) ![]u8 {
+    return std.json.Stringify.valueAlloc(a, .{ .schema_version = manifest.schema_version, .instance_id = "instance", .pack_version = "old", .files = &.{.{ .path = file.path, .provider = file.provider, .project_id = file.project_id, .version_id = file.version_id, .hashes = file.hashes, .size = file.size, .role = file.role, .identity_provenance = file.identity_provenance, .standalone = file.standalone }} }, .{});
 }
 
 const protected_roots = [_][]const u8{ ".vela-instance.json", ".VeLa-InStAnCe.JsOn/child", ".vela-loader.json", ".VELA-LOADER.JSON/child", "Test.json", "tEsT.JsOn/child", "Test.jar", "TEST.JAR/child" };
@@ -931,7 +778,8 @@ test "persisted protected removals reject before conflicts lease or transaction 
     fixture.guard.running = true;
     for (protected_roots) |path| {
         const old = record(&fixture.old_hash, path, "old");
-        const bytes = try std.json.Stringify.valueAlloc(a, manifest.Manifest{ .schema_version = manifest.schema_version, .instance_id = "instance", .pack_version = "old", .files = &.{old} }, .{});
+        // Deliberate current wire input bypasses validation to exercise protected paths.
+        const bytes = try uncheckedReceipt(old);
         defer a.free(bytes);
         try fixture.write(".vela/instances/instance/content.json", bytes);
         var options = fixture.options(plan.value, &files);
@@ -949,7 +797,7 @@ test "persisted protected removals reject before conflicts lease or transaction 
     try fixture.assertBefore();
 }
 
-test "recovery source destination and prior receipt protections precede lease and rollback" {
+test "recovery paths and prior receipt protections precede lease and rollback" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     try fixture.seed();
@@ -972,11 +820,11 @@ test "recovery source destination and prior receipt protections precede lease an
     const acquired = fixture.guard.acquired;
     fixture.guard.running = true;
     for (protected_roots) |path| {
-        for ([_][]const u8{ "path", "destination" }) |field| {
+        {
             var parsed = try std.json.parseFromSlice(std.json.Value, a, original, .{ .allocate = .alloc_always });
             defer parsed.deinit();
             const entry = &parsed.value.object.getPtr("entries").?.array.items[0];
-            entry.object.getPtr(field).?.* = .{ .string = path };
+            entry.object.getPtr("path").?.* = .{ .string = path };
             const bytes = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
             defer a.free(bytes);
             try txn.deleteFile(io, "journal.json");
@@ -993,7 +841,8 @@ test "recovery source destination and prior receipt protections precede lease an
         defer a.free(backup);
         for (protected_roots) |path| {
             const bad = record(&fixture.old_hash, path, "old");
-            const bytes = try std.json.Stringify.valueAlloc(a, manifest.Manifest{ .schema_version = manifest.schema_version, .instance_id = "instance", .pack_version = "old", .files = &.{bad} }, .{});
+            // Deliberate current wire input exercises protected recovery receipts.
+            const bytes = try uncheckedReceipt(bad);
             defer a.free(bytes);
             try txn.deleteFile(io, backup_name);
             try fs.write(txn, io, backup_name, bytes);
@@ -1155,4 +1004,193 @@ test "terminal history beyond pending capacity stays launchable with bounded sca
         try txn.deleteFile(io, if (index % 2 == 0) "committed" else "rolled-back");
     }
     try expectRecoveryBlocked(&fixture);
+}
+
+fn expectContents(dir: std.Io.Dir, path: []const u8, expected: []const u8) !void {
+    const bytes = try dir.readFileAlloc(io, path, a, .limited(8 * 1024 * 1024));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings(expected, bytes);
+}
+fn expectNoPending(fixture: *Fixture) !void {
+    var pending = try install.listPendingTransactions(a, io, &fixture.paths, "instance", "Test");
+    defer pending.deinit();
+    try std.testing.expectEqual(@as(usize, 0), pending.value.len);
+}
+fn openFixtureTxn(fixture: *Fixture, id: []const u8) !std.Io.Dir {
+    const path = try std.fmt.allocPrint(a, ".minecraft/versions/Test/.vela-content/{s}", .{id});
+    defer a.free(path);
+    return fs.descend(fixture.tmp.dir, io, path, false);
+}
+
+test "directory aliases in a forged plan fail before lease fetch or filesystem creation" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const expected = fingerprint("new");
+    const first = record(&expected, "config/Foo/a.cfg", "new");
+    const second = record(&expected, "config/foo/b.cfg", "new");
+    const records = [_]manifest.ManagedFile{ first, second };
+    const plan: manifest.UpdatePlan = .{
+        .ready = true,
+        .fully_applied = true,
+        .actions = &.{ .{ .kind = .install, .path = first.path, .desired = first }, .{ .kind = .install, .path = second.path, .desired = second } },
+        .conflicts = &.{},
+        .next_manifest = .{ .instance_id = "instance", .pack_version = "new", .files = &records },
+    };
+    const files = [_]manifest.InstallFile{ .{ .record = first, .download = .{ .remote = "https://cdn.modrinth.com/replace" } }, .{ .record = second, .download = .{ .remote = "https://cdn.modrinth.com/new" } } };
+    try std.testing.expectError(error.PathCollision, install.execute(a, io, fixture.options(plan, &files)));
+    try std.testing.expectEqual(@as(usize, 0), fixture.guard.acquired);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+    try std.testing.expect((try fs.inspectEntry(fixture.tmp.dir, io, ".vela")) == null);
+    try std.testing.expect((try fs.inspectEntry(fixture.tmp.dir, io, ".minecraft")) == null);
+}
+
+test "directory namespace is shared by every plan and supplied input view" {
+    for (0..5) |view| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        const expected = fingerprint("new");
+        const first = record(&expected, "config/Foo/a.cfg", "new");
+        const second = record(&expected, "config/foo/b.cfg", "new");
+        const plan: manifest.UpdatePlan = .{
+            .ready = true,
+            .fully_applied = true,
+            .actions = &.{.{ .kind = .install, .path = first.path, .desired = first }},
+            .conflicts = &.{},
+            .next_manifest = .{ .instance_id = "instance", .pack_version = "new", .files = &.{first} },
+        };
+        const files = [_]manifest.InstallFile{.{ .record = first, .download = .{ .remote = "https://cdn.modrinth.com/replace" } }};
+        const alternate: manifest.InstallFile = .{ .record = second, .download = .{ .remote = "https://cdn.modrinth.com/new" } };
+        var options = fixture.options(plan, &files);
+        switch (view) {
+            0 => options.files = &.{alternate},
+            1 => options.manual_files = &.{.{ .path = second.path, .source_absolute_path = "unused" }},
+            2 => options.pack = .{ .identity = .{ .provider = .modrinth, .project_id = "project", .version_id = "new" }, .name = "Pack", .version = "new", .minecraft_version = "1.20.1", .files = &.{alternate} },
+            3 => options.plan.conflicts = &.{.{ .path = second.path, .reason = .unmanaged }},
+            4 => options.plan.actions = &.{.{ .kind = .install, .path = first.path, .desired = second }},
+            else => unreachable,
+        }
+        try std.testing.expectError(error.PathCollision, install.execute(a, io, options));
+        try std.testing.expectEqual(@as(usize, 0), fixture.guard.acquired);
+        try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+        try std.testing.expect((try fs.inspectEntry(fixture.tmp.dir, io, ".vela")) == null);
+        try std.testing.expect((try fs.inspectEntry(fixture.tmp.dir, io, ".minecraft")) == null);
+    }
+}
+
+test "persisted receipt directory spelling participates in mutation preflight" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.seed();
+    fixture.old_records[0].path = "config/Foo/old.cfg";
+    try fixture.tmp.dir.createDirPath(io, ".minecraft/versions/Test/config/Foo");
+    try fixture.write(".minecraft/versions/Test/config/Foo/old.cfg", "old");
+    const before = try manifest.serialize(a, fixture.oldManifest());
+    defer a.free(before);
+    try fixture.write(".vela/instances/instance/content.json", before);
+    const next = record(&fixture.new_hash, "config/foo/new.cfg", "new");
+    const plan: manifest.UpdatePlan = .{ .ready = true, .fully_applied = true, .actions = &.{.{ .kind = .install, .path = next.path, .desired = next }}, .conflicts = &.{}, .next_manifest = .{ .instance_id = "instance", .pack_version = "new", .files = &.{next} } };
+    const files = [_]manifest.InstallFile{.{ .record = next, .download = .{ .remote = "https://cdn.modrinth.com/replace" } }};
+    try std.testing.expectError(error.PathCollision, install.execute(a, io, fixture.options(plan, &files)));
+    try std.testing.expectEqual(@as(usize, 0), fixture.guard.acquired);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+    try expectContents(fixture.tmp.dir, ".minecraft/versions/Test/config/Foo/old.cfg", "old");
+    try expectContents(fixture.tmp.dir, ".vela/instances/instance/content.json", before);
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft/versions/Test/.vela-content", .{}));
+}
+
+test "shared nested directories roll back real mutations recover and allow retry" {
+    for ([_]bool{ false, true }) |crash| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        try fixture.seed();
+        fixture.new_records[0].path = "config/Foo/nested/a.cfg";
+        fixture.new_records[1].path = "config/Foo/nested/b.cfg";
+        var plan = try fixture.plan();
+        defer plan.deinit();
+        const files = fixture.files();
+        var inject: Inject = .{ .point = .after_mutation, .index = 0, .crash = crash };
+        var options = fixture.options(plan.value, &files);
+        options.fault = inject.fault();
+        try std.testing.expectError(if (crash) error.SimulatedCrash else error.InjectedFailure, install.execute(a, io, options));
+        try std.testing.expectEqual(@as(usize, 1), inject.hits);
+        if (crash) {
+            var pending = try install.listPendingTransactions(a, io, &fixture.paths, "instance", "Test");
+            defer pending.deinit();
+            try std.testing.expectEqual(@as(usize, 1), pending.value.len);
+            try expectContents(fixture.tmp.dir, ".minecraft/versions/Test/config/Foo/nested/a.cfg", "new");
+            for (0..2) |_| {
+                var recovered = try install.recover(a, io, fixture.recovery(pending.value[0]));
+                defer recovered.deinit();
+                try std.testing.expect(!recovered.committed);
+            }
+        }
+        try fixture.assertBefore();
+        const nested = try fs.descend(fixture.tmp.dir, io, ".minecraft/versions/Test/config/Foo/nested", false);
+        defer nested.close(io);
+        try std.testing.expect((try fs.inspectEntry(nested, io, "a.cfg")) == null);
+        try std.testing.expect((try fs.inspectEntry(nested, io, "b.cfg")) == null);
+        try expectNoPending(&fixture);
+        options.fault = null;
+        var report = try install.execute(a, io, options);
+        defer report.deinit();
+        try std.testing.expect(report.committed);
+        try expectContents(fixture.tmp.dir, ".minecraft/versions/Test/config/Foo/nested/a.cfg", "new");
+        try expectContents(fixture.tmp.dir, ".minecraft/versions/Test/config/Foo/nested/b.cfg", "new");
+    }
+}
+
+test "recovery rejects directory aliases before acquiring a lease or touching content" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.seed();
+    var plan = try fixture.plan();
+    defer plan.deinit();
+    const files = fixture.files();
+    var inject: Inject = .{ .point = .after_journal, .crash = true };
+    var options = fixture.options(plan.value, &files);
+    options.fault = inject.fault();
+    try std.testing.expectError(error.SimulatedCrash, install.execute(a, io, options));
+    var pending = try install.listPendingTransactions(a, io, &fixture.paths, "instance", "Test");
+    defer pending.deinit();
+    try std.testing.expectEqual(@as(usize, 1), pending.value.len);
+    const txn = try openFixtureTxn(&fixture, pending.value[0]);
+    defer txn.close(io);
+    const original = try fs.read(a, txn, io, "journal.json", providers.max_json_bytes);
+    defer a.free(original);
+    const one = try std.mem.replaceOwned(u8, a, original, "mods/replace.jar", "config/Foo/a.cfg");
+    defer a.free(one);
+    const aliased = try std.mem.replaceOwned(u8, a, one, "mods/new.jar", "config/foo/b.cfg");
+    defer a.free(aliased);
+    try txn.writeFile(io, .{ .sub_path = "journal.json", .data = aliased });
+    const acquired = fixture.guard.acquired;
+    try std.testing.expectError(error.InvalidJournal, install.recover(a, io, fixture.recovery(pending.value[0])));
+    try std.testing.expectEqual(acquired, fixture.guard.acquired);
+    try fixture.assertBefore();
+    try expectContents(txn, "journal.json", aliased);
+    // Restore the trusted journal and prove a rejected inspection did not mutate
+    // backups, content, or recovery markers needed by a real rollback.
+    try txn.writeFile(io, .{ .sub_path = "journal.json", .data = original });
+    var recovered = try install.recover(a, io, fixture.recovery(pending.value[0]));
+    defer recovered.deinit();
+    try std.testing.expect(!recovered.committed);
+    try fixture.assertBefore();
+    try expectNoPending(&fixture);
+}
+
+test "regular sealing handle supports verified reads permission writes and flush" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try fs.write(tmp.dir, io, "staged", "verified");
+    const readonly = try fs.openRegular(tmp.dir, io, "staged");
+    defer readonly.close(io);
+    const before = try fs.stream(readonly, null, io, 8, null, null);
+    const writable = try fs.openRegularForSeal(tmp.dir, io, "staged");
+    defer writable.close(io);
+    const sealed = try fs.stream(writable, null, io, 8, null, null);
+    try sealed.verify(before.hashes(), before.size);
+    try writable.setPermissions(io, fs.privatePermissions(false));
+    try writable.sync(io);
+    try tmp.dir.createDir(io, "directory", .default_dir);
+    try std.testing.expectError(error.UnsafeFileType, fs.openRegularForSeal(tmp.dir, io, "directory"));
+    try expectContents(tmp.dir, "staged", "verified");
 }

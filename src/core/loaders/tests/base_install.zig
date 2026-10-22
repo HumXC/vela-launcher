@@ -31,8 +31,6 @@ const PreparedRunFixture = struct {
         var checksum: m.Sha1 = undefined;
         std.crypto.hash.Sha1.hash(prepared_run_base, &checksum, .{});
         self.entries = .{.{ .id = "1.20.1", .kind = "release", .url = "https://piston-meta.mojang.com/v1/packages/fixture/1.20.1.json", .time = "", .release_time = "", .sha1 = checksum, .compliance_level = null }};
-        const metadata_root = try std.fs.path.join(a, &.{ root, ".minecraft" });
-        defer a.free(metadata_root);
         return loader_install.prepareMetadata(a, io, .{
             .root = root,
             .instance_id = "pack-fixture",
@@ -40,7 +38,7 @@ const PreparedRunFixture = struct {
             .generation = 7,
             .selection = .{ .kind = .fabric, .base_id = "1.20.1", .loader_id = "0.16.0" },
             .environment = .{ .os_name = "linux", .arch = "x86_64" },
-            .vanilla = .{ .root = metadata_root, .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
+            .vanilla = .{ .version_id = "1.20.1", .manifest = .{ .latest = .{ .release = "1.20.1", .snapshot = "1.20.1" }, .versions = &self.entries } },
             .fetcher = .{ .context = self, .fetch = vanilla },
             .transport = .{ .context = self, .get = get },
         }, prepared_run_control);
@@ -104,7 +102,7 @@ fn preparedRunTarget(prepared: *const loader_install.PreparedMetadata) loader_in
     return .{ .root = prepared.root, .instance_id = prepared.instance_id, .instance_name = prepared.instance_name, .generation = prepared.generation, .selection = prepared.selection, .environment = prepared.environment };
 }
 fn preparedRunConfig(minecraft: []const u8) Config {
-    return .{ .version_id = "1.20.1", .root = minecraft, .instance_name = "private-stage", .environment = .{ .os_name = "linux", .arch = "x86_64" }, .manifest_url = "https://example.invalid/not-replay", .metadata_path = "missing-prepared-version.json" };
+    return .{ .version_id = "1.20.1", .root = minecraft, .target = .{ .directory_name = "private-stage", .name = "Final Pack" }, .environment = .{ .os_name = "linux", .arch = "x86_64" }, .manifest_url = "https://example.invalid/not-replay", .metadata_path = "missing-prepared-version.json" };
 }
 
 test "prepared executor binds final target and actual planner environment before artifact IO" {
@@ -174,9 +172,9 @@ test "prepared executor validates window IDs cancellation and deadline without t
     config.version_id = "../escape";
     try std.testing.expectError(error.UnsafeVersionId, runPrepared(std.testing.allocator, std.testing.io, &service, config, &prepared, target, prepared_run_control));
     config.version_id = "1.20.1";
-    config.instance_name = "../escape";
+    config.target.directory_name = "../escape";
     try std.testing.expectError(error.UnsafeVersionId, runPrepared(std.testing.allocator, std.testing.io, &service, config, &prepared, target, prepared_run_control));
-    config.instance_name = "private-stage";
+    config.target.directory_name = "private-stage";
     var cancel = std.atomic.Value(bool).init(true);
     config.cancel = &cancel;
     try std.testing.expectError(error.Canceled, runPrepared(std.testing.allocator, std.testing.io, &service, config, &prepared, target, prepared_run_control));

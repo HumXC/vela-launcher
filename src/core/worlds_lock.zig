@@ -40,7 +40,7 @@ pub fn probe(io: Io, directory: Io.Dir, name: []const u8) Access {
     return .available;
 }
 
-/// Hold a legacy recovery token too, without adding files to immutable payloads.
+/// Inspect live session state without creating or rewriting the token.
 pub fn acquireExisting(io: Io, directory: Io.Dir, name: []const u8) !?Held {
     try requireSupported();
     const file = directory.openFile(io, name, .{ .mode = .read_write, .follow_symlinks = false, .allow_directory = false }) catch |err| {

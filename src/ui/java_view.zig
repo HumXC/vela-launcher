@@ -800,8 +800,8 @@ test "search selection follows result identity and adds only checked owned paths
     defer ui.deinit();
     var first_path = [_]u8{ '/', 'a' };
     const results = [_]java.Runtime{
-        .{ .path = &first_path, .major = 21, .vendor = "Vendor A" },
-        .{ .path = "/b", .major = 17, .vendor = "Vendor B" },
+        .{ .path = &first_path, .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor A" },
+        .{ .path = "/b", .major = 17, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor B" },
     };
     try ui.syncSelection(&results);
     ui.search_selection[0] = true;
@@ -824,8 +824,8 @@ fn exerciseQueueAllocations(a: std.mem.Allocator) !void {
     try ui.queuePath("/remove", false);
     try ui.queueChoice("1.21", "/chosen", 21);
     const results = [_]java.Runtime{
-        .{ .path = "/a", .major = 21, .vendor = "Vendor A" },
-        .{ .path = "/b", .major = 21, .vendor = "Vendor B" },
+        .{ .path = "/a", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor A" },
+        .{ .path = "/b", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor B" },
     };
     try ui.syncSelection(&results);
     @memset(ui.search_selection, true);
@@ -839,7 +839,7 @@ test "deferred command ownership releases all partial allocations" {
 test "a new search clears selection even when results are identical" {
     var ui = Ui.init(std.testing.allocator);
     defer ui.deinit();
-    const results = [_]java.Runtime{.{ .path = "/a", .major = 21, .vendor = "Vendor A" }};
+    const results = [_]java.Runtime{.{ .path = "/a", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor A" }};
     try ui.syncSelection(&results);
     ui.search_selection[0] = true;
     ui.clearSelection();
@@ -856,7 +856,7 @@ test "choice persistence failure is visible scoped and reset on successful retry
     try tmp.dir.createDir(io, ".vela", .default_dir);
     try tmp.dir.writeFile(io, .{
         .sub_path = ".vela/java.json",
-        .data = "{\"version\":1,\"runtimes\":[{\"path\":\"/java-test\",\"major\":21,\"vendor\":\"Test Vendor\"}],\"choices\":[]}",
+        .data = comptime std.fmt.comptimePrint("{{\"version\":2,\"runtimes\":[{{\"path\":\"/java-test\",\"major\":21,\"vendor\":\"Test Vendor\",\"architecture\":\"{s}\"}}],\"choices\":[],\"hidden\":[]}}", .{@tagName(@import("../core/java_runtime.zig").host())}),
     });
     var root_buffer: [4096]u8 = undefined;
     const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
@@ -901,8 +901,8 @@ test "failed add keeps selection and allows a smaller retry without fatal search
     var ui = Ui.init(a);
     defer ui.deinit();
     const results = [_]java.Runtime{
-        .{ .path = "/a", .major = 21, .vendor = "Vendor A" },
-        .{ .path = "/b", .major = 21, .vendor = "Vendor B" },
+        .{ .path = "/a", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor A" },
+        .{ .path = "/b", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor B" },
     };
     ui.search_started = true;
     try ui.syncSelection(&results);
@@ -956,7 +956,7 @@ test "deferred management filters choices and obeys use lease barrier" {
     defer a.free(path);
     var manager = try java.Manager.init(a, std.testing.io, root);
     defer manager.deinit();
-    try manager.addDownloaded(.{ .path = path, .major = 21, .vendor = "OpenJDK" });
+    try manager.addDownloaded(.{ .path = path, .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "OpenJDK" });
     try manager.choose("game", path, 21);
     var ui = Ui.init(a);
     defer ui.deinit();
@@ -990,7 +990,7 @@ test "restoring a forgotten hidden Java clears suppression without registering i
     defer a.free(path);
     var manager = try java.Manager.init(a, std.testing.io, root);
     defer manager.deinit();
-    try manager.addDownloaded(.{ .path = path, .major = 21, .vendor = "OpenJDK" });
+    try manager.addDownloaded(.{ .path = path, .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "OpenJDK" });
     var ui = Ui.init(a);
     defer ui.deinit();
     try ui.selectPath(path);
@@ -1019,7 +1019,7 @@ test "UI layout Java search-only runtime cannot resolve management after all reg
     defer a.free(root);
     var manager = try java.Manager.init(a, std.testing.io, root);
     defer manager.deinit();
-    const runtime: java.Runtime = .{ .path = "/fixture/java", .vendor = "Fixture", .major = 21 };
+    const runtime: java.Runtime = .{ .path = "/fixture/java", .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Fixture", .major = 21 };
     try manager.addDownloaded(runtime);
     var ui = Ui.init(a);
     defer ui.deinit();

@@ -16,6 +16,7 @@ const Installer = struct {
     held: std.atomic.Value(bool) = .init(false),
     releases: usize = 0,
     succeed: bool = false,
+    delete_failure: ?anyerror = null,
     cancel_observed: std.atomic.Value(bool) = .init(false),
 
     fn acquire(raw: ?*anyopaque, _: []const u8) !void {
@@ -89,6 +90,14 @@ const Installer = struct {
         control.task.?.reportDetails(details.*);
         return error.SizeMismatch;
     }
+    fn deleteRecheck(raw: ?*anyopaque, id: []const u8) !void {
+        const self: *Installer = @ptrCast(@alignCast(raw.?));
+        try recheck(raw, id);
+        self.ready.store(true, .release);
+        while (!self.finish.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+        if (self.delete_failure) |err| return err;
+    }
+
     fn waitReady(self: *Installer) !void {
         const start = std.Io.Clock.awake.now(io).nanoseconds;
         while (!self.ready.load(.acquire)) {
@@ -192,7 +201,7 @@ const Frame = struct {
             const root = dvui.box(@src(), .{}, .{ .expand = .both, .padding = dvui.Rect.all(16) });
             defer root.deinit();
             if (show_instance_page) {
-                view.drawWithEnabled(ui, store, manager, .{ .installed = &.{}, .available = &.{}, .phase = .idle, .failure = null, .completed = 0, .total = 0, .installing_version = null }, &.{}, true);
+                view.drawWithEnabled(ui, store, manager, .{ .installed = &.{}, .available = &.{}, .phase = .idle, .failure = null }, &.{}, true);
             } else {
                 dvui.labelNoFmt(@src(), "Another panel", .{}, .{});
             }
@@ -311,7 +320,7 @@ const Frame = struct {
         try noText("任务详情");
         try noText("操作失败");
         try noText("关闭此窗口");
-        const label = try paintedText(if (working) "取消" else "关闭");
+        const label = try paintedText(if (working) "取消" else if (ui.task.phase == .complete) "完成" else "关闭");
         try inside(button, label.rect);
         return footer_rect;
     }
@@ -559,6 +568,7 @@ fn completed(installer: *Installer, registry: *tasks.Registry) !void {
     try std.testing.expectEqual(@as(usize, 1), installer.releases);
     try std.testing.expect(!installer.held.load(.acquire));
     _ = try Frame.footer(false);
+    try Frame.noText("关闭");
     try Frame.fileRow(0, "fixture-client.jar", 1);
     try Frame.fileRow(7, "fixture-library-5.jar", 1);
     registry.pruneFinished(0);
@@ -640,4 +650,228 @@ test "instance task modal working Escape blocked and cancel closes joins worker 
 }
 test "instance task modal successful completion requires manual close after publication and pruning" {
     try atBothSizes(completed, false);
+}
+
+fn deleteLayout(unfinished: bool, actionable: bool) !void {
+    const modal = try Frame.geometry("instance-task-modal");
+    const viewport = dvui.Rect.Physical.cast(dvui.windowRect());
+    const body = try Frame.geometry("instance-task-body");
+    const footer = try Frame.geometry("instance-task-footer");
+    try inside(viewport, modal);
+    try inside(modal, body);
+    try inside(modal, footer);
+    try std.testing.expectApproxEqAbs(viewport.center().x, modal.center().x, 0.1);
+    try std.testing.expectApproxEqAbs(viewport.center().y, modal.center().y, 0.1);
+    const dialogs = @import("ui/style.zig").dialogs;
+    const problem = Frame.ui.task.failure != null or Frame.ui.task.durability_uncertain or Frame.ui.task.recovery_directory != null or Frame.ui.task_can_retry;
+    try std.testing.expectApproxEqAbs(if (problem) dialogs.instance_delete_task_error_height else dialogs.instance_delete_task_height, modal.h, 0.1);
+    try std.testing.expect(body.y + body.h <= footer.y + 0.1);
+    const button_key = if (unfinished) "instance-task-cancel" else "instance-task-close";
+    const button = try dvui.testing.tagGet(button_key);
+    try std.testing.expect(button.visible);
+    try inside(footer, try Frame.geometry(button_key));
+    var tab_entries: usize = 0;
+    for (dvui.currentWindow().tab_index_prev.items) |entry| if (entry.widgetId == button.id) {
+        tab_entries += 1;
+    };
+    try std.testing.expectEqual(@as(usize, if (actionable) 1 else 0), tab_entries);
+    try Frame.absent(if (unfinished) "instance-task-close" else "instance-task-cancel");
+    for ([_][]const u8{ "instance-task-summary", "instance-task-progress", "instance-task-bytes", "instance-task-speed", "instance-task-files-panel", "instance-task-files", "instance-task-file-0", "instance-task-file-progress-0", "instance-task-no-files", "instance-task-omitted" }) |key| try Frame.absent(key);
+    for ([_][]const u8{ "总体进度", "传输：", "速度：", "暂无文件详情", "fixture-hidden-file", "服务器配置已移除" }) |fragment| try Frame.noText(fragment);
+    _ = try Frame.paintedText(if (unfinished and actionable) "正在永久删除实例" else if (unfinished) "实例文件已删除" else "关闭");
+}
+
+fn deleteBodyReach(key: []const u8) !void {
+    for (0..24) |_| {
+        const body = try Frame.geometry("instance-task-body");
+        const target = try Frame.geometry(key);
+        if (contains(body, target)) return;
+        try dvui.testing.moveTo("instance-task-body");
+        _ = try dvui.currentWindow().addEventMouseWheel(if (target.y < body.y) 40 else -40, .vertical, null);
+        try dvui.testing.settle(Frame.draw);
+    }
+    return error.DeleteTaskContentCannotScrollIntoView;
+}
+
+fn atDeleteSizes(comptime scenario: fn (*Installer, *tasks.Registry, *dvui.testing, std.Io.Dir) anyerror!void) !void {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    for ([_]dvui.Size{ .{ .w = 640, .h = 400 }, .{ .w = 1280, .h = 720 } }) |size| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, ".minecraft/versions/Task fixture/saves/World");
+        try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Task fixture/saves/World/level.dat", .data = "world" });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var paths = try instances.Paths.init(a, io, root);
+        defer paths.deinit();
+        var store = try config.Store.init(a, io, root);
+        defer store.deinit();
+        try store.update(.{ .instances = &.{example} });
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var worker: Installer = .{};
+        var manager = try manager_module.Manager.init(a, io, &paths, &registry, .{}, worker.lease());
+        defer manager.deinit();
+        // Always release the worker gate before Manager.deinit joins it, including failures.
+        defer worker.finish.store(true, .release);
+        manager.setWorkerRecheck(Installer.deleteRecheck);
+        var ui = view.Ui.init(a);
+        defer ui.deinit();
+        Frame.ui = &ui;
+        Frame.manager = &manager;
+        Frame.store = &store;
+        Frame.show_instance_page = false;
+        defer Frame.clear();
+        var window = try dvui.testing.init(.{ .window_size = size });
+        defer window.deinit();
+        window.backend.size_pixels = .cast(size);
+        var theme = dvui.Theme.builtin.adwaita_dark;
+        theme.font_body = theme.font_body.withSize(16);
+        theme.font_heading = theme.font_body.withSize(18);
+        theme.font_title = theme.font_body.withSize(24);
+        window.window.themeSet(theme);
+        try manager.startDelete(example);
+        try worker.waitReady();
+        // Even unexpected worker telemetry must never introduce download controls.
+        var details: tasks.Details = .{ .stage = .finalizing, .completed = 1, .total = 2, .received = 1024, .total_bytes = 2048, .bytes_per_second = 512 };
+        details.addFile(tasks.File.init("fixture-hidden-file", 1024, 2048, 512, .downloading, null));
+        manager.active.?.task.?.reportDetails(details);
+        try dvui.testing.settle(Frame.draw);
+        try deleteLayout(true, true);
+        try scenario(&worker, &registry, &window, tmp.dir);
+    }
+}
+
+fn deleteCanceled(worker: *Installer, _: *tasks.Registry, window: *dvui.testing, dir: std.Io.Dir) !void {
+    try dvui.testing.pressKey(.escape, .none);
+    try dvui.testing.settle(Frame.draw);
+    Frame.ui.queue(.close_task, null);
+    _ = try dvui.testing.step(Frame.draw);
+    try dvui.testing.settle(Frame.draw);
+    try deleteLayout(true, true);
+    try std.testing.expect(worker.held.load(.acquire));
+    for ([_]dvui.Size{ .{ .w = 1280, .h = 720 }, .{ .w = 640, .h = 400 } }) |size| {
+        window.backend.size = .cast(size);
+        window.backend.size_pixels = .cast(size);
+        _ = try dvui.testing.step(Frame.draw);
+        try dvui.testing.settle(Frame.draw);
+        try deleteLayout(true, true);
+        const before = try Frame.geometry("instance-task-modal");
+        for ([_]f32{ 24, before.h / 2 }) |offset| {
+            const start: dvui.Point.Physical = .{ .x = before.x + 80, .y = before.y + offset };
+            _ = try window.window.addEventMouseMotion(.{ .pt = start });
+            try dvui.testing.settle(Frame.draw);
+            _ = try window.window.addEventMouseButton(.left, .press);
+            try dvui.testing.settle(Frame.draw);
+            _ = try window.window.addEventMouseMotion(.{ .pt = .{ .x = start.x + 50, .y = start.y + 30 } });
+            try dvui.testing.settle(Frame.draw);
+            _ = try window.window.addEventMouseButton(.left, .release);
+            try dvui.testing.settle(Frame.draw);
+            try std.testing.expectEqualDeep(before, try Frame.geometry("instance-task-modal"));
+        }
+    }
+    try Frame.click("instance-task-cancel");
+    try assertClosed();
+    worker.finish.store(true, .release);
+    try join(Frame.manager);
+    try dvui.testing.settle(Frame.draw);
+    try assertClosed();
+    try std.testing.expectEqual(manager_module.Phase.canceled, Frame.manager.snapshot().phase);
+    try std.testing.expectEqual(@as(usize, 1), worker.releases);
+    try std.testing.expect(!worker.held.load(.acquire));
+    try dir.access(io, ".minecraft/versions/Task fixture/saves/World/level.dat", .{});
+}
+
+fn deleteRetry(worker: *Installer, registry: *tasks.Registry, _: *dvui.testing, dir: std.Io.Dir) !void {
+    const id = Frame.manager.snapshot().task_id.?;
+    worker.finish.store(true, .release);
+    try join(Frame.manager);
+    try std.testing.expectEqual(manager_module.Phase.awaiting_publication, Frame.manager.snapshot().phase);
+    // Block config publication after the real filesystem deletion, then permit retry.
+    Frame.store.publication_uncertain = true;
+    _ = try dvui.testing.step(Frame.draw);
+    try dvui.testing.settle(Frame.draw);
+    try deleteLayout(true, false);
+    _ = try Frame.paintedText("保存配置失败");
+    try std.testing.expect(Frame.ui.task_can_retry and worker.held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), Frame.store.snapshot().instances.len);
+    try std.testing.expectError(error.FileNotFound, dir.access(io, ".minecraft/versions/Task fixture", .{}));
+    // The disabled cancel must not abandon a committed deletion awaiting publication.
+    const cancel = try dvui.testing.tagGet("instance-task-cancel");
+    _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = cancel.rect.center() });
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(Frame.draw);
+    try std.testing.expect(Frame.ui.task.visible and Frame.manager.pending != null);
+    try deleteBodyReach("instance-task-retry");
+    _ = try Frame.nativeButton("instance-task-retry");
+    Frame.store.publication_uncertain = false;
+    try Frame.click("instance-task-retry");
+    try deleteBodyReach("instance-task-status");
+    try deleteLayout(false, true);
+    _ = try Frame.paintedText("服务器已保留并解除绑定");
+    try Frame.absent("instance-task-retry");
+    try std.testing.expectEqual(manager_module.Phase.complete, Frame.manager.snapshot().phase);
+    try std.testing.expectEqual(@as(usize, 0), Frame.store.snapshot().instances.len);
+    try std.testing.expectEqual(@as(usize, 1), worker.releases);
+    registry.pruneFinished(0);
+    try std.testing.expect(!registry.dismiss(id));
+    try dvui.testing.settle(Frame.draw);
+    try deleteLayout(false, true);
+    try Frame.click("instance-task-close");
+    try assertClosed();
+}
+
+fn deleteFailed(worker: *Installer, _: *tasks.Registry, _: *dvui.testing, dir: std.Io.Dir) !void {
+    worker.delete_failure = error.PermanentDeletionIncomplete;
+    worker.finish.store(true, .release);
+    try join(Frame.manager);
+    try dvui.testing.settle(Frame.draw);
+    try deleteLayout(false, true);
+    _ = try Frame.paintedText("任务失败");
+    try deleteBodyReach("instance-task-failure");
+    _ = try Frame.paintedText("部分文件可能已经删除");
+    _ = try Frame.paintedText("PermanentDeletionIncomplete");
+    try Frame.absent("instance-task-retry");
+    try std.testing.expect(Frame.manager.isBusy() and worker.held.load(.acquire));
+    try Frame.click("instance-task-close");
+    try assertClosed();
+    try std.testing.expectEqual(@as(usize, 1), Frame.store.snapshot().instances.len);
+    // This injected pre-mutation failure checks UI handling without erasing fixture data.
+    try dir.access(io, ".minecraft/versions/Task fixture/saves/World/level.dat", .{});
+}
+
+fn deleteRecovery(worker: *Installer, _: *tasks.Registry, _: *dvui.testing, _: std.Io.Dir) !void {
+    worker.finish.store(true, .release);
+    try join(Frame.manager);
+    _ = try dvui.testing.step(Frame.draw);
+    try std.testing.expectEqual(manager_module.Phase.complete, Frame.manager.snapshot().phase);
+    // Inject result diagnostics independently of platform directory-sync support.
+    const result = &Frame.manager.published.?.result.?;
+    result.durability_uncertain = true;
+    result.recovery_directory = "fixture-recovery-directory";
+    try dvui.testing.settle(Frame.draw);
+    try deleteLayout(false, true);
+    try deleteBodyReach("instance-task-durability");
+    _ = try Frame.paintedText("勿重复执行删除");
+    try deleteBodyReach("instance-task-recovery");
+    _ = try Frame.paintedText("fixture-recovery-directory");
+    try Frame.absent("instance-task-retry");
+    try Frame.click("instance-task-close");
+    try assertClosed();
+}
+
+test "instance deletion compact task stays centered through resize ignores dragging and cancels a real worker" {
+    try atDeleteSizes(deleteCanceled);
+}
+
+test "instance deletion compact task retains config failure and retries saving before manual close" {
+    try atDeleteSizes(deleteRetry);
+}
+
+test "instance deletion compact task preserves partial deletion failure and retained safety lease" {
+    try atDeleteSizes(deleteFailed);
+}
+
+test "instance deletion compact task keeps uncertain durability and recovery path reachable" {
+    try atDeleteSizes(deleteRecovery);
 }

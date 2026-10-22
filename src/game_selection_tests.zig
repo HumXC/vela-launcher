@@ -71,7 +71,7 @@ fn expectOfflineTarget(manager: *const server_manager.Manager, server_id: []cons
     try testing.expectEqual(servers.State.offline, snapshot.state);
     try testing.expectEqual(error.ConnectionRefused, snapshot.failure.?);
     try testing.expectEqualStrings(server_id, snapshot.server.?.id);
-    try testing.expectEqualStrings(instance_id, snapshot.server.?.instance_id);
+    try testing.expectEqualStrings(instance_id, snapshot.server.?.instance_id.?);
 }
 
 test "game selector persists exact instance IDs with shared Minecraft versions and clears server selection" {
@@ -107,10 +107,10 @@ test "game selector commits each server exact bound instance rather than matchin
 
     for (fixture_servers) |server| {
         try game_selection_view.selectServer(&store, &manager, server.id);
-        try expectSelection(store.snapshot(), server.instance_id, server.id);
-        try expectReload(&store, server.instance_id, server.id);
+        try expectSelection(store.snapshot(), server.instance_id.?, server.id);
+        try expectReload(&store, server.instance_id.?, server.id);
         try awaitSettled(&manager);
-        try expectOfflineTarget(&manager, server.id, server.instance_id);
+        try expectOfflineTarget(&manager, server.id, server.instance_id.?);
     }
 }
 
@@ -300,7 +300,7 @@ test "switching cached server cards and management selections reuse queries whil
         try manager.updateSelected(store.snapshot(), true);
         try manager.updatePicker(store.snapshot().servers, true);
         try testing.expectEqual(statuses[i], manager.snapshot().status.?);
-        try expectSelection(store.snapshot(), fixture_servers[i].instance_id, fixture_servers[i].id);
+        try expectSelection(store.snapshot(), fixture_servers[i].instance_id.?, fixture_servers[i].id);
     }
     // Management/sidebar selection follows the same selection contract.
     ui.pending = .{ .action = .select_sidebar, .id = try testing.allocator.dupe(u8, "server-beta") };
