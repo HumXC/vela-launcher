@@ -181,7 +181,7 @@ fn caption(src: std.builtin.SourceLocation, value: []const u8, font: dvui.Font, 
         .font = font,
         .expand = if (rect == null) .horizontal else .none,
         .max_size_content = .width(0),
-        .color_text = .{ .color = theme.muted },
+        .color_text = .{ .color = theme.colors.muted },
         .padding = .all(0),
         .margin = .all(0),
         .background = false,
@@ -211,10 +211,10 @@ pub fn draw(ui: *Ui, snapshot: Snapshot) void {
     drawFooter(ui, snapshot);
     const scroll = components.scrollBody(@src());
     defer scroll.deinit();
-    if (snapshot.failure) |err| components.text(@src(), frameFmt("读取失败：{s}", .{@errorName(err)}), theme.danger);
-    if (ui.failure) |err| components.text(@src(), frameFmt("操作失败：{s}", .{@errorName(err)}), theme.danger);
-    if (snapshot.recovery_required) components.text(@src(), "需要先恢复内容状态，修改操作暂不可用", theme.warning);
-    if (snapshot.truncated) components.text(@src(), "目录内容超过扫描上限，当前仅显示部分文件", theme.warning);
+    if (snapshot.failure) |err| components.text(@src(), frameFmt("读取失败：{s}", .{@errorName(err)}), theme.colors.danger);
+    if (ui.failure) |err| components.text(@src(), frameFmt("操作失败：{s}", .{@errorName(err)}), theme.colors.danger);
+    if (snapshot.recovery_required) components.text(@src(), "需要先恢复内容状态，修改操作暂不可用", theme.colors.warning);
+    if (snapshot.truncated) components.text(@src(), "目录内容超过扫描上限，当前仅显示部分文件", theme.colors.warning);
     const visible = dvui.currentWindow().arena().alloc(Row, snapshot.rows.len) catch {
         ui.failure = error.OutOfMemory;
         return;
@@ -273,7 +273,7 @@ fn drawToolbar(ui: *Ui) void {
         const font = theme.bodyFont();
         const geometry = theme.controlGeometry(@max(font.lineHeight(), font.textSize(label).h), height, if (narrow) 0 else 104, 16, 1);
         var button: dvui.ButtonWidget = undefined;
-        button.init(@src(), .{}, theme.controlOptions(font.lineHeight()).override(.{
+        button.init(@src(), .{}, theme.panelButtonOptions(theme.controlOptions(font.lineHeight()).override(.{
             .tag = frameFmt("mods-filter-{d}", .{i}),
             .label = .{ .text = label },
             .expand = if (narrow) .horizontal else .none,
@@ -281,11 +281,10 @@ fn drawToolbar(ui: *Ui) void {
             .padding = geometry.padding,
             .margin = .all(0),
             .style = if (ui.filter == value) .highlight else .control,
-        }));
+        }), ui.filter == value));
         button.processEvents();
-        button.drawBackground();
+        theme.buttonBackground(&button, .{ .material = ui.filter != value });
         dvui.labelNoFmt(@src(), label, .{ .align_y = 0.5 }, button.style().override(.{ .gravity_x = 0.5, .gravity_y = 0.5, .padding = .all(0), .margin = .all(0), .background = false }));
-        button.drawFocus();
         if (button.clicked()) ui.filter = value;
         button.deinit();
         item.deinit();
@@ -294,11 +293,11 @@ fn drawToolbar(ui: *Ui) void {
     const controls = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = if (narrow) .horizontal else .none, .gravity_x = if (narrow) 0 else 1, .padding = .all(0), .margin = .all(0), .background = false });
     defer controls.deinit();
     const sort_geometry = theme.controlGeometry(theme.bodyFont().lineHeight(), height, 0, 16, 1);
-    _ = components.dropdownStyled(@src(), "排序", &.{ "名称 A–Z", "名称 Z–A", "文件时间：最新", "文件时间：最早" }, .{ .choice = &sort_index }, .{}, .{ .tag = "mods-sort", .expand = if (narrow) .horizontal else .none, .min_size_content = .{ .w = if (narrow) 0 else 180, .h = height }, .max_size_content = .width(if (narrow) 0 else 180), .padding = sort_geometry.padding, .margin = .{ .w = 8 } });
-    if (components.iconButton(@src(), "网格", dvui.entypo.grid, .{ .selected = !ui.list, .size = height, .tag = "mods-grid" })) ui.queue(.{ .list_view = false }) catch |err| {
+    _ = components.dropdown(@src(), "排序", &.{ "名称 A–Z", "名称 Z–A", "文件时间：最新", "文件时间：最早" }, .{ .choice = &sort_index }, .{}, .{ .tag = "mods-sort", .expand = if (narrow) .horizontal else .none, .min_size_content = .{ .w = if (narrow) 0 else 180, .h = height }, .max_size_content = .width(if (narrow) 0 else 180), .padding = sort_geometry.padding, .margin = .{ .w = 8 } });
+    if (components.iconButton(@src(), "网格", dvui.entypo.grid, .{ .standalone = true, .selected = !ui.list, .size = height, .tag = "mods-grid" })) ui.queue(.{ .list_view = false }) catch |err| {
         ui.failure = err;
     };
-    if (components.iconButton(@src(), "列表", dvui.entypo.list, .{ .selected = ui.list, .size = height, .tag = "mods-list" })) ui.queue(.{ .list_view = true }) catch |err| {
+    if (components.iconButton(@src(), "列表", dvui.entypo.list, .{ .standalone = true, .selected = ui.list, .size = height, .tag = "mods-list" })) ui.queue(.{ .list_view = true }) catch |err| {
         ui.failure = err;
     };
     ui.sort = @fromBackingInt(@intCast(sort_index));
@@ -319,14 +318,14 @@ fn drawFooter(ui: *Ui, snapshot: Snapshot) void {
     const label = if (selected) |row| if (row.entry.enabled) "禁用" else "启用" else "禁用";
     const hint: ?[:0]const u8 = if (selected == null) "先选择一项内容" else if (!managed) "仅模组支持启用或禁用" else if (snapshot.recovery_required) "需要先恢复内容状态" else if (!snapshot.can_mutate) "当前实例状态不允许修改" else null;
     const width = if (narrow) @max(0, (available - gap) / 2) else theme.footerButtonWidth(available);
-    if (components.button(@src(), label, .{ .enabled = allowed and managed, .primary = allowed and managed, .placement = .footer, .min_width = width, .tooltip = hint, .tag = "mods-toggle" })) {
+    if (components.button(@src(), label, .{ .enabled = allowed and managed, .primary = allowed and managed, .placement = .footer, .standalone = true, .min_width = width, .tooltip = hint, .tag = "mods-toggle" })) {
         const row = selected.?;
         ui.queue(.{ .toggle = .{ .path = row.entry.path, .enabled = !row.entry.enabled } }) catch |err| {
             ui.failure = err;
         };
     }
     _ = dvui.spacer(@src(), .{ .min_size_content = .width(gap) });
-    if (components.button(@src(), "刷新", .{ .enabled = !snapshot.busy and ui.pending == null and !ui.info_open, .placement = .footer, .min_width = width, .tag = "mods-refresh" })) ui.queue(.refresh) catch |err| {
+    if (components.button(@src(), "刷新", .{ .enabled = !snapshot.busy and ui.pending == null and !ui.info_open, .placement = .footer, .standalone = true, .min_width = width, .tag = "mods-refresh" })) ui.queue(.refresh) catch |err| {
         ui.failure = err;
     };
     left.deinit();
@@ -334,7 +333,7 @@ fn drawFooter(ui: *Ui, snapshot: Snapshot) void {
         .mod => "获取模组",
         .resourcepack => "获取资源包",
         .shader => "获取光影",
-    }, .{ .enabled = snapshot.can_mutate and !snapshot.busy and !ui.info_open, .primary = true, .placement = .footer, .gravity_x = if (narrow) 0 else 1, .min_width = if (narrow) available else width, .tag = "mods-download" })) ui.acquisition.open();
+    }, .{ .enabled = snapshot.can_mutate and !snapshot.busy and !ui.info_open, .primary = true, .placement = .footer, .standalone = true, .gravity_x = if (narrow) 0 else 1, .min_width = if (narrow) available else width, .tag = "mods-download" })) ui.acquisition.open();
 }
 fn drawCard(ui: *Ui, row: Row, width: f32, list: bool) void {
     const entry = row.entry;
@@ -355,15 +354,15 @@ fn drawCard(ui: *Ui, row: Row, width: f32, list: bool) void {
         .padding = .{ .x = inset_x, .w = inset_x, .y = inset_y, .h = inset_y },
         .margin = .{ .h = if (list) 8 else 0 },
         .border = .all(1),
-        .corners = .all(if (list) theme.sizing.control_radius else theme.sizing.card_radius),
-        .color_border = .{ .color = if (selected) theme.accent else theme.outline },
-        .color_fill = .{ .color = theme.surface },
-        .color_fill_hover = .{ .color = theme.surface },
-        .color_fill_press = .{ .color = theme.surface },
+        .corners = .all(if (list) theme.controlRadius() else theme.cardRadius()),
+        .color_border = .{ .color = if (selected) theme.colors.accent else theme.colors.outline },
+        .color_fill = .{ .color = theme.panelColor(theme.colors.surface) },
+        .color_fill_hover = .{ .color = theme.panelColor(theme.colors.surface) },
+        .color_fill_press = .{ .color = theme.panelColor(theme.colors.surface) },
     });
     defer card.deinit();
     card.processHover();
-    card.drawBackground();
+    theme.buttonBackground(&card, .{ .material = true });
     if (card.data().accesskit_node()) |node| dvui.AccessKit.nodeSetSelected(node, selected);
     if (selected or card.hovered() or card.focused()) {
         if (infoButton(ui, .{ .x = @max(0, content_width - 24), .y = if (list) (content_height - 24) / 2 else content_height - 24, .w = 24, .h = 24 }, entry.path)) ui.openInfo(entry.path) catch |err| {
@@ -378,12 +377,12 @@ fn drawCard(ui: *Ui, row: Row, width: f32, list: bool) void {
         const usable = @max(0, content_width - 32 - 44);
         const title_w = usable * 0.44;
         const version_w = usable * 0.24;
-        rowLabel(@src(), entry.name, title_font, .{ .x = 44, .y = 0, .w = @max(0, title_w - 8), .h = content_height }, theme.foreground);
+        rowLabel(@src(), entry.name, title_font, .{ .x = 44, .y = 0, .w = @max(0, title_w - 8), .h = content_height }, theme.colors.foreground);
         versionCaption(@src(), entry.version orelse "版本未知", entry.enabled, .{ .x = 44 + title_w, .w = @max(0, version_w - 8), .h = content_height });
-        rowLabel(@src(), date, theme.fontSized(14), .{ .x = 44 + title_w + version_w, .w = usable - title_w - version_w, .h = content_height }, theme.muted);
+        rowLabel(@src(), date, theme.fontSized(14), .{ .x = 44 + title_w + version_w, .w = usable - title_w - version_w, .h = content_height }, theme.colors.muted);
     } else {
         localIcon(ui, entry.icon_png, 48, .{ .w = 48, .h = 48 }, entry.enabled);
-        rowLabel(@src(), entry.name, title_font, .{ .x = 64, .w = @max(0, content_width - 64), .h = 28 }, theme.foreground);
+        rowLabel(@src(), entry.name, title_font, .{ .x = 64, .w = @max(0, content_width - 64), .h = 28 }, theme.colors.foreground);
         versionCaption(@src(), entry.version orelse "版本未知", entry.enabled, .{ .x = 64, .y = 36, .w = @max(0, content_width - 64), .h = 24 });
         caption(@src(), date, theme.fontSized(14), .{ .y = 64, .w = @max(0, content_width - 32), .h = 20 });
     }
@@ -409,21 +408,21 @@ fn drawCard(ui: *Ui, row: Row, width: f32, list: bool) void {
     components.tooltip(@src(), card.data().id, card.data().borderRectScale().r, frameFmt("{s}\n{s}{s}", .{ entry.name, entry.path, if (entry.parse_failure != null) "\n元数据读取失败" else "" }));
 }
 fn versionCaption(src: std.builtin.SourceLocation, value: []const u8, enabled: bool, rect: R) void {
-    if (enabled) return rowLabel(src, value, theme.bodyFont(), rect, theme.muted);
+    if (enabled) return rowLabel(src, value, theme.bodyFont(), rect, theme.colors.muted);
     const line = dvui.box(src, .{ .dir = .horizontal }, .{ .rect = rect, .padding = .all(0), .margin = .all(0), .background = false });
     defer line.deinit();
-    dvui.labelNoFmt(@src(), components.ellipsize(value, theme.bodyFont(), @max(0, rect.w - 64)), .{}, .{ .font = theme.bodyFont(), .gravity_y = 0.5, .padding = .all(0), .margin = .{ .w = 8 }, .color_text = .{ .color = theme.muted } });
-    dvui.labelNoFmt(@src(), "· 已禁用", .{}, .{ .font = theme.fontSized(14), .gravity_y = 0.5, .padding = .all(0), .margin = .all(0), .color_text = .{ .color = theme.muted } });
+    dvui.labelNoFmt(@src(), components.ellipsize(value, theme.bodyFont(), @max(0, rect.w - 64)), .{}, .{ .font = theme.bodyFont(), .gravity_y = 0.5, .padding = .all(0), .margin = .{ .w = 8 }, .color_text = .{ .color = theme.colors.muted } });
+    dvui.labelNoFmt(@src(), "· 已禁用", .{}, .{ .font = theme.fontSized(14), .gravity_y = 0.5, .padding = .all(0), .margin = .all(0), .color_text = .{ .color = theme.colors.muted } });
 }
 fn rowLabel(src: std.builtin.SourceLocation, value: []const u8, font: dvui.Font, rect: R, color: dvui.Color) void {
     dvui.labelNoFmt(src, components.ellipsize(value, font, rect.w), .{ .align_y = 0.5 }, .{ .rect = rect, .font = font, .padding = .all(0), .margin = .all(0), .background = false, .color_text = .{ .color = color }, .role = .none });
 }
 fn infoButton(ui: *Ui, rect: R, path: []const u8) bool {
     var button: dvui.ButtonWidget = undefined;
-    button.init(@src(), .{ .draw_focus = false }, .{ .rect = rect, .tag = frameFmt("mods-info-{s}", .{path}), .label = .{ .text = "查看信息" }, .min_size_content = .all(24), .max_size_content = .size(.all(24)), .padding = .all(0), .margin = .all(0), .border = .all(0), .background = false, .color_text = .{ .color = theme.accent } });
+    button.init(@src(), .{ .draw_focus = false }, .{ .rect = rect, .tag = frameFmt("mods-info-{s}", .{path}), .label = .{ .text = "查看信息" }, .min_size_content = .all(24), .max_size_content = .size(.all(24)), .padding = .all(0), .margin = .all(0), .border = .all(0), .background = false, .color_text = .{ .color = theme.colors.accent } });
     defer button.deinit();
     button.processEvents();
-    dvui.icon(@src(), "查看信息", dvui.entypo.info_with_circle, .{}, .{ .min_size_content = .all(24), .max_size_content = .size(.all(24)), .padding = .all(0), .margin = .all(0), .role = .none, .color_text = .{ .color = theme.accent } });
+    dvui.icon(@src(), "查看信息", dvui.entypo.info_with_circle, .{}, .{ .min_size_content = .all(24), .max_size_content = .size(.all(24)), .padding = .all(0), .margin = .all(0), .role = .none, .color_text = .{ .color = theme.colors.accent } });
     if (button.focused()) {
         button.data().focusBorder();
         // Keep the pure icon visible when keyboard focus moves from the card.
@@ -444,7 +443,7 @@ fn legitimateHomepage(url: []const u8) bool {
 fn localIcon(ui: *Ui, bytes: ?[]const u8, size: f32, rect: ?R, enabled: bool) void {
     const bitmap = if (ui.acquisition.icons) |*cache| if (bytes) |png| (if (enabled) cache.local(png) else cache.localDisabled(png)) else null else null;
     if (!enabled and bitmap == null) {
-        dvui.icon(@src(), "模组图标", dvui.entypo.archive, .{}, .{ .rect = rect, .min_size_content = .all(size), .max_size_content = .size(.all(size)), .padding = .all(0), .margin = .all(0), .color_text = .{ .color = theme.muted } });
+        dvui.icon(@src(), "模组图标", dvui.entypo.archive, .{}, .{ .rect = rect, .min_size_content = .all(size), .max_size_content = .size(.all(size)), .padding = .all(0), .margin = .all(0), .color_text = .{ .color = theme.colors.muted } });
     } else @import("resource_icons.zig").draw(@src(), bitmap, size, rect);
 }
 pub fn drawDialogs(ui: *Ui, snapshot: Snapshot) void {
@@ -469,11 +468,11 @@ pub fn drawDialogs(ui: *Ui, snapshot: Snapshot) void {
         defer heading.deinit();
         localIcon(ui, entry.icon_png, 64, .{ .x = 0, .y = 0, .w = 64, .h = 64 }, true);
         const width = @max(0, heading.data().contentRect().w - 88);
-        dvui.labelNoFmt(@src(), components.ellipsize(entry.name, theme.headingFont(), width), .{}, .{ .rect = .{ .x = 88, .y = 4, .w = width, .h = 28 }, .font = theme.headingFont(), .color_text = .{ .color = theme.foreground }, .padding = .all(0), .margin = .all(0), .background = false });
-        dvui.labelNoFmt(@src(), components.ellipsize(entry.version orelse "版本未知", theme.bodyFont(), width), .{}, .{ .rect = .{ .x = 88, .y = 40, .w = width, .h = 24 }, .font = theme.bodyFont(), .color_text = .{ .color = theme.muted }, .padding = .all(0), .margin = .all(0), .background = false });
+        dvui.labelNoFmt(@src(), components.ellipsize(entry.name, theme.headingFont(), width), .{}, .{ .rect = .{ .x = 88, .y = 4, .w = width, .h = 28 }, .font = theme.headingFont(), .color_text = .{ .color = theme.colors.foreground }, .padding = .all(0), .margin = .all(0), .background = false });
+        dvui.labelNoFmt(@src(), components.ellipsize(entry.version orelse "版本未知", theme.bodyFont(), width), .{}, .{ .rect = .{ .x = 88, .y = 40, .w = width, .h = 24 }, .font = theme.bodyFont(), .color_text = .{ .color = theme.colors.muted }, .padding = .all(0), .margin = .all(0), .background = false });
     }
-    dvui.labelNoFmt(@src(), "依赖", .{}, .{ .font = theme.headingFont(), .min_size_content = .height(24), .expand = .horizontal, .padding = .all(0), .margin = .{ .h = if (compact) 8 else 16 }, .background = false, .color_text = .{ .color = theme.foreground } });
-    const dependencies = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .max_size_content = .width(0), .padding = .{ .x = 8, .w = 8, .y = 4, .h = 4 }, .margin = .{ .h = if (compact) 8 else 24 }, .border = .all(1), .corners = .all(theme.sizing.card_radius), .background = true, .color_fill = .{ .color = theme.background }, .color_border = .{ .color = theme.outline }, .tag = "mods-dependencies" });
+    dvui.labelNoFmt(@src(), "依赖", .{}, .{ .font = theme.headingFont(), .min_size_content = .height(24), .expand = .horizontal, .padding = .all(0), .margin = .{ .h = if (compact) 8 else 16 }, .background = false, .color_text = .{ .color = theme.colors.foreground } });
+    const dependencies = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both, .max_size_content = .width(0), .padding = .{ .x = 8, .w = 8, .y = 4, .h = 4 }, .margin = .{ .h = if (compact) 8 else 24 }, .border = .all(1), .corners = .all(theme.cardRadius()), .background = true, .color_fill = .{ .color = theme.colors.inset }, .color_border = .{ .color = theme.colors.outline }, .tag = "mods-dependencies" });
     defer dependencies.deinit();
     if (entry.dependencies.len == 0) components.hint(@src(), if (entry.parse_failure != null) "无法读取依赖" else "没有声明依赖");
     for (entry.dependencies, 0..) |dependency, i| {
@@ -481,12 +480,12 @@ pub fn drawDialogs(ui: *Ui, snapshot: Snapshot) void {
         const name = if (target) |match| match.entry.name else if (std.mem.eql(u8, dependency.id, "fabricloader")) "Fabric Loader" else if (std.mem.eql(u8, dependency.id, "minecraft")) "Minecraft" else dependency.id;
         const version = if (target) |match| match.entry.version orelse dependency.version orelse "任意版本" else dependency.version orelse "任意版本";
         var track: dvui.ButtonWidget = undefined;
-        track.init(@src(), .{ .draw_focus = target != null }, .{ .id_extra = i, .tag = frameFmt("mods-dependency-{d}", .{i}), .label = .{ .text = frameFmt("{s}{s}", .{ if (target != null) "定位 " else "", name }) }, .role = if (target != null) .button else .none, .tab_index = if (target != null) null else 0, .expand = .horizontal, .min_size_content = .height(56), .max_size_content = .width(0), .padding = .{ .x = 12, .w = 4 }, .margin = .all(0), .border = .all(0), .corners = .all(10), .background = true, .color_fill = .{ .color = theme.background }, .color_fill_hover = .{ .color = if (target != null) theme.surface else theme.background }, .color_fill_press = .{ .color = theme.surface } });
+        track.init(@src(), .{ .draw_focus = target != null }, .{ .id_extra = i, .tag = frameFmt("mods-dependency-{d}", .{i}), .label = .{ .text = frameFmt("{s}{s}", .{ if (target != null) "定位 " else "", name }) }, .role = if (target != null) .button else .none, .tab_index = if (target != null) null else 0, .expand = .horizontal, .min_size_content = .height(56), .max_size_content = .width(0), .padding = .{ .x = 12, .w = 4 }, .margin = .all(0), .border = .all(0), .corners = .all(theme.controlRadius()), .background = true, .color_fill = .{ .color = theme.style.colors.transparent }, .color_fill_hover = .{ .color = if (target != null) theme.colors.selected_surface else theme.style.colors.transparent }, .color_fill_press = .{ .color = if (target != null) theme.colors.pressed_surface else theme.style.colors.transparent } });
         defer track.deinit();
         if (target != null) {
             track.processHover();
         }
-        track.drawBackground();
+        theme.surface.buttonBackground(&track);
         const width = track.data().contentRect().w;
         const arrow_x = @max(0, width - 48);
         const version_width = @min(192, @max(0, width * 0.36));
@@ -495,22 +494,21 @@ pub fn drawDialogs(ui: *Ui, snapshot: Snapshot) void {
         const display_name = frameFmt("{s}{s}", .{ name, if (dependency.optional) " · 可选" else "" });
         const name_font = theme.bodyFont();
         const version_font = theme.captionFont();
-        dvui.labelNoFmt(@src(), components.ellipsize(display_name, name_font, name_width), .{}, .{ .rect = .{ .x = 0, .y = (56 - name_font.textHeight()) / 2, .w = name_width, .h = name_font.textHeight() }, .font = name_font, .padding = .all(0), .margin = .all(0), .background = false, .color_text = .{ .color = theme.foreground } });
-        dvui.labelNoFmt(@src(), components.ellipsize(version, version_font, version_width), .{}, .{ .rect = .{ .x = version_x, .y = (56 - version_font.textHeight()) / 2, .w = version_width, .h = version_font.textHeight() }, .font = version_font, .padding = .all(0), .margin = .all(0), .background = false, .color_text = .{ .color = theme.muted } });
+        dvui.labelNoFmt(@src(), components.ellipsize(display_name, name_font, name_width), .{}, .{ .rect = .{ .x = 0, .y = (56 - name_font.textHeight()) / 2, .w = name_width, .h = name_font.textHeight() }, .font = name_font, .padding = .all(0), .margin = .all(0), .background = false, .color_text = .{ .color = theme.colors.foreground } });
+        dvui.labelNoFmt(@src(), components.ellipsize(version, version_font, version_width), .{}, .{ .rect = .{ .x = version_x, .y = (56 - version_font.textHeight()) / 2, .w = version_width, .h = version_font.textHeight() }, .font = version_font, .padding = .all(0), .margin = .all(0), .background = false, .color_text = .{ .color = theme.colors.muted } });
         if (target) |match| {
-            const arrow = dvui.box(@src(), .{}, .{ .rect = .{ .x = arrow_x, .y = 4, .w = 48, .h = 48 }, .padding = .all(0), .margin = .all(0), .border = .all(0), .corners = .all(theme.sizing.control_radius), .background = false, .color_border = .{ .color = if (track.hovered() or track.focused()) theme.accent else theme.outline } });
+            const arrow = dvui.box(@src(), .{}, .{ .rect = .{ .x = arrow_x, .y = 4, .w = 48, .h = 48 }, .padding = .all(0), .margin = .all(0), .border = .all(0), .corners = .all(theme.controlRadius()), .background = false, .color_border = .{ .color = if (track.hovered() or track.focused()) theme.colors.accent else theme.colors.outline } });
             if (components.iconButton(@src(), "定位模组", dvui.entypo.chevron_small_right, .{ .size = 48, .selected = true, .tag = frameFmt("mods-dependency-arrow-{d}", .{i}) })) ui.locate(match) catch |err| {
                 ui.failure = err;
             };
             arrow.deinit();
-            track.drawFocus();
             track.processEvents();
             if (track.clicked()) ui.locate(match) catch |err| {
                 ui.failure = err;
             };
         }
         if (i + 1 < entry.dependencies.len) {
-            const divider = dvui.box(@src(), .{}, .{ .rect = .{ .x = 0, .y = 55, .w = @max(0, width - 8), .h = 1 }, .padding = .all(0), .margin = .all(0), .background = true, .color_fill = .{ .color = theme.outline }, .role = .none });
+            const divider = dvui.box(@src(), .{}, .{ .rect = .{ .x = 0, .y = 55, .w = @max(0, width - 8), .h = 1 }, .padding = .all(0), .margin = .all(0), .background = true, .color_fill = .{ .color = theme.colors.outline }, .role = .none });
             divider.deinit();
         }
         components.tooltip(@src(), track.data().id, track.data().borderRectScale().r, frameFmt("{s}\n要求 {s}", .{ name, dependency.version orelse "任意版本" }));

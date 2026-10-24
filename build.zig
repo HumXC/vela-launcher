@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
     const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3 });
     const dvui = dvui_dep.module("dvui_sdl3");
     dvui.linkLibrary(sdl.artifact("SDL3"));
+    @import("build-support/sdl_software.zig").apply(b, dvui);
     @import("build-support/webp.zig").link(b, target, optimize, dvui);
     const curl_dep = b.dependency("curl", .{
         .target = target,
@@ -98,6 +99,22 @@ pub fn build(b: *std.Build) void {
     preview_tests_module.addImport("test_allocations", test_allocations);
     const preview_tests = b.addTest(.{ .root_module = preview_tests_module, .filters = &.{"component preview"} });
     b.step("test-ui-preview", "Test mock data, states and intent-only interactions").dependOn(&b.addRunArtifact(preview_tests).step);
+    const surface_pixels = b.addExecutable(.{ .name = "vela-surface-pixels", .root_module = cloneAppModule(b, app_mod, b.path("src/ui_surface_pixels.zig")) });
+    b.step("build-ui-pixels", "Build native surface pixel regression for graphics-driver checks").dependOn(&b.addInstallArtifact(surface_pixels, .{}).step);
+    const surface_pixels_run = b.addRunArtifact(surface_pixels);
+    surface_pixels_run.setEnvironmentVariable("SDL_VIDEODRIVER", "offscreen");
+    surface_pixels_run.setEnvironmentVariable("SDL_AUDIODRIVER", "dummy");
+    surface_pixels_run.setEnvironmentVariable("SDL_RENDER_DRIVER", "opengl");
+    const layout_filter = b.option([]const u8, "layout-test-filter", "Run a focused UI layout test group") orelse "UI layout";
+    b.step("test-ui-layout", "Test production UI layout with the testing renderer").dependOn(&@import("ui_layout_test_build.zig").addTests(b, target, optimize, layout_filter).step);
+    const surface_pixels_step = b.step("test-ui-pixels", "Compare native SDL material pixels with OpenGL and software rendering");
+    surface_pixels_step.dependOn(&surface_pixels_run.step);
+    const surface_pixels_software_run = b.addRunArtifact(surface_pixels);
+    surface_pixels_software_run.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
+    surface_pixels_software_run.setEnvironmentVariable("SDL_AUDIODRIVER", "dummy");
+    surface_pixels_software_run.setEnvironmentVariable("SDL_RENDER_DRIVER", "software");
+    surface_pixels_software_run.step.dependOn(&surface_pixels_run.step);
+    surface_pixels_step.dependOn(&surface_pixels_software_run.step);
     // Acceptance clones the production module; this root is never default-installed.
     const lifecycle_exe = b.addExecutable(.{
         .name = "vela-lifecycle-acceptance",

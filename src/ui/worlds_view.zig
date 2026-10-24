@@ -12,8 +12,6 @@ const A = std.mem.Allocator;
 const R = dvui.Rect;
 const Part = @FieldType(worlds.BackupRef, "part");
 const preview_limit = 4 * 1024 * 1024;
-const warning = theme.warning;
-const danger = theme.danger;
 
 const Operation = enum { copy, rename_display, rename_folder, restore, delete };
 
@@ -352,17 +350,17 @@ fn drawHeader(ui: *Ui, doc: *const config.Document, snapshot: worlds_manager.Sna
             if (header.data().contentRect().w < theme.style.layout.world_compact_width)
                 components.hint(@src(), subtitle)
             else
-                components.text(@src(), subtitle, theme.muted);
+                components.text(@src(), subtitle, theme.colors.muted);
         }
         heading.deinit();
     }
-    if (components.button(@src(), "刷新", .{ .icon = dvui.entypo.cw, .tag = "world-refresh", .placement = .footer, .enabled = enabled and !snapshot.worker_active and snapshot.instance != null and !ui.select_queued and ui.draft == null })) ui.refresh_queued = true;
+    if (components.button(@src(), "刷新", .{ .standalone = true, .icon = dvui.entypo.cw, .tag = "world-refresh", .placement = .footer, .enabled = enabled and !snapshot.worker_active and snapshot.instance != null and !ui.select_queued and ui.draft == null })) ui.refresh_queued = true;
     actions.deinit();
     if (snapshot.worker_active) {
         const task = components.toolbar(@src());
         defer task.deinit();
-        components.text(@src(), if (snapshot.loading) "正在读取存档…" else "正在处理存档…", theme.muted);
-        if (components.iconButton(@src(), "取消当前任务", dvui.entypo.cross, .{ .tag = "world-cancel", .enabled = enabled })) ui.cancel_queued = true;
+        components.text(@src(), if (snapshot.loading) "正在读取存档…" else "正在处理存档…", theme.colors.muted);
+        if (components.iconButton(@src(), "取消当前任务", dvui.entypo.cross, .{ .standalone = true, .tag = "world-cancel", .enabled = enabled })) ui.cancel_queued = true;
     }
 }
 
@@ -407,27 +405,27 @@ fn drawWorldActions(ui: *Ui, doc: *const config.Document, source: config.Instanc
     const action_size = if (section.data().contentRect().w < theme.style.layout.world_compact_actions_width) theme.sizing.compact_icon_button else theme.sizing.control_height;
     const actions = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .padding = R.all(0), .margin = R.all(0), .background = false });
     defer actions.deinit();
-    const backup_clicked = if (compact) components.iconButton(@src(), "备份", dvui.entypo.box, .{ .tag = "world-backup", .enabled = enabled, .size = action_size }) else components.button(@src(), "备份", .{ .tag = "world-backup", .enabled = enabled });
+    const backup_clicked = if (compact) components.iconButton(@src(), "备份", dvui.entypo.box, .{ .standalone = true, .tag = "world-backup", .enabled = enabled, .size = action_size }) else components.button(@src(), "备份", .{ .standalone = true, .tag = "world-backup", .enabled = enabled });
     if (backup_clicked) ui.queueRequest(source, .{ .backup = world.folder }) catch |err| {
         ui.failure = err;
     };
-    const copy_clicked = if (compact) components.iconButton(@src(), "复制到实例", dvui.entypo.copy, .{ .tag = "world-copy", .enabled = enabled and doc.instances.len > 1, .size = action_size }) else components.button(@src(), "复制到实例", .{ .tag = "world-copy", .enabled = enabled and doc.instances.len > 1 });
+    const copy_clicked = if (compact) components.iconButton(@src(), "复制到实例", dvui.entypo.copy, .{ .standalone = true, .tag = "world-copy", .enabled = enabled and doc.instances.len > 1, .size = action_size }) else components.button(@src(), "复制到实例", .{ .standalone = true, .tag = "world-copy", .enabled = enabled and doc.instances.len > 1 });
     if (copy_clicked) ui.openWorld(.copy, source, world) catch |err| {
         ui.failure = err;
     };
-    const rename_clicked = if (compact) components.iconButton(@src(), "重命名", dvui.entypo.pencil, .{ .tag = "world-rename", .enabled = enabled and world.metadata_status == .valid, .size = action_size }) else components.button(@src(), "重命名", .{ .tag = "world-rename", .enabled = enabled and world.metadata_status == .valid });
+    const rename_clicked = if (compact) components.iconButton(@src(), "重命名", dvui.entypo.pencil, .{ .standalone = true, .tag = "world-rename", .enabled = enabled and world.metadata_status == .valid, .size = action_size }) else components.button(@src(), "重命名", .{ .standalone = true, .tag = "world-rename", .enabled = enabled and world.metadata_status == .valid });
     if (rename_clicked) ui.openWorld(.rename_display, source, world) catch |err| {
         ui.failure = err;
     };
-    const folder_clicked = if (compact) components.iconButton(@src(), "修改文件夹名称", dvui.entypo.folder, .{ .tag = "world-rename-folder", .enabled = enabled, .size = action_size }) else components.button(@src(), "修改文件夹", .{ .tag = "world-rename-folder", .enabled = enabled });
+    const folder_clicked = if (compact) components.iconButton(@src(), "修改文件夹名称", dvui.entypo.folder, .{ .standalone = true, .tag = "world-rename-folder", .enabled = enabled, .size = action_size }) else components.button(@src(), "修改文件夹", .{ .standalone = true, .tag = "world-rename-folder", .enabled = enabled });
     if (folder_clicked) ui.openWorld(.rename_folder, source, world) catch |err| {
         ui.failure = err;
     };
-    const open_clicked = if (compact) components.iconButton(@src(), "打开存档目录", dvui.entypo.folder, .{ .tag = "world-open", .enabled = can_view, .size = action_size }) else components.button(@src(), "打开目录", .{ .tag = "world-open", .enabled = can_view });
+    const open_clicked = if (compact) components.iconButton(@src(), "打开存档目录", dvui.entypo.folder, .{ .standalone = true, .tag = "world-open", .enabled = can_view, .size = action_size }) else components.button(@src(), "打开目录", .{ .standalone = true, .tag = "world-open", .enabled = can_view });
     if (open_clicked) ui.queueDirectoryOpen(source, world.folder) catch |err| {
         ui.failure = err;
     };
-    if (components.button(@src(), "删除", .{ .tag = "world-delete", .destructive = true, .enabled = enabled, .min_width = if (compact) 0 else theme.sizing.button_min_width })) ui.openWorld(.delete, source, world) catch |err| {
+    if (components.button(@src(), "删除", .{ .standalone = true, .tag = "world-delete", .destructive = true, .enabled = enabled, .min_width = if (compact) 0 else theme.sizing.button_min_width })) ui.openWorld(.delete, source, world) catch |err| {
         ui.failure = err;
     };
 }
@@ -437,8 +435,8 @@ pub fn drawWithEnabled(ui: *Ui, doc: *const config.Document, manager: *worlds_ma
     defer root.deinit();
     drawHeader(ui, doc, snapshot, controls_enabled);
     const source = snapshot.instance orelse {
-        if (ui.failure) |err| components.text(@src(), failureText(err), danger);
-        if (snapshot.failure) |err| components.text(@src(), failureText(err), danger);
+        if (ui.failure) |err| components.text(@src(), failureText(err), theme.colors.danger);
+        if (snapshot.failure) |err| components.text(@src(), failureText(err), theme.colors.danger);
         components.emptyState(@src(), if (doc.instances.len == 0) "尚无实例" else if (ui.entry_refresh_pending) "正在读取存档…" else "从左侧选择一个实例");
         return;
     };
@@ -446,7 +444,7 @@ pub fn drawWithEnabled(ui: *Ui, doc: *const config.Document, manager: *worlds_ma
     const current = if (desired) |v| sameInstance(v, source) else false;
     const running = manager.isRunning(source.id);
     if (!current) {
-        components.text(@src(), "正在切换实例…", theme.muted);
+        components.text(@src(), "正在切换实例…", theme.colors.muted);
         return;
     }
     const can_view = controls_enabled and !ui.select_queued and ui.draft == null;
@@ -463,9 +461,9 @@ pub fn drawWithEnabled(ui: *Ui, doc: *const config.Document, manager: *worlds_ma
     drawBackups(ui, source, snapshot.backups, snapshot.worlds, enabled);
     const scroll = components.scrollBody(@src());
     defer scroll.deinit();
-    if (ui.failure) |err| components.text(@src(), failureText(err), danger);
-    if (snapshot.failure) |err| components.text(@src(), failureText(err), danger);
-    if (running) components.text(@src(), "实例正在运行，可以查看存档，修改操作暂不可用", warning);
+    if (ui.failure) |err| components.text(@src(), failureText(err), theme.colors.danger);
+    if (snapshot.failure) |err| components.text(@src(), failureText(err), theme.colors.danger);
+    if (running) components.text(@src(), "实例正在运行，可以查看存档，修改操作暂不可用", theme.colors.warning);
     if (snapshot.worlds.len == 0 and !snapshot.loading) components.emptyState(@src(), "此实例还没有存档");
     var budget: usize = preview_limit;
     {
@@ -502,11 +500,11 @@ pub fn drawWithEnabled(ui: *Ui, doc: *const config.Document, manager: *worlds_ma
                 .avatar_text = "存",
                 .avatar_source = previewSource(world.folder, snapshot.previews, &budget),
                 .avatar_size = theme.style.cards.world_preview,
-                .avatar_radius = theme.sizing.control_radius,
+                .avatar_radius = theme.controlRadius(),
                 .avatar_tag = fmt("world-preview-{s}", .{world.folder}),
                 .description = description,
                 .status = worldStatus(world),
-                .status_color = if (world.access == .in_use) theme.accent else warning,
+                .status_color = if (world.access == .in_use) theme.colors.accent else theme.colors.warning,
                 .status_gap = theme.spacing.row_gap,
                 .tag = fmt("world-card-{s}", .{world.folder}),
             })) {
@@ -551,16 +549,16 @@ fn drawBackups(ui: *Ui, source: config.Instance, backups: []const worlds.Backup,
             .padding = .{ .x = theme.spacing.panel_compact_padding - theme.sizing.control_border, .y = theme.spacing.row_gap - theme.sizing.control_border, .w = theme.spacing.panel_compact_padding - theme.sizing.control_border, .h = theme.spacing.row_gap - theme.sizing.control_border },
             .margin = .{ .h = theme.spacing.row_gap },
             .border = R.all(theme.sizing.control_border),
-            .color_border = .{ .color = theme.outline },
-            .corners = .all(theme.sizing.card_radius),
+            .color_border = .{ .color = theme.colors.outline },
+            .corners = .all(theme.cardRadius()),
             .background = true,
-            .color_fill = .{ .color = theme.surface },
+            .color_fill = .{ .color = theme.colors.surface },
         });
         {
             const info = dvui.box(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = if (compact) theme.spacing.row_gap else theme.spacing.card_gap }, .background = false });
             dvui.labelNoFmt(@src(), timestamp(backup.created_ms), .{ .ellipsize = true }, .{ .font = theme.bodyFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = theme.spacing.detail_gap }, .background = false });
             const caption = if (backup.source_folder) |folder| fmt("{s} · 原文件夹：{s}", .{ operationText(backup.operation), folder }) else fmt("{s} · 记录：{s}", .{ operationText(backup.operation), backup.id });
-            dvui.labelNoFmt(@src(), caption, .{ .ellipsize = true }, .{ .font = theme.captionFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = theme.muted } });
+            dvui.labelNoFmt(@src(), caption, .{ .ellipsize = true }, .{ .font = theme.captionFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = theme.colors.muted } });
             if (backup.part == .overwritten) components.hint(@src(), if (compact) "已替换" else "被替换数据");
             if (!sameId(backup.source_instance, source.id) and backup.source_instance != null) components.hint(@src(), fmt("来源实例：{s}", .{backup.source_instance.?}));
             if (!backupRestorable(backup)) components.hint(@src(), "备份信息不可用，无法安全恢复");
@@ -652,13 +650,13 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.
         {
             const identity = components.modalSection(@src(), .{ .min_height = 128, .tag = "world-dialog-identity" });
             defer identity.deinit();
-            components.text(@src(), fmt("世界：{s}", .{draft.display_name}), theme.muted);
+            components.text(@src(), fmt("世界：{s}", .{draft.display_name}), theme.colors.muted);
             _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.row_gap) });
-            components.text(@src(), fmt("源实例：{s}", .{draft.source.name}), theme.muted);
+            components.text(@src(), fmt("源实例：{s}", .{draft.source.name}), theme.colors.muted);
             _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.row_gap) });
             if (draft.operation == .restore) {
-                components.text(@src(), fmt("恢复记录：{s} · {s}", .{ draft.backup_id, if (draft.part == .original) "原始数据" else "被替换数据" }), theme.muted);
-            } else components.text(@src(), fmt("文件夹：{s}", .{draft.folder}), theme.muted);
+                components.text(@src(), fmt("恢复记录：{s} · {s}", .{ draft.backup_id, if (draft.part == .original) "原始数据" else "被替换数据" }), theme.colors.muted);
+            } else components.text(@src(), fmt("文件夹：{s}", .{draft.folder}), theme.colors.muted);
         }
         const confirmation = components.modalSection(@src(), .{ .min_height = switch (draft.operation) {
             .copy => 284,
@@ -686,7 +684,7 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.
                 }
                 components.fieldLabel(@src(), "目标实例");
                 var choice: ?usize = selected;
-                if (components.dropdown(@src(), "目标实例", labels[0..count], .{ .choice_nullable = &choice }, .{ .placeholder = "选择目标实例", .null_selectable = false })) {
+                if (components.dropdown(@src(), "目标实例", labels[0..count], .{ .choice_nullable = &choice }, .{ .placeholder = "选择目标实例", .null_selectable = false }, .{})) {
                     const index = choice orelse 0;
                     if (ids[index]) |id| try draft.setTarget(id) else {
                         draft.target_id = null;
@@ -703,12 +701,12 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.
             }
         }
         if (draft.operation != .delete) _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
-        if (draft.name_too_long) components.text(@src(), "名称过长，请重新输入", danger);
+        if (draft.name_too_long) components.text(@src(), "名称过长，请重新输入", theme.colors.danger);
         if (draft.operation == .copy or draft.operation == .restore or draft.operation == .rename_folder) {
             _ = components.checkbox(@src(), &draft.replace_backed_up, "目标存在时，先备份再替换", true);
         }
         if (draft.operation == .delete) {
-            components.text(@src(), "世界将从 saves 移除，删除前数据保留在恢复记录中。", warning);
+            components.text(@src(), "世界将从 saves 移除，删除前数据保留在恢复记录中。", theme.colors.warning);
             _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
         }
         _ = components.checkbox(@src(), &draft.confirmed, switch (draft.operation) {
@@ -719,8 +717,8 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document, manager: *worlds_manager.
             .restore => "确认恢复所选数据",
         }, true);
         const blocked = draftBlocked(draft, doc, manager);
-        if (blocked) |err| components.text(@src(), fmt("暂不可执行：{s}", .{@errorName(err)}), warning);
-        if (ui.failure) |err| components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), danger);
+        if (blocked) |err| components.text(@src(), fmt("暂不可执行：{s}", .{@errorName(err)}), theme.colors.warning);
+        if (ui.failure) |err| components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), theme.colors.danger);
         if (action == .save and draft.open and blocked == null and draft.confirmed and !ui.select_queued) {
             ui.queueDraft(doc) catch |err| {
                 ui.failure = err;

@@ -10,7 +10,6 @@ const components = @import("components.zig");
 const Allocator = std.mem.Allocator;
 const Manager = accounts_manager.Manager;
 const R = dvui.Rect;
-const danger = theme.danger;
 
 const Action = enum { add, edit, save, close_editor, select, ask_delete, ask_sign_out, confirm, close_confirm, start, cancel, close_login, copy_code, open_verification, open_uri, probe_remember, forget_remember, retry_cleanup, retry_publication, refresh };
 const Pending = struct {
@@ -147,21 +146,23 @@ pub fn draw(ui: *Ui, store: *config.Store, manager: *Manager, avatars: ?*avatar_
         components.title(@src(), "选择账户");
         if (doc.selected_account) |id| {
             if (findAccount(doc, id)) |account| {
-                if (components.iconButton(@src(), "编辑账户", dvui.entypo.edit, .{ .enabled = !controls_busy, .tag = "account-edit" })) ui.queue(.edit, account.id, null);
+                if (components.iconButton(@src(), "编辑账户", dvui.entypo.edit, .{ .standalone = true, .enabled = !controls_busy, .tag = "account-edit" })) ui.queue(.edit, account.id, null);
             }
         }
-        if (components.iconButton(@src(), "添加账户", dvui.entypo.plus, .{ .enabled = !controls_busy, .tag = "account-add" })) ui.queue(.add, null, null);
+        if (components.iconButton(@src(), "添加账户", dvui.entypo.plus, .{ .standalone = true, .enabled = !controls_busy, .tag = "account-add" })) ui.queue(.add, null, null);
     }
     {
         const scroll = components.scrollBody(@src());
         defer scroll.deinit();
         if (!ui.editor_open and !ui.login_open and ui.confirmation == null) {
-            if (ui.failure) |err| components.text(@src(), errorText(err), danger);
-            if (snapshot.failure) |err| components.text(@src(), errorText(err), danger);
+            if (ui.failure) |err| components.text(@src(), errorText(err), theme.colors.danger);
+            if (snapshot.failure) |err| components.text(@src(), errorText(err), theme.colors.danger);
         }
         if (snapshot.busy) {
-            components.text(@src(), phaseText(snapshot.phase), theme.accent);
-            if (components.button(@src(), "取消操作", .{})) ui.queue(.cancel, null, null);
+            components.text(@src(), phaseText(snapshot.phase), theme.colors.accent);
+            if (components.button(@src(), "取消操作", .{
+                .standalone = true,
+            })) ui.queue(.cancel, null, null);
         }
         if (doc.accounts.len == 0) components.emptyState(@src(), "暂无账户，点击右上角 ＋ 添加");
         var cards = @import("card_grid.zig").init(@src(), doc.accounts.len, .{ .min_width = theme.style.layout.account_min_width, .max_columns = theme.style.layout.account_columns, .tag = "account-cards" });
@@ -192,12 +193,12 @@ pub fn draw(ui: *Ui, store: *config.Store, manager: *Manager, avatars: ?*avatar_
         }
         cards.deinit();
         if (snapshot.cleanup_count != 0) {
-            components.text(@src(), fmt("待清理凭据：{d}", .{snapshot.cleanup_count}), theme.muted);
-            if (components.button(@src(), "重试清理", .{ .enabled = !snapshot.busy })) ui.queue(.retry_cleanup, null, null);
+            components.text(@src(), fmt("待清理凭据：{d}", .{snapshot.cleanup_count}), theme.colors.muted);
+            if (components.button(@src(), "重试清理", .{ .standalone = true, .enabled = !snapshot.busy })) ui.queue(.retry_cleanup, null, null);
         }
         if (snapshot.publication_pending) {
-            components.text(@src(), "账户保存未完成", danger);
-            if (components.button(@src(), "重试保存", .{ .enabled = !snapshot.busy })) ui.queue(.retry_publication, null, null);
+            components.text(@src(), "账户保存未完成", theme.colors.danger);
+            if (components.button(@src(), "重试保存", .{ .standalone = true, .enabled = !snapshot.busy })) ui.queue(.retry_publication, null, null);
         }
     }
     if (avatars) |cache| {
@@ -246,33 +247,33 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, busy: bool) void {
     const scroll = components.scrollBody(@src());
     defer scroll.deinit();
     if (adding) {
-        const panel = components.formPanel(@src(), .{ .compact = true, .tag = "account-form-panel", .options = .{ .corners = .all(theme.sizing.card_radius), .margin = R.all(0), .min_size_content = .height(80) } });
+        const panel = components.formPanel(@src(), .{ .compact = true, .tag = "account-form-panel", .options = .{ .corners = .all(theme.cardRadius()), .margin = R.all(0), .min_size_content = .height(80) } });
         defer panel.deinit();
         _ = components.field(@src(), "用户名或者邮箱", &ui.draft.name, .{ .tag = "account-name", .gap_after = 0 });
     } else if (account) |value| {
         if (microsoft) {
             const information = components.modalSection(@src(), .{ .min_height = 248, .gap_after = 0, .tag = "account-microsoft-details" });
             defer information.deinit();
-            components.text(@src(), "用户名", theme.muted);
+            components.text(@src(), "用户名", theme.colors.muted);
             _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
             dvui.labelNoFmt(@src(), value.name, .{ .ellipsize = true }, .{ .font = theme.headingFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = theme.spacing.card_gap } });
-            components.text(@src(), "UUID", theme.muted);
+            components.text(@src(), "UUID", theme.colors.muted);
             _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
             components.hint(@src(), value.uuid);
             _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
-            components.text(@src(), "微软账户信息由登录同步。删除账户或退出登录将移除此账户，并清理已保存的登录凭据。", theme.muted);
+            components.text(@src(), "微软账户信息由登录同步。删除账户或退出登录将移除此账户，并清理已保存的登录凭据。", theme.colors.muted);
         } else {
-            const panel = components.formPanel(@src(), .{ .compact = true, .tag = "account-form-panel", .options = .{ .corners = .all(theme.sizing.card_radius), .margin = R.all(0), .min_size_content = .height(80) } });
+            const panel = components.formPanel(@src(), .{ .compact = true, .tag = "account-form-panel", .options = .{ .corners = .all(theme.cardRadius()), .margin = R.all(0), .min_size_content = .height(80) } });
             defer panel.deinit();
             _ = components.field(@src(), "用户名", &ui.draft.name, .{ .tag = "account-name", .gap_after = 0 });
         }
-        if (!current) components.text(@src(), "所选账户已更改，请关闭后重新编辑", danger);
-    } else components.text(@src(), "账户不存在，请关闭后重新选择", danger);
+        if (!current) components.text(@src(), "所选账户已更改，请关闭后重新编辑", theme.colors.danger);
+    } else components.text(@src(), "账户不存在，请关闭后重新选择", theme.colors.danger);
     // Footer layout runs first; copy only after the field handles this frame’s events.
     if (save_clicked) ui.queue(.save, ui.draft.id, std.mem.sliceTo(&ui.draft.name, 0));
     if (ui.failure) |err| {
         _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
-        components.text(@src(), errorText(err), danger);
+        components.text(@src(), errorText(err), theme.colors.danger);
     }
 }
 fn drawConfirmation(ui: *Ui, doc: *const config.Document, busy: bool) void {
@@ -291,9 +292,9 @@ fn drawConfirmation(ui: *Ui, doc: *const config.Document, busy: bool) void {
     defer information.deinit();
     if (account) |value| {
         dvui.labelNoFmt(@src(), if (confirmation.sign_out) fmt("退出「{s}」的登录？", .{value.name}) else fmt("删除账户「{s}」？", .{value.name}), .{ .ellipsize = true }, .{ .font = theme.headingFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = if (value.kind == .microsoft) theme.spacing.card_gap else 0 } });
-        if (value.kind == .microsoft) components.text(@src(), "此操作将移除账户，并清理已保存的登录凭据。", theme.muted);
-    } else components.text(@src(), "账户不存在", danger);
-    if (ui.failure) |err| components.text(@src(), errorText(err), danger);
+        if (value.kind == .microsoft) components.text(@src(), "此操作将移除账户，并清理已保存的登录凭据。", theme.colors.muted);
+    } else components.text(@src(), "账户不存在", theme.colors.danger);
+    if (ui.failure) |err| components.text(@src(), errorText(err), theme.colors.danger);
 }
 fn drawLogin(ui: *Ui, snapshot: accounts_manager.Snapshot, now_ms: u64) void {
     const window = components.modal(@src(), if (ui.verification_open) "微软登录 · 等待授权" else "微软登录 · 验证码", if (ui.verification_open) theme.style.dialogs.device_wait_height else theme.style.dialogs.device_code_height);
@@ -305,15 +306,15 @@ fn drawLogin(ui: *Ui, snapshot: accounts_manager.Snapshot, now_ms: u64) void {
     }
     const scroll = components.scrollBody(@src());
     defer scroll.deinit();
-    components.text(@src(), "在浏览器中登录微软账户，并输入下方验证码。授权完成后将自动登录。", theme.muted);
+    components.text(@src(), "在浏览器中登录微软账户，并输入下方验证码。授权完成后将自动登录。", theme.colors.muted);
     _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
     const information = components.modalSection(@src(), .{ .min_height = if (ui.verification_open) 248 else 200, .gap_after = 0, .tag = "account-device-information" });
     defer information.deinit();
-    components.text(@src(), phaseText(snapshot.phase), if (snapshot.phase == .authenticated) theme.accent else theme.muted);
+    components.text(@src(), phaseText(snapshot.phase), if (snapshot.phase == .authenticated) theme.colors.accent else theme.colors.muted);
     if (snapshot.device) |device| {
         const usable = (snapshot.phase == .device_pending or snapshot.phase == .slow_down) and now_ms < device.expires_at_ms;
         _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
-        dvui.labelNoFmt(@src(), device.userCode(), .{}, .{ .font = theme.fontSized(24), .min_size_content = .{ .w = 184, .h = 36 }, .padding = .{ .x = 12, .y = 10, .w = 12, .h = 10 }, .border = R.all(0), .margin = .{ .h = 18 }, .background = true, .color_fill = .{ .color = theme.background }, .tag = "account-device-code" });
+        dvui.labelNoFmt(@src(), device.userCode(), .{}, .{ .font = theme.fontSized(24), .min_size_content = .{ .w = 184, .h = 36 }, .padding = .{ .x = 12, .y = 10, .w = 12, .h = 10 }, .border = R.all(0), .margin = .{ .h = 18 }, .background = true, .color_fill = .{ .color = theme.colors.inset }, .tag = "account-device-code" });
         components.hint(@src(), device.verificationUri());
         components.hint(@src(), fmt("有效期剩余 {d} 秒 · 下次检查 {d} 秒后", .{ ((device.expires_at_ms -| now_ms) + 999) / 1000, ((device.next_poll_ms -| now_ms) + 999) / 1000 }));
         {
@@ -324,8 +325,8 @@ fn drawLogin(ui: *Ui, snapshot: accounts_manager.Snapshot, now_ms: u64) void {
             if (components.button(@src(), if (ui.verification_open) "重新打开验证页" else "打开验证页", .{ .enabled = usable, .primary = true, .placement = .footer, .min_width = if (ui.verification_open) 184 else 144, .tag = "account-open-verification" })) ui.queue(.open_verification, null, null);
         }
     }
-    if (snapshot.failure) |err| components.text(@src(), errorText(err), danger);
-    if (ui.failure) |err| components.text(@src(), errorText(err), danger);
+    if (snapshot.failure) |err| components.text(@src(), errorText(err), theme.colors.danger);
+    if (ui.failure) |err| components.text(@src(), errorText(err), theme.colors.danger);
     const unconfigured = if (ui.failure) |err| err == error.Unconfigured else false;
     if (!snapshot.busy and !snapshot.publication_pending and (snapshot.phase == .failed or snapshot.phase == .expired or snapshot.phase == .cancelled or unconfigured)) {
         if (components.button(@src(), "重试登录", .{ .primary = true, .tag = "account-login-retry" })) ui.queue(.start, null, null);

@@ -130,7 +130,7 @@ pub fn drawHomeWithOptions(ui: *Ui, doc: *const config.Document, compact: bool) 
     };
     defer choices.deinit(ui.allocator);
     var choice = choices.choice;
-    if (components.dropdownTagged(@src(), "启动目标", choices.labels, .{ .choice_nullable = &choice }, .{ .placeholder = "当前服务器不可用", .null_selectable = false }, "home-server-target")) {
+    if (components.dropdown(@src(), "启动目标", choices.labels, .{ .choice_nullable = &choice }, .{ .placeholder = "当前服务器不可用", .null_selectable = false }, .{ .tag = "home-server-target" })) {
         if (choice) |index| {
             if (choices.ids[index]) |id| ui.queue(.select, id) else ui.queue(.clear_server, null);
         }
@@ -145,14 +145,14 @@ pub fn drawHomeSummary(ui: *Ui, doc: *const config.Document, compact: bool) void
         if (findServer(doc, id)) |server| {
             const detail_font = theme.captionFont();
             dvui.labelNoFmt(@src(), server.name, .{}, .{ .tag = "home-server-target", .font = font, .padding = R.all(0), .margin = R.all(0), .expand = .horizontal, .max_size_content = .width(0) });
-            const detail_options: dvui.Options = .{ .font = detail_font, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .y = theme.spacing.detail_gap, .h = if (compact) 0 else theme.spacing.row_gap }, .color_text = .{ .color = theme.accent } };
+            const detail_options: dvui.Options = .{ .font = detail_font, .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .y = theme.spacing.detail_gap, .h = if (compact) 0 else theme.spacing.row_gap }, .color_text = .{ .color = theme.colors.accent } };
             const address = dvui.textLayout(@src(), .{}, detail_options.override(.{ .tag = "home-server-address" }));
             address.addText(fmt("{s}:{d}", .{ server.address, server.port }), .{});
             address.deinit();
             const bound_name = if (server.instance_id) |bound| for (doc.instances) |instance| {
                 if (std.mem.eql(u8, instance.id, bound)) break instance.name;
             } else "未绑定实例" else "未绑定实例";
-            const bound_instance = dvui.textLayout(@src(), .{}, detail_options.override(.{ .tag = "home-server-instance", .color_text = .{ .color = theme.muted } }));
+            const bound_instance = dvui.textLayout(@src(), .{}, detail_options.override(.{ .tag = "home-server-instance", .color_text = .{ .color = theme.colors.muted } }));
             bound_instance.addText(bound_name, .{});
             bound_instance.deinit();
         }
@@ -186,8 +186,10 @@ fn drawEditor(ui: *Ui, doc: *const config.Document) void {
     const scroll = components.scrollBody(@src());
     defer scroll.deinit();
     if (ui.failure) |err| {
-        components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), theme.danger);
-        if (ui.dirty and !ui.adding and components.button(@src(), "重试", .{})) ui.queue(.save, null);
+        components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), theme.colors.danger);
+        if (ui.dirty and !ui.adding and components.button(@src(), "重试", .{
+            .standalone = true,
+        })) ui.queue(.save, null);
     }
     {
         const panel = components.formPanel(@src(), .{ .tag = "server-editor" });
@@ -222,7 +224,7 @@ fn drawEditor(ui: *Ui, doc: *const config.Document) void {
             labels[index + 1] = instance.name;
             if (sameId(ui.draft.instance_id, instance.id)) choice = index + 1;
         }
-        if (components.dropdownStyled(@src(), "绑定实例", labels, .{ .choice_nullable = &choice }, .{ .null_selectable = false }, .{ .tag = "server-instance-binding", .margin = R.all(0) })) {
+        if (components.dropdown(@src(), "绑定实例", labels, .{ .choice_nullable = &choice }, .{ .null_selectable = false }, .{ .tag = "server-instance-binding", .margin = R.all(0) })) {
             if (choice) |index| {
                 const owned = if (index == 0) null else ui.allocator.dupe(u8, doc.instances[index - 1].id) catch |err| {
                     ui.failure = err;
@@ -235,7 +237,7 @@ fn drawEditor(ui: *Ui, doc: *const config.Document) void {
         }
     }
     if (!ui.adding) {
-        if (ui.draft.id) |id| if (components.button(@src(), "删除", .{ .tag = "server-delete", .destructive = true, .expand = true, .enabled = ui.deleting_id == null })) ui.queue(.ask_delete, id);
+        if (ui.draft.id) |id| if (components.button(@src(), "删除", .{ .standalone = true, .tag = "server-delete", .destructive = true, .expand = true, .enabled = ui.deleting_id == null })) ui.queue(.ask_delete, id);
     }
 }
 
@@ -313,8 +315,8 @@ fn drawBindingPrompt(ui: *Ui, server: config.Server) void {
     }
     const body = components.scrollBody(@src());
     defer body.deinit();
-    components.text(@src(), "请先前往服务器编辑页面绑定实例，再启动游戏。", theme.foreground);
-    if (ui.failure) |err| components.text(@src(), fmt("无法打开编辑页面：{s}", .{@errorName(err)}), theme.danger);
+    components.text(@src(), "请先前往服务器编辑页面绑定实例，再启动游戏。", theme.colors.foreground);
+    if (ui.failure) |err| components.text(@src(), fmt("无法打开编辑页面：{s}", .{@errorName(err)}), theme.colors.danger);
 }
 
 pub fn drawModal(ui: *Ui, doc: *const config.Document) void {
@@ -339,8 +341,8 @@ pub fn drawModal(ui: *Ui, doc: *const config.Document) void {
     }
     const body = components.scrollBody(@src());
     defer body.deinit();
-    components.text(@src(), fmt("删除服务器「{s}」？", .{server.name}), theme.foreground);
-    if (ui.failure) |err| components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), theme.danger);
+    components.text(@src(), fmt("删除服务器「{s}」？", .{server.name}), theme.colors.foreground);
+    if (ui.failure) |err| components.text(@src(), fmt("操作失败：{s}", .{@errorName(err)}), theme.colors.danger);
 }
 
 pub fn selectLaunchTarget(store: *config.Store, manager: *server_manager.Manager, id: []const u8) !void {

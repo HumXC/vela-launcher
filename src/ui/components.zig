@@ -31,17 +31,17 @@ pub fn sidebarItem(src: std.builtin.SourceLocation, key: []const u8, name: []con
         .min_size_content = geometry.content,
         .padding = geometry.padding,
         .margin = .{ .x = options.indent, .h = options.gap_after },
-        .corners = .all(theme.sizing.control_radius),
+        .corners = .all(theme.controlRadius()),
         .border = R.all(theme.sizing.control_border),
-        .color_border = .{ .color = if (options.selected) theme.accent else theme.outline },
-        .color_fill = .{ .color = if (options.selected) theme.selected_surface else theme.sidebar },
-        .color_fill_hover = .{ .color = theme.selected_surface },
-        .color_fill_press = .{ .color = theme.outline },
-        .color_text = if (!options.enabled) .{ .color = theme.muted } else if (options.selected) .{ .color = theme.selected_text } else null,
+        .color_border = .{ .color = if (options.selected) theme.colors.accent else theme.colors.outline },
+        .color_fill = .{ .color = if (options.selected) theme.colors.selected_surface else theme.colors.sidebar },
+        .color_fill_hover = .{ .color = theme.colors.selected_surface },
+        .color_fill_press = .{ .color = theme.panelColor(theme.colors.outline) },
+        .color_text = if (!options.enabled) .{ .color = theme.colors.muted } else if (options.selected) .{ .color = theme.colors.selected_text } else null,
         .tab_index = if (options.enabled) null else 0,
     });
     defer control.deinit();
-    buttonState(&control, options.enabled);
+    buttonState(&control, options.enabled, false);
     const row = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .horizontal,
         .min_size_content = .{ .h = geometry.content.h },
@@ -73,12 +73,12 @@ pub fn sidebarItem(src: std.builtin.SourceLocation, key: []const u8, name: []con
         }));
         if (options.subtitle) |subtitle| {
             _ = dvui.spacer(@src(), .{ .min_size_content = .{ .h = theme.spacing.detail_gap } });
-            const detail = dvui.textLayout(@src(), .{ .break_lines = false }, control.style().override(.{
+            const detail = dvui.textLayout(@src(), .{ .break_lines = false }, theme.foregroundOptions(control.style()).override(.{
                 .expand = .horizontal,
                 .min_size_content = .{ .h = subtitle_height },
                 .max_size_content = .width(0),
                 .font = subtitle_font,
-                .color_text = .{ .color = theme.muted },
+                .color_text = .{ .color = theme.colors.muted },
                 .background = false,
                 .padding = R.all(0),
                 .margin = R.all(0),
@@ -87,7 +87,6 @@ pub fn sidebarItem(src: std.builtin.SourceLocation, key: []const u8, name: []con
             detail.deinit();
         }
     }
-    if (options.enabled) control.drawFocus();
     const tooltip_text = if (options.subtitle) |subtitle| std.fmt.allocPrint(dvui.currentWindow().arena(), "{s}\n{s}", .{ name, subtitle }) catch name else name;
     tooltip(src, control.data().id, control.data().borderRectScale().r, tooltip_text);
     return options.enabled and control.clicked();
@@ -109,12 +108,12 @@ pub fn sidebarAction(src: std.builtin.SourceLocation, key: []const u8, name: []c
         .padding = geometry.padding,
         .margin = .{ .h = options.gap_after },
         .border = R.all(theme.sizing.control_border),
-        .corners = .all(theme.sizing.control_radius),
-        .color_border = .{ .color = if (options.selected) theme.accent else theme.control_outline },
-        .color_fill = .{ .color = if (options.selected) theme.selected_surface else theme.sidebar },
-        .color_fill_hover = .{ .color = if (options.enabled) theme.selected_surface else theme.sidebar },
-        .color_fill_press = .{ .color = if (options.enabled) theme.outline else theme.sidebar },
-        .color_text = if (options.selected) .{ .color = theme.selected_text } else null,
+        .corners = .all(theme.controlRadius()),
+        .color_border = .{ .color = if (options.selected) theme.colors.accent else theme.colors.control_outline },
+        .color_fill = .{ .color = if (options.selected) theme.colors.selected_surface else theme.colors.sidebar },
+        .color_fill_hover = .{ .color = if (options.enabled) theme.colors.selected_surface else theme.colors.sidebar },
+        .color_fill_press = .{ .color = if (options.enabled) theme.panelColor(theme.colors.outline) else theme.colors.sidebar },
+        .color_text = if (options.selected) .{ .color = theme.colors.selected_text } else null,
         .tab_index = if (options.enabled) null else 0,
     });
     defer control.deinit();
@@ -127,14 +126,13 @@ pub fn sidebarAction(src: std.builtin.SourceLocation, key: []const u8, name: []c
         }
     }
     if (options.enabled) control.processEvents() else control.processHover();
-    control.drawBackground();
+    theme.surface.buttonBackground(&control);
     {
         const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .h = geometry.content.h }, .padding = R.all(0), .margin = R.all(0), .background = false });
         defer row.deinit();
         if (options.icon) |asset| dvui.icon(@src(), name, asset, .{}, control.style().override(.{ .min_size_content = dvui.Size.all(theme.sizing.sidebar_icon), .max_size_content = .size(dvui.Size.all(theme.sizing.sidebar_icon)), .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.control_padding_x }, .role = .none }));
         dvui.labelNoFmt(@src(), name, .{}, control.style().override(.{ .font = font, .expand = .horizontal, .max_size_content = .width(0), .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .background = false, .role = .none, .tab_index = 0 }));
     }
-    if (options.enabled) control.drawFocus();
     tooltip(src, control.data().id, control.data().borderRectScale().r, name);
     return options.enabled and control.clicked();
 }
@@ -181,7 +179,7 @@ pub fn selectionCard(src: std.builtin.SourceLocation, key: []const u8, name: []c
     const padding = style.spacing.panel_compact_padding - style.sizing.control_border;
     const content_width = @max(0, @min(options.width, available) - 2 * (padding + theme.sizing.control_border));
     var control: dvui.ButtonWidget = undefined;
-    control.init(src, .{ .draw_focus = options.enabled }, .{
+    control.init(src, .{ .draw_focus = false }, .{
         .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, key))),
         .tag = options.tag,
         .label = .{ .text = name },
@@ -190,17 +188,18 @@ pub fn selectionCard(src: std.builtin.SourceLocation, key: []const u8, name: []c
         .max_size_content = .width(content_width),
         .padding = R.all(padding),
         .margin = R.all(0),
-        .corners = .all(theme.sizing.card_radius),
+        .corners = .all(theme.cardRadius()),
         .border = R.all(theme.sizing.control_border),
-        .color_border = .{ .color = if (options.selected) theme.accent else theme.outline },
-        .color_fill = .{ .color = if (options.selected) theme.selected_surface else theme.surface },
-        .color_fill_hover = .{ .color = if (options.enabled) theme.selected_surface else theme.surface },
-        .color_fill_press = .{ .color = if (options.enabled) theme.outline else theme.surface },
-        .color_text = if (options.enabled) null else .{ .color = theme.muted },
+        .color_border = .{ .color = dvui.Color.transparent },
+        .color_fill = .{ .color = theme.panelColor(if (options.selected) theme.colors.selected_surface else theme.colors.surface) },
+        .color_fill_hover = .{ .color = theme.panelColor(if (options.enabled) theme.colors.selected_surface else theme.colors.surface) },
+        .color_fill_press = .{ .color = theme.panelColor(if (options.enabled) theme.colors.outline else theme.colors.surface) },
+        .color_text = if (options.enabled) null else .{ .color = theme.colors.muted },
         .tab_index = if (options.enabled) null else 0,
     });
     defer control.deinit();
-    buttonState(&control, options.enabled);
+    buttonEvents(&control, options.enabled);
+    theme.panelFill(control.data(), control.style());
     if (options.visible) |visible| visible.* = control.data().visible();
     if (control.data().accesskit_node()) |node| {
         dvui.AccessKit.nodeSetSelected(node, options.selected);
@@ -238,12 +237,12 @@ pub fn selectionCard(src: std.builtin.SourceLocation, key: []const u8, name: []c
                         .border = R.all(0),
                         .corners = .all(options.avatar_radius),
                         .background = options.avatar_source == null,
-                        .color_fill = .{ .color = theme.accent },
+                        .color_fill = .{ .color = theme.colors.accent },
                         .role = .none,
                     });
                     defer avatar.deinit();
                     if (options.avatar_source) |image| {
-                        _ = dvui.image(@src(), .{ .source = image }, .{
+                        _ = @import("surface.zig").image(@src(), .{ .source = image }, .{
                             .tag = options.avatar_tag,
                             .min_size_content = dvui.Size.all(options.avatar_size),
                             .max_size_content = .size(dvui.Size.all(options.avatar_size)),
@@ -258,7 +257,7 @@ pub fn selectionCard(src: std.builtin.SourceLocation, key: []const u8, name: []c
                             .gravity_x = 0.5,
                             .gravity_y = 0.5,
                             .font = theme.fontSized(theme.typography.avatar),
-                            .color_text = .{ .color = theme.background },
+                            .color_text = .{ .color = theme.colors.background },
                             .background = false,
                             .padding = R.all(0),
                             .margin = R.all(0),
@@ -306,10 +305,10 @@ pub fn selectionCard(src: std.builtin.SourceLocation, key: []const u8, name: []c
         if (options.footer_text) |caption| controlText(@src(), caption, control.style().override(.{
             .font = theme.captionFont(),
             .margin = .{ .y = 2 },
-            .color_text = .{ .color = theme.muted },
+            .color_text = .{ .color = theme.colors.muted },
         }));
     }
-    if (options.enabled) control.drawFocus();
+    theme.drawCardOutline(control.data(), options.selected or (options.enabled and control.focused()));
     if ((options.bounded_text and options.auto_tooltip) or options.tooltip != null) {
         const full_text = std.fmt.allocPrint(dvui.currentWindow().arena(), "{s}\n{s}\n{s}", .{ name, options.tooltip orelse options.description, options.status orelse "" }) catch name;
         tooltip(src, control.data().id, control.data().borderRectScale().r, full_text);
@@ -356,7 +355,7 @@ pub fn selectionCheck(src: std.builtin.SourceLocation, options: SelectionCheckOp
             .border = R.all(0),
             .corners = .all(options.diameter / 2),
             .background = true,
-            .color_fill = .{ .color = if (options.enabled) theme.accent else theme.muted },
+            .color_fill = .{ .color = if (options.enabled) theme.colors.accent else theme.colors.muted },
             .role = .none,
             .tab_index = 0,
         });
@@ -379,7 +378,7 @@ pub fn selectionCheck(src: std.builtin.SourceLocation, options: SelectionCheckOp
             .{ .x = rs.r.x + rs.r.w * 0.4, .y = rs.r.y + rs.r.h * 0.75 },
             .{ .x = rs.r.x + rs.r.w * 0.85, .y = rs.r.y + rs.r.h * 0.25 },
         };
-        (dvui.Path{ .points = &points }).stroke(.{ .thickness = rs.s * 2, .color = .{ .color = theme.background }, .endcap_style = .square });
+        (dvui.Path{ .points = &points }).stroke(.{ .thickness = rs.s * 2, .color = .{ .color = theme.colors.background }, .endcap_style = .square });
     }
 }
 
@@ -401,7 +400,7 @@ fn selectionCardDetails(control: *dvui.ButtonWidget, options: SelectionCardOptio
         const description = if (options.bounded_text) boundedLines(options.description, font, dvui.parentGet().data().contentRect().w) else options.description;
         controlText(@src(), description, control.style().override(.{
             .font = theme.captionFont(),
-            .color_text = .{ .color = theme.muted },
+            .color_text = .{ .color = theme.colors.muted },
             .margin = .{ .y = style.spacing.detail_gap },
         }));
     }
@@ -421,7 +420,7 @@ fn selectionCardDetails(control: *dvui.ButtonWidget, options: SelectionCardOptio
             const width = @max(0, status_row.data().contentRect().w - if (options.signal != null) @as(f32, 33) else 0);
             controlText(@src(), if (options.bounded_text) ellipsize(status, font, width) else status, control.style().override(.{
                 .font = font,
-                .color_text = .{ .color = options.status_color orelse theme.muted },
+                .color_text = .{ .color = options.status_color orelse theme.colors.muted },
             }));
         }
     }
@@ -488,7 +487,7 @@ fn disclosureHeader(src: std.builtin.SourceLocation, key: []const u8, name: []co
         .min_size_content = geometry.content,
         .padding = geometry.padding,
         .margin = .{ .h = if (expanded.*) content_gap else 0 },
-        .corners = .all(theme.sizing.control_radius),
+        .corners = .all(theme.controlRadius()),
         .border = R.all(0),
         .background = !embedded,
         .color_fill = .{ .color = style.colors.transparent },
@@ -496,7 +495,7 @@ fn disclosureHeader(src: std.builtin.SourceLocation, key: []const u8, name: []co
         .color_fill_press = .{ .color = style.colors.pressed_surface },
     });
     defer control.deinit();
-    buttonState(&control, true);
+    buttonState(&control, true, false);
     if (control.clicked()) expanded.* = !expanded.*;
     if (control.data().accesskit_node()) |node| dvui.AccessKit.nodeSetExpanded(node, expanded.*);
     {
@@ -536,7 +535,6 @@ fn disclosureHeader(src: std.builtin.SourceLocation, key: []const u8, name: []co
         }
         dvui.labelNoFmt(@src(), name, .{ .align_y = 0.5 }, control.style().override(.{ .tag = std.fmt.allocPrint(dvui.currentWindow().arena(), "{s}-label", .{key}) catch null, .expand = .horizontal, .gravity_y = 0.5, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0), .background = false, .role = .none, .tab_index = 0 }));
     }
-    control.drawFocus();
 }
 
 /// Keep word boundaries in narrow cards; DVUI only does this at wider measures.
@@ -568,7 +566,7 @@ fn controlText(src: std.builtin.SourceLocation, value: []const u8, options: dvui
         .process_events_in_deinit = false,
         .focused = false,
         .show_touch_draggables = false,
-    }, options.override(.{
+    }, theme.foregroundOptions(options).override(.{
         .expand = .horizontal,
         .min_size_content = .{ .h = options.fontGet().textHeight() },
         .max_size_content = .width(0),
@@ -602,7 +600,7 @@ fn signalBars(src: std.builtin.SourceLocation, signal: Signal, enabled: bool) vo
     const active = switch (signal) {
         .fair => style.colors.warning,
         .poor => style.colors.danger,
-        else => theme.accent,
+        else => theme.colors.accent,
     };
     const bars = dvui.box(src, .{ .dir = .horizontal }, .{
         .gravity_x = 1,
@@ -706,7 +704,7 @@ pub fn section(src: std.builtin.SourceLocation, name: []const u8) void {
         .expand = .horizontal,
         .max_size_content = .width(0),
         .font = theme.headingFont(),
-        .color_text = .{ .color = theme.muted },
+        .color_text = .{ .color = theme.colors.muted },
         .background = false,
         .padding = R.all(0),
         .margin = .{ .y = theme.spacing.section_gap, .h = theme.spacing.section_label_gap },
@@ -728,7 +726,7 @@ pub fn text(src: std.builtin.SourceLocation, value: []const u8, color: dvui.Colo
 }
 
 pub fn emptyState(src: std.builtin.SourceLocation, value: []const u8) void {
-    text(src, value, theme.muted);
+    text(src, value, theme.colors.muted);
 }
 
 /// Standard inline action; use button options for primary actions or icons.
@@ -790,7 +788,7 @@ pub const ModalSectionOptions = struct {
 };
 
 pub fn modalSection(src: std.builtin.SourceLocation, options: ModalSectionOptions) *dvui.BoxWidget {
-    return dvui.box(src, .{}, .{ .tag = options.tag, .expand = if (options.expand) .both else .horizontal, .max_size_content = .width(0), .min_size_content = .height(@max(0, options.min_height - 2 * style.spacing.panel_compact_padding)), .padding = R.all(style.spacing.panel_compact_padding - style.sizing.control_border), .margin = .{ .h = options.gap_after }, .border = R.all(style.sizing.control_border), .corners = .all(style.sizing.card_radius), .background = true, .color_fill = .{ .color = theme.surface }, .color_border = .{ .color = theme.outline } });
+    return theme.panel(src, .{}, .{ .tag = options.tag, .expand = if (options.expand) .both else .horizontal, .max_size_content = .width(0), .min_size_content = .height(@max(0, options.min_height - 2 * style.spacing.panel_compact_padding)), .padding = R.all(style.spacing.panel_compact_padding - style.sizing.control_border), .margin = .{ .h = options.gap_after }, .border = R.all(style.sizing.control_border), .corners = .all(theme.cardRadius()), .background = true, .color_fill = .{ .color = theme.panelColor(theme.colors.surface) }, .color_border = .{ .color = theme.colors.outline } });
 }
 
 pub fn alert(src: std.builtin.SourceLocation, heading: []const u8, message: []const u8) void {
@@ -829,7 +827,7 @@ fn alertDisplay(id: dvui.Id) !void {
     defer scroll.deinit();
     const information = modalSection(@src(), .{ .gap_after = 0 });
     defer information.deinit();
-    text(@src(), message, theme.foreground);
+    text(@src(), message, theme.colors.foreground);
 }
 
 /// Reserve this footer before drawing an expanding editor body. Callers queue
@@ -851,7 +849,7 @@ pub fn formActions(src: std.builtin.SourceLocation, options: FormOptions) FormAc
 }
 
 fn formButton(src: std.builtin.SourceLocation, name: []const u8, enabled: bool, primary: bool, right: bool, width: f32) bool {
-    return button(src, name, .{ .enabled = enabled, .primary = primary, .gravity_x = if (right) 1 else 0, .placement = .footer, .min_width = width });
+    return button(src, name, .{ .enabled = enabled, .primary = primary, .gravity_x = if (right) 1 else 0, .placement = .footer, .standalone = true, .min_width = width });
 }
 
 pub fn title(src: std.builtin.SourceLocation, name: []const u8) void {
@@ -861,7 +859,7 @@ pub fn title(src: std.builtin.SourceLocation, name: []const u8) void {
 }
 
 pub fn hint(src: std.builtin.SourceLocation, value: []const u8) void {
-    const layout = dvui.textLayout(src, .{}, .{ .font = theme.captionFont(), .color_text = .{ .color = theme.muted }, .expand = .horizontal, .max_size_content = .width(0), .background = false, .padding = R.all(0), .margin = R.all(0) });
+    const layout = dvui.textLayout(src, .{}, .{ .font = theme.captionFont(), .color_text = .{ .color = theme.colors.muted }, .expand = .horizontal, .max_size_content = .width(0), .background = false, .padding = R.all(0), .margin = R.all(0) });
     layout.addText(value, .{});
     layout.deinit();
 }
@@ -885,6 +883,8 @@ pub const ButtonOptions = struct {
     tag: ?[]const u8 = null,
     placement: enum { inline_action, footer } = .inline_action,
     expand: bool = false,
+    /// Use panel-strength fills when the control sits directly on the wallpaper.
+    standalone: bool = false,
     rect_out: ?*?dvui.Rect.Physical = null,
     min_width: f32 = theme.sizing.button_min_width,
     tooltip: ?[]const u8 = null,
@@ -892,7 +892,12 @@ pub const ButtonOptions = struct {
     label_alignment: f32 = 0.5,
 };
 
-fn buttonState(control: *dvui.ButtonWidget, enabled: bool) void {
+fn buttonState(control: *dvui.ButtonWidget, enabled: bool, material: bool) void {
+    buttonEvents(control, enabled);
+    theme.buttonBackground(control, .{ .material = material });
+}
+
+fn buttonEvents(control: *dvui.ButtonWidget, enabled: bool) void {
     if (control.data().accesskit_node()) |node| {
         if (!enabled) {
             dvui.AccessKit.nodeSetDisabled(node);
@@ -901,7 +906,6 @@ fn buttonState(control: *dvui.ButtonWidget, enabled: bool) void {
         }
     }
     if (enabled) control.processEvents() else control.processHover();
-    control.drawBackground();
 }
 
 pub fn button(src: std.builtin.SourceLocation, name: []const u8, options: ButtonOptions) bool {
@@ -918,21 +922,22 @@ pub fn button(src: std.builtin.SourceLocation, name: []const u8, options: Button
         .min_size_content = geometry.content,
         .padding = geometry.padding,
         .margin = if (options.placement == .footer) R.all(0) else .{ .w = theme.spacing.action_gap, .h = theme.spacing.action_gap },
-        .corners = .all(theme.sizing.control_radius),
+        .corners = .all(theme.controlRadius()),
         .style = if (options.primary and options.enabled) .highlight else .control,
         .color_border = if (options.destructive) .{ .color = style.colors.danger } else null,
-        .color_fill = if (!options.enabled) .{ .color = theme.surface } else null,
+        .color_fill = if (options.standalone and !(options.primary and options.enabled)) .{ .color = theme.panelColor(theme.colors.surface) } else if (!options.enabled) .{ .color = theme.colors.surface } else null,
+        .color_fill_hover = if (options.standalone and !(options.primary and options.enabled)) .{ .color = theme.panelColor(if (options.enabled) theme.colors.selected_surface else theme.colors.surface) } else if (!options.enabled) .{ .color = theme.colors.surface } else null,
+        .color_fill_press = if (options.standalone and !(options.primary and options.enabled)) .{ .color = theme.panelColor(if (options.enabled) theme.colors.pressed_surface else theme.colors.surface) } else if (!options.enabled) .{ .color = theme.colors.surface } else null,
         .tab_index = if (options.enabled) null else 0,
     }));
     defer control.deinit();
-    buttonState(&control, options.enabled);
+    buttonState(&control, options.enabled, options.standalone and !(options.primary and options.enabled));
     {
         const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = options.label_alignment, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .background = false });
         defer row.deinit();
         if (options.icon) |asset| dvui.icon(@src(), name, asset, .{}, control.style().override(.{ .min_size_content = dvui.Size.all(theme.sizing.icon), .max_size_content = .{ .w = theme.sizing.icon, .h = theme.sizing.icon }, .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.row_gap }, .role = .none }));
-        dvui.labelNoFmt(@src(), name, .{ .align_y = 0.5 }, control.style().override(.{ .color_text = if (!options.enabled) .{ .color = theme.muted } else null, .background = false, .padding = R.all(0), .margin = R.all(0), .gravity_y = 0.5 }));
+        dvui.labelNoFmt(@src(), name, .{ .align_y = 0.5 }, control.style().override(.{ .color_text = if (!options.enabled) .{ .color = theme.colors.muted } else null, .background = false, .padding = R.all(0), .margin = R.all(0), .gravity_y = 0.5 }));
     }
-    if (options.enabled) control.drawFocus();
     if (options.rect_out) |out| out.* = control.data().borderRectScale().r;
     if (options.tooltip) |value| tooltip(src, control.data().id, control.data().borderRectScale().r, value);
     return options.enabled and control.clicked();
@@ -941,6 +946,7 @@ pub fn button(src: std.builtin.SourceLocation, name: []const u8, options: Button
 pub const IconOptions = struct {
     enabled: bool = true,
     selected: bool = false,
+    standalone: bool = false,
     tag: ?[]const u8 = null,
     /// Explicit outer size for compact task actions; a supplied rect takes precedence.
     size: f32 = theme.sizing.icon_button,
@@ -958,13 +964,15 @@ pub fn iconButton(src: std.builtin.SourceLocation, name: []const u8, asset: []co
         .min_size_content = geometry.content,
         .padding = geometry.padding,
         .margin = if (options.rect != null) R.all(0) else .{ .w = theme.sizing.sidebar_action_gap },
-        .corners = .all(theme.sizing.control_radius),
-        .color_text = if (!options.enabled) .{ .color = theme.muted } else if (options.selected) .{ .color = theme.accent } else null,
+        .corners = .all(theme.controlRadius()),
+        .color_fill = if (options.standalone) .{ .color = theme.panelColor(theme.colors.surface) } else null,
+        .color_fill_hover = if (options.standalone) .{ .color = theme.panelColor(if (options.enabled) theme.colors.selected_surface else theme.colors.surface) } else if (!options.enabled) .{ .color = theme.colors.surface } else null,
+        .color_fill_press = if (options.standalone) .{ .color = theme.panelColor(if (options.enabled) theme.colors.pressed_surface else theme.colors.surface) } else if (!options.enabled) .{ .color = theme.colors.surface } else null,
+        .color_text = if (!options.enabled) .{ .color = theme.colors.muted } else if (options.selected) .{ .color = theme.colors.accent } else null,
         .tab_index = if (options.enabled) null else 0,
     }));
-    buttonState(&control, options.enabled);
+    buttonState(&control, options.enabled, options.standalone);
     dvui.icon(@src(), name, asset, .{}, control.style().override(.{ .min_size_content = dvui.Size.all(theme.sizing.icon), .max_size_content = .size(dvui.Size.all(theme.sizing.icon)), .gravity_x = 0.5, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .role = .none }));
-    if (options.enabled) control.drawFocus();
     const clicked = options.enabled and control.clicked();
     const id = control.data().id;
     const rect = control.data().borderRectScale().r;
@@ -1031,14 +1039,13 @@ pub fn field(src: std.builtin.SourceLocation, name: []const u8, buffer: []u8, op
     return entry(@src(), name, buffer, options);
 }
 
-fn dropdownOptions(name: []const u8, entries: []const []const u8, tag: ?[]const u8) dvui.Options {
+fn dropdownOptions(name: []const u8, entries: []const []const u8) dvui.Options {
     const font = theme.bodyFont();
     var line_height = @max(font.lineHeight(), font.textSize(name).h);
     for (entries) |label| line_height = @max(line_height, font.textSize(label).h);
     // DVUI puts borders and padding on the inner menu item; the wrapper needs
     // the full outer minimum so expanding the item really allocates 48.
     return theme.controlOptions(line_height).override(.{
-        .tag = tag,
         .label = .{ .text = name },
         .expand = .horizontal,
         .min_size_content = .{ .h = theme.sizing.control_height },
@@ -1047,18 +1054,9 @@ fn dropdownOptions(name: []const u8, entries: []const []const u8, tag: ?[]const 
     });
 }
 
-pub fn dropdown(src: std.builtin.SourceLocation, name: []const u8, entries: []const []const u8, choice: dvui.DropdownChoice(usize), init_opts: dvui.DropdownInitOptions) bool {
-    return dvui.dropdown(src, entries, choice, init_opts, dropdownOptions(name, entries, null));
-}
-
-/// Stable identifiers are separate from user-facing labels.
-pub fn dropdownTagged(src: std.builtin.SourceLocation, name: []const u8, entries: []const []const u8, choice: dvui.DropdownChoice(usize), init_opts: dvui.DropdownInitOptions, tag: []const u8) bool {
-    return dvui.dropdown(src, entries, choice, init_opts, dropdownOptions(name, entries, tag));
-}
-
-/// Explicit geometry overrides for form-owned gaps, while legacy callers keep defaults.
-pub fn dropdownStyled(src: std.builtin.SourceLocation, name: []const u8, entries: []const []const u8, choice: dvui.DropdownChoice(usize), init_opts: dvui.DropdownInitOptions, options: dvui.Options) bool {
-    return dvui.dropdown(src, entries, choice, init_opts, dropdownOptions(name, entries, options.tag).override(options));
+/// Shared control geometry with explicit per-form tags and layout overrides.
+pub fn dropdown(src: std.builtin.SourceLocation, name: []const u8, entries: []const []const u8, choice: dvui.DropdownChoice(usize), init_opts: dvui.DropdownInitOptions, options: dvui.Options) bool {
+    return dvui.dropdown(src, entries, choice, init_opts, dropdownOptions(name, entries).override(options));
 }
 
 pub const CheckboxOptions = struct {
@@ -1098,7 +1096,7 @@ pub fn checkboxStyled(src: std.builtin.SourceLocation, value: *bool, name: []con
 pub fn checkbox(src: std.builtin.SourceLocation, value: *bool, name: []const u8, enabled: bool) bool {
     const opts = checkboxOptions(name, .{});
     if (enabled) return dvui.checkbox(src, value, name, opts);
-    const row = dvui.box(src, .{ .dir = .horizontal }, opts.override(.{ .expand = .horizontal, .max_size_content = .width(0), .color_text = .{ .color = theme.muted }, .tab_index = 0 }));
+    const row = dvui.box(src, .{ .dir = .horizontal }, opts.override(.{ .expand = .horizontal, .max_size_content = .width(0), .color_text = .{ .color = theme.colors.muted }, .tab_index = 0 }));
     defer row.deinit();
     if (row.data().accesskit_node()) |node| {
         dvui.AccessKit.nodeSetDisabled(node);
@@ -1106,24 +1104,23 @@ pub fn checkbox(src: std.builtin.SourceLocation, value: *bool, name: []const u8,
     }
     const mark = dvui.spacer(@src(), .{ .min_size_content = dvui.Size.all(opts.fontGet().textHeight()), .gravity_y = 0.5 });
     dvui.checkmark(value.*, false, mark.borderRectScale(), false, 0, opts);
-    dvui.labelNoFmt(@src(), name, .{}, .{ .color_text = .{ .color = theme.muted }, .gravity_y = 0.5, .padding = .{ .x = 6 }, .margin = R.all(0) });
+    dvui.labelNoFmt(@src(), name, .{}, .{ .color_text = .{ .color = theme.colors.muted }, .gravity_y = 0.5, .padding = .{ .x = 6 }, .margin = R.all(0) });
     return false;
 }
 
 pub fn toggle(src: std.builtin.SourceLocation, value: *bool, name: []const u8, enabled: bool) bool {
     const row = dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = theme.spacing.field_gap }, .background = false });
     defer row.deinit();
-    dvui.labelNoFmt(@src(), name, .{}, .{ .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .color_text = if (enabled) null else .{ .color = theme.muted } });
+    dvui.labelNoFmt(@src(), name, .{}, .{ .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .color_text = if (enabled) null else .{ .color = theme.colors.muted } });
     var control: dvui.ButtonWidget = undefined;
     control.init(@src(), .{ .grayed = !enabled, .draw_focus = enabled }, .{ .label = .{ .text = name }, .role = .ak_switch, .gravity_x = 1, .min_size_content = .{ .w = style.sizing.switch_width, .h = style.sizing.switch_height }, .max_size_content = .{ .w = style.sizing.switch_width, .h = style.sizing.switch_height }, .padding = R.all(0), .corners = .all(style.sizing.switch_height / 2), .border = R.all(0), .color_fill = .{ .color = if (value.*) style.colors.accent else style.colors.muted }, .tab_index = if (enabled) null else 0 });
     defer control.deinit();
-    buttonState(&control, enabled);
+    buttonState(&control, enabled, false);
     const changed = enabled and control.clicked();
     if (changed) value.* = !value.*;
     if (control.data().accesskit_node()) |node| dvui.AccessKit.nodeSetToggled(node, if (value.*) .ak_true else .ak_false);
     const knob = dvui.box(@src(), .{}, .{ .rect = .{ .x = if (value.*) style.sizing.switch_width - style.sizing.switch_inset - style.sizing.switch_knob else style.sizing.switch_inset, .y = style.sizing.switch_inset, .w = style.sizing.switch_knob, .h = style.sizing.switch_knob }, .padding = R.all(0), .margin = R.all(0), .background = true, .border = R.all(0), .corners = .all(style.sizing.switch_knob / 2), .color_fill = .{ .color = style.colors.foreground } });
     knob.deinit();
-    if (enabled) control.drawFocus();
     return changed;
 }
 
@@ -1133,7 +1130,7 @@ pub fn sidebarTitle(src: std.builtin.SourceLocation, name: []const u8, compact: 
 }
 
 pub fn sidebarPanel(src: std.builtin.SourceLocation) *dvui.BoxWidget {
-    return dvui.box(src, .{}, .{ .expand = .both, .padding = R.all(theme.spacing.sidebar_padding), .margin = .{ .x = theme.spacing.page_margin, .y = theme.spacing.page_margin, .h = theme.spacing.page_margin }, .corners = .all(theme.sizing.sidebar_radius), .background = true, .color_fill = .{ .color = theme.surface }, .border = R.all(1), .color_border = .{ .color = theme.outline } });
+    return theme.panel(src, .{}, .{ .expand = .both, .padding = R.all(theme.spacing.sidebar_padding), .margin = .{ .x = theme.spacing.page_margin, .y = theme.spacing.page_margin, .h = theme.spacing.page_margin }, .corners = .all(theme.sidebarRadius()), .background = true, .color_fill = .{ .color = theme.panelColor(theme.colors.surface) }, .border = R.all(1), .color_border = .{ .color = theme.colors.outline } });
 }
 
 /// Reserve the navigation footer before the expanding sidebar list.
@@ -1152,18 +1149,17 @@ pub fn sidebarNavigationButton(src: std.builtin.SourceLocation, key: []const u8,
         .padding = geometry.padding,
         .margin = R.all(0),
         .border = R.all(theme.sizing.control_border),
-        .corners = .all(theme.sizing.control_radius),
+        .corners = .all(theme.controlRadius()),
         .background = true,
-        .color_border = .{ .color = theme.outline },
-        .color_fill = .{ .color = theme.sidebar },
-        .color_fill_hover = .{ .color = theme.selected_surface },
+        .color_border = .{ .color = theme.colors.outline },
+        .color_fill = .{ .color = theme.colors.sidebar },
+        .color_fill_hover = .{ .color = theme.colors.selected_surface },
         .color_fill_press = .{ .color = style.colors.pressed_surface },
         .tab_index = if (enabled) null else 0,
     });
     defer control.deinit();
-    buttonState(&control, enabled);
-    dvui.labelNoFmt(@src(), name, .{ .ellipsize = true, .align_y = 0.5 }, control.style().override(.{ .font = font, .expand = .horizontal, .max_size_content = .width(0), .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .background = false, .color_fill = .{ .color = transparent }, .color_text = if (!enabled) .{ .color = theme.muted } else null }));
-    if (enabled) control.drawFocus();
+    buttonState(&control, enabled, false);
+    dvui.labelNoFmt(@src(), name, .{ .ellipsize = true, .align_y = 0.5 }, control.style().override(.{ .font = font, .expand = .horizontal, .max_size_content = .width(0), .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .background = false, .color_fill = .{ .color = transparent }, .color_text = if (!enabled) .{ .color = theme.colors.muted } else null }));
     return enabled and control.clicked();
 }
 
@@ -1179,7 +1175,7 @@ pub fn scrollBody(src: std.builtin.SourceLocation) *dvui.ScrollAreaWidget {
 
 /// Content-bearing Bento panels share one surface, inset, and spacing rhythm.
 pub fn bentoPanel(src: std.builtin.SourceLocation, options: dvui.Options) *dvui.BoxWidget {
-    return dvui.box(src, .{}, (dvui.Options{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(style.spacing.panel_padding - style.sizing.control_border), .margin = .{ .h = style.spacing.group_gap }, .border = R.all(style.sizing.control_border), .corners = .all(style.sizing.panel_radius), .background = true, .color_fill = .{ .color = style.colors.surface }, .color_border = .{ .color = style.colors.outline } }).override(options));
+    return theme.panel(src, .{}, (dvui.Options{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(style.spacing.panel_padding - style.sizing.control_border), .margin = .{ .h = style.spacing.group_gap }, .border = R.all(style.sizing.control_border), .corners = .all(theme.panelRadius()), .background = true, .color_fill = .{ .color = theme.panelColor(style.colors.surface) }, .color_border = .{ .color = style.colors.outline } }).override(options));
 }
 
 /// Form panels own all four visible insets, including the final field's bottom.
@@ -1240,7 +1236,7 @@ pub fn modalWithClose(src: std.builtin.SourceLocation, name: []const u8, request
 
 /// A left aligned 24 px title replaces the platform window header and separator.
 pub fn modalTitle(src: std.builtin.SourceLocation, name: []const u8, tag: ?[]const u8) void {
-    const label = dvui.textLayout(src, .{}, .{ .tag = tag, .label = .{ .text = name }, .role = .label, .tab_index = 0, .font = theme.titleFont(), .color_text = .{ .color = theme.foreground }, .expand = .horizontal, .min_size_content = .height(style.dialogs.title_height), .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = style.dialogs.title_gap }, .background = false });
+    const label = dvui.textLayout(src, .{}, .{ .tag = tag, .label = .{ .text = name }, .role = .label, .tab_index = 0, .font = theme.titleFont(), .color_text = .{ .color = theme.colors.foreground }, .expand = .horizontal, .min_size_content = .height(style.dialogs.title_height), .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = style.dialogs.title_gap }, .background = false });
     label.addText(name, .{});
     label.deinit();
 }
@@ -1267,10 +1263,10 @@ fn fixedModalPanel(src: std.builtin.SourceLocation, name: []const u8, requested_
         .padding = R.all(@max(0, inset - 1)),
         .margin = R.all(0),
         .border = R.all(1),
-        .corners = .all(theme.sizing.modal_radius),
-        .color_fill = .{ .color = theme.surface },
+        .corners = .all(theme.modalRadius()),
+        .color_fill = .{ .color = theme.panelColor(theme.colors.surface) },
         .color_text = .{ .color = dvui.Color.black },
-        .color_border = .{ .color = theme.control_outline },
+        .color_border = .{ .color = theme.colors.control_outline },
         .label = .{ .text = name },
     });
     // FloatingWindow defaults to dragging on all unused panel space.
@@ -1294,16 +1290,15 @@ pub fn toolbar(src: std.builtin.SourceLocation) *dvui.BoxWidget {
 /// Only the More > Game overview uses these navigation cards.
 pub fn managementCard(src: std.builtin.SourceLocation, name: []const u8, asset: []const u8) bool {
     var card: dvui.ButtonWidget = undefined;
-    card.init(src, .{}, .{ .expand = .both, .min_size_content = .{ .h = style.cards.management_content_height }, .max_size_content = .width(0), .padding = R.all(style.spacing.panel_padding - style.sizing.control_border), .margin = R.all(0), .corners = .all(style.sizing.panel_radius), .border = R.all(style.sizing.control_border), .color_fill = .{ .color = style.colors.surface }, .color_border = .{ .color = style.colors.outline }, .label = .{ .text = name } });
+    card.init(src, .{}, .{ .expand = .both, .min_size_content = .{ .h = style.cards.management_content_height }, .max_size_content = .width(0), .padding = R.all(style.spacing.panel_padding - style.sizing.control_border), .margin = R.all(0), .corners = .all(theme.panelRadius()), .border = R.all(style.sizing.control_border), .color_fill = .{ .color = theme.panelColor(style.colors.surface) }, .color_fill_hover = .{ .color = theme.panelColor(style.colors.selected_surface) }, .color_fill_press = .{ .color = theme.panelColor(style.colors.pressed_surface) }, .color_border = .{ .color = style.colors.outline }, .label = .{ .text = name } });
     defer card.deinit();
-    buttonState(&card, true);
+    buttonState(&card, true, true);
     {
         const contents = dvui.box(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .gravity_y = 0.5 });
         defer contents.deinit();
         dvui.icon(@src(), name, asset, .{}, card.style().override(.{ .min_size_content = dvui.Size.all(style.cards.management_icon), .color_text = .{ .color = style.colors.accent }, .role = .none, .padding = R.all(0), .margin = .{ .h = style.cards.management_icon_gap } }));
         controlText(@src(), name, card.style().override(.{ .font = theme.headingFont(), .padding = R.all(0), .margin = R.all(0) }));
     }
-    card.drawFocus();
     return card.clicked();
 }
 

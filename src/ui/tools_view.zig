@@ -29,6 +29,7 @@ pub fn moreMenu(model: *const state.Model, pending: *?state.Msg) void {
     gap(@src(), theme.spacing.sidebar_header_gap);
     if (components.sidebarItem(@src(), "game", "游戏", .{ .icon = dvui.entypo.game_controller, .selected = model.category == .game })) pending.* = .{ .select_category = .game };
     if (components.sidebarItem(@src(), "settings", "设置", .{ .icon = dvui.entypo.cog, .selected = model.category == .settings })) pending.* = .{ .select_category = .settings };
+    if (components.sidebarItem(@src(), "theme", "主题", .{ .icon = dvui.entypo.brush, .selected = model.category == .theme })) pending.* = .{ .select_category = .theme };
 }
 
 pub fn moreContent(model: *const state.Model, pending: *?state.Msg) void {
@@ -53,6 +54,7 @@ pub fn moreContent(model: *const state.Model, pending: *?state.Msg) void {
                 if (components.managementCard(@src(), entry[0], entry[1])) pending.* = entry[2];
             }
         },
+        .theme => {},
         .settings => {
             components.title(@src(), "设置");
             gap(@src(), theme.spacing.page_title_gap);

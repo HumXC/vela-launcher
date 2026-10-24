@@ -184,7 +184,7 @@ fn clippedLabel(src: std.builtin.SourceLocation, text: []const u8, small: bool) 
         .expand = .horizontal,
         .max_size_content = .width(0),
         .font = if (small) theme.captionFont() else theme.bodyFont(),
-        .color_text = if (small) .{ .color = theme.muted } else null,
+        .color_text = if (small) .{ .color = theme.colors.muted } else null,
         .background = false,
         .padding = R.all(0),
         .margin = R.all(0),
@@ -305,9 +305,10 @@ fn sidebarRow(ui: *Ui, runtime: java.Runtime, interactive: bool, last: bool) voi
     const selected = !ui.acquisition_open and if (ui.selected_path) |path| std.mem.eql(u8, path, runtime.path) else false;
     const enabled = interactive and !hasModal(ui);
     const border = if (selected) theme.style.sizing.selected_border else theme.style.sizing.control_border;
-    // Native design line boxes: 24/24/21 px, independent of font leading.
-    const body_height = theme.typography.body * theme.typography.body_line_height;
-    const path_height = theme.typography.caption * theme.typography.body_line_height;
+    // Preserve the design line boxes while allowing larger active fonts to fit.
+    const body_font = theme.bodyFont();
+    const body_height = @max(theme.typography.body * theme.typography.body_line_height, @max(body_font.textHeight(), body_font.textSize(runtime.vendor).h));
+    const path_height = @max(theme.typography.caption * theme.typography.body_line_height, theme.captionFont().textHeight());
     const detail_gap = theme.style.spacing.row_gap;
     const content_height = 2 * body_height + 2 * detail_gap + path_height;
     var control: dvui.ButtonWidget = undefined;
@@ -318,13 +319,13 @@ fn sidebarRow(ui: *Ui, runtime: java.Runtime, interactive: bool, last: bool) voi
         .min_size_content = .height(content_height),
         .padding = R.all(theme.style.spacing.list_row_padding - border),
         .border = R.all(border),
-        .corners = .all(theme.sizing.card_radius),
+        .corners = .all(theme.cardRadius()),
         .margin = .{ .h = if (last) 0 else theme.spacing.card_gap },
         .background = true,
-        .color_border = .{ .color = if (selected) theme.accent else theme.outline },
-        .color_fill = .{ .color = if (selected) theme.selected_surface else theme.sidebar },
-        .color_fill_hover = .{ .color = theme.selected_surface },
-        .color_fill_press = .{ .color = theme.outline },
+        .color_border = .{ .color = if (selected) theme.colors.accent else theme.colors.outline },
+        .color_fill = .{ .color = if (selected) theme.colors.selected_surface else theme.colors.sidebar },
+        .color_fill_hover = .{ .color = if (enabled or selected) theme.colors.selected_surface else theme.colors.sidebar },
+        .color_fill_press = .{ .color = if (enabled) theme.colors.pressed_surface else if (selected) theme.colors.selected_surface else theme.colors.sidebar },
         .tab_index = if (enabled) null else 0,
     });
     defer control.deinit();
@@ -337,12 +338,11 @@ fn sidebarRow(ui: *Ui, runtime: java.Runtime, interactive: bool, last: bool) voi
         }
     }
     if (enabled) control.processEvents() else control.processHover();
-    control.drawBackground();
+    theme.surface.buttonBackground(&control);
     const width = control.data().contentRect().w;
-    dvui.labelNoFmt(@src(), runtime.vendor, .{ .align_y = 0.5 }, control.style().override(.{ .font = theme.bodyFont(), .rect = .{ .x = 0, .y = 0, .w = width, .h = body_height }, .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = if (!enabled) theme.muted else if (selected) theme.selected_text else theme.foreground }, .role = .none, .tab_index = 0 }));
-    dvui.labelNoFmt(@src(), frameFmt("Java {d}", .{runtime.major}), .{ .align_y = 0.5 }, control.style().override(.{ .font = theme.bodyFont(), .rect = .{ .x = 0, .y = body_height + detail_gap, .w = width, .h = body_height }, .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = theme.muted }, .role = .none, .tab_index = 0 }));
-    dvui.labelNoFmt(@src(), runtime.path, .{ .align_y = 0.5 }, control.style().override(.{ .font = theme.captionFont(), .rect = .{ .x = 0, .y = 2 * (body_height + detail_gap), .w = width, .h = path_height }, .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = theme.muted }, .role = .none, .tab_index = 0 }));
-    if (enabled) control.drawFocus();
+    dvui.labelNoFmt(@src(), runtime.vendor, .{ .align_y = 0.5 }, control.style().override(.{ .font = theme.bodyFont(), .rect = .{ .x = 0, .y = 0, .w = width, .h = body_height }, .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = if (!enabled) theme.colors.muted else if (selected) theme.colors.selected_text else theme.colors.foreground }, .role = .none, .tab_index = 0 }));
+    dvui.labelNoFmt(@src(), frameFmt("Java {d}", .{runtime.major}), .{ .align_y = 0.5 }, control.style().override(.{ .font = theme.bodyFont(), .rect = .{ .x = 0, .y = body_height + detail_gap, .w = width, .h = body_height }, .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = theme.colors.muted }, .role = .none, .tab_index = 0 }));
+    dvui.labelNoFmt(@src(), runtime.path, .{ .align_y = 0.5 }, control.style().override(.{ .font = theme.captionFont(), .rect = .{ .x = 0, .y = 2 * (body_height + detail_gap), .w = width, .h = path_height }, .padding = R.all(0), .margin = R.all(0), .background = false, .color_text = .{ .color = theme.colors.muted }, .role = .none, .tab_index = 0 }));
     components.tooltip(@src(), control.data().id, control.data().borderRectScale().r, frameFmt("{s} · Java {d}\n{s}", .{ runtime.vendor, runtime.major, runtime.path }));
     if (enabled and control.clicked()) {
         ui.selectPath(runtime.path) catch |err| {
@@ -386,11 +386,11 @@ pub fn drawPage(ui: *Ui, manager: *java.Manager, download_ui: *download_view.Ui,
     if (acquiring) {
         const methods = components.toolbar(@src());
         defer methods.deinit();
-        if (components.button(@src(), "下载", .{ .primary = ui.acquisition_mode == .download, .enabled = ui.interactive and !hasModal(ui), .tag = "java-acquire-download" })) {
+        if (components.button(@src(), "下载", .{ .standalone = true, .primary = ui.acquisition_mode == .download, .enabled = ui.interactive and !hasModal(ui), .tag = "java-acquire-download" })) {
             discardPicker(ui);
             ui.acquisition_mode = .download;
         }
-        if (components.button(@src(), "本机", .{ .primary = ui.acquisition_mode == .local, .enabled = ui.interactive and !hasModal(ui), .tag = "java-acquire-local" })) ui.acquisition_mode = .local;
+        if (components.button(@src(), "本机", .{ .standalone = true, .primary = ui.acquisition_mode == .local, .enabled = ui.interactive and !hasModal(ui), .tag = "java-acquire-local" })) ui.acquisition_mode = .local;
     }
     if (acquiring) {
         const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_y = 1, .padding = R.all(0), .margin = .{ .y = theme.spacing.footer_gap }, .tag = "java-actions" });
@@ -405,10 +405,10 @@ pub fn drawPage(ui: *Ui, manager: *java.Manager, download_ui: *download_view.Ui,
         const selected = runtime.?;
         const hidden = manager.isHidden(selected.path);
         const is_registered = registered(manager, selected.path);
-        if ((hidden or is_registered) and components.button(@src(), if (hidden) "恢复显示" else "隐藏 Java", .{ .enabled = enabled })) ui.queueManagement(selected.path, if (hidden) .unhide else .hide) catch |err| {
+        if ((hidden or is_registered) and components.button(@src(), if (hidden) "恢复显示" else "隐藏 Java", .{ .standalone = true, .enabled = enabled })) ui.queueManagement(selected.path, if (hidden) .unhide else .hide) catch |err| {
             ui.failure = err;
         };
-        if (is_registered and components.button(@src(), "移除 Java", .{ .enabled = enabled, .destructive = true, .tag = "java-remove" })) ui.queuePath(selected.path, false) catch |err| {
+        if (is_registered and components.button(@src(), "移除 Java", .{ .standalone = true, .enabled = enabled, .destructive = true, .tag = "java-remove" })) ui.queuePath(selected.path, false) catch |err| {
             ui.failure = err;
         };
     }
@@ -416,20 +416,20 @@ pub fn drawPage(ui: *Ui, manager: *java.Manager, download_ui: *download_view.Ui,
     defer body.deinit();
     const page = components.scrollBody(@src());
     defer page.deinit();
-    if (ui.failure) |err| components.text(@src(), frameFmt("操作失败：{s}", .{@errorName(err)}), theme.danger);
-    if (!ui.interactive) components.text(@src(), "正在启动游戏或管理模组包，请稍后修改 Java。", theme.muted);
+    if (ui.failure) |err| components.text(@src(), frameFmt("操作失败：{s}", .{@errorName(err)}), theme.colors.danger);
+    if (!ui.interactive) components.text(@src(), "正在启动游戏或管理模组包，请稍后修改 Java。", theme.colors.muted);
     if (deletion.phase == .running) {
-        components.text(@src(), "正在删除 Java…", theme.muted);
-        if (components.action(@src(), "取消删除", ui.interactive)) ui.enqueue(.cancel) catch |err| {
+        components.text(@src(), "正在删除 Java…", theme.colors.muted);
+        if (components.button(@src(), "取消删除", .{ .standalone = true, .enabled = ui.interactive })) ui.enqueue(.cancel) catch |err| {
             ui.failure = err;
         };
     } else if (deletion.failure) |err| {
-        components.text(@src(), frameFmt("删除未完成：{s}", .{@errorName(err)}), theme.danger);
-        if (deletion.files_deleted) components.text(@src(), "Java 文件已删除，条目保存失败；请再次移除条目。", theme.warning);
+        components.text(@src(), frameFmt("删除未完成：{s}", .{@errorName(err)}), theme.colors.danger);
+        if (deletion.files_deleted) components.text(@src(), "Java 文件已删除，条目保存失败；请再次移除条目。", theme.colors.warning);
     } else if (deletion.phase == .complete) {
-        components.text(@src(), "Java 已移除", theme.muted);
+        components.text(@src(), "Java 已移除", theme.colors.muted);
     } else if (deletion.phase == .canceled) {
-        components.text(@src(), "删除已取消；条目保留，部分文件可能已删除，可重试完成清理。", theme.warning);
+        components.text(@src(), "删除已取消；条目保留，部分文件可能已删除，可重试完成清理。", theme.colors.warning);
     }
     if (acquiring) {
         switch (ui.acquisition_mode) {
@@ -448,13 +448,13 @@ pub fn drawPage(ui: *Ui, manager: *java.Manager, download_ui: *download_view.Ui,
     const panel = components.formPanel(@src(), .{ .tag = "java-runtime-detail", .compact = compact });
     defer panel.deinit();
     const selected = runtime.?;
-    components.text(@src(), selected.vendor, theme.muted);
+    components.text(@src(), selected.vendor, theme.colors.muted);
     gap(@src(), if (compact) theme.spacing.detail_gap else theme.spacing.section_gap);
     components.fieldLabel(@src(), "路径");
     components.hint(@src(), selected.path);
     if (manager.isHidden(selected.path)) {
         gap(@src(), if (compact) theme.spacing.detail_gap else theme.spacing.section_gap);
-        components.text(@src(), "已隐藏 · 不参与游戏启动", theme.muted);
+        components.text(@src(), "已隐藏 · 不参与游戏启动", theme.colors.muted);
     }
 }
 
@@ -473,9 +473,9 @@ fn drawSearchActions(ui: *Ui, manager: *java.Manager, enabled: bool) SearchActio
     }
     const compact = dvui.parentGet().data().contentRect().w < 400;
     if (!busy and ui.search_started and manager.searchResults().len != 0) {
-        if (components.button(@src(), if (compact) "添加所选" else "添加所选 Java", .{ .enabled = enabled and ui.selectedCount() != 0, .min_width = 0, .placement = .footer, .tag = "java-search-add", .tooltip = "添加所选 Java" })) return .add;
+        if (components.button(@src(), if (compact) "添加所选" else "添加所选 Java", .{ .standalone = true, .enabled = enabled and ui.selectedCount() != 0, .min_width = 0, .placement = .footer, .tag = "java-search-add", .tooltip = "添加所选 Java" })) return .add;
     }
-    if (components.button(@src(), if (busy) "取消搜索" else if (compact) "搜索" else "搜索本机 Java", .{ .enabled = enabled and (!busy or !ui.search_queued), .primary = !busy, .min_width = 0, .gravity_x = 1, .placement = .footer, .tag = "java-search-start", .tooltip = if (busy) "取消搜索" else "搜索本机 Java" })) return if (busy) .cancel else .search;
+    if (components.button(@src(), if (busy) "取消搜索" else if (compact) "搜索" else "搜索本机 Java", .{ .standalone = true, .enabled = enabled and (!busy or !ui.search_queued), .primary = !busy, .min_width = 0, .gravity_x = 1, .placement = .footer, .tag = "java-search-start", .tooltip = if (busy) "取消搜索" else "搜索本机 Java" })) return if (busy) .cancel else .search;
     return .none;
 }
 
@@ -541,9 +541,9 @@ fn drawDeleteConfirmation(ui: *Ui) void {
         defer information.deinit();
         const confirmation = components.modalSection(@src(), .{ .min_height = 172, .gap_after = 0, .tag = "java-delete-information" });
         defer confirmation.deinit();
-        components.text(@src(), path, theme.muted);
+        components.text(@src(), path, theme.colors.muted);
         gap(@src(), theme.spacing.card_gap);
-        components.text(@src(), "删除文件只作用于经所有权凭据验证的 Java 安装目录。此操作无法撤销。", theme.muted);
+        components.text(@src(), "删除文件只作用于经所有权凭据验证的 Java 安装目录。此操作无法撤销。", theme.colors.muted);
     }
     if (!open) clearDeleteConfirmation(ui);
 }
@@ -568,11 +568,11 @@ fn drawSearch(ui: *Ui, manager: *java.Manager, enabled: bool) void {
     }
     if (!ui.search_started and !busy) return;
     if (busy or ui.search_queued) {
-        components.text(@src(), "正在搜索…", theme.muted);
+        components.text(@src(), "正在搜索…", theme.colors.muted);
         return;
     }
     if (manager.searchFailure()) |err| {
-        components.text(@src(), frameFmt("搜索失败：{s}", .{@errorName(err)}), theme.danger);
+        components.text(@src(), frameFmt("搜索失败：{s}", .{@errorName(err)}), theme.colors.danger);
         return;
     }
     const results = manager.searchResults();
@@ -590,7 +590,7 @@ fn drawSearch(ui: *Ui, manager: *java.Manager, enabled: bool) void {
                 defer row.deinit();
                 if (registered(manager, result.path)) {
                     ui.search_selection[index] = false;
-                    dvui.labelNoFmt(@src(), "已注册", .{}, .{ .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.card_gap }, .color_text = .{ .color = theme.muted }, .background = false });
+                    dvui.labelNoFmt(@src(), "已注册", .{}, .{ .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.card_gap }, .color_text = .{ .color = theme.colors.muted }, .background = false });
                 } else if (enabled) {
                     _ = dvui.checkbox(@src(), &ui.search_selection[index], null, .{ .min_size_content = .{ .w = theme.style.sizing.selection_diameter, .h = theme.style.sizing.selection_diameter }, .max_size_content = .{ .w = theme.style.sizing.selection_diameter, .h = theme.style.sizing.selection_diameter }, .gravity_y = 0.5, .margin = .{ .w = theme.spacing.card_gap }, .padding = R.all(theme.style.spacing.tooltip_padding), .label = .{ .text = frameFmt("选择 {s} Java {d} {s}", .{ result.vendor, result.major, result.path }) } });
                 }
@@ -599,7 +599,7 @@ fn drawSearch(ui: *Ui, manager: *java.Manager, enabled: bool) void {
             _ = dvui.separator(@src(), .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, result.path))), .expand = .horizontal, .margin = R.all(0) });
         }
     }
-    if (ui.add_failure) |err| components.text(@src(), frameFmt("添加失败：{s}", .{@errorName(err)}), theme.danger);
+    if (ui.add_failure) |err| components.text(@src(), frameFmt("添加失败：{s}", .{@errorName(err)}), theme.colors.danger);
 }
 
 pub fn versionChoice(ui: *Ui, manager: *java.Manager, game: []const u8, required: u32) void {
@@ -613,7 +613,7 @@ pub fn versionChoice(ui: *Ui, manager: *java.Manager, game: []const u8, required
     clippedLabel(@src(), heading, true);
     gap(@src(), theme.spacing.row_gap);
     if (ui.choice_failure) |err| {
-        components.text(@src(), frameFmt("选择失败：{s}", .{@errorName(err)}), theme.danger);
+        components.text(@src(), frameFmt("选择失败：{s}", .{@errorName(err)}), theme.colors.danger);
         gap(@src(), theme.spacing.row_gap);
     }
     const entries = manager.entries();

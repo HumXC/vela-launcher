@@ -176,9 +176,12 @@ pub const View = struct {
                 defer rail.deinit();
                 try self.errorRail(buffer, indices, rail.data().contentRect().h);
             }
+            // Paint the material before ScrollArea initializes its scrollbars.
+            const viewport = theme.panel(@src(), .{}, .{ .tag = "logs-surface", .expand = .both, .background = true, .color_fill = .{ .color = theme.panelColor(theme.colors.background) }, .border = R.all(0), .padding = R.all(0), .margin = R.all(0), .corners = .all(0) });
+            defer viewport.deinit();
             const before = self.scroll.viewport.y;
             var user_scroll: dvui.Point = .{};
-            const area = dvui.scrollArea(@src(), .{ .scroll_info = &self.scroll, .vertical_bar = .show, .horizontal_bar = .auto, .user_scroll = &user_scroll }, .{ .tag = "logs-viewport", .expand = .both, .background = false, .padding = R.all(0), .margin = R.all(0), .corners = .all(0) });
+            const area = dvui.scrollArea(@src(), .{ .scroll_info = &self.scroll, .vertical_bar = .show, .horizontal_bar = .auto, .user_scroll = &user_scroll }, .{ .tag = "logs-viewport", .expand = .both, .background = false, .color_fill = .{ .color = theme.panelColor(theme.colors.background) }, .padding = R.all(0), .margin = R.all(0), .corners = .all(0) });
             // Scrollbars process input during area initialization, before the
             // container starts tracking user_scroll. Capture that movement now;
             // deinit also clamps after viewport growth, which is not user input.
@@ -196,7 +199,7 @@ pub const View = struct {
                 }
                 const visible = visibleRows(count, self.scroll.viewport.y, self.scroll.viewport.h);
                 for (indices[visible.first..visible.end], visible.first..) |index, row| self.drawLine(lines[index], row);
-                if (count == 0) dvui.labelNoFmt(@src(), if (lines.len == 0) "No retained output" else "No matching lines", .{}, .{ .padding = R.all(theme.spacing.panel_compact_padding), .color_text = .{ .color = theme.muted } });
+                if (count == 0) dvui.labelNoFmt(@src(), if (lines.len == 0) "No retained output" else "No matching lines", .{}, .{ .padding = R.all(theme.spacing.panel_compact_padding), .color_text = .{ .color = theme.colors.muted } });
             }
         }
         if (copy.selected) self.copySelected(buffer);
@@ -211,7 +214,7 @@ pub const View = struct {
         dvui.labelNoFmt(@src(), if (self.follow_tail) "Live output" else "Retained output", .{}, .{ .font = theme.titleFont(), .background = false, .padding = R.all(0), .margin = .{ .h = theme.spacing.detail_gap } });
         const phase_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0), .background = false });
         defer phase_row.deinit();
-        dvui.labelNoFmt(@src(), if (self.follow_tail) "Following latest" else "Scroll paused", .{ .align_y = 0.5 }, .{ .font = theme.captionFont(), .gravity_y = 0.5, .color_text = .{ .color = if (self.follow_tail) theme.accent else theme.muted }, .background = false, .padding = R.all(0), .margin = R.all(0) });
+        dvui.labelNoFmt(@src(), if (self.follow_tail) "Following latest" else "Scroll paused", .{ .align_y = 0.5 }, .{ .font = theme.captionFont(), .gravity_y = 0.5, .color_text = .{ .color = if (self.follow_tail) theme.colors.accent else theme.colors.muted }, .background = false, .padding = R.all(0), .margin = R.all(0) });
         dvui.label(@src(), "{d} errors", .{controller.logBuffer().errorIds().len}, .{ .font = theme.captionFont(), .gravity_x = 1, .gravity_y = 0.5, .color_text = .{ .color = severityColor(.@"error") }, .background = false, .padding = R.all(0), .margin = .{ .x = theme.spacing.row_gap } });
     }
 
@@ -240,8 +243,8 @@ pub const View = struct {
             // Align with the entry border, not its row including the bottom field gap.
             const navigation = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1, .gravity_y = 0, .min_size_content = .{ .w = 2 * (theme.sizing.icon_button + theme.sizing.sidebar_action_gap), .h = theme.sizing.icon_button }, .padding = R.all(0), .margin = R.all(0), .background = false });
             const enabled = std.mem.sliceTo(&self.query, 0).len != 0;
-            const previous = components.iconButton(@src(), "上一个匹配", dvui.entypo.chevron_up, .{ .tag = "logs-search-prev", .enabled = enabled });
-            const next = components.iconButton(@src(), "下一个匹配", dvui.entypo.chevron_down, .{ .tag = "logs-search-next", .enabled = enabled });
+            const previous = components.iconButton(@src(), "上一个匹配", dvui.entypo.chevron_up, .{ .standalone = true, .tag = "logs-search-prev", .enabled = enabled });
+            const next = components.iconButton(@src(), "下一个匹配", dvui.entypo.chevron_down, .{ .standalone = true, .tag = "logs-search-next", .enabled = enabled });
             navigation.deinit();
             const changed = components.entry(@src(), "搜索日志", &self.query, .{ .tag = "logs-search-entry", .gap_after = 0 });
             const empty = std.mem.sliceTo(&self.query, 0).len == 0;
@@ -260,7 +263,7 @@ pub const View = struct {
             .no_match => "No matches in enabled filters",
             .boundary => "No more matches",
         };
-        statusText(@src(), message, theme.muted, .{ .h = theme.spacing.row_gap }, 0);
+        statusText(@src(), message, theme.colors.muted, .{ .h = theme.spacing.row_gap }, 0);
     }
 
     fn outputBar(self: *View, controller: *game_launch.Controller) struct { selected: bool, retained: bool, latest: bool } {
@@ -273,7 +276,7 @@ pub const View = struct {
         const side = theme.sizing.icon_button;
         const gap = std.math.clamp((row.data().contentRect().w - 5 * side) / 4, 0, theme.spacing.row_gap);
         const step = side + gap;
-        const latest = components.iconButton(@src(), "跳转到最新日志", dvui.entypo.chevron_down, .{ .tag = "logs-jump-latest", .enabled = buffer.lineCount() != 0, .rect = .{ .x = 0, .y = 0, .w = side, .h = side } });
+        const latest = components.iconButton(@src(), "跳转到最新日志", dvui.entypo.chevron_down, .{ .standalone = true, .tag = "logs-jump-latest", .enabled = buffer.lineCount() != 0, .rect = .{ .x = 0, .y = 0, .w = side, .h = side } });
         if (latest) {
             self.jump = null;
             self.anchor = null;
@@ -281,13 +284,13 @@ pub const View = struct {
             self.follow_tail = true;
             self.scroll.velocity = .{};
         }
-        const selected = components.iconButton(@src(), "复制选中日志", dvui.entypo.copy, .{ .tag = "logs-copy-line", .enabled = self.selected != null, .rect = .{ .x = step, .y = 0, .w = side, .h = side } });
-        const retained = components.iconButton(@src(), "复制保留日志", dvui.entypo.documents, .{ .tag = "logs-copy-output", .enabled = buffer.lineCount() != 0, .rect = .{ .x = 2 * step, .y = 0, .w = side, .h = side } });
-        if (components.iconButton(@src(), "清空保留日志", dvui.entypo.trash, .{ .tag = "logs-clear-output", .enabled = buffer.lineCount() != 0, .rect = .{ .x = 3 * step, .y = 0, .w = side, .h = side } })) {
+        const selected = components.iconButton(@src(), "复制选中日志", dvui.entypo.copy, .{ .standalone = true, .tag = "logs-copy-line", .enabled = self.selected != null, .rect = .{ .x = step, .y = 0, .w = side, .h = side } });
+        const retained = components.iconButton(@src(), "复制保留日志", dvui.entypo.documents, .{ .standalone = true, .tag = "logs-copy-output", .enabled = buffer.lineCount() != 0, .rect = .{ .x = 2 * step, .y = 0, .w = side, .h = side } });
+        if (components.iconButton(@src(), "清空保留日志", dvui.entypo.trash, .{ .standalone = true, .tag = "logs-clear-output", .enabled = buffer.lineCount() != 0, .rect = .{ .x = 3 * step, .y = 0, .w = side, .h = side } })) {
             self.pending_clear = true;
             self.pending_attempt = snap.attempt_id;
         }
-        if (components.iconButton(@src(), "停止游戏", dvui.entypo.controller_stop, .{ .tag = "logs-stop-game", .enabled = snap.phase == .preparing or snap.phase == .running, .rect = .{ .x = 4 * step, .y = 0, .w = side, .h = side } })) {
+        if (components.iconButton(@src(), "停止游戏", dvui.entypo.controller_stop, .{ .standalone = true, .tag = "logs-stop-game", .enabled = snap.phase == .preparing or snap.phase == .running, .rect = .{ .x = 4 * step, .y = 0, .w = side, .h = side } })) {
             self.pending_stop = true;
             self.pending_attempt = snap.attempt_id;
         }
@@ -327,16 +330,15 @@ pub const View = struct {
         var button: dvui.ButtonWidget = undefined;
         const selected = self.selected != null and self.selected.? == line.id;
         const matched = self.cursor != null and self.cursor.?.id == line.id;
-        button.init(@src(), .{}, .{ .id_extra = @intCast(line.id), .rect = .{ .x = 0, .y = @as(f32, @floatFromInt(row)) * row_height, .w = self.scroll.virtual_size.w, .h = row_height }, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .corners = .all(0), .color_fill = .{ .color = if (selected) theme.style.colors.pressed_surface else if (matched) theme.style.colors.log_match else theme.background }, .label = .{ .text = "Log line" } });
+        button.init(@src(), .{}, .{ .id_extra = @intCast(line.id), .rect = .{ .x = 0, .y = @as(f32, @floatFromInt(row)) * row_height, .w = self.scroll.virtual_size.w, .h = row_height }, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .corners = .all(0), .color_fill = .{ .color = if (selected) theme.style.colors.pressed_surface else if (matched) theme.style.colors.log_match else theme.style.colors.transparent }, .color_fill_hover = .{ .color = if (selected) theme.style.colors.pressed_surface else if (matched) theme.style.colors.log_match else theme.colors.selected_surface }, .color_fill_press = .{ .color = if (matched and !selected) theme.style.colors.log_match else theme.style.colors.pressed_surface }, .label = .{ .text = "Log line" } });
         defer button.deinit();
         button.processEvents();
-        button.drawBackground();
+        theme.surface.buttonBackground(&button);
         const opts: dvui.Options = .{ .font = theme.monoFont(), .background = false, .padding = R.all(0), .margin = R.all(0), .role = .none };
-        dvui.labelNoFmt(@src(), if (line.source == .stdout) "OUT" else "ERR", .{ .align_y = 0.5 }, opts.override(.{ .rect = .{ .x = 6, .y = 0, .w = 32, .h = row_height }, .color_text = .{ .color = if (line.source == .stdout) theme.muted else theme.warning } }));
+        dvui.labelNoFmt(@src(), if (line.source == .stdout) "OUT" else "ERR", .{ .align_y = 0.5 }, opts.override(.{ .rect = .{ .x = 6, .y = 0, .w = 32, .h = row_height }, .color_text = .{ .color = if (line.source == .stdout) theme.colors.muted else theme.colors.warning } }));
         dvui.labelNoFmt(@src(), @tagName(line.severity), .{ .align_y = 0.5 }, opts.override(.{ .rect = .{ .x = 44, .y = 0, .w = 48, .h = row_height }, .color_text = .{ .color = severityColor(line.severity) } }));
-        dvui.labelNoFmt(@src(), if (line.truncated) "CUT" else if (line.invalid_utf8) "UTF" else "", .{ .align_y = 0.5 }, opts.override(.{ .rect = .{ .x = 98, .y = 0, .w = 28, .h = row_height }, .color_text = .{ .color = theme.muted } }));
+        dvui.labelNoFmt(@src(), if (line.truncated) "CUT" else if (line.invalid_utf8) "UTF" else "", .{ .align_y = 0.5 }, opts.override(.{ .rect = .{ .x = 98, .y = 0, .w = 28, .h = row_height }, .color_text = .{ .color = theme.colors.muted } }));
         dvui.labelNoFmt(@src(), line.text, .{ .align_y = 0.5 }, opts.override(.{ .rect = .{ .x = 132, .y = 0, .w = self.scroll.virtual_size.w - 132, .h = row_height }, .color_text = .{ .color = severityColor(line.severity) } }));
-        button.drawFocus();
         if (button.clicked()) self.selected = line.id;
     }
 
@@ -354,10 +356,9 @@ pub const View = struct {
             const id = maybe_id orelse continue;
             const name = try std.fmt.allocPrint(dvui.currentWindow().arena(), "Error line {d}", .{id});
             var marker: dvui.ButtonWidget = undefined;
-            marker.init(@src(), .{}, .{ .id_extra = bin, .rect = .{ .x = 2, .y = @as(f32, @floatFromInt(bin)) * height / @as(f32, @floatFromInt(bins)), .w = 8, .h = 5 }, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .corners = .all(0), .color_fill = .{ .color = severityColor(.@"error") }, .label = .{ .text = name } });
+            marker.init(@src(), .{}, .{ .id_extra = bin, .rect = .{ .x = 2, .y = @as(f32, @floatFromInt(bin)) * height / @as(f32, @floatFromInt(bins)), .w = 8, .h = 5 }, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .corners = .all(0), .color_fill = .{ .color = severityColor(.@"error") }, .color_fill_hover = .{ .color = severityColor(.@"error") }, .color_fill_press = .{ .color = severityColor(.@"error") }, .label = .{ .text = name } });
             marker.processEvents();
-            marker.drawBackground();
-            marker.drawFocus();
+            theme.surface.buttonBackground(&marker);
             components.tooltip(@src(), marker.data().id, marker.data().borderRectScale().r, name);
             if (marker.clicked()) {
                 self.selected = id;
@@ -405,8 +406,8 @@ pub const View = struct {
         const health = controller.logStatus();
         const arena = dvui.currentWindow().arena();
         const summary = try std.fmt.allocPrint(arena, "{s}  {s}  {d}/{d} lines  {d} KiB  {d} errors  omitted {d}", .{ @tagName(snap.phase), snap.version_id orelse "", visible_count, buffer.lineCount(), buffer.byteCount() / 1024, buffer.errorIds().len, health.dropped_packets });
-        statusText(@src(), summary, theme.muted, .{ .y = 4 }, 0);
-        if (self.copy_status != .none) statusText(@src(), if (self.copy_status == .limited) "Copied first 1 MiB" else "Copied", theme.muted, .{ .y = 4 }, 1);
+        statusText(@src(), summary, theme.colors.muted, .{ .y = 4 }, 0);
+        if (self.copy_status != .none) statusText(@src(), if (self.copy_status == .limited) "Copied first 1 MiB" else "Copied", theme.colors.muted, .{ .y = 4 }, 1);
         const failures = .{ health.disk_failure, health.capture_failure, health.view_failure, snap.failure };
         inline for (.{ "Disk", "Capture", "View", "Launch" }, 0..) |name, i| {
             if (failures[i]) |failure| {
@@ -414,7 +415,7 @@ pub const View = struct {
                 statusText(@src(), text, severityColor(.@"error"), R.all(0), i);
             }
         }
-        if (snap.exit_code) |code| dvui.label(@src(), "Exit code: {d}", .{code}, .{ .color_text = .{ .color = theme.muted }, .padding = R.all(0) });
+        if (snap.exit_code) |code| dvui.label(@src(), "Exit code: {d}", .{code}, .{ .color_text = .{ .color = theme.colors.muted }, .padding = R.all(0) });
     }
 };
 
@@ -426,10 +427,10 @@ fn statusText(src: std.builtin.SourceLocation, text: []const u8, color: dvui.Col
 
 fn severityColor(severity: logs.Severity) dvui.Color {
     return switch (severity) {
-        .trace, .debug => theme.muted,
-        .info => theme.foreground,
-        .warn => theme.warning,
-        .@"error" => theme.danger,
+        .trace, .debug => theme.colors.muted,
+        .info => theme.colors.foreground,
+        .warn => theme.colors.warning,
+        .@"error" => theme.colors.danger,
         .fatal => theme.style.colors.log_fatal,
     };
 }

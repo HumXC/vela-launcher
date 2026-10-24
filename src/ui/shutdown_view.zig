@@ -76,11 +76,11 @@ pub fn drawWithLayout(active_background: usize, layout: ?*Layout) ?lifecycle.Clo
                     .expand = .horizontal,
                     .padding = R.all(0),
                     .margin = .{ .h = 16 },
-                    .color_text = .{ .color = theme.muted },
+                    .color_text = .{ .color = theme.colors.muted },
                     .background = false,
                 });
                 defer status.deinit();
-                status.addText(count, .{ .color_text = .{ .color = theme.muted } });
+                status.addText(count, .{ .color_text = .{ .color = theme.colors.muted } });
             }
         }
         for (dvui.events()) |*event| {

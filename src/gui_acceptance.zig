@@ -21,6 +21,7 @@ const java = @import("ui/java_manager.zig");
 const java_view = @import("ui/java_view.zig");
 const game_launch = @import("ui/game_launch.zig");
 const settings_view = @import("ui/settings_view.zig");
+const appearance_view = @import("ui/appearance_view.zig");
 const java_download = @import("ui/java_download_controller.zig");
 const java_download_view = @import("ui/java_download_view.zig");
 const server_manager = @import("ui/server_manager.zig");
@@ -70,7 +71,7 @@ pub const main = dvui.App.main;
 pub const panic = dvui.App.panic;
 pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
 
-const Panel = enum { home, versions, more, settings, java, servers, logs, worlds, instances, mods, @"mods-download", @"mods-download-scroll", @"mods-detail-slow", @"mods-detail", @"mods-detail-optional", @"mods-detail-loading", @"mods-confirm", @"mods-task", @"mods-task-complete", @"mods-task-failed", player, @"account-add", shutdown };
+const Panel = enum { home, versions, more, settings, theme, java, servers, logs, worlds, instances, mods, @"mods-download", @"mods-download-scroll", @"mods-detail-slow", @"mods-detail", @"mods-detail-optional", @"mods-detail-loading", @"mods-confirm", @"mods-task", @"mods-task-complete", @"mods-task-failed", player, @"account-add", shutdown };
 fn isResourcePreview(panel: Panel) bool {
     return switch (panel) {
         .@"mods-download", .@"mods-download-scroll", .@"mods-detail-slow", .@"mods-detail", .@"mods-detail-optional", .@"mods-detail-loading", .@"mods-confirm", .@"mods-task", .@"mods-task-complete", .@"mods-task-failed" => true,
@@ -174,7 +175,7 @@ pub fn frame() !dvui.App.Result {
         file_picker_sdl.pump(&f.picker, win);
         try f.pollNativePickerActions();
         const native_close = if (comptime dvui.backend.kind == .sdl3) f.native_window.takeCloseRequested() else false;
-        if (native_close or fixtureCloseRequested(dvui.events())) f.requestNativeClose();
+        if ((native_close or fixtureCloseRequested(dvui.events())) and appearance_view.guardClose(&f.appearance)) f.requestNativeClose();
         if (f.native_quit_requested) {
             if (f.picker.isDrained()) return .close;
             // Keep SDL/portal events pumping until the outstanding callback ends.
@@ -183,7 +184,7 @@ pub fn frame() !dvui.App.Result {
         }
     }
     try f.tickServices();
-    if (!f.native_pickers and fixtureCloseRequested(dvui.events())) return .close;
+    if (!f.native_pickers and fixtureCloseRequested(dvui.events()) and appearance_view.guardClose(&f.appearance)) return .close;
     // Constrain window bounds without an open wrapper around deferred publication.
     const old_rect = win.data().rect;
     const old_pixels = win.rect_pixels;
@@ -201,6 +202,7 @@ pub fn frame() !dvui.App.Result {
         .tasks = &f.registry,
         .task_viewport_height = f.viewport.h,
         .settings = &f.settings,
+        .appearance = &f.appearance,
         .cf_credentials = &f.cf_credentials,
         .java_download = &f.java_download_controller,
         .java_download_ui = &f.java_download_ui,
@@ -217,6 +219,9 @@ pub fn frame() !dvui.App.Result {
         .mods = &f.mods,
         .mods_ui = &f.mods_ui,
     });
+    if (appearance_view.takeClose(&f.appearance)) {
+        if (f.native_pickers) f.requestNativeClose() else return .close;
+    }
     try f.writeLogsReceipt();
     try f.writeResourceReceipt();
     if (f.shutdown_prompt) {
@@ -318,6 +323,7 @@ const Fixture = struct {
     java_ui: java_view.Ui,
     launcher: game_launch.Controller,
     settings: settings_view.Ui,
+    appearance: appearance_view.Ui,
     cf_vault: FixtureVault,
     cf_credentials: cf_credentials_controller.Controller,
     java_download_controller: java_download.Controller,
@@ -529,6 +535,8 @@ const Fixture = struct {
 
     fn discardNativePickers(f: *Fixture) void {
         java_view.discardPicker(&f.java_ui);
+        if (f.appearance.ticket) |ticket| f.picker.discard(ticket);
+        f.appearance.ticket = null;
     }
 
     fn requestNativeClose(f: *Fixture) void {
@@ -790,6 +798,9 @@ const Fixture = struct {
         if (scene == .layout) try seedFixtureLogs(&f.launcher.buffer);
         f.settings = try settings_view.Ui.init(a, f.configuration.snapshot().settings);
         errdefer f.settings.deinit();
+        f.appearance = try appearance_view.Ui.init(a, io, f.configuration.snapshot().appearance);
+        errdefer f.appearance.deinit();
+        f.appearance.picker = &f.picker;
         f.java_download_controller = try java_download.Controller.initWithOptions(a, io, .{
             .root = root,
             .task_registry = &f.registry,
@@ -870,6 +881,10 @@ const Fixture = struct {
                 f.model.panel = .more;
                 f.model.category = .settings;
             },
+            .theme => {
+                f.model.panel = .more;
+                f.model.category = .theme;
+            },
             .java => {
                 f.model.panel = .java;
                 f.java_ui.search_started = true;
@@ -900,7 +915,7 @@ const Fixture = struct {
         const a = f.allocator;
         if (comptime dvui.backend.kind == .sdl3) f.native_window.deinit();
         // frame only returns close after native callback storage has drained.
-        if (f.native_pickers) f.discardNativePickers();
+        f.discardNativePickers();
         f.picker.beginShutdown();
         std.debug.assert(f.picker.isDrained());
         f.content.cancel();
@@ -924,6 +939,7 @@ const Fixture = struct {
         f.java_download_ui.deinit();
         f.java_manager.deinit();
         f.java_ui.deinit();
+        f.appearance.deinit();
         f.picker.deinit();
         f.library.deinit();
         f.cf_credentials.deinit();
@@ -1604,7 +1620,7 @@ fn pngChunk(a: std.mem.Allocator, output: *std.ArrayList(u8), kind: *const [4]u8
 }
 
 test "acceptance fixture exposes direct pages and dialog scenes" {
-    for ([_][]const u8{ "home", "versions", "more", "settings", "java", "servers", "logs", "worlds", "instances", "mods", "mods-download", "mods-download-scroll", "mods-detail-slow", "mods-detail", "mods-detail-optional", "mods-detail-loading", "mods-confirm", "mods-task", "mods-task-complete", "mods-task-failed", "player", "account-add", "shutdown" }) |name|
+    for ([_][]const u8{ "home", "versions", "more", "settings", "theme", "java", "servers", "logs", "worlds", "instances", "mods", "mods-download", "mods-download-scroll", "mods-detail-slow", "mods-detail", "mods-detail-optional", "mods-detail-loading", "mods-confirm", "mods-task", "mods-task-complete", "mods-task-failed", "player", "account-add", "shutdown" }) |name|
         try std.testing.expect(std.meta.stringToEnum(Panel, name) != null);
     try std.testing.expect(std.meta.stringToEnum(Panel, "preview") == null);
 }
@@ -1615,6 +1631,7 @@ test "direct preview scenes initialize target page and modal without input" {
     const cases = [_]struct { scene: Panel, expected: state.Panel, editor_open: bool = false }{
         .{ .scene = .versions, .expected = .versions },
         .{ .scene = .more, .expected = .more },
+        .{ .scene = .theme, .expected = .more },
         .{ .scene = .@"account-add", .expected = .players, .editor_open = true },
     };
     for (cases) |case| {
@@ -1625,6 +1642,11 @@ test "direct preview scenes initialize target page and modal without input" {
         const f = try Fixture.create(a, io, root, case.scene, .{ .w = 1280, .h = 720 });
         defer f.destroy();
         try std.testing.expectEqual(case.expected, f.model.panel);
+        if (case.scene == .theme) {
+            try std.testing.expectEqual(state.Category.theme, f.model.category);
+            try std.testing.expect(f.appearance.picker == &f.picker);
+            try std.testing.expect(!f.appearance.dirty());
+        }
         try std.testing.expectEqual(case.editor_open, f.accounts_ui.editor_open);
         try std.testing.expect(f.accounts_ui.pending == null);
         try std.testing.expect(f.accounts_ui.draft.id == null);
@@ -2185,6 +2207,9 @@ test "prepared ordinary Root scene derives genuine 17/8 before writes" {
     try testStartPrepared(f);
     try testWaitFixture(f, .installer_held);
     try std.testing.expect(f.instance_data.validated_roles.load(.acquire));
+    try std.testing.expect(f.instance_data.runtime_marker_probed.load(.acquire));
+    try std.testing.expect(f.instance_data.installer_marker_probed.load(.acquire));
+    try std.testing.expect(f.creation_core.snapshot().instance.?.java_path == null);
     try std.testing.expect(f.instance_data.proof_borrowed.load(.acquire));
     try std.testing.expect(!f.instance_data.staged.load(.acquire));
     try std.testing.expect(f.instance_data.synthetic_requests.load(.monotonic) > 0);
@@ -2216,8 +2241,9 @@ test "prepared ordinary Root publishes materialized synthetic game without conte
     try std.testing.expectEqualStrings(instance_fixture.base_id, row.minecraft_version);
     try std.testing.expectEqual(config.Loader.forge, row.loader);
     try std.testing.expectEqualStrings(instance_fixture.forge_id, row.loader_version.?);
-    try std.testing.expectEqualStrings(f.instance_data.prepared.?.java17_path, row.java_path.?);
-    try std.testing.expect(instances.findById(f.configuration.snapshot(), row.id) != null);
+    try std.testing.expect(row.java_path == null);
+    const saved = instances.findById(f.configuration.snapshot(), row.id) orelse return error.FixtureCreatedInstanceMissing;
+    try std.testing.expect(saved.java_path == null);
     try std.testing.expect(f.content.snapshot().proposal == null);
     try std.testing.expect(f.instance_data.validated_roles.load(.acquire));
     try std.testing.expect(f.instance_data.installer_exited.load(.acquire));
@@ -2230,6 +2256,21 @@ test "prepared ordinary Root publishes materialized synthetic game without conte
     defer parsed.deinit();
     try std.testing.expectEqualStrings(row.id, parsed.value.object.get("instance_id").?.string);
     try std.testing.expect(parsed.value.object.get("artifact_bindings").?.array.items.len == 1);
+    const client_name = try std.fmt.allocPrint(a, "{s}.jar", .{row.name});
+    defer a.free(client_name);
+    try std.testing.expectEqualStrings(client_name, parsed.value.object.get("client_jar").?.string);
+    const client_path = try f.paths.instancePath(row, client_name);
+    defer a.free(client_path);
+    const client = try std.Io.Dir.cwd().readFileAlloc(io, client_path, a, .limited(8 * 1024 * 1024));
+    defer a.free(client);
+    try std.testing.expectEqualSlices(u8, f.instance_data.prepared.?.client_bytes, client);
+    try std.testing.expectEqual(@as(i64, @intCast(client.len)), parsed.value.object.get("client_size").?.integer);
+    var client_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(client, &client_digest, .{});
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(&client_digest, .lower), parsed.value.object.get("client_sha256").?.string);
+    const cache_path = try f.paths.instancePath(row, ".cache");
+    defer a.free(cache_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, cache_path, .{ .follow_symlinks = false }));
     const descriptor_name = try std.fmt.allocPrint(a, "{s}.json", .{row.name});
     defer a.free(descriptor_name);
     const descriptor_path = try f.paths.instancePath(row, descriptor_name);
@@ -2250,7 +2291,7 @@ test "prepared ordinary Root publishes materialized synthetic game without conte
 test "prepared genuine owner rejects root id name generation loader environment and swapped Java roles before writes" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const Checkpoint = enum { fixture_setup, proof_factory, requirements, binding, replay, table_binding, table_replay, positive_request, swapped_installer, swapped_runtime, canceled_probe, no_publication };
+    const Checkpoint = enum { fixture_setup, proof_factory, requirements, binding, replay, table_binding, table_replay, missing_probes, runtime_probe, installer_probe, positive_request, explicit_runtime, swapped_installer, swapped_runtime, changed_marker, fresh_preparation, canceled_probe, no_publication };
     const Wrong = enum { root, id, name, generation, loader, environment };
     var checkpoint: Checkpoint = .fixture_setup;
     var wrong_case: ?Wrong = null;
@@ -2293,10 +2334,30 @@ test "prepared genuine owner rejects root id name generation loader environment 
     }
     wrong_case = null;
     const data = f.instance_data.prepared.?;
-    var request: instances_manager.CreateRequest = .{ .root = target.root, .instance = .{ .id = target.instance_id, .name = target.instance_name, .minecraft_version = instance_fixture.base_id, .loader = .forge, .loader_version = instance_fixture.forge_id, .java_path = data.java17_path }, .lease = f.instance_manager.lease, .installer_java = data.java8_path, .prepared = &proof, .prepared_generation = target.generation };
+    var request: instances_manager.CreateRequest = .{ .root = target.root, .instance = .{ .id = target.instance_id, .name = target.instance_name, .minecraft_version = instance_fixture.base_id, .loader = .forge, .loader_version = instance_fixture.forge_id }, .lease = f.instance_manager.lease, .installer_java = data.java8_path, .prepared = &proof, .prepared_generation = target.generation };
+    checkpoint = .missing_probes;
+    try std.testing.expectError(error.FixtureMissingJavaProbe, instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel }));
+    const runner = f.instance_data.runner();
+    const selected_runtime = f.java_manager.resolve(target.instance_name, 17) orelse return error.FixtureMissingRuntime;
+    const installer_key = try std.fmt.allocPrint(a, "{s}:installer", .{target.instance_id});
+    defer a.free(installer_key);
+    const selected_installer = f.java_manager.resolve(installer_key, 8) orelse return error.FixtureMissingInstaller;
+    try std.testing.expectEqualStrings(data.java17_path, selected_runtime.path);
+    try std.testing.expectEqualStrings(data.java8_path, selected_installer.path);
+    checkpoint = .runtime_probe;
+    const runtime = try runner.probe(runner.context, a, io, selected_runtime.path, &cancel);
+    defer java.freeRuntime(a, runtime);
+    try std.testing.expectError(error.FixtureMissingJavaProbe, instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel }));
+    checkpoint = .installer_probe;
+    const installer = try runner.probe(runner.context, a, io, selected_installer.path, &cancel);
+    defer java.freeRuntime(a, installer);
     checkpoint = .positive_request;
     var recipe = try instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel });
     defer recipe.deinit();
+    checkpoint = .explicit_runtime;
+    request.instance.java_path = selected_runtime.path;
+    var explicit_recipe = try instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel });
+    defer explicit_recipe.deinit();
     checkpoint = .swapped_installer;
     request.installer_java = data.java17_path;
     try std.testing.expectError(error.FixtureWrongJavaRole, instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel }));
@@ -2304,9 +2365,34 @@ test "prepared genuine owner rejects root id name generation loader environment 
     checkpoint = .swapped_runtime;
     request.instance.java_path = data.java8_path;
     try std.testing.expectError(error.FixtureWrongJavaRole, instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel }));
+    request.instance.java_path = null;
+    checkpoint = .changed_marker;
+    for ([_]struct { path: []const u8, bytes: []const u8 }{
+        .{ .path = data.java17_path, .bytes = "SyntheticMaterialization Java marker 17\n" },
+        .{ .path = data.java8_path, .bytes = "SyntheticMaterialization Java marker 8\n" },
+    }) |marker| {
+        {
+            const file = try std.Io.Dir.cwd().createFile(io, marker.path, .{});
+            defer file.close(io);
+            try file.writeStreamingAll(io, "changed marker\n");
+        }
+        try std.testing.expectError(error.FixtureJavaMarkerChanged, instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel }));
+        {
+            const file = try std.Io.Dir.cwd().createFile(io, marker.path, .{});
+            defer file.close(io);
+            try file.writeStreamingAll(io, marker.bytes);
+        }
+    }
+    checkpoint = .fresh_preparation;
+    var fresh_proof = try instance_fixture.prepareProof(&f.instance_data, a, io, target, &cancel);
+    defer fresh_proof.deinit();
+    request.prepared = &fresh_proof;
+    try std.testing.expectError(error.FixtureMissingJavaProbe, instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel }));
     checkpoint = .canceled_probe;
     cancel.store(true, .release);
-    try std.testing.expectError(error.Canceled, f.instance_data.runner().probe(&f.instance_data, a, io, data.java17_path, &cancel));
+    try std.testing.expectError(error.Canceled, runner.probe(runner.context, a, io, data.java17_path, &cancel));
+    try std.testing.expect(!f.instance_data.runtime_marker_probed.load(.acquire));
+    try std.testing.expect(!f.instance_data.installer_marker_probed.load(.acquire));
     checkpoint = .no_publication;
     try std.testing.expect(!f.instance_data.staged.load(.acquire));
     const final_path = try f.paths.instanceDirectory(target.instance_name);

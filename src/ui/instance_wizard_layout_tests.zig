@@ -34,7 +34,7 @@ fn expectInside(outer: dvui.Rect.Physical, inner: dvui.Rect.Physical) !void {
 
 const Frame = struct {
     const Footer = struct { id: dvui.Id, rect: dvui.Rect.Physical, text: dvui.Rect.Physical, clip: dvui.Rect.Physical };
-    const Text = struct { rect: dvui.Rect.Physical, clip: dvui.Rect.Physical, font_size: f32 };
+    const Text = struct { rect: dvui.Rect.Physical, clip: dvui.Rect.Physical, font: dvui.Font };
     const Geometry = struct { border: dvui.Rect.Physical, content: dvui.Rect.Physical };
     var render_commands: []const dvui.RenderCommand = &.{};
     var render_arena: ?std.heap.ArenaAllocator = null;
@@ -205,7 +205,7 @@ const Frame = struct {
                         summary_loader016 = summary_loader016 or std.mem.indexOf(u8, text.text, "0.16.0") != null;
                     }
                 }
-                const rendered: Text = .{ .rect = text.rs.r, .clip = command.clip, .font_size = text.font.size };
+                const rendered: Text = .{ .rect = text.rs.r, .clip = command.clip, .font = text.font };
                 if (std.mem.eql(u8, text.text, "1.21.1") and textInCard("instance-version-1.21.1", text.rs.r)) version_name = rendered;
                 if (std.mem.eql(u8, text.text, "2024/08/08") and textInCard("instance-version-1.21.1", text.rs.r)) version_date = rendered;
                 if (std.mem.eql(u8, text.text, "0.16.0") and textInCard("instance-loader-fabric-0.16.0", text.rs.r)) loader_name = rendered;
@@ -333,7 +333,7 @@ const Frame = struct {
         try expectInside(left_border, try renderedTextBounds(left_label));
         var primary_label_buffer: [96]u8 = undefined;
         const primary_label = try std.fmt.bufPrint(&primary_label_buffer, "{s}-label", .{primary});
-        try renderedAppearance(primary_label, 16, if (enabled) null else @import("theme.zig").muted);
+        try renderedAppearance(primary_label, 16, if (enabled) null else @import("theme.zig").colors.muted);
         try expectInside(right_border, try renderedTextBounds(primary_label));
         try renderedSingleLine(primary_label);
         try std.testing.expect(left.rect.center().x < body.x + body.w * 0.25);
@@ -389,7 +389,7 @@ fn sidebarFirstFrame() !void {
     try expectInside(side, navigation.rect);
     try expectInside(navigation.rect, navigation.text);
     try expectInside(navigation.clip, navigation.text);
-    try renderedFont("instance-sidebar-title", theme.titleFont().size);
+    try renderedFont("instance-sidebar-title", theme.typography.title);
     try renderedFont("instance-sidebar-footer", 16);
     try renderedFont("one", 16);
     const title = try renderedTextBounds("instance-sidebar-title");
@@ -515,6 +515,8 @@ fn atBothSizes(comptime scenario: fn () anyerror!void) !void {
         window.backend.size_pixels = .{ .w = size.w, .h = size.h };
         // Production colours and type sizes; native captures cover discovered CJK fonts.
         @import("theme.zig").install(window.window);
+        // The fixture bypasses view.draw, which resolves EM sizes against the active face.
+        bento_theme.applyTypography();
         try dvui.testing.settle(Frame.draw);
         // Initial viewport must show the first instance before focus traversal can scroll it.
         try sidebarFirstFrame();
@@ -598,8 +600,11 @@ fn renderedAppearance(key: []const u8, size: f32, expected_color: ?dvui.Color) !
             const center = text.rs.r.center();
             if (center.x < target.rect.x or center.x > target.rect.x + target.rect.w or
                 center.y < target.rect.y or center.y > target.rect.y + target.rect.h) continue;
-            errdefer std.debug.print("renderedAppearance: tag={s} text={s} expected-font={d} actual-font={d} scale={d} rect={any} color={any} tvg={any}\n", .{ key, text.text, size, text.font.size, text.rs.s, text.rs.r, text.color, dvui.useTvg });
-            try std.testing.expectApproxEqAbs(size, text.font.size, 0.01);
+            // Design sizes are EM pixels; Font.size is the capital-M height.
+            const expected_height = bento_theme.fontSized(size).textHeight();
+            const actual_height = text.font.textHeight();
+            errdefer std.debug.print("renderedAppearance: tag={s} text={s} design-pixels={d} expected-height={d} actual-height={d} scale={d} rect={any} color={any} tvg={any}\n", .{ key, text.text, size, expected_height, actual_height, text.rs.s, text.rs.r, text.color, dvui.useTvg });
+            try std.testing.expectApproxEqAbs(expected_height, actual_height, 0.01);
             if (expected_color) |color| try std.testing.expectEqual(color, text.color);
             try expectInside(command.clip, text.rs.r);
             found = true;
@@ -628,7 +633,7 @@ fn renderedCheck(comptime key: []const u8, diameter: f32, icon_size: f32) !void 
     errdefer std.debug.print("renderedCheck: tag={s} circle={any} icon={any} badge={any} icon-rect={any} commands={d}\n", .{ key, circle_rendered, icon_rendered, badge.rect, icon.rect, Frame.render_commands.len });
     for (Frame.render_commands) |command| switch (command.cmd) {
         .pathFillConvex => |fill| {
-            if (fill.path.points.len < 8 or !std.meta.eql(fill.opts.color.toColor(), @import("theme.zig").accent)) continue;
+            if (fill.path.points.len < 8 or !std.meta.eql(fill.opts.color.toColor(), @import("theme.zig").colors.accent)) continue;
             var min_x: f32 = std.math.inf(f32);
             var min_y: f32 = std.math.inf(f32);
             var max_x: f32 = -std.math.inf(f32);
@@ -652,7 +657,7 @@ fn renderedCheck(comptime key: []const u8, diameter: f32, icon_size: f32) !void 
             circle_rendered = true;
         },
         .pathStroke => |stroke| {
-            if (!std.meta.eql(stroke.opts.color.toColor(), @import("theme.zig").background) or stroke.path.points.len != 3) continue;
+            if (!std.meta.eql(stroke.opts.color.toColor(), @import("theme.zig").colors.background) or stroke.path.points.len != 3) continue;
             var min_x: f32 = std.math.inf(f32);
             var min_y: f32 = std.math.inf(f32);
             var max_x: f32 = -std.math.inf(f32);
@@ -720,7 +725,7 @@ fn wizardHeading(title_text: []const u8, prefix_text: []const u8) !dvui.Rect.Phy
     try renderedTextEquals("instance-wizard-title", title_text);
     try renderedTextEquals("instance-wizard-prefix", prefix_text);
     try renderedAppearance("instance-wizard-title", 24, dvui.themeGet().text);
-    try renderedAppearance("instance-wizard-prefix", 24, @import("theme.zig").muted);
+    try renderedAppearance("instance-wizard-prefix", 24, @import("theme.zig").colors.muted);
     // The prefix and title share the title font; only their colors differ.
     for ([_][]const u8{ "instance-wizard-title", "instance-wizard-prefix" }) |key| {
         const target = try dvui.testing.tagGet(key);
@@ -760,31 +765,33 @@ fn catalogueCard(comptime key: []const u8, rendered_name: ?Frame.Text, rendered_
     const name_label = try layoutElement(key ++ "-name");
     const date_label = try layoutElement(key ++ "-date");
     const slot = try layoutElement(key ++ "-check-slot");
-    try std.testing.expect(card.h >= 80);
+    try std.testing.expect(card.h >= @import("style.zig").cards.version_height);
     try expectInside(card, name.rect);
     try expectInside(card, date.rect);
     try expectInside(name_label, name.rect);
     try expectInside(date_label, date.rect);
     try expectInside(name.clip, name.rect);
     try expectInside(date.clip, date.rect);
-    try std.testing.expectApproxEqAbs(@as(f32, 18), name.font_size, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 14), date.font_size, 0.01);
-    try std.testing.expectApproxEqAbs(name.rect.x, date.rect.x, 1);
-    try std.testing.expect(name.rect.y + name.rect.h + 4 <= date.rect.y + 0.1);
-    try std.testing.expect(date.rect.x < card.x + card.w * 0.25);
+    try std.testing.expectApproxEqAbs(bento_theme.headingFont().textHeight(), name.font.textHeight(), 0.01);
+    try std.testing.expectApproxEqAbs(bento_theme.captionFont().textHeight(), date.font.textHeight(), 0.01);
+    // The current row reserves the date and check at the right of the title.
+    try std.testing.expect(name.rect.x + name.rect.w <= date_label.x + 0.1);
+    try std.testing.expect(name_label.x + name_label.w <= date_label.x + 0.1);
+    try std.testing.expectApproxEqAbs(name_label.center().y, date_label.center().y, 0.1);
+    try std.testing.expectApproxEqAbs(date_label.x + date_label.w, slot.x, 0.1);
     try expectInside(card, slot);
     // The native outer tag includes the Bento card leading gap.
-    try std.testing.expectApproxEqAbs(@as(f32, 20) + bento_theme.spacing.card_gap, slot.w, 0.1);
-    try std.testing.expectApproxEqAbs(@as(f32, 20), slot.h, 0.1);
+    try std.testing.expectApproxEqAbs(bento_theme.sizing.selection_diameter + bento_theme.style.cards.version_gap, slot.w, 0.1);
+    try std.testing.expectApproxEqAbs(bento_theme.sizing.selection_diameter, slot.h, 0.1);
     try std.testing.expect(slot.center().x > card.x + card.w * 0.75);
     try std.testing.expectApproxEqAbs(card.center().y, slot.center().y, 0.1);
     try std.testing.expect(name_label.x + name_label.w <= slot.x + 0.1);
     if (selected) {
         const check = try layoutElement(key ++ "-selected");
         try expectInside(slot, check);
-        try std.testing.expectApproxEqAbs(slot.x + bento_theme.spacing.card_gap, check.x, 0.1);
-        try std.testing.expect(name_label.x + name_label.w + bento_theme.spacing.card_gap <= check.x + 0.1);
-        try renderedCheck(key, 20, 14);
+        try std.testing.expectApproxEqAbs(slot.x + bento_theme.style.cards.version_gap, check.x, 0.1);
+        try std.testing.expect(name_label.x + name_label.w + bento_theme.style.cards.version_gap <= check.x + 0.1);
+        try renderedCheck(key, bento_theme.sizing.selection_diameter, bento_theme.sizing.selection_icon);
     } else {
         try std.testing.expect(dvui.tagGet(key ++ "-selected") == null);
         try std.testing.expect(dvui.tagGet(key ++ "-check-icon") == null);
@@ -850,16 +857,16 @@ fn catalogueGeometry(loader: bool) !void {
     if (loader) {
         try catalogueCard("instance-loader-fabric-0.16.0", Frame.loader_name, Frame.loader_date, false);
         const undated = try dvui.testing.tagGet("instance-loader-fabric-0.15.0");
-        try std.testing.expect(undated.rect.h >= 80);
+        try std.testing.expect(undated.rect.h >= bento_theme.style.cards.version_height);
         try std.testing.expectApproxEqAbs(row.h, undated.rect.h, 0.1);
-        try std.testing.expectApproxEqAbs(row.y + row.h + bento_theme.spacing.card_gap, undated.rect.y, 0.1);
+        try std.testing.expectApproxEqAbs(row.y + row.h + bento_theme.style.cards.version_gap, undated.rect.y, 0.1);
         try std.testing.expect(dvui.tagGet("instance-loader-fabric-0.15.0-date") == null);
     } else {
         try catalogueCard("instance-version-1.21.1", Frame.version_name, Frame.version_date, false);
         const undated = try dvui.testing.tagGet("instance-version-1.20.1");
-        try std.testing.expect(undated.rect.h >= 80);
+        try std.testing.expect(undated.rect.h >= bento_theme.style.cards.version_height);
         try std.testing.expectApproxEqAbs(row.h, undated.rect.h, 0.1);
-        try std.testing.expectApproxEqAbs(row.y + row.h + bento_theme.spacing.card_gap, undated.rect.y, 0.1);
+        try std.testing.expectApproxEqAbs(row.y + row.h + bento_theme.style.cards.version_gap, undated.rect.y, 0.1);
         try std.testing.expect(dvui.tagGet("instance-version-1.20.1-date") == null);
     }
 }
@@ -1401,6 +1408,7 @@ test "UI layout shared controls and home brand keep fixed geometry and server ch
         defer Frame.clearRenderCommands();
         window.backend.size_pixels = .{ .w = size.w, .h = size.h };
         @import("theme.zig").install(window.window);
+        bento_theme.applyTypography();
         ServerCheckFrame.name = @splat(0);
         @memcpy(ServerCheckFrame.name[0..5], "World");
         try dvui.testing.settle(ServerCheckFrame.draw);

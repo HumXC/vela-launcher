@@ -43,7 +43,7 @@ fn failureMessage(err: anyerror) []const u8 {
     };
 }
 fn errorHint(ui: *state.Ui) void {
-    if (ui.failure) |err| components.text(@src(), failureMessage(err), theme.danger);
+    if (ui.failure) |err| components.text(@src(), failureMessage(err), theme.colors.danger);
 }
 fn enabled(ui: *const state.Ui, snapshot: content.Snapshot, allowed: bool) bool {
     return allowed and ui.job == .idle and !snapshot.busy and !snapshot.recovery_required and ui.pending == null;
@@ -55,7 +55,7 @@ fn footer() *dvui.BoxWidget {
 fn installedLabel(snapshot: content.Snapshot, entries: []const local.Entry, provider: providers.Provider, project: []const u8) void {
     const file = state.installed(snapshot, provider, project) orelse return;
     const version = state.installedVersion(snapshot, file, entries);
-    components.text(@src(), fmt("已安装{s}{s}", .{ if (version) |name| fmt(" {s}", .{name}) else "", if (file.enabled) "" else " · 已禁用" }), theme.accent);
+    components.text(@src(), fmt("已安装{s}{s}", .{ if (version) |name| fmt(" {s}", .{name}) else "", if (file.enabled) "" else " · 已禁用" }), theme.colors.accent);
 }
 pub fn draw(ui: *state.Ui, snapshot: content.Snapshot, allowed: bool, entries: []const local.Entry) void {
     const root = plain(@src(), .vertical, .{ .expand = .both, .tag = "resource-download-page" });
@@ -101,8 +101,8 @@ fn drawCatalog(ui: *state.Ui, snapshot: content.Snapshot, ready: bool, entries: 
             defer source_row.deinit();
             var choice: usize = if (ui.provider == .modrinth) 0 else 1;
             const previous = choice;
-            _ = components.dropdownStyled(@src(), "资源来源", &.{ "Modrinth", if (snapshot.curseforge_available) "CurseForge" else "CurseForge（未配置）" }, .{ .choice = &choice }, .{}, .{ .tag = "resource-provider", .expand = .horizontal, .min_size_content = .height(theme.sizing.control_height), .margin = .{ .w = theme.spacing.action_gap } });
-            if (components.button(@src(), if (ui.job == .search) "搜索中…" else "搜索", .{ .enabled = ready, .primary = true, .placement = .footer, .min_width = 96, .tag = "resource-search" })) ui.queue(.search);
+            _ = components.dropdown(@src(), "资源来源", &.{ "Modrinth", if (snapshot.curseforge_available) "CurseForge" else "CurseForge（未配置）" }, .{ .choice = &choice }, .{}, .{ .tag = "resource-provider", .expand = .horizontal, .min_size_content = .height(theme.sizing.control_height), .margin = .{ .w = theme.spacing.action_gap } });
+            if (components.button(@src(), if (ui.job == .search) "搜索中…" else "搜索", .{ .standalone = true, .enabled = ready, .primary = true, .placement = .footer, .min_width = 96, .tag = "resource-search" })) ui.queue(.search);
             if (choice != previous and ready) {
                 if (choice == 1 and !snapshot.curseforge_available) ui.failure = error.ProviderDisabled else ui.queue(.{ .provider = if (choice == 0) .modrinth else .curseforge });
             }
@@ -118,7 +118,7 @@ fn drawCatalog(ui: *state.Ui, snapshot: content.Snapshot, ready: bool, entries: 
         backButtonAt(ui, .{ .w = footer_button_width, .h = theme.sizing.control_height });
         pagination(ui, ready);
         const refresh_x = @max(3 * footer_button_step, actions.data().contentRect().w - footer_button_width);
-        if (components.button(@src(), "刷新", .{ .enabled = ready, .placement = .footer, .rect = .{ .x = refresh_x, .w = footer_button_width, .h = theme.sizing.control_height }, .min_width = footer_button_width, .tag = "resource-refresh" })) ui.queue(.search);
+        if (components.button(@src(), "刷新", .{ .standalone = true, .enabled = ready, .placement = .footer, .rect = .{ .x = refresh_x, .w = footer_button_width, .h = theme.sizing.control_height }, .min_width = footer_button_width, .tag = "resource-refresh" })) ui.queue(.search);
     }
     const scroll = rememberedScroll(@src(), &ui.catalog_scroll);
     defer scroll.deinit();
@@ -138,7 +138,7 @@ fn drawCatalog(ui: *state.Ui, snapshot: content.Snapshot, ready: bool, entries: 
         {
             const details = plain(@src(), .vertical, .{});
             defer details.deinit();
-            dvui.labelNoFmt(@src(), components.ellipsize(project.name, theme.headingFont(), details.data().contentRect().w), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .font = theme.headingFont(), .padding = .all(0), .margin = .{ .h = 8 }, .color_text = .{ .color = theme.foreground } });
+            dvui.labelNoFmt(@src(), components.ellipsize(project.name, theme.headingFont(), details.data().contentRect().w), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .font = theme.headingFont(), .padding = .all(0), .margin = .{ .h = 8 }, .color_text = .{ .color = theme.colors.foreground } });
             components.hint(@src(), project.summary);
             installedLabel(snapshot, entries, project.provider, project.id);
         }
@@ -163,9 +163,9 @@ fn platformRow(src: std.builtin.SourceLocation, name: []const u8, version: []con
     defer row.deinit();
     const width = row.data().contentRect().w;
     const left = @min(260, width * 0.48);
-    fixedText(@src(), name, theme.headingFont(), .{ .w = left, .h = 28 }, theme.foreground);
-    fixedText(@src(), fmt("当前实例 {s}", .{version}), theme.fontSized(14), .{ .y = 28, .w = left, .h = 24 }, theme.muted);
-    fixedText(@src(), if (compatible) "所选发布版支持" else "兼容信息未提供", theme.fontSized(14), .{ .x = left + 24, .y = 28, .w = @max(0, width - left - 24), .h = 24 }, if (compatible) theme.accent else theme.muted);
+    fixedText(@src(), name, theme.headingFont(), .{ .w = left, .h = 28 }, theme.colors.foreground);
+    fixedText(@src(), fmt("当前实例 {s}", .{version}), theme.fontSized(14), .{ .y = 28, .w = left, .h = 24 }, theme.colors.muted);
+    fixedText(@src(), if (compatible) "所选发布版支持" else "兼容信息未提供", theme.fontSized(14), .{ .x = left + 24, .y = 28, .w = @max(0, width - left - 24), .h = 24 }, if (compatible) theme.colors.accent else theme.colors.muted);
 }
 fn drawDetail(ui: *state.Ui, snapshot: content.Snapshot, ready: bool, entries: []const local.Entry) void {
     const detail = ui.frame() orelse return;
@@ -180,12 +180,12 @@ fn drawDetail(ui: *state.Ui, snapshot: content.Snapshot, ready: bool, entries: [
         if (!compact) resourceLinks(ui, detail.project);
         const installed = state.installed(snapshot, detail.project.provider, detail.project.id);
         const label = if (installed != null) "安装 / 更新" else "安装";
-        if (ui.failure != null and components.button(@src(), "重试", .{ .enabled = ready, .tag = "resource-detail-retry" })) ui.queue(.retry);
-        if (components.button(@src(), if (ui.job == .prepare) "检查中…" else label, .{ .enabled = ready and detail.version() != null and ui.currentProposal(snapshot), .primary = true, .placement = .footer, .gravity_x = 1, .min_width = 144, .tag = "resource-install" })) ui.queue(.confirm);
+        if (ui.failure != null and components.button(@src(), "重试", .{ .standalone = true, .enabled = ready, .tag = "resource-detail-retry" })) ui.queue(.retry);
+        if (components.button(@src(), if (ui.job == .prepare) "检查中…" else label, .{ .standalone = true, .enabled = ready and detail.version() != null and ui.currentProposal(snapshot), .primary = true, .placement = .footer, .gravity_x = 1, .min_width = 144, .tag = "resource-install" })) ui.queue(.confirm);
     }
     const scroll = rememberedScroll(@src(), &detail.scroll);
     defer scroll.deinit();
-    const panel = components.bentoPanel(@src(), .{ .expand = .horizontal, .min_size_content = .height(@max(0, scroll.data().contentRect().h - 56)), .max_size_content = .width(0), .padding = .all(23), .margin = .all(0), .corners = .all(theme.sizing.panel_radius) });
+    const panel = components.bentoPanel(@src(), .{ .expand = .horizontal, .min_size_content = .height(@max(0, scroll.data().contentRect().h - 56)), .max_size_content = .width(0), .padding = .all(23), .margin = .all(0), .corners = .all(theme.panelRadius()) });
     defer panel.deinit();
     {
         const heading = plain(@src(), .vertical, .{ .expand = .horizontal, .min_size_content = .height(64), .max_size_content = .height(64), .margin = .{ .h = 32 } });
@@ -195,21 +195,21 @@ fn drawDetail(ui: *state.Ui, snapshot: content.Snapshot, ready: bool, entries: [
         @import("resource_icons.zig").draw(@src(), bitmap, 64, .{ .w = 64, .h = 64 });
         if (ui.icons) |*cache| if (cache.busy()) dvui.refresh(null, @src(), null);
         const receipt = state.installed(snapshot, detail.project.provider, detail.project.id);
-        fixedText(@src(), detail.project.name, theme.fontSized(24), .{ .x = 88, .w = @max(0, width - 88 - (if (receipt != null and width > 620) @as(f32, 256) else 0)), .h = 36 }, theme.foreground);
-        fixedText(@src(), detail.project.summary, theme.bodyFont(), .{ .x = 88, .y = 40, .w = @max(0, width - 88), .h = 24 }, theme.muted);
+        fixedText(@src(), detail.project.name, theme.fontSized(24), .{ .x = 88, .w = @max(0, width - 88 - (if (receipt != null and width > 620) @as(f32, 256) else 0)), .h = 36 }, theme.colors.foreground);
+        fixedText(@src(), detail.project.summary, theme.bodyFont(), .{ .x = 88, .y = 40, .w = @max(0, width - 88), .h = 24 }, theme.colors.muted);
         if (receipt) |file| {
             const version = state.installedVersion(snapshot, file, entries);
             const text = fmt("已安装{s}{s}", .{ if (version) |name| fmt(" {s}", .{name}) else "", if (file.enabled) "" else " · 已禁用" });
-            if (width > 620) fixedText(@src(), text, theme.fontSized(14), .{ .x = width - 240, .w = 240, .h = 24 }, if (file.enabled) theme.accent else theme.warning);
+            if (width > 620) fixedText(@src(), text, theme.fontSized(14), .{ .x = width - 240, .w = 240, .h = 24 }, if (file.enabled) theme.colors.accent else theme.colors.warning);
         }
     }
     {
         const line = plain(@src(), .horizontal, .{ .min_size_content = .height(24), .margin = .{ .h = 4 } });
         defer line.deinit();
-        dvui.labelNoFmt(@src(), "选择版本", .{}, .{ .font = theme.fontSized(14), .min_size_content = .{ .w = 176, .h = 24 }, .padding = .all(0), .margin = .{ .w = 40 }, .color_text = .{ .color = theme.foreground } });
+        dvui.labelNoFmt(@src(), "选择版本", .{}, .{ .font = theme.fontSized(14), .min_size_content = .{ .w = 176, .h = 24 }, .padding = .all(0), .margin = .{ .w = 40 }, .color_text = .{ .color = theme.colors.foreground } });
         if (line.data().contentRect().w > 620) if (ui.instance) |instance| {
-            dvui.labelNoFmt(@src(), "兼容条件", .{}, .{ .font = theme.fontSized(14), .padding = .all(0), .margin = .{ .w = 16 }, .color_text = .{ .color = theme.foreground } });
-            dvui.labelNoFmt(@src(), fmt("Minecraft {s} · {s}", .{ instance.minecraft_version, loaderTitle(instance.loader) }), .{}, .{ .font = theme.fontSized(14), .padding = .all(0), .margin = .all(0), .color_text = .{ .color = theme.muted } });
+            dvui.labelNoFmt(@src(), "兼容条件", .{}, .{ .font = theme.fontSized(14), .padding = .all(0), .margin = .{ .w = 16 }, .color_text = .{ .color = theme.colors.foreground } });
+            dvui.labelNoFmt(@src(), fmt("Minecraft {s} · {s}", .{ instance.minecraft_version, loaderTitle(instance.loader) }), .{}, .{ .font = theme.fontSized(14), .padding = .all(0), .margin = .all(0), .color_text = .{ .color = theme.colors.muted } });
         };
     }
     if (detail.versions.len == 0) {
@@ -224,14 +224,14 @@ fn drawDetail(ui: *state.Ui, snapshot: content.Snapshot, ready: bool, entries: [
     };
     for (detail.versions, names) |version, *name| name.* = version.name;
     var choice = detail.selected;
-    _ = components.dropdownStyled(@src(), "安装版本", names, .{ .choice = &choice }, .{}, .{ .tag = "resource-version", .expand = .horizontal, .max_size_content = .width(0), .margin = .all(0) });
+    _ = components.dropdown(@src(), "安装版本", names, .{ .choice = &choice }, .{}, .{ .tag = "resource-version", .expand = .horizontal, .max_size_content = .width(0), .margin = .all(0) });
     if (choice != detail.selected and ready) ui.queue(.{ .version = choice });
-    _ = dvui.separator(@src(), .{ .expand = .horizontal, .margin = .{ .y = 24, .h = 23 }, .color_border = .{ .color = theme.outline } });
+    _ = dvui.separator(@src(), .{ .expand = .horizontal, .margin = .{ .y = 24, .h = 23 }, .color_border = .{ .color = theme.colors.outline } });
     {
         const header = plain(@src(), .horizontal, .{ .min_size_content = .height(32), .margin = .{ .h = 24 } });
         defer header.deinit();
-        dvui.labelNoFmt(@src(), "依赖", .{}, .{ .font = theme.headingFont(), .padding = .all(0), .margin = .{ .w = 64 }, .color_text = .{ .color = theme.foreground } });
-        dvui.labelNoFmt(@src(), if (ui.failure) |err| failureMessage(err) else "按所选版本识别", .{}, .{ .font = theme.fontSized(14), .gravity_y = 0.5, .padding = .all(0), .margin = .all(0), .color_text = .{ .color = if (ui.failure != null) theme.danger else theme.muted } });
+        dvui.labelNoFmt(@src(), "依赖", .{}, .{ .font = theme.headingFont(), .padding = .all(0), .margin = .{ .w = 64 }, .color_text = .{ .color = theme.colors.foreground } });
+        dvui.labelNoFmt(@src(), if (ui.failure) |err| failureMessage(err) else "按所选版本识别", .{}, .{ .font = theme.fontSized(14), .gravity_y = 0.5, .padding = .all(0), .margin = .all(0), .color_text = .{ .color = if (ui.failure != null) theme.colors.danger else theme.colors.muted } });
     }
     const version = detail.version().?;
     if (version.dependencies.len == 0) components.hint(@src(), "此版本没有声明依赖");
@@ -255,12 +255,12 @@ fn drawDetail(ui: *state.Ui, snapshot: content.Snapshot, ready: bool, entries: [
     }
 }
 fn pendingVersion(src: std.builtin.SourceLocation, width: f32, message: []const u8) void {
-    const placeholder = plain(src, .horizontal, .{ .expand = .none, .rect = .{ .w = width, .h = theme.sizing.control_height }, .padding = .{ .x = 12, .w = 12 }, .border = .all(theme.sizing.control_border), .corners = .all(theme.sizing.control_radius), .background = true, .color_fill = .{ .color = theme.surface }, .color_border = .{ .color = theme.outline } });
+    const placeholder = plain(src, .horizontal, .{ .expand = .none, .rect = .{ .w = width, .h = theme.sizing.control_height }, .padding = .{ .x = 12, .w = 12 }, .border = .all(theme.sizing.control_border), .corners = .all(theme.controlRadius()), .background = true, .color_fill = .{ .color = theme.colors.surface }, .color_border = .{ .color = theme.colors.outline } });
     defer placeholder.deinit();
-    dvui.labelNoFmt(@src(), message, .{}, .{ .font = theme.bodyFont(), .gravity_y = 0.5, .padding = .all(0), .margin = .all(0), .color_text = .{ .color = theme.muted } });
+    dvui.labelNoFmt(@src(), message, .{}, .{ .font = theme.bodyFont(), .gravity_y = 0.5, .padding = .all(0), .margin = .all(0), .color_text = .{ .color = theme.colors.muted } });
 }
 fn dependencySeparator(src: std.builtin.SourceLocation, index: usize) void {
-    _ = dvui.separator(src, .{ .id_extra = index, .expand = .horizontal, .margin = .{ .y = theme.spacing.action_gap, .h = theme.spacing.action_gap }, .color_border = .{ .color = theme.outline } });
+    _ = dvui.separator(src, .{ .id_extra = index, .expand = .horizontal, .margin = .{ .y = theme.spacing.action_gap, .h = theme.spacing.action_gap }, .color_border = .{ .color = theme.colors.outline } });
 }
 fn dependencyDisplayName(ui: *const state.Ui, dep: providers.Dependency, versions: []const providers.Version, provider: providers.Provider) []const u8 {
     const project_id: ?[]const u8 = if (versions.len > 0) versions[0].project_id else dep.project_id;
@@ -273,12 +273,12 @@ fn dependencyDisplayName(ui: *const state.Ui, dep: providers.Dependency, version
     return if (ui.job != .idle or !ui.proposal_current) "正在加载依赖…" else "未知依赖";
 }
 fn dependencyInclude(src: std.builtin.SourceLocation, value: *bool, ready: bool, index: usize) bool {
-    const slot = plain(src, .horizontal, .{ .expand = .none, .rect = .{ .w = 104, .h = theme.sizing.control_height }, .border = .all(theme.sizing.control_border), .corners = .all(theme.sizing.control_radius), .background = true, .color_fill = .{ .color = theme.surface }, .color_border = .{ .color = if (value.*) theme.accent else theme.control_outline } });
+    const slot = plain(src, .horizontal, .{ .expand = .none, .rect = .{ .w = 104, .h = theme.sizing.control_height }, .border = .all(theme.sizing.control_border), .corners = .all(theme.controlRadius()), .background = true, .color_fill = .{ .color = theme.colors.surface }, .color_border = .{ .color = if (value.*) theme.colors.accent else theme.colors.control_outline } });
     defer slot.deinit();
     const opts = components.checkboxOptions("包含", .{ .tag = fmt("resource-dep-include-{d}", .{index}) }).override(.{ .expand = .none, .rect = .{ .w = 102, .h = 46 }, .min_size_content = .height(0), .max_size_content = .width(102), .margin = .all(0), .padding = .{ .x = 11, .w = 11 }, .border = .all(0), .corners = .all(4), .background = false });
     const checkbox_src = @src();
     if (ready) return dvui.checkbox(checkbox_src, value, "包含", opts);
-    const row = dvui.box(checkbox_src, .{ .dir = .horizontal }, opts.override(.{ .tab_index = 0, .color_text = .{ .color = theme.muted } }));
+    const row = dvui.box(checkbox_src, .{ .dir = .horizontal }, opts.override(.{ .tab_index = 0, .color_text = .{ .color = theme.colors.muted } }));
     defer row.deinit();
     // Keep only the current focus target registered while its metadata refreshes.
     if (dvui.focusedWidgetId() == row.data().id) dvui.tabIndexSet(row.data().id, 1, row.data().rectScale().r);
@@ -289,7 +289,7 @@ fn dependencyInclude(src: std.builtin.SourceLocation, value: *bool, ready: bool,
     const mark = dvui.spacer(@src(), .{ .min_size_content = dvui.Size.all(opts.fontGet().textHeight()), .gravity_y = 0.5 });
     if (row.data().visible()) dvui.checkmark(value.*, false, mark.borderRectScale(), false, 0, opts);
     _ = dvui.spacer(@src(), .{ .min_size_content = .width(dvui.checkbox_defaults.paddingGet().w) });
-    dvui.labelNoFmt(@src(), "包含", .{}, opts.strip().override(.{ .gravity_y = 0.5, .color_text = .{ .color = theme.muted } }));
+    dvui.labelNoFmt(@src(), "包含", .{}, opts.strip().override(.{ .gravity_y = 0.5, .color_text = .{ .color = theme.colors.muted } }));
     return false;
 }
 fn drawDependency(ui: *state.Ui, snapshot: content.Snapshot, detail: *state.Detail, root: providers.Version, dep: providers.Dependency, index: usize, ready: bool, entries: []const local.Entry) void {
@@ -321,20 +321,20 @@ fn drawDependency(ui: *state.Ui, snapshot: content.Snapshot, detail: *state.Deta
         const width = description.data().contentRect().w;
         const left = @min(260, width * 0.48);
         const name = dependencyDisplayName(ui, dep, versions, root.provider);
-        fixedText(@src(), name, theme.headingFont(), .{ .w = width, .h = 28 }, theme.foreground);
+        fixedText(@src(), name, theme.headingFont(), .{ .w = width, .h = 28 }, theme.colors.foreground);
         fixedText(@src(), switch (dep.kind) {
             .required => "必需依赖",
             .optional => "可选依赖",
             .incompatible => "不兼容资源",
             .embedded => "已内置",
-        }, theme.fontSized(14), .{ .y = 28, .w = left, .h = 24 }, theme.muted);
+        }, theme.fontSized(14), .{ .y = 28, .w = left, .h = 24 }, theme.colors.muted);
         if (versions.len > 0) {
             const receipt = state.installed(snapshot, root.provider, versions[0].project_id);
             const label = if (receipt) |file| block: {
                 const version = state.installedVersion(snapshot, file, entries);
                 break :block fmt("已安装{s}{s}", .{ if (version) |value| fmt(" {s}", .{value}) else "", if (file.enabled) "" else " · 已禁用" });
             } else if (dep.kind == .required or (if (choice) |value| value.include else false)) "缺失 · 自动补齐" else "未包含";
-            fixedText(@src(), label, theme.fontSized(14), .{ .x = left + 16, .y = 28, .w = @max(0, width - left - 16), .h = 24 }, if (receipt != null and !receipt.?.enabled) theme.warning else theme.accent);
+            fixedText(@src(), label, theme.fontSized(14), .{ .x = left + 16, .y = 28, .w = @max(0, width - left - 16), .h = 24 }, if (receipt != null and !receipt.?.enabled) theme.colors.warning else theme.colors.accent);
         }
     }
     if (!can_choose) return;
@@ -360,7 +360,7 @@ fn drawDependency(ui: *state.Ui, snapshot: content.Snapshot, detail: *state.Deta
             };
         }
         const previous = selected;
-        _ = components.dropdownStyled(@src(), "依赖版本", names, .{ .choice = &selected }, .{}, .{ .tag = fmt("resource-dep-version-{d}", .{index}), .expand = .none, .max_size_content = .width(@max(0, control_width - 56)), .rect = .{ .w = @max(0, control_width - 56), .h = 48 }, .margin = .all(0) });
+        _ = components.dropdown(@src(), "依赖版本", names, .{ .choice = &selected }, .{}, .{ .tag = fmt("resource-dep-version-{d}", .{index}), .expand = .none, .max_size_content = .width(@max(0, control_width - 56)), .rect = .{ .w = @max(0, control_width - 56), .h = 48 }, .margin = .all(0) });
         if (previous != selected and ready) ui.queue(.{ .choice = .{ .dependency_index = index, .version_id = versions[selected].id, .include = if (dep.kind == .required) true else if (choice) |value| value.include else false } });
     } else {
         const loading = ui.failure == null and (ui.job != .idle or !ui.proposal_current);
@@ -387,11 +387,11 @@ fn backButton(ui: *state.Ui) void {
     backButtonAt(ui, null);
 }
 fn backButtonAt(ui: *state.Ui, rect: ?dvui.Rect) void {
-    if (components.button(@src(), "返回", .{ .enabled = !ui.confirm_open and ui.task_state == .none and ui.job != .install and ui.job != .recover, .min_width = footer_button_width, .placement = if (rect != null) .footer else .inline_action, .rect = rect, .tag = "resource-download-back" })) ui.queue(.back);
+    if (components.button(@src(), "返回", .{ .standalone = true, .enabled = !ui.confirm_open and ui.task_state == .none and ui.job != .install and ui.job != .recover, .min_width = footer_button_width, .placement = if (rect != null) .footer else .inline_action, .rect = rect, .tag = "resource-download-back" })) ui.queue(.back);
 }
 fn pagination(ui: *state.Ui, ready: bool) void {
-    if (components.button(@src(), "上一页", .{ .enabled = ready and ui.offset >= 40, .min_width = footer_button_width, .placement = .footer, .rect = .{ .x = footer_button_step, .w = footer_button_width, .h = theme.sizing.control_height }, .tag = "resource-previous" })) ui.queue(.{ .page = ui.offset - 40 });
-    if (components.button(@src(), "下一页", .{ .enabled = ready and ui.catalog.len == 40 and ui.offset < std.math.maxInt(u32) - 40, .min_width = footer_button_width, .placement = .footer, .rect = .{ .x = 2 * footer_button_step, .w = footer_button_width, .h = theme.sizing.control_height }, .tag = "resource-next" })) ui.queue(.{ .page = ui.offset + 40 });
+    if (components.button(@src(), "上一页", .{ .standalone = true, .enabled = ready and ui.offset >= 40, .min_width = footer_button_width, .placement = .footer, .rect = .{ .x = footer_button_step, .w = footer_button_width, .h = theme.sizing.control_height }, .tag = "resource-previous" })) ui.queue(.{ .page = ui.offset - 40 });
+    if (components.button(@src(), "下一页", .{ .standalone = true, .enabled = ready and ui.catalog.len == 40 and ui.offset < std.math.maxInt(u32) - 40, .min_width = footer_button_width, .placement = .footer, .rect = .{ .x = 2 * footer_button_step, .w = footer_button_width, .h = theme.sizing.control_height }, .tag = "resource-next" })) ui.queue(.{ .page = ui.offset + 40 });
 }
 fn proposalBelongs(ui: *state.Ui, proposal: *const content.Proposal) bool {
     return ui.currentProposal(.{ .proposal = proposal });
@@ -434,14 +434,14 @@ pub fn drawDialogs(ui: *state.Ui, snapshot: content.Snapshot, allowed: bool) voi
             if (detail.version()) |version| components.hint(@src(), version.name);
         }
         if (ui.instance) |instance| components.hint(@src(), fmt("安装到：{s}", .{instance.name}));
-        if (value.blocker) |err| components.text(@src(), failureMessage(err), theme.warning);
+        if (value.blocker) |err| components.text(@src(), failureMessage(err), theme.colors.warning);
         if (!value.dependencies_ready) components.hint(@src(), "请返回详情选择依赖的兼容版本，或启用已有的必需依赖。");
         components.section(@src(), "安装内容与依赖");
         for (value.files, 0..) |file, i| {
             if (file.selected == false) continue;
             const row = components.bentoPanel(@src(), .{ .id_extra = i, .expand = .horizontal, .max_size_content = .width(0), .padding = .all(15), .margin = .{ .h = 8 } });
             defer row.deinit();
-            components.text(@src(), std.fs.path.basename(file.record.path), theme.foreground);
+            components.text(@src(), std.fs.path.basename(file.record.path), theme.colors.foreground);
             const previous = state.installed(snapshot, file.record.provider, file.record.project_id);
             components.hint(@src(), if (previous) |old| if (std.mem.eql(u8, old.version_id, file.record.version_id)) (if (old.enabled) "版本相同，保留已有文件" else "已有版本被禁用") else "将更新已有版本" else if (value.root != null and !std.mem.eql(u8, value.root.?.id, file.record.version_id)) "自动补齐依赖" else "将安装此版本");
             if (file.download == .manual_required) {
@@ -449,7 +449,7 @@ pub fn drawDialogs(ui: *state.Ui, snapshot: content.Snapshot, allowed: bool) voi
                     if (std.mem.eql(u8, mapping.path, file.record.path)) break mapping;
                 } else null;
                 if (status) |mapping| {
-                    if (mapping.verified) components.text(@src(), "文件已匹配", theme.accent) else if (mapping.source_absolute_path != null) components.text(@src(), "文件不匹配，请重新选择", theme.danger) else components.hint(@src(), "需要手动下载并选择文件");
+                    if (mapping.verified) components.text(@src(), "文件已匹配", theme.colors.accent) else if (mapping.source_absolute_path != null) components.text(@src(), "文件不匹配，请重新选择", theme.colors.danger) else components.hint(@src(), "需要手动下载并选择文件");
                 }
                 const actions = plain(@src(), .horizontal, .{});
                 defer actions.deinit();
@@ -460,7 +460,7 @@ pub fn drawDialogs(ui: *state.Ui, snapshot: content.Snapshot, allowed: bool) voi
         for (value.plan.conflicts, 0..) |conflict, i| {
             const row = plain(@src(), .vertical, .{ .id_extra = i, .margin = .{ .h = 8 } });
             defer row.deinit();
-            components.text(@src(), fmt("文件冲突：{s}", .{conflict.path}), theme.warning);
+            components.text(@src(), fmt("文件冲突：{s}", .{conflict.path}), theme.colors.warning);
             const actions = plain(@src(), .horizontal, .{});
             defer actions.deinit();
             if (components.button(@src(), "保留本地", .{ .enabled = ready, .tag = fmt("resource-keep-{d}", .{i}) })) ui.queue(.{ .conflict = .{ .path = conflict.path, .choice = .keep_local } });

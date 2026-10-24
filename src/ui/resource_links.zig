@@ -37,7 +37,7 @@ pub fn draw(name: []const u8, homepage: ?[]const u8, provider: ?providers.Provid
     var success = true;
     for (destinations, 0..) |link, index| {
         const url = link.url orelse continue;
-        if (dvui.labelClick(@src(), "{s}", .{link.label}, .{}, .{ .id_extra = index, .tag = std.fmt.allocPrint(a, "{s}-{s}", .{ prefix, link.suffix }) catch null, .font = theme.fontSized(14).withUnderline(.{}), .color_text = .{ .color = theme.accent }, .gravity_y = 0.5, .margin = .{ .w = if (index == destinations.len - 1) 0 else 12 }, .padding = .all(0) })) {
+        if (dvui.labelClick(@src(), "{s}", .{link.label}, .{}, .{ .id_extra = index, .tag = std.fmt.allocPrint(a, "{s}-{s}", .{ prefix, link.suffix }) catch null, .font = theme.fontSized(14).withUnderline(.{}), .color_text = .{ .color = theme.colors.accent }, .gravity_y = 0.5, .margin = .{ .w = if (index == destinations.len - 1) 0 else 12 }, .padding = .all(0) })) {
             if (!dvui.openURL(.{ .url = url })) success = false;
         }
     }

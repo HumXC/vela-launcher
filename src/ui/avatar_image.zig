@@ -117,7 +117,7 @@ pub fn source(face: *Face) dvui.ImageSource {
 }
 
 pub fn draw(src: std.builtin.SourceLocation, face: *Face) void {
-    _ = dvui.image(src, .{ .source = source(face) }, .{ .tag = "player-avatar", .label = .{ .text = "玩家头像" }, .min_size_content = .{ .w = 48, .h = 48 }, .max_size_content = .{ .w = 48, .h = 48 }, .gravity_y = 0.5, .padding = dvui.Rect.all(0), .margin = dvui.Rect.all(0) });
+    _ = @import("surface.zig").image(src, .{ .source = source(face) }, .{ .tag = "player-avatar", .label = .{ .text = "玩家头像" }, .min_size_content = .{ .w = 48, .h = 48 }, .max_size_content = .{ .w = 48, .h = 48 }, .gravity_y = 0.5, .padding = dvui.Rect.all(0), .margin = dvui.Rect.all(0) });
 }
 
 fn fixtureChunk(a: std.mem.Allocator, output: *std.ArrayList(u8), kind: *const [4]u8, data: []const u8) !void {

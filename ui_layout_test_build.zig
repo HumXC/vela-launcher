@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const filter = b.option([]const u8, "test-filter", "Run a focused testing-renderer test group") orelse "UI layout";
+    b.default_step.dependOn(&addTests(b, target, optimize, filter).step);
+}
+
+pub fn addTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, filter: []const u8) *std.Build.Step.Run {
     const dvui = b.dependency("dvui", .{
         .target = target,
         .optimize = optimize,
@@ -21,6 +26,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     module.addImport("dvui", dvui.module("dvui_testing"));
+    @import("build-support/webp.zig").link(b, target, optimize, module);
     const curl = b.dependency("curl", .{
         .target = target,
         .optimize = optimize,
@@ -38,8 +44,6 @@ pub fn build(b: *std.Build) void {
     module.addImport("test_allocations", b.createModule(.{ .root_source_file = b.path("src/test_allocations.zig") }));
     if (target.result.os.tag == .linux)
         module.addImport("linux_c", @import("build-support/linux_c.zig").create(b, target, optimize));
-    const filter = b.option([]const u8, "test-filter", "Run a focused testing-renderer test group") orelse "UI layout";
     const tests = b.addTest(.{ .root_module = module, .filters = &.{filter} });
-    const run = b.addRunArtifact(tests);
-    b.default_step.dependOn(&run.step);
+    return b.addRunArtifact(tests);
 }

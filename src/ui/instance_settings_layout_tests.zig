@@ -206,12 +206,13 @@ const Frame = struct {
         return target;
     }
 
-    fn text(key: []const u8, expected: []const u8, size: f32, expected_color: ?dvui.Color) !Text {
+    fn text(key: []const u8, expected: []const u8, size: ?f32, expected_color: ?dvui.Color) !Text {
         const target = try dvui.testing.tagGet(key);
         for (texts) |sample| {
             if (!std.mem.eql(u8, sample.value, expected) or !contains(target.rect, sample.rect, 0.1)) continue;
             try expectInside(sample.clip, sample.rect);
-            try std.testing.expectApproxEqAbs(size, sample.font.size, 0.01);
+            // The role size is in EM pixels, while DVUI stores a capital-M height.
+            if (size) |pixels| try std.testing.expectApproxEqAbs(theme.fontSized(pixels).textHeight(), sample.font.textHeight(), 0.01);
             if (expected_color) |color| try std.testing.expectEqualDeep(color, sample.color);
             return sample;
         }
@@ -328,7 +329,8 @@ fn atBothSizes(comptime scenario: fn () anyerror!void) !void {
         var store = try config.Store.init(a, std.testing.io, root);
         defer store.deinit();
         try store.update(.{ .instances = &.{saved}, .selected_instance = saved.id, .settings = .{ .default_memory_mb = 2048 } });
-        const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 1), .runtimes = &[_]java.Runtime{runtime} }, .{});
+        // Match java.Manager's current registry schema; these controls use registered paths.
+        const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .runtimes = &[_]java.Runtime{runtime}, .choices = .{}, .hidden = &[_]java.Runtime{} }, .{});
         defer a.free(fixture);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/java.json", .data = fixture });
         var java_registry = try java.Manager.init(a, std.testing.io, root);
@@ -357,12 +359,9 @@ fn atBothSizes(comptime scenario: fn () anyerror!void) !void {
         var window = try dvui.testing.init(.{ .window_size = size });
         defer window.deinit();
         window.backend.size_pixels = .{ .w = size.w, .h = size.h };
-        // Match the existing renderer fixtures: each fresh window owns its built-in font.
-        var settings_theme = dvui.Theme.builtin.adwaita_dark;
-        settings_theme.font_body = settings_theme.font_body.withSize(16);
-        settings_theme.font_heading = settings_theme.font_body.withSize(18);
-        settings_theme.font_title = settings_theme.font_body.withSize(24);
-        window.window.themeSet(settings_theme);
+        // Keep a deterministic built-in face, then resolve the production EM sizes.
+        window.window.themeSet(dvui.Theme.builtin.adwaita_dark);
+        theme.applyTypography();
         try dvui.testing.settle(Frame.draw);
         try scenario();
         try Frame.savedUnchanged();
@@ -411,13 +410,13 @@ fn settingsGeometry() !void {
     } else try std.testing.expect(debug_panel.y >= memory.y + memory.h + theme.spacing.group_gap - 0.1);
     var previous_bottom: ?f32 = null;
     for (label_tags, controls, 0..) |label_tag, control_tag, index| {
-        const width = if (side_by_side and index >= 2) (memory.w - 2 * theme.spacing.panel_padding) / 2 - theme.spacing.row_gap else viewport.w - 2 * theme.spacing.panel_padding;
+        const width = if (side_by_side and index >= 2) (memory.w - 2 * theme.spacing.panel_padding - theme.spacing.field_gap) / 2 else viewport.w - 2 * theme.spacing.panel_padding;
         const geometry = try field(label_tag, control_tag, width);
         if (previous_bottom) |bottom| {
             if (side_by_side and index == 3) {
                 const minimum = (try Frame.captured(controls[2])).border;
                 try std.testing.expectApproxEqAbs(minimum.y, geometry.border.y, 0.1);
-                try std.testing.expectApproxEqAbs(minimum.x + minimum.w + theme.spacing.card_gap, geometry.border.x, 0.1);
+                try std.testing.expectApproxEqAbs(minimum.x + minimum.w + theme.spacing.field_gap, geometry.border.x, 0.1);
             } else try std.testing.expect((try Frame.captured(label_tag)).border.y >= bottom + theme.spacing.field_label_gap - 0.1);
         }
         previous_bottom = geometry.border.y + geometry.border.h;
@@ -443,10 +442,10 @@ fn settingsGeometry() !void {
     const knob = (try dvui.testing.tagGet("instance-settings-debug-knob")).rect;
     const label = (try Frame.captured("instance-settings-debug-label")).border;
     const live_debug = (try Frame.captured("instance-settings-debug")).border;
-    try std.testing.expectApproxEqAbs(@as(f32, 42), track.w, 0.1);
-    try std.testing.expectApproxEqAbs(@as(f32, 24), track.h, 0.1);
-    try std.testing.expectApproxEqAbs(@as(f32, 18), knob.w, 0.1);
-    try std.testing.expectApproxEqAbs(@as(f32, 18), knob.h, 0.1);
+    try std.testing.expectApproxEqAbs(theme.sizing.switch_width, track.w, 0.1);
+    try std.testing.expectApproxEqAbs(theme.sizing.switch_height, track.h, 0.1);
+    try std.testing.expectApproxEqAbs(theme.sizing.switch_knob, knob.w, 0.1);
+    try std.testing.expectApproxEqAbs(theme.sizing.switch_knob, knob.h, 0.1);
     try std.testing.expectApproxEqAbs(live_debug.x + live_debug.w, track.x + track.w, 0.1);
     try std.testing.expectApproxEqAbs(live_debug.center().y, track.center().y, 0.1);
     try std.testing.expectApproxEqAbs(track.center().y, rendered_label.rect.center().y, 0.1);
@@ -551,6 +550,7 @@ const DeleteBackground = struct {
         try expectRect(self.footer.title, footer.title);
         for (controls, self.fields) |key, expected| {
             const current = try Frame.captured(key);
+            errdefer std.debug.print("Delete background geometry: control={s}, active={}, expected={any}, actual={any}\n", .{ key, active, expected, current });
             // Absolute field positions also prove the scroll offset survived the popup.
             try expectRect(expected.border, current.border);
             try expectRect(expected.content, current.content);
@@ -572,7 +572,7 @@ fn deleteParagraph(key: []const u8, expected_parts: []const []const u8, modal: d
         if (!contains(paragraph, sample.rect, 0.1)) continue;
         try expectInside(modal, sample.rect);
         try expectInside(sample.clip, sample.rect);
-        try std.testing.expectApproxEqAbs(@as(f32, 16), sample.font.size, 0.01);
+        try std.testing.expectApproxEqAbs(theme.bodyFont().textHeight(), sample.font.textHeight(), 0.01);
         try rendered.appendSlice(std.testing.allocator, sample.value);
     }
     for (expected_parts) |part| {
@@ -587,11 +587,11 @@ fn deleteModalGeometry() !void {
     try expectInside(.{ .x = 12, .y = 12, .w = window.w - 24, .h = window.h - 24 }, modal);
     const margin: f32 = if (window.h < 480) 16 else theme.spacing.page_margin;
     try std.testing.expectApproxEqAbs(@min(@as(f32, 620), window.w - 2 * margin), modal.w, 0.1);
-    try std.testing.expectApproxEqAbs(@min(@as(f32, 400), window.h - 2 * margin), modal.h, 0.1);
+    try std.testing.expectApproxEqAbs(@min(theme.style.dialogs.instance_delete_height, window.h - 2 * margin), modal.h, 0.1);
     try std.testing.expectApproxEqAbs(window.w / 2, modal.center().x, 0.1);
     try std.testing.expectApproxEqAbs(window.h / 2, modal.center().y, 0.1);
-    const heading = try Frame.text("instance-delete-confirm-title", "永久删除实例", 18, theme.accent);
-    try std.testing.expectEqualDeep(theme.headingFont(), heading.font);
+    const heading = try Frame.text("instance-delete-confirm-title", "永久删除实例", null, theme.colors.foreground);
+    try std.testing.expectEqualDeep(theme.titleFont(), heading.font);
     try expectInside(modal, heading.rect);
     try deleteParagraph("instance-delete-confirm-warning", &.{ "实例「", saved.name, "目录内的存档", "Mod", "配置将永久删除", "无法恢复" }, modal);
     try deleteParagraph("instance-delete-confirm-servers", &.{ "绑定服务器将保留", "仅解除与此实例的绑定", "共享 Minecraft 资源", "其他实例", "外部服务器文件不受影响" }, modal);
@@ -742,7 +742,7 @@ fn renderedMemoryError() !void {
     for (Frame.texts) |sample| {
         if (!contains(page, sample.rect, 1.1) or !contains(sample.clip, sample.rect, 1.1)) continue;
         try message.appendSlice(std.testing.allocator, sample.value);
-        if (std.mem.indexOf(u8, sample.value, "内存") != null) try std.testing.expectApproxEqAbs(@as(f32, 16), sample.font.size, 0.01);
+        if (std.mem.indexOf(u8, sample.value, "内存") != null) try std.testing.expectApproxEqAbs(theme.bodyFont().textHeight(), sample.font.textHeight(), 0.01);
     }
     try std.testing.expect(std.mem.indexOf(u8, message.items, "内存必须为 256–1048576 MiB") != null);
     try std.testing.expect(std.mem.indexOf(u8, message.items, "最小内存不能大于最大内存") != null);

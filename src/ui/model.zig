@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const Panel = enum { home, players, versions, more, java, servers, logs, instances, worlds, mods };
-pub const Category = enum { game, settings };
+pub const Category = enum { game, settings, theme };
 
 pub const GameName = struct {
     bytes: [256]u8 = undefined,

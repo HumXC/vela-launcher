@@ -36,6 +36,10 @@ pub const Context = struct {
     installer_exited: std.atomic.Value(bool) = .init(false),
     proof_borrowed: std.atomic.Value(bool) = .init(false),
     validated_roles: std.atomic.Value(bool) = .init(false),
+    // Only successful Runner.probe callbacks publish these known, distinct paths.
+    // A fresh metadata preparation clears evidence from any earlier creation.
+    runtime_marker_probed: std.atomic.Value(bool) = .init(false),
+    installer_marker_probed: std.atomic.Value(bool) = .init(false),
     staged: std.atomic.Value(bool) = .init(false),
     rolled_back: std.atomic.Value(bool) = .init(false),
     fail_after_staging: std.atomic.Value(bool) = .init(false),
@@ -254,6 +258,8 @@ fn syntheticManifest(raw: ?*anyopaque, a: A, _: Io, cancel: ?*const CancelToken)
     try checkCancel(cancel);
     const self = try Context.from(raw);
     const data = self.prepared orelse return error.FixtureMetadataUnavailable;
+    self.runtime_marker_probed.store(false, .release);
+    self.installer_marker_probed.store(false, .release);
     _ = self.synthetic_requests.fetchAdd(1, .monotonic);
     return metadata.manifest.parseSlice(a, data.manifest_bytes);
 }
@@ -284,6 +290,14 @@ fn syntheticGet(raw: ?*anyopaque, a: A, url: []const u8, max_bytes: usize, contr
     return .{ .bytes = bytes, .final_url = final_url, .status = 200 };
 }
 fn markerProbe(raw: ?*anyopaque, a: A, io: Io, path: []const u8, cancel: ?*const CancelToken) !java.Runtime {
+    const runtime = try readMarker(raw, a, io, path, cancel);
+    const self = try Context.from(raw);
+    if (runtime.major == 17) self.runtime_marker_probed.store(true, .release) else self.installer_marker_probed.store(true, .release);
+    return runtime;
+}
+
+// Revalidation reads the real marker again without manufacturing probe evidence.
+fn readMarker(raw: ?*anyopaque, a: A, io: Io, path: []const u8, cancel: ?*const CancelToken) !java.Runtime {
     try checkCancel(cancel);
     const self = try Context.from(raw);
     const data = self.prepared orelse return error.FixtureMetadataUnavailable;
@@ -346,9 +360,13 @@ pub fn validateRequest(self: *Context, a: A, io: Io, request: instances_manager.
     errdefer recipe.deinit();
     const requirements = loaders.recipes.javaRequirements(recipe.value);
     if (requirements.runtime_major != proof.requirements.runtime_major or requirements.installer_major != proof.requirements.installer_major or requirements.runtime_major != 17 or requirements.installer_major != 8) return error.FixtureJavaRequirementsChanged;
-    const runtime = try markerProbe(self, a, io, request.instance.java_path orelse return error.FixtureWrongJavaRole, control.cancel);
+    // Core probes Java Manager's exact selections before calling the installer.
+    // Its original row keeps automatic Java null; it is not the resolved runtime.
+    if (!self.runtime_marker_probed.load(.acquire) or !self.installer_marker_probed.load(.acquire)) return error.FixtureMissingJavaProbe;
+    const runtime_path = request.instance.java_path orelse data.java17_path;
+    const runtime = try readMarker(self, a, io, runtime_path, control.cancel);
     defer java.freeRuntime(a, runtime);
-    const installer = try markerProbe(self, a, io, request.installer_java orelse return error.FixtureWrongJavaRole, control.cancel);
+    const installer = try readMarker(self, a, io, request.installer_java orelse return error.FixtureWrongJavaRole, control.cancel);
     defer java.freeRuntime(a, installer);
     if (runtime.major != requirements.runtime_major or installer.major != requirements.installer_major or std.mem.eql(u8, runtime.path, installer.path)) return error.FixtureWrongJavaRole;
     try control.check();
@@ -536,8 +554,8 @@ fn syntheticInstall(raw: ?*anyopaque, a: A, io: Io, request: instances_manager.C
     if (self.fail_after_staging.load(.acquire)) return error.FixtureSyntheticStagingFailure;
     var assets = try metadata.asset_index.parseSlice(g, index_bytes);
     defer assets.deinit();
-    const client_relative_path = try (@import("core/minecraft/layout.zig").Target{ .directory_name = request.instance.name, .name = request.instance.name }).clientPath(g);
-    var plan = try install_plan.build(g, recipe.value.version, assets.value, try environment(), .{ .root = p.minecraft, .client_relative_path = client_relative_path, .instance_name = request.instance.name, .game_directory = final });
+    const client_relative_path = try (@import("core/minecraft/layout.zig").Target{ .directory_name = std.fs.path.basename(stage), .name = request.instance.name }).clientPath(g);
+    var plan = try install_plan.build(g, recipe.value.version, assets.value, try environment(), .{ .root = p.minecraft, .client_relative_path = client_relative_path, .instance_name = request.instance.name, .game_directory = stage });
     defer plan.deinit();
     // The declared synthetic metadata has no processors, natives, logging or assets.
     // Reject a changed plan instead of silently skipping any required artifact.
@@ -557,6 +575,13 @@ fn syntheticInstall(raw: ?*anyopaque, a: A, io: Io, request: instances_manager.C
             .native, .asset, .logging => return error.FixtureUnexpectedGamePlan,
         };
         try verifyBytes(bytes, file.sha1, file.size);
+        // The native installer keeps the client in its private stage until rename.
+        // Only shared libraries and asset metadata may be published as caches.
+        if (file.kind == .client) {
+            if (!std.mem.eql(u8, file.path, staged_client)) return error.FixtureUnexpectedGamePlan;
+            try verifyWritten(g, io, staged_client, bytes);
+            continue;
+        }
         const relative = try std.fs.path.relative(g, p.root, null, p.minecraft, file.path);
         if (std.mem.startsWith(u8, relative, "..") or std.fs.path.isAbsolute(relative)) return error.FixtureUnsafePath;
         const staged_path = try std.fs.path.join(g, &.{ cache_stage, relative });
@@ -564,7 +589,7 @@ fn syntheticInstall(raw: ?*anyopaque, a: A, io: Io, request: instances_manager.C
         try verifyWritten(g, io, staged_path, bytes);
         try materialized.append(g, .{ .destination = file.path, .staged_path = staged_path, .bytes = bytes });
     }
-    if (materialized.items.len != 3 or recipe.value.artifacts.len != 1) return error.FixtureUnexpectedGamePlan;
+    if (plan.value.files.len != 3 or materialized.items.len != 2 or recipe.value.artifacts.len != 1) return error.FixtureUnexpectedGamePlan;
     const bindings = try g.alloc(ArtifactBinding, recipe.value.artifacts.len);
     for (recipe.value.artifacts, bindings) |artifact, *binding| {
         try verifyBytes(data.library_bytes, artifact.sha1, artifact.size);

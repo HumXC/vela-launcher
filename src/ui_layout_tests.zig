@@ -3,6 +3,7 @@ const dvui = @import("dvui");
 const tasks = @import("core/tasks.zig");
 const task_view = @import("ui/tasks_view.zig");
 const settings_view = @import("ui/settings_view.zig");
+const appearance_view = @import("ui/appearance_view.zig");
 const view = @import("ui/view.zig");
 const model = @import("ui/model.zig");
 const config = @import("core/config.zig");
@@ -38,6 +39,7 @@ comptime {
     _ = @import("ui/instance_settings_layout_tests.zig");
     _ = @import("ui/card_grid_layout_tests.zig");
     _ = @import("ui/logs_layout_tests.zig");
+    _ = @import("ui/surface_layout_tests.zig");
 }
 const accounts_view = @import("ui/accounts_view.zig");
 const accounts_manager = @import("ui/accounts_manager.zig");
@@ -76,6 +78,60 @@ fn expectInside(outer: dvui.Rect.Physical, inner: dvui.Rect.Physical) !void {
     try std.testing.expect(inner.y + inner.h <= outer.y + outer.h + 0.1);
 }
 
+// The app normalizes design pixels through the active face inside a frame.
+// Keep the larger-font cases, but do not confuse DVUI's capital-M size with EM pixels.
+fn applyLayoutTypography(body_pixels: f32) void {
+    vela_theme.install(dvui.currentWindow());
+    vela_theme.applyTypography();
+    var value = dvui.themeGet();
+    value.font_body = vela_theme.fontSized(body_pixels);
+    dvui.currentWindow().themeSet(value);
+}
+
+const RenderedPaint = struct { fill: ?dvui.Color = null, border: ?dvui.Color = null };
+
+fn pathBounds(path: dvui.Path) ?dvui.Rect.Physical {
+    if (path.points.len == 0) return null;
+    var left = std.math.inf(f32);
+    var top = std.math.inf(f32);
+    var right = -std.math.inf(f32);
+    var bottom = -std.math.inf(f32);
+    for (path.points) |point| {
+        left = @min(left, point.x);
+        top = @min(top, point.y);
+        right = @max(right, point.x);
+        bottom = @max(bottom, point.y);
+    }
+    return .{ .x = left, .y = top, .w = right - left, .h = bottom - top };
+}
+
+fn sameRect(first: dvui.Rect.Physical, second: dvui.Rect.Physical) bool {
+    return @abs(first.x - second.x) <= 0.01 and @abs(first.y - second.y) <= 0.01 and
+        @abs(first.w - second.w) <= 0.01 and @abs(first.h - second.h) <= 0.01;
+}
+
+// Uniform shared surfaces suppress the native border and paint their own contour.
+// Match the actual fill and stroke to the captured widget's physical geometry.
+fn renderedPaint(commands: []const dvui.RenderCommand, widget: dvui.Debug.CapturedWidget) RenderedPaint {
+    var result: RenderedPaint = .{};
+    for (commands) |command| switch (command.cmd) {
+        .pathFillConvex => |fill| {
+            const bounds = pathBounds(fill.path) orelse continue;
+            if (command.alpha > 0 and sameRect(bounds, widget.rect_background) and
+                !bounds.intersect(command.clip).empty()) result.fill = fill.opts.color.toColor();
+        },
+        .pathStroke => |stroke| {
+            const bounds = pathBounds(stroke.path) orelse continue;
+            const color = stroke.opts.color.toColor();
+            if (command.alpha > 0 and color.a > 0 and
+                sameRect(bounds.outsetAll(stroke.opts.thickness / 2), widget.rect_border) and
+                !bounds.intersect(command.clip).empty()) result.border = color;
+        },
+        else => {},
+    };
+    return result;
+}
+
 const HomeFrame = struct {
     var state: model.Model = .{};
     var manager: *java.Manager = undefined;
@@ -88,6 +144,7 @@ const HomeFrame = struct {
 
     fn draw() !dvui.App.Result {
         const win = dvui.currentWindow();
+        applyLayoutTypography(vela_theme.typography.body);
         var commands: std.ArrayList(dvui.RenderCommand) = .empty;
         defer commands.deinit(win.arena());
         const previous_commands = win.defer_render_cmds;
@@ -136,6 +193,8 @@ test "UI layout Home Choose Game and Choose Account reserve Start and preserve n
     const root = path_buffer[0..path_length];
     var store = try config.Store.init(a, std.testing.io, root);
     defer store.deinit();
+    var appearance = try appearance_view.Ui.init(a, std.testing.io, store.snapshot().appearance);
+    defer appearance.deinit();
     try store.update(.{ .instances = &.{.{ .id = "fixture-game", .name = "fixture-game", .minecraft_version = "1.21" }}, .servers = &.{.{ .id = "fixture-server", .name = "Fixture Survival", .address = "survival.fixture.invalid", .instance_id = "fixture-game", .show_on_home = true }}, .selected_instance = "fixture-game", .selected_server = "fixture-server" });
     var manager = try java.Manager.init(a, std.testing.io, root);
     defer manager.deinit();
@@ -167,6 +226,7 @@ test "UI layout Home Choose Game and Choose Account reserve Start and preserve n
         .tasks = &registry,
         .servers_ui = &server_ui,
         .settings = undefined,
+        .appearance = &appearance,
         .java_download = &java_download,
         .java_download_ui = undefined,
         .servers = &server_service,
@@ -250,17 +310,17 @@ test "UI layout Home Choose Game and Choose Account reserve Start and preserve n
             const group = try dvui.testing.tagGet("game-instances-panel");
             const header = try dvui.testing.tagGet("game-instances");
             const servers_before = try dvui.testing.tagGet("game-servers-panel");
-            // Tag bounds include the bottom margin separating expanded cards.
-            try std.testing.expectApproxEqAbs(@as(f32, 44), header.rect.h - 30, 0.1);
-            try std.testing.expectApproxEqAbs(group.rect.x + 24, header.rect.x, 0.1);
-            try std.testing.expectApproxEqAbs(group.rect.y + 14, header.rect.y, 0.1);
-            try std.testing.expectApproxEqAbs(group.rect.w - 48, header.rect.w, 0.1);
+            // Tag bounds include the expanded header's content gap and panel margin.
+            try std.testing.expectApproxEqAbs(vela_theme.style.cards.disclosure_height, header.rect.h - vela_theme.style.cards.disclosure_gap, 0.1);
+            try std.testing.expectApproxEqAbs(group.rect.x + vela_theme.spacing.panel_compact_padding, header.rect.x, 0.1);
+            try std.testing.expectApproxEqAbs(group.rect.y + vela_theme.style.cards.disclosure_top, header.rect.y, 0.1);
+            try std.testing.expectApproxEqAbs(group.rect.w - 2 * vela_theme.spacing.panel_compact_padding, header.rect.w, 0.1);
             try dvui.testing.moveTo("game-instances");
             try dvui.testing.settle(HomeFrame.draw);
             try dvui.testing.click(.left);
             try dvui.testing.settle(HomeFrame.draw);
             const collapsed = try dvui.testing.tagGet("game-instances-panel");
-            try std.testing.expectApproxEqAbs(@as(f32, 72), collapsed.rect.h - vela_theme.spacing.panel_padding, 0.1);
+            try std.testing.expectApproxEqAbs(2 * vela_theme.style.cards.disclosure_top + vela_theme.style.cards.disclosure_height, collapsed.rect.h - vela_theme.spacing.group_gap, 0.1);
             try std.testing.expect(dvui.tagGet("game-instance-fixture-game") == null);
             try std.testing.expect((try dvui.testing.tagGet("game-servers-panel")).rect.y < servers_before.rect.y);
             try dvui.testing.expectFocused("game-instances");
@@ -272,7 +332,7 @@ test "UI layout Home Choose Game and Choose Account reserve Start and preserve n
             try dvui.testing.settle(HomeFrame.draw);
             try dvui.testing.click(.left);
             try dvui.testing.settle(HomeFrame.draw);
-            try std.testing.expectApproxEqAbs(@as(f32, 72), (try dvui.testing.tagGet("game-servers-panel")).rect.h - vela_theme.spacing.panel_padding, 0.1);
+            try std.testing.expectApproxEqAbs(2 * vela_theme.style.cards.disclosure_top + vela_theme.style.cards.disclosure_height, (try dvui.testing.tagGet("game-servers-panel")).rect.h - vela_theme.spacing.group_gap, 0.1);
             try std.testing.expect(dvui.tagGet("game-server-fixture-server") == null);
             try dvui.testing.pressKey(.enter, .none);
             try dvui.testing.settle(HomeFrame.draw);
@@ -704,6 +764,8 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
     defer download_ui.deinit();
     var settings = try settings_view.Ui.init(a, store.snapshot().settings);
     defer settings.deinit();
+    var appearance = try appearance_view.Ui.init(a, std.testing.io, store.snapshot().appearance);
+    defer appearance.deinit();
     var server_ui = servers_view.Ui.init(a);
     defer server_ui.deinit();
     var server_service = server_manager.Manager.initWithQuery(a, std.testing.io, EditorsFrame.rejectQuery);
@@ -711,11 +773,18 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
     @memcpy(server_ui.draft.name[0..12], "Server Draft");
     const original_draft = server_ui.draft;
     var logs: logs_view.View = .{};
+    var paths = try instances.Paths.init(a, std.testing.io, root);
+    defer paths.deinit();
+    var coordinator = instance_leases.Coordinator.init(std.testing.io);
+    var world_service = try worlds_manager.Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3) });
+    defer world_service.deinit();
+    var world_ui = try worlds_view.Ui.init(a);
+    defer world_ui.deinit();
     RootHomeFrame.library = &library;
     RootHomeFrame.manager = &manager;
     RootHomeFrame.java_ui = &java_ui;
     RootHomeFrame.launcher = &launcher;
-    RootHomeFrame.services = .{ .configuration = &store, .tasks = &registry, .settings = &settings, .java_download = &download, .java_download_ui = &download_ui, .servers_ui = &server_ui, .servers = &server_service, .logs = &logs, .worlds = undefined, .worlds_ui = undefined, .allow_mutations = false };
+    RootHomeFrame.services = .{ .configuration = &store, .tasks = &registry, .settings = &settings, .appearance = &appearance, .java_download = &download, .java_download_ui = &download_ui, .servers_ui = &server_ui, .servers = &server_service, .logs = &logs, .worlds = &world_service, .worlds_ui = &world_ui, .allow_mutations = false };
     for ([_]dvui.Size{ .{ .w = 640, .h = 400 }, .{ .w = 1280, .h = 720 } }) |size| {
         var window = try dvui.testing.init(.{ .window_size = size });
         defer window.deinit();
@@ -725,6 +794,7 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
         theme.font_heading = theme.font_body.withSize(18);
         theme.font_title = theme.font_body.withSize(24);
         window.window.themeSet(theme);
+        RootHomeFrame.services.allow_mutations = false;
         RootHomeFrame.state = .{};
         try std.testing.expect(RootHomeFrame.state.active_game.set("Saved Fixture"));
         for ([_]games.Phase{ .idle, .loading }) |phase| {
@@ -786,6 +856,42 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
         try std.testing.expectEqual(@as(usize, 1), store.snapshot().instances.len);
         try std.testing.expectEqualStrings("Saved Fixture", RootHomeFrame.state.active_game.get());
         try std.testing.expectEqualStrings("saved-game", store.snapshot().selected_instance.?);
+
+        // Exercise the theme through the complete root service lifecycle: preview
+        // remains private, Save publishes after drawing, and Cancel restores it.
+        RootHomeFrame.state.panel = .more;
+        RootHomeFrame.state.category = .theme;
+        RootHomeFrame.state.sidebar_width = 276;
+        RootHomeFrame.services.allow_mutations = true;
+        try dvui.testing.settle(RootHomeFrame.draw);
+        const before = store.snapshot().appearance.corner_radius;
+        const next: u8 = if (before == 0) 20 else 0;
+        appearance.draft.corner_radius = next;
+        try dvui.testing.settle(RootHomeFrame.draw);
+        try std.testing.expect(appearance.drawn and appearance.active and appearance.dirty());
+        try std.testing.expectEqual(before, store.snapshot().appearance.corner_radius);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(next)), vela_theme.controlRadius());
+        for ([_][]const u8{ "theme-defaults", "theme-cancel", "theme-apply" }) |tag| {
+            const action = try dvui.testing.tagGet(tag);
+            try std.testing.expect(action.visible);
+            try expectInside(RootHomeFrame.layout.?.right, action.rect);
+        }
+        try dvui.testing.moveTo("theme-apply");
+        try dvui.testing.click(.left);
+        try dvui.testing.settle(RootHomeFrame.draw);
+        try std.testing.expectEqual(next, store.snapshot().appearance.corner_radius);
+        try std.testing.expect(appearance.saved and !appearance.dirty());
+        // Reload through the existing owner; a second Store correctly rejects its live lock.
+        try store.reconcile();
+        try std.testing.expectEqual(next, store.snapshot().appearance.corner_radius);
+        appearance.draft.corner_radius = before;
+        try dvui.testing.settle(RootHomeFrame.draw);
+        try dvui.testing.moveTo("theme-cancel");
+        try dvui.testing.click(.left);
+        try dvui.testing.settle(RootHomeFrame.draw);
+        try std.testing.expect(!appearance.dirty());
+        try std.testing.expectEqual(next, appearance.draft.corner_radius);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(next)), vela_theme.controlRadius());
     }
 }
 
@@ -1063,8 +1169,8 @@ test "UI layout server and instance editor widget IDs keep independent focus and
     try std.testing.expectEqual(inputs.len, count);
     const buffers = [_][]u8{ &server_ui.draft.name, &server_ui.draft.address, &server_ui.draft.port, &instance_ui.draft.name, &instance_ui.draft.min_memory, &instance_ui.draft.memory };
     const typed = [_][]const u8{ "Server Draft", "fixture.invalid", "25a566", "Instance Draft", "1x024", "4x096" };
-    // The port keeps raw text for validation; both installed memory entries filter digits.
-    const expected = [_][]const u8{ "Server Draft", "fixture.invalid", "25a566", "Instance Draft", "1024", "4096" };
+    // Port and memory inputs all use the product's digits-only field contract.
+    const expected = [_][]const u8{ "Server Draft", "fixture.invalid", "25566", "Instance Draft", "1024", "4096" };
     for (inputs, 0..) |input, index| {
         // Edits can change either pane's minimum width; use this frame's real input rectangle.
         var live_rect: ?dvui.Rect.Physical = null;
@@ -1160,7 +1266,7 @@ const ServerLayoutFrame = struct {
                             // smallest actual button containing the rendered label.
                             if (previous.rect.w * previous.rect.h <= widget.rect_border.w * widget.rect_border.h) continue;
                         }
-                        controls[index] = .{ .id = widget.id, .rect = widget.rect_border, .text = text.rs.r, .clip = command.clip, .border = widget.color_border, .color = widget.color_text };
+                        controls[index] = .{ .id = widget.id, .rect = widget.rect_border, .text = text.rs.r, .clip = command.clip, .border = renderedPaint(commands, widget).border orelse return error.ButtonOutlineNotRendered, .color = text.color };
                     }
                 }
             },
@@ -1168,18 +1274,25 @@ const ServerLayoutFrame = struct {
         };
     }
 
+    var body_pixels: f32 = vela_theme.typography.body;
+    var selected_card_border: ?dvui.Color = null;
+
     fn draw() !dvui.App.Result {
         const win = dvui.currentWindow();
+        applyLayoutTypography(body_pixels);
         var commands: std.ArrayList(dvui.RenderCommand) = .empty;
         defer commands.deinit(win.arena());
         const previous_commands = win.defer_render_cmds;
+        const previous_after = win.defer_render_cmds_after;
         const previous_rendering = win.render_target.rendering;
         win.defer_render_cmds = &commands;
+        win.defer_render_cmds_after = &commands;
         win.render_target.rendering = false;
         dvui.debug.captureScopeBegin(win.gpa);
         defer {
             dvui.debug.captureScopeEnd();
             win.defer_render_cmds = previous_commands;
+            win.defer_render_cmds_after = previous_after;
             win.render_target.rendering = previous_rendering;
         }
         {
@@ -1206,9 +1319,13 @@ const ServerLayoutFrame = struct {
             try commands.appendSlice(win.arena(), subwindow.render_cmds_after.items);
         }
         try observe(commands.items);
+        selected_card_border = null;
         card_text = @splat(false);
-        if (mode == .servers) {
-            const card = (try dvui.testing.tagGet("server-option-legacy")).rect;
+        // Capture is optional during initial layout and modal transitions. The test
+        // requires the actual Button and its tab registration after settling.
+        if (mode == .servers) if (capturedCard("server-option-legacy")) |button| {
+            selected_card_border = renderedPaint(commands.items, button).border;
+            const card = button.rect_border;
             for (commands.items) |command| switch (command.cmd) {
                 .text => |text| {
                     if (!JavaFrame.contains(card, text.rs.r.center())) continue;
@@ -1220,7 +1337,7 @@ const ServerLayoutFrame = struct {
                 },
                 else => {},
             };
-        }
+        };
         return .ok;
     }
 
@@ -1265,10 +1382,15 @@ const ServerLayoutFrame = struct {
         server_ui.pending = null;
     }
 
+    fn capturedCard(key: []const u8) ?dvui.Debug.CapturedWidget {
+        const tagged = dvui.tagGet(key) orelse return null;
+        const capture = dvui.debug.lastCapture() orelse return null;
+        for (capture.widgets.items) |widget| if (widget.id == tagged.id) return widget;
+        return null;
+    }
+
     fn taggedButton(key: []const u8) !dvui.Debug.CapturedWidget {
-        const tagged = try dvui.testing.tagGet(key);
-        const capture = dvui.debug.lastCapture() orelse return error.ServerLayoutCaptureMissing;
-        for (capture.widgets.items) |widget| if (widget.id == tagged.id) {
+        if (capturedCard(key)) |widget| {
             try std.testing.expectEqualStrings("Button", widget.name orelse "");
             try expectInside((try dvui.testing.tagGet("server-layout-sidebar")).rect, widget.rect_border);
             var registered: usize = 0;
@@ -1277,7 +1399,7 @@ const ServerLayoutFrame = struct {
             };
             try std.testing.expectEqual(@as(usize, 1), registered);
             return widget;
-        };
+        }
         return error.ServerCardButtonMissing;
     }
 
@@ -1333,11 +1455,7 @@ test "UI layout Servers cards keep legacy targets available and shared sidebar a
             var window = try dvui.testing.init(.{ .window_size = size });
             defer window.deinit();
             window.backend.size_pixels = .{ .w = size.w, .h = size.h };
-            var theme = dvui.themeGet();
-            theme.font_body = theme.font_body.withSize(font_size);
-            theme.font_heading = theme.font_body.withSize(18);
-            theme.font_title = theme.font_body.withSize(24);
-            window.window.themeSet(theme);
+            ServerLayoutFrame.body_pixels = font_size;
             try dvui.testing.settle(ServerLayoutFrame.draw);
             const card = try ServerLayoutFrame.taggedButton("server-option-legacy");
             for (ServerLayoutFrame.card_text) |rendered| try std.testing.expect(rendered);
@@ -1350,8 +1468,9 @@ test "UI layout Servers cards keep legacy targets available and shared sidebar a
             try std.testing.expectEqual(error.InvalidAddress, server_ui.failure.?);
             try std.testing.expectEqualStrings("legacy", store.snapshot().selected_server.?);
             try dvui.testing.settle(ServerLayoutFrame.draw);
-            const accent = @import("ui/theme.zig").accent;
-            try std.testing.expectEqual(accent, (try ServerLayoutFrame.taggedButton("server-option-legacy")).color_border);
+            const accent = @import("ui/theme.zig").colors.accent;
+            _ = try ServerLayoutFrame.taggedButton("server-option-legacy");
+            try std.testing.expectEqual(accent, ServerLayoutFrame.selected_card_border orelse return error.SelectedCardOutlineNotRendered);
             try std.testing.expect(server_ui.editor_open);
             try std.testing.expect(ServerLayoutFrame.controls[3] == null and ServerLayoutFrame.controls[4] == null);
             try std.testing.expect(ServerLayoutFrame.controls[6] == null and ServerLayoutFrame.controls[7] == null);
@@ -1393,6 +1512,12 @@ test "UI layout Servers cards keep legacy targets available and shared sidebar a
             try ServerLayoutFrame.click(0);
             servers_view.finish(&server_ui, &store, &server_service);
             try dvui.testing.settle(ServerLayoutFrame.draw);
+            const focused_action = try ServerLayoutFrame.visible(0);
+            try std.testing.expectEqual(focused_action.id, dvui.focusedWidgetId().?);
+            try std.testing.expectEqual(dvui.themeGet().focus, focused_action.border);
+            // Compare selected actions in the same unfocused state.
+            window.window.focusWidget(null, null, null);
+            try dvui.testing.settle(ServerLayoutFrame.draw);
             const server_action = try ServerLayoutFrame.visible(0);
             instance_ui.mode = .create;
             ServerLayoutFrame.mode = .instances;
@@ -1409,10 +1534,10 @@ test "UI layout Servers cards keep legacy targets available and shared sidebar a
                 try std.testing.expectApproxEqAbs(instance_action.text.x - instance_action.rect.x, action.text.x - action.rect.x, 0.1);
                 try std.testing.expectApproxEqAbs(instance_action.text.center().y, action.text.center().y, 0.1);
                 try std.testing.expectEqual(accent, action.border);
-                try std.testing.expectEqual(vela_theme.selected_text, action.color);
+                try std.testing.expectEqual(vela_theme.colors.selected_text, action.color);
             }
             try std.testing.expectEqual(accent, instance_action.border);
-            try std.testing.expectEqual(vela_theme.selected_text, instance_action.color);
+            try std.testing.expectEqual(vela_theme.colors.selected_text, instance_action.color);
             try std.testing.expect(server_ui.pending == null and instance_ui.pending == null and java_ui.commands.items.len == 0);
             try std.testing.expectEqual(@as(usize, 0), EditorsFrame.service_calls);
             try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
@@ -1428,7 +1553,7 @@ const JavaFrame = struct {
     const Text = enum { empty, visible, disclosure, hidden, hidden_status, acquire, download, search, visible_path, hidden_path, acquisition_heading, details_nav, restore, add, vendor, major, search_path };
     const default_labels = [_][]const u8{ "暂无 Java", "Fixture Visible · Java 21", "已隐藏 (1)", "Fixture Hidden · Java 17", "已隐藏 · 不参与游戏启动", "获取 Java", "下载 Java", "搜索本机 Java", "", "", "获取 Java", "查看所选 Java", "恢复显示", "添加 Java", "发行商", "版本", "搜索路径" };
     var labels = default_labels;
-    const Observation = struct { rect: dvui.Rect.Physical, clip: dvui.Rect.Physical, control: ?Control, fill: ?dvui.Color, border: ?dvui.Color, focused: bool, background: bool };
+    const Observation = struct { rect: dvui.Rect.Physical, clip: dvui.Rect.Physical, control: ?Control, fill: ?dvui.Color, border: ?dvui.Color, focused: bool, background: bool, name_lines: ?[2]RenderedTextBounds = null };
     var observations: [labels.len]?Observation = @splat(null);
     var ui: *java_view.Ui = undefined;
     var manager: *java.Manager = undefined;
@@ -1446,18 +1571,24 @@ const JavaFrame = struct {
         interactive = true;
     }
 
+    var body_pixels: f32 = vela_theme.typography.body;
+
     fn draw() !dvui.App.Result {
         const win = dvui.currentWindow();
+        applyLayoutTypography(body_pixels);
         var commands: std.ArrayList(dvui.RenderCommand) = .empty;
         defer commands.deinit(win.arena());
         const previous_commands = win.defer_render_cmds;
+        const previous_after = win.defer_render_cmds_after;
         const previous_rendering = win.render_target.rendering;
         win.defer_render_cmds = &commands;
+        win.defer_render_cmds_after = &commands;
         win.render_target.rendering = false;
         dvui.debug.captureScopeBegin(win.gpa);
         defer {
             dvui.debug.captureScopeEnd();
             win.defer_render_cmds = previous_commands;
+            win.defer_render_cmds_after = previous_after;
             win.render_target.rendering = previous_rendering;
         }
         observations = @splat(null);
@@ -1496,10 +1627,11 @@ const JavaFrame = struct {
                         if (!std.mem.eql(u8, widget.name orelse continue, "Button") or !contains(widget.rect_border, visible_rect.center()) or !insideScrollClips(capture.widgets.items, widget.parent_id, visible_rect.center())) continue;
                         try std.testing.expect(sample.control == null);
                         sample.control = .{ .id = widget.id, .rect = widget.rect_border };
-                        sample.fill = widget.color_fill;
-                        sample.border = widget.color_border;
+                        const paint = renderedPaint(commands.items, widget);
+                        sample.fill = paint.fill;
+                        sample.border = paint.border;
                         sample.focused = widget.focused;
-                        sample.background = widget.background;
+                        sample.background = paint.fill != null;
                     }
                     if (observations[index]) |previous| if (previous.control != null and sample.control == null) continue;
                     observations[index] = sample;
@@ -1524,36 +1656,41 @@ const JavaFrame = struct {
     }
 
     fn completeName(commands: []const dvui.RenderCommand, widget: dvui.Debug.CapturedWidget, name: []const u8) ?Observation {
-        var consumed: usize = 0;
-        var sample: ?Observation = null;
+        // Vendor and Java version are separate labels inside one real Button.
+        const separator = std.mem.indexOf(u8, name, " · ") orelse return null;
+        const parts = [_][]const u8{ name[0..separator], name[separator + " · ".len ..] };
+        var lines: [parts.len]?RenderedTextBounds = @splat(null);
         for (commands) |command| switch (command.cmd) {
             .text => |text| {
                 const visible = text.rs.r.intersect(command.clip);
-                if (visible.w <= 0 or visible.h <= 0 or !contains(widget.rect_border, visible.center())) continue;
-                const fragment = std.mem.trim(u8, text.text, " ");
-                const remaining = std.mem.trimStart(u8, name[consumed..], " ");
-                if (fragment.len == 0 or !std.mem.startsWith(u8, remaining, fragment)) continue;
-                consumed = name.len - remaining.len + fragment.len;
-                // Wrapped lines include a trailing blank in the render rectangle.
-                // Check the nonblank title advance, retaining strict glyph containment.
-                var content_rect = text.rs.r;
-                const content = std.mem.trimEnd(u8, text.text, " ");
-                if (content.len != text.text.len) content_rect.w = text.font.textSizeEx(content, .{ .kerning = text.kerning orelse command.kerning, .kern_in = text.kern_in }).w * text.rs.s;
-                if (sample) |*previous| {
-                    const x = @min(previous.rect.x, content_rect.x);
-                    const y = @min(previous.rect.y, content_rect.y);
-                    const right = @max(previous.rect.x + previous.rect.w, content_rect.x + content_rect.w);
-                    const bottom = @max(previous.rect.y + previous.rect.h, content_rect.y + content_rect.h);
-                    previous.rect = .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
-                    previous.clip = previous.clip.intersect(command.clip);
-                } else {
-                    sample = .{ .rect = content_rect, .clip = command.clip, .control = .{ .id = widget.id, .rect = widget.rect_border }, .fill = widget.color_fill, .border = widget.color_border, .focused = widget.focused, .background = widget.background };
+                if (visible.empty() or !contains(widget.rect_border, visible.center())) continue;
+                for (parts, 0..) |part, index| {
+                    if (!std.mem.eql(u8, part, text.text)) continue;
+                    if (lines[index] != null) return null;
+                    lines[index] = .{ .rect = text.rs.r, .clip = command.clip, .font_height = text.font.textHeight() * text.rs.s };
                 }
-                if (consumed == name.len) return sample;
             },
             else => {},
         };
-        return null;
+        const first = lines[0] orelse return null;
+        const second = lines[1] orelse return null;
+        const left = @min(first.rect.x, second.rect.x);
+        const top = @min(first.rect.y, second.rect.y);
+        const right = @max(first.rect.x + first.rect.w, second.rect.x + second.rect.w);
+        const bottom = @max(first.rect.y + first.rect.h, second.rect.y + second.rect.h);
+        const paint = renderedPaint(commands, widget);
+        return .{
+            .rect = .{ .x = left, .y = top, .w = right - left, .h = bottom - top },
+            // This aggregate is bounded by the Button. observed() first validates
+            // each actual glyph rectangle against its own original command clip.
+            .clip = widget.rect_border,
+            .control = .{ .id = widget.id, .rect = widget.rect_border },
+            .fill = paint.fill,
+            .border = paint.border,
+            .focused = widget.focused,
+            .background = paint.fill != null,
+            .name_lines = .{ first, second },
+        };
     }
 
     fn matchesLabel(index: usize, rendered: []const u8) bool {
@@ -1572,6 +1709,27 @@ const JavaFrame = struct {
         return point.x >= rect.x and point.x <= rect.x + rect.w and point.y >= rect.y and point.y <= rect.y + rect.h;
     }
 
+    fn revealRow(name: Text) !void {
+        for (0..20) |_| {
+            const area = (try dvui.testing.tagGet("java-sidebar")).rect;
+            if (observations[@backingInt(name)]) |sample| {
+                if (sample.control) |target| {
+                    if (contains(area, target.rect.topLeft()) and contains(area, target.rect.bottomRight())) {
+                        if (sample.name_lines) |lines| {
+                            var unclipped = true;
+                            for (lines) |line| unclipped = unclipped and contains(line.clip, line.rect.topLeft()) and contains(line.clip, line.rect.bottomRight());
+                            if (unclipped) return;
+                        }
+                    }
+                }
+            }
+            _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = area.center() });
+            _ = try dvui.currentWindow().addEventMouseWheel(if (name == .hidden) -vela_theme.sizing.control_height else vela_theme.sizing.control_height, .vertical, null);
+            try dvui.testing.settle(draw);
+        }
+        return error.JavaRowNotFullyVisible;
+    }
+
     fn insideScrollClips(widgets: []const dvui.Debug.CapturedWidget, parent_id: dvui.Id, point: dvui.Point.Physical) bool {
         var current = parent_id;
         for (0..widgets.len) |_| {
@@ -1587,7 +1745,17 @@ const JavaFrame = struct {
     }
 
     fn observed(text: Text) !Observation {
-        return observations[@backingInt(text)] orelse error.JavaTextNotRendered;
+        const sample = observations[@backingInt(text)] orelse return error.JavaTextNotRendered;
+        if (sample.name_lines) |lines| {
+            const target = sample.control orelse return error.JavaControlNotRegistered;
+            for (lines) |line| {
+                try std.testing.expect(line.rect.w > 0 and line.rect.h >= line.font_height - 0.01);
+                try expectInside(line.clip, line.rect);
+                try expectInside(target.rect, line.rect);
+            }
+            try std.testing.expect(lines[1].rect.y >= lines[0].rect.y + lines[0].rect.h - 0.1);
+        }
+        return sample;
     }
 
     fn control(text: Text) !Control {
@@ -1628,17 +1796,27 @@ const JavaFrame = struct {
     fn click(text: Text) !void {
         const target = try control(text);
         const sample = try observed(text);
-        try std.testing.expect(contains(sample.clip, target.rect.center()));
+        try expectInside(sample.clip, sample.rect);
+        try std.testing.expect(contains(dvui.windowRectPixels(), target.rect.center()));
+        const capture = dvui.debug.lastCapture() orelse return error.JavaCaptureMissing;
+        const button = for (capture.widgets.items) |widget| {
+            if (widget.id == target.id) break widget;
+        } else return error.JavaControlNotRegistered;
+        try std.testing.expect(insideScrollClips(capture.widgets.items, button.parent_id, target.rect.center()));
         _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = target.rect.center() });
+        // Let metadata from the previous hover close before the press event.
+        try dvui.testing.settle(draw);
         try dvui.testing.click(.left);
         try dvui.testing.settle(draw);
     }
 
     fn clickText(text: Text) !void {
         const sample = try observed(text);
-        const target = sample.rect.intersect(sample.clip);
+        // Exercise the actual Java-version line, rather than the gap between labels.
+        const target = if (sample.name_lines) |lines| lines[1].rect.intersect(lines[1].clip) else sample.rect.intersect(sample.clip);
         try std.testing.expect(target.w > 0 and target.h > 0);
         _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = target.center() });
+        try dvui.testing.settle(draw);
         try dvui.testing.click(.left);
         try dvui.testing.settle(draw);
     }
@@ -1662,6 +1840,7 @@ const JavaFrame = struct {
     }
 
     fn expectWholeRow(name: Text, path: Text, enabled: bool) !Control {
+        try revealRow(name);
         const title = try observed(name);
         const subtitle = try observed(path);
         const target = try control(name);
@@ -1815,7 +1994,7 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
     const hidden_path = "/fixture/hidden-runtime-with-a-long-directory-name/another-long-directory/bin/java";
     const visible: java.Runtime = .{ .path = visible_path, .major = 21, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Visible" };
     const hidden: java.Runtime = .{ .path = hidden_path, .major = 17, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Hidden" };
-    const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 1), .runtimes = &[_]java.Runtime{ visible, hidden }, .hidden = &[_]java.Runtime{hidden} }, .{});
+    const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .runtimes = &[_]java.Runtime{ visible, hidden }, .choices = &[_]struct { game: []const u8, path: []const u8 }{}, .hidden = &[_]java.Runtime{hidden} }, .{});
     defer a.free(fixture);
     try tmp.dir.createDirPath(std.testing.io, ".vela");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/java.json", .data = fixture });
@@ -1856,8 +2035,8 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
         const unselected_border = (try JavaFrame.observed(.visible)).border.?;
         const acquisition_fill = (try JavaFrame.observed(.acquire)).fill.?;
         const acquisition_border = (try JavaFrame.observed(.acquire)).border.?;
-        try std.testing.expectEqual(vela_theme.sidebar, unselected_fill);
-        try std.testing.expectEqual(vela_theme.selected_surface, acquisition_fill);
+        try std.testing.expectEqual(vela_theme.colors.sidebar, unselected_fill);
+        try std.testing.expectEqual(vela_theme.colors.selected_surface, acquisition_fill);
 
         // A click in the second line must focus and select the same whole Button.
         try JavaFrame.clickText(.visible_path);
@@ -1965,7 +2144,7 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
     defer a.free(hidden_path);
     const visible: java.Runtime = .{ .path = visible_path, .major = 21, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Visible" };
     const hidden: java.Runtime = .{ .path = hidden_path, .major = 17, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Hidden" };
-    const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 1), .runtimes = &[_]java.Runtime{ visible, hidden }, .hidden = &[_]java.Runtime{hidden} }, .{});
+    const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .runtimes = &[_]java.Runtime{ visible, hidden }, .choices = &[_]struct { game: []const u8, path: []const u8 }{}, .hidden = &[_]java.Runtime{hidden} }, .{});
     defer a.free(fixture);
     try tmp.dir.createDirPath(std.testing.io, ".vela");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/java.json", .data = fixture });
@@ -1998,11 +2177,7 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
         var window = try dvui.testing.init(.{ .window_size = size });
         defer window.deinit();
         window.backend.size_pixels = .{ .w = size.w, .h = size.h };
-        var test_theme = dvui.themeGet();
-        test_theme.font_body = test_theme.font_body.withSize(viewport.font_size);
-        test_theme.font_heading = test_theme.font_body.withSize(18);
-        test_theme.font_title = test_theme.font_body.withSize(24);
-        window.window.themeSet(test_theme);
+        JavaFrame.body_pixels = viewport.font_size;
         try dvui.testing.settle(JavaFrame.draw);
         try JavaFrame.expectVisible(.empty, "java-sidebar");
         try JavaFrame.expectVisible(.acquire, "java-sidebar");
@@ -2051,6 +2226,7 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
 
         JavaFrame.manager = &manager;
         try dvui.testing.settle(JavaFrame.draw);
+        try JavaFrame.revealRow(.visible);
         try JavaFrame.expectVisible(.visible, "java-sidebar");
         try JavaFrame.expectVisible(.disclosure, "java-sidebar");
         try std.testing.expect(JavaFrame.observations[@backingInt(JavaFrame.Text.hidden)] == null);
@@ -2764,18 +2940,24 @@ const EditorTextFrame = struct {
     var samples: [3][]const u8 = undefined;
     var bounds: [3]?RenderedTextBounds = @splat(null);
 
+    var body_pixels: f32 = vela_theme.typography.body;
+
     fn draw() !dvui.App.Result {
         const win = dvui.currentWindow();
+        applyLayoutTypography(body_pixels);
         var commands: std.ArrayList(dvui.RenderCommand) = .empty;
         defer commands.deinit(win.arena());
         const previous_commands = win.defer_render_cmds;
+        const previous_after = win.defer_render_cmds_after;
         const previous_rendering = win.render_target.rendering;
         win.defer_render_cmds = &commands;
+        win.defer_render_cmds_after = &commands;
         win.render_target.rendering = false;
         dvui.debug.captureScopeBegin(win.gpa);
         defer {
             dvui.debug.captureScopeEnd();
             win.defer_render_cmds = previous_commands;
+            win.defer_render_cmds_after = previous_after;
             win.render_target.rendering = previous_rendering;
         }
         bounds = @splat(null);
@@ -2840,11 +3022,7 @@ test "UI layout real server and instance editor font lines are not clipped at co
                 var window = try dvui.testing.init(.{ .window_size = size });
                 defer window.deinit();
                 window.backend.size_pixels = .{ .w = size.w, .h = size.h };
-                var theme = dvui.themeGet();
-                theme.font_body = theme.font_body.withSize(font_size);
-                theme.font_heading = theme.font_body.withSize(18);
-                theme.font_title = theme.font_body.withSize(24);
-                window.window.themeSet(theme);
+                EditorTextFrame.body_pixels = font_size;
                 EditorTextFrame.server = server;
                 const offset: usize = if (server) 0 else 3;
                 const field_count: usize = 3;
@@ -2870,15 +3048,21 @@ test "UI layout real server and instance editor font lines are not clipped at co
                     try std.testing.expect(count < inputs.len);
                     inputs[count] = entry.widgetId;
                     widths[count] = (entry.rect orelse return error.InputRectangleMissing).w;
+                    const input_rect = entry.rect orelse return error.InputRectangleMissing;
+                    const capture = dvui.debug.lastCapture() orelse return error.EditorCaptureMissing;
+                    const input_widget = for (capture.widgets.items) |widget| {
+                        if (widget.id == entry.widgetId) break widget;
+                    } else return error.EditorInputCaptureMissing;
+                    const group = for (capture.widgets.items) |widget| {
+                        if (widget.id == input_widget.parent_id) break widget;
+                    } else return error.EditorFieldGroupMissing;
+                    // Full fields fill their actual form column, including the port.
+                    try std.testing.expectApproxEqAbs(group.rect_content.x, input_rect.x, 0.01);
+                    try std.testing.expectApproxEqAbs(group.rect_content.w, input_rect.w, 0.01);
+                    try std.testing.expect(input_rect.w >= vela_theme.bodyFont().textSize(EditorTextFrame.samples[count]).w);
                     if (server and count == 2) {
-                        // The server port keeps its native 240px numeric entry.
-                        try std.testing.expectApproxEqAbs(@as(f32, 240), widths[count], 0.01);
-                    } else {
-                        // Entries fill the Bento panel within the page margins.
-                        if (!server and count > 0 and size.w >= 1280) {
-                            try std.testing.expect(widths[count] >= vela_theme.bodyFont().textSize("最大内存（MiB）").w);
-                            try std.testing.expect(widths[count] < size.w - 112);
-                        } else try std.testing.expect(widths[count] >= size.w - 112);
+                        const binding = try dvui.testing.tagGet("server-instance-binding");
+                        try std.testing.expectApproxEqAbs(input_rect.w, binding.rect.w, 0.01);
                     }
                     count += 1;
                 }
@@ -2903,7 +3087,7 @@ test "UI layout real server and instance editor font lines are not clipped at co
                     errdefer std.debug.print("Editor text clipped: server={any}, size={any}, font={d}, input={s}, bounds={any}\n", .{ server, size, font_size, EditorTextFrame.samples[index], text });
                     try std.testing.expect(text.rect.h >= text.font_height - 0.01);
                     try expectInside(text.clip, text.rect);
-                    if (font_size == 24) try std.testing.expect(text.font_height > 20);
+                    try std.testing.expectApproxEqAbs(vela_theme.bodyFont().textHeight() * dvui.windowNaturalScale(), text.font_height, 0.01);
                 }
                 for (buffers, samples) |buffer, sample| try std.testing.expectEqualStrings(sample, std.mem.sliceTo(buffer, 0));
                 try std.testing.expect(server_ui.pending == null);
@@ -2925,7 +3109,7 @@ const WorldsTextFrame = struct {
         // The card description retains its explicit line separator in commands.
         "文件夹：world-gypQ · 生存模式\n",
         "最后游玩：",
-        "世界备份",
+        "世界备份 · 原文件夹：world-gypQ",
         "",
         "备份 · 6",
         "正在游玩",
@@ -2949,6 +3133,11 @@ const WorldsTextFrame = struct {
     var card_has_version = false;
     var card_text: [512]u8 = undefined;
     var card_text_length: usize = 0;
+    const recovery_rows = [_][]const u8{ "world-backup-item-" ++ recovery_id ++ "-original", "world-backup-item-22222222222222222222222222222222-overwritten" };
+    var recovery_labels: [recovery_rows.len]?dvui.Debug.CapturedWidget = @splat(null);
+    var recovery_captions: [recovery_rows.len]TextFragments = @splat(.{});
+    var recovery_date_labels: [recovery_rows.len]?dvui.Debug.CapturedWidget = @splat(null);
+    var recovery_dates: [recovery_rows.len]TextFragments = @splat(.{});
 
     fn observeFragments(commands: []const dvui.RenderCommand) !void {
         observed = @splat(.{});
@@ -2970,13 +3159,14 @@ const WorldsTextFrame = struct {
                     const local_date = date[0..10];
                     if (std.mem.indexOf(u8, text.text, "版本：") != null or std.mem.indexOf(u8, text.text, "1.21.4 gypQ") != null) card_has_version = true;
                     if (std.mem.indexOf(u8, text.text, "最后游玩") != null or std.mem.indexOf(u8, text.text, local_date) != null) playing_card_has_date = true;
-                    if (std.mem.eql(u8, text.text, "正在游玩")) playing_status_accent = std.meta.eql(text.color, @import("ui/theme.zig").accent);
+                    if (std.mem.eql(u8, text.text, "正在游玩")) playing_status_accent = std.meta.eql(text.color, @import("ui/theme.zig").colors.accent);
                 };
                 if (text.text.len == 0) continue;
                 var matched: ?usize = null;
                 if (active) |index| {
                     const remaining = samples[index][observed[index].length..];
-                    if (std.mem.startsWith(u8, remaining, text.text)) matched = index else {
+                    const shortened_date = index == 2 and std.mem.endsWith(u8, text.text, "…") and std.mem.startsWith(u8, remaining, text.text[0 .. text.text.len - "…".len]);
+                    if (std.mem.startsWith(u8, remaining, text.text) or shortened_date) matched = index else {
                         // A short action label such as 备份 can also prefix the
                         // recovery title. Discard that incomplete candidate.
                         observed[index] = .{};
@@ -2985,7 +3175,8 @@ const WorldsTextFrame = struct {
                 }
                 if (matched == null) {
                     for (samples, 0..) |sample, index| {
-                        if (observed[index].length == 0 and std.mem.startsWith(u8, sample, text.text)) {
+                        const shortened_date = index == 2 and std.mem.endsWith(u8, text.text, "…") and std.mem.startsWith(u8, sample, text.text[0 .. text.text.len - "…".len]);
+                        if (observed[index].length == 0 and (std.mem.startsWith(u8, sample, text.text) or shortened_date)) {
                             matched = index;
                             break;
                         }
@@ -2999,9 +3190,11 @@ const WorldsTextFrame = struct {
                     // separator and leading/trailing spaces; never normalize it.
                     @memcpy(capture.bytes[capture.length..][0..text.text.len], text.text);
                     capture.length += text.text.len;
-                    capture.fragments[capture.count] = .{ .rect = text.rs.r, .clip = command.clip, .font_height = text.font.textHeight() * text.rs.s };
+                    var bounds = text.rs.r;
+                    if (std.mem.eql(u8, text.text, "…")) bounds.w = text.font.textSize(text.text).w * text.rs.s;
+                    capture.fragments[capture.count] = .{ .rect = bounds, .clip = command.clip, .font_height = text.font.textHeight() * text.rs.s };
                     capture.count += 1;
-                    active = if (capture.length == samples[index].len) null else index;
+                    active = if (capture.length == samples[index].len or (index == 2 and std.mem.endsWith(u8, text.text, "…"))) null else index;
                 }
             },
             .texture => |texture| {
@@ -3011,6 +3204,7 @@ const WorldsTextFrame = struct {
             },
             else => {},
         };
+        try observeRecoveryCaptions(commands);
     }
 
     fn ownedWorld(a: std.mem.Allocator, folder: []const u8, name: []const u8) !worlds.World {
@@ -3100,8 +3294,11 @@ const WorldsTextFrame = struct {
         return error.WorldRendererWorkerTimedOut;
     }
 
+    var body_pixels: f32 = vela_theme.typography.body;
+
     fn draw() !dvui.App.Result {
         const win = dvui.currentWindow();
+        applyLayoutTypography(body_pixels);
         dvui.debug.captureScopeBegin(win.gpa);
         defer dvui.debug.captureScopeEnd();
         var commands: std.ArrayList(dvui.RenderCommand) = .empty;
@@ -3254,6 +3451,77 @@ const WorldsTextFrame = struct {
         try std.testing.expect(!ui.refresh_queued and !ui.cancel_queued and !ui.select_queued);
     }
 
+    fn observeRecoveryCaptions(commands: []const dvui.RenderCommand) !void {
+        const capture = dvui.debug.lastCapture() orelse return;
+        for (0..2) |kind| {
+            const labels = if (kind == 0) &recovery_labels else &recovery_date_labels;
+            const fragments = if (kind == 0) &recovery_captions else &recovery_dates;
+            const font = if (kind == 0) vela_theme.captionFont() else vela_theme.bodyFont();
+            labels.* = @splat(null);
+            fragments.* = @splat(.{});
+            for (recovery_rows, 0..) |row_tag, index| {
+                const row = dvui.tagGet(row_tag) orelse continue;
+                for (capture.widgets.items) |widget| {
+                    if (!std.mem.eql(u8, widget.name orelse "", "Label") or
+                        !std.mem.eql(u8, widget.src_fn, "drawBackups") or
+                        !row.rect.contains(widget.rect_content.center()) or
+                        widget.font.size != font.size) continue;
+                    try std.testing.expect(labels[index] == null);
+                    labels[index] = widget;
+                }
+                const label = labels[index] orelse continue;
+                const actual = &fragments[index];
+                for (commands) |command| switch (command.cmd) {
+                    .text => |text| {
+                        // LabelWidget retains the line layout width on its ellipsis command.
+                        // The glyph run uses only the measured dots at that command origin.
+                        var bounds = text.rs.r;
+                        if (std.mem.eql(u8, text.text, "...")) bounds.w = text.font.textSize(text.text).w * text.rs.s;
+                        if (text.text.len == 0 or !label.rect_content.contains(bounds.center())) continue;
+                        if (actual.count == actual.fragments.len or actual.length + text.text.len > actual.bytes.len) return error.WorldTextCaptureOverflow;
+                        @memcpy(actual.bytes[actual.length..][0..text.text.len], text.text);
+                        actual.length += text.text.len;
+                        actual.fragments[actual.count] = .{ .rect = bounds, .clip = command.clip, .font_height = text.font.textHeight() * text.rs.s };
+                        actual.count += 1;
+                    },
+                    else => {},
+                };
+            }
+        }
+    }
+
+    fn expectRecoveryText(row_tag: []const u8, kind: enum { caption, date }) !void {
+        const index = for (recovery_rows, 0..) |tag, i| {
+            if (std.mem.eql(u8, tag, row_tag)) break i;
+        } else return error.WorldRecoveryCaptionMissing;
+        const row = try dvui.testing.tagGet(row_tag);
+        const label = (if (kind == .caption) recovery_labels[index] else recovery_date_labels[index]) orelse return error.WorldRecoveryCaptionMissing;
+        const actual = if (kind == .caption) recovery_captions[index] else recovery_dates[index];
+        // The full caption is a single ellipsized label; status is a separate hint.
+        // Predict the prefix from the source text, font and allocated label width,
+        // then require every real glyph command, including the ellipsis.
+        const full = samples[if (kind == .caption) 3 else 4];
+        const font = label.font;
+        const width = label.rect_content.w / dvui.windowNaturalScale();
+        const ellipsized = font.textSize(full).w > width + 0.001;
+        errdefer std.debug.print("Recovery metadata: kind={s}, full={s}, rendered={s}, chunks={d}, width={d}, text_width={d}, font={any}\n", .{ @tagName(kind), full, actual.bytes[0..actual.length], actual.count, width, font.textSize(full).w, font });
+        var end = full.len;
+        if (ellipsized) _ = font.textSizeEx(full, .{ .max_width = width - font.textSize("...").w, .end_idx = &end });
+        try std.testing.expect(end >= (if (kind == .caption) @as(usize, "世界备份".len) else 4));
+        try std.testing.expectEqual(@as(usize, if (ellipsized) 2 else 1), actual.count);
+        try std.testing.expectEqual(end + @as(usize, if (ellipsized) 3 else 0), actual.length);
+        try std.testing.expectEqualStrings(full[0..end], actual.bytes[0..end]);
+        try std.testing.expectEqualStrings(if (ellipsized) "..." else "", actual.bytes[end..actual.length]);
+        for (actual.fragments[0..actual.count]) |text| {
+            try std.testing.expect(text.rect.w > 0 and text.rect.h >= text.font_height - 0.01);
+            try expectInside(text.clip, text.rect);
+            try expectInside(label.rect_content, text.rect);
+            try expectInside(row.rect, text.rect);
+            try expectInside(try recoveryViewport(), text.rect);
+        }
+        observed[if (kind == .caption) 3 else 4] = actual;
+    }
+
     fn expectLines(start: usize, end: usize, size: dvui.Size, font_size: f32) !void {
         for (start..end) |index| {
             const capture = &observed[index];
@@ -3262,7 +3530,14 @@ const WorldsTextFrame = struct {
             // Exact concatenation in command order requires every chunk. A
             // missing, reordered or altered chunk (including spaces) fails.
             try std.testing.expect(capture.count > 0);
-            try std.testing.expectEqualStrings(samples[index], capture.bytes[0..capture.length]);
+            const rendered = capture.bytes[0..capture.length];
+            const shortened_date = index == 2 and std.mem.endsWith(u8, rendered, "…");
+            if (shortened_date) {
+                const prefix = rendered[0 .. rendered.len - "…".len];
+                const minimum = if (std.mem.startsWith(u8, samples[index], "最后游玩：")) "最后游玩：".len + 10 else 10;
+                try std.testing.expect(prefix.len >= minimum);
+                try std.testing.expect(std.mem.startsWith(u8, samples[index], prefix));
+            } else try std.testing.expectEqualStrings(samples[index], rendered);
             for (capture.fragments[0..capture.count], 0..) |text, fragment| {
                 errdefer std.debug.print("World/recovery fragment clipped: label={s}, fragment={d}, bounds={any}\n", .{ samples[index], fragment, text });
                 try std.testing.expect(text.rect.w > 0 and text.rect.h > 0);
@@ -3271,10 +3546,13 @@ const WorldsTextFrame = struct {
                 try expectInside(.{ .x = 0, .y = 0, .w = size.w, .h = size.h }, text.rect);
                 // Card headings/captions keep their semantic font sizes;
                 // Backup dates follow the selected body font.
-                if (font_size == 24 and index == 4) try std.testing.expect(text.font_height > 20);
+                if (index == 4) try std.testing.expectApproxEqAbs(vela_theme.bodyFont().textHeight() * dvui.windowNaturalScale(), text.font_height, 0.01);
                 if (fragment > 0) {
                     const previous = capture.fragments[fragment - 1].rect;
-                    try std.testing.expect(text.rect.y >= previous.y + previous.h - 0.1);
+                    if (shortened_date and fragment == capture.count - 1) {
+                        try std.testing.expectApproxEqAbs(previous.y, text.rect.y, 0.1);
+                        try std.testing.expect(text.rect.x >= previous.x + previous.w - 0.1);
+                    } else try std.testing.expect(text.rect.y >= previous.y + previous.h - 0.1);
                 }
             }
         }
@@ -3326,18 +3604,14 @@ test "UI layout world cards, selected actions and recovery remain responsive and
         WorldsTextFrame.native_geometry = layout.native_geometry;
         // Compact cards show each metadata field on its own bounded line.
         WorldsTextFrame.samples[0] = "World gypQ";
-        WorldsTextFrame.samples[1] = if (layout.native_geometry) "world-gypQ\n生存模式" else if (size.w == 640) "world-gypQ\n生存模式\n" else "文件夹：world-gypQ · 生存模式\n";
+        WorldsTextFrame.samples[1] = if (size.w == 640) "world-gypQ\n生存模式\n" else "文件夹：world-gypQ · 生存模式\n";
         WorldsTextFrame.samples[2] = if (size.w == 640) world_time else world_date_label[0 .. "最后游玩：".len + world_time.len];
-        WorldsTextFrame.samples[7] = if (size.w == 640) "世界备份 · 已替换" else "世界备份 · 被替换数据";
+        WorldsTextFrame.samples[7] = if (size.w == 640) "已替换" else "被替换数据";
         for ([_]f32{ 16, 24 }) |font_size| {
             var window = try dvui.testing.init(.{ .window_size = size });
             defer window.deinit();
             window.backend.size_pixels = .{ .w = size.w, .h = size.h };
-            var theme = dvui.themeGet();
-            theme.font_body = theme.font_body.withSize(font_size);
-            theme.font_heading = theme.font_body.withSize(18);
-            theme.font_title = theme.font_body.withSize(24);
-            window.window.themeSet(theme);
+            WorldsTextFrame.body_pixels = font_size;
             if (ui.selected_world) |old| a.free(old);
             ui.selected_world = null;
             ui.backups_expanded = false;
@@ -3356,8 +3630,8 @@ test "UI layout world cards, selected actions and recovery remain responsive and
             const card = try dvui.testing.tagGet("world-card-world-gypQ");
             const second = try dvui.testing.tagGet("world-card-filler");
             const preview = try dvui.testing.tagGet("world-preview-world-gypQ");
-            try std.testing.expectApproxEqAbs(@as(f32, 64), preview.rect.w, 0.1);
-            try std.testing.expectApproxEqAbs(@as(f32, 64), preview.rect.h, 0.1);
+            try std.testing.expectApproxEqAbs(vela_theme.style.cards.world_preview, preview.rect.w, 0.1);
+            try std.testing.expectApproxEqAbs(vela_theme.style.cards.world_preview, preview.rect.h, 0.1);
             try expectInside(card.rect, preview.rect);
             if (layout.native_geometry) {
                 const date = &WorldsTextFrame.observed[2];
@@ -3366,7 +3640,7 @@ test "UI layout world cards, selected actions and recovery remain responsive and
                     try std.testing.expect(fragment.rect.y >= preview.rect.y + preview.rect.h or fragment.rect.x >= preview.rect.x + preview.rect.w);
                 }
             }
-            try std.testing.expectEqualDeep(dvui.CornerRect.round(10), WorldsTextFrame.preview_corners orelse return error.WorldPreviewRenderMissing);
+            try std.testing.expectEqualDeep(dvui.CornerRect.round(vela_theme.controlRadius()), WorldsTextFrame.preview_corners orelse return error.WorldPreviewRenderMissing);
             try WorldsTextFrame.expectTabStop("world-preview-world-gypQ", false);
             try WorldsTextFrame.expectTabStop("world-refresh", true);
             if (size.w == 640) {
@@ -3433,7 +3707,9 @@ test "UI layout world cards, selected actions and recovery remain responsive and
             }) |tag| try std.testing.expect(dvui.tagGet(tag) != null);
             try WorldsTextFrame.expectTabStop("world-restore-55555555555555555555555555555555-original", false);
             try WorldsTextFrame.reveal(first_row_tag);
-            try WorldsTextFrame.expectLines(3, 5, size, font_size);
+            // Recovery captions are validated separately, including real ellipsis glyphs.
+            try WorldsTextFrame.expectRecoveryText(first_row_tag, .date);
+            try WorldsTextFrame.expectRecoveryText(first_row_tag, .caption);
             const first_row = try dvui.testing.tagGet(first_row_tag);
             const viewport = try WorldsTextFrame.recoveryViewport();
             const visible_first_row = first_row.rect.intersect(viewport);
@@ -3454,6 +3730,7 @@ test "UI layout world cards, selected actions and recovery remain responsive and
             try WorldsTextFrame.scrollRecovery(-100000);
             try WorldsTextFrame.reveal("world-backup-item-22222222222222222222222222222222-overwritten");
             try WorldsTextFrame.expectLines(7, 8, size, font_size);
+            try WorldsTextFrame.expectRecoveryText("world-backup-item-22222222222222222222222222222222-overwritten", .caption);
             const last_row = try dvui.testing.tagGet("world-backup-item-22222222222222222222222222222222-overwritten");
             const last_viewport = try WorldsTextFrame.recoveryViewport();
             const visible_last_row = last_row.rect.intersect(last_viewport);
@@ -3557,7 +3834,7 @@ const AccountEditorFrame = struct {
     const validation_text = "用户名须为 3–16 位字母、数字或下划线";
     const labels = [_][]const u8{ "取消", "离线登录", "微软登录" };
     const tags = [_][]const u8{ "account-cancel", "account-offline-login", "account-microsoft-login" };
-    const Footer = struct { id: dvui.Id, parent_id: dvui.Id, window_id: dvui.Id, label_id: dvui.Id, rect: dvui.Rect.Physical, text: dvui.Rect.Physical, clip: dvui.Rect.Physical };
+    const Footer = struct { id: dvui.Id, parent_id: dvui.Id, window_id: dvui.Id, label_id: dvui.Id, rect: dvui.Rect.Physical, modal_rect: dvui.Rect.Physical, text: dvui.Rect.Physical, clip: dvui.Rect.Physical };
     var ui: *accounts_view.Ui = undefined;
     var store: *config.Store = undefined;
     var manager: *accounts_manager.Manager = undefined;
@@ -3567,8 +3844,11 @@ const AccountEditorFrame = struct {
     var validation_fragments: [16]RenderedTextBounds = undefined;
     var validation_count: usize = 0;
 
+    var body_pixels: f32 = vela_theme.typography.body;
+
     fn draw() !dvui.App.Result {
         const win = dvui.currentWindow();
+        applyLayoutTypography(body_pixels);
         var commands: std.ArrayList(dvui.RenderCommand) = .empty;
         defer commands.deinit(win.arena());
         const previous_commands = win.defer_render_cmds;
@@ -3666,7 +3946,8 @@ const AccountEditorFrame = struct {
                         try uniqueWidget(&owned_label, child);
                     }
                     const label_widget = owned_label orelse return error.AccountEditorFooterLabelOwnershipMissing;
-                    const observed: Footer = .{ .id = widget.id, .parent_id = widget.parent_id, .window_id = modal_id, .label_id = label_widget.id, .rect = widget.rect_border, .text = text.rs.r, .clip = command.clip };
+                    const modal = dvui.currentWindow().subwindows.get(modal_id) orelse return error.AccountEditorModalMissing;
+                    const observed: Footer = .{ .id = widget.id, .parent_id = widget.parent_id, .window_id = modal_id, .label_id = label_widget.id, .rect = widget.rect_border, .modal_rect = modal.rect_pixels, .text = text.rs.r, .clip = command.clip };
                     if (footers[index]) |previous| {
                         // Do not hide a different button, label, bounds or scissor.
                         try std.testing.expectEqual(previous, observed);
@@ -3685,6 +3966,10 @@ const AccountEditorFrame = struct {
         const modal = dvui.currentWindow().subwindows.get(footer.window_id) orelse return error.AccountEditorModalMissing;
         // endFrame resets used; draw already verified live modal ownership.
         try std.testing.expect(modal.modal);
+        const viewport = dvui.windowRectPixels();
+        const requested_height = vela_theme.style.dialogs.account_height + if (ui.failure != null) vela_theme.style.dialogs.error_height else @as(f32, 0);
+        try std.testing.expectApproxEqAbs(@min(requested_height, viewport.h - 2 * vela_theme.spacing.page_margin), modal.rect_pixels.h, 0.1);
+        try std.testing.expectApproxEqAbs(viewport.y + viewport.h / 2, modal.rect_pixels.y + modal.rect_pixels.h / 2, 0.1);
         try expectInside(modal.rect_pixels, footer.rect);
         try expectInside(dvui.windowRectPixels(), footer.rect);
         try expectInside(footer.rect, footer.text);
@@ -3738,11 +4023,7 @@ test "UI layout real account editor keeps submission errors and three footer act
             var window = try dvui.testing.init(.{ .window_size = size });
             defer window.deinit();
             window.backend.size_pixels = .{ .w = size.w, .h = size.h };
-            var theme = dvui.themeGet();
-            theme.font_body = theme.font_body.withSize(font_size);
-            theme.font_heading = theme.font_body.withSize(18);
-            theme.font_title = theme.font_body.withSize(24);
-            window.window.themeSet(theme);
+            AccountEditorFrame.body_pixels = font_size;
             ui.editor_open = true;
             @memset(&ui.draft.name, 0);
             @memcpy(ui.draft.name[0..invalid_name.len], invalid_name);
@@ -3771,7 +4052,15 @@ test "UI layout real account editor keeps submission errors and three footer act
             _ = try window.window.addEventMouseWheel(-100000, .vertical, null);
             try dvui.testing.settle(AccountEditorFrame.draw);
             try AccountEditorFrame.expectValidation();
-            for (controls, 0..) |control, index| try std.testing.expectEqual(control.rect, (try AccountEditorFrame.visibleFooter(index)).rect);
+            // Validation grows the centered dialog; actions remain anchored to its bottom.
+            for (controls, 0..) |control, index| {
+                const current = try AccountEditorFrame.visibleFooter(index);
+                try std.testing.expectEqual(control.id, current.id);
+                try std.testing.expectApproxEqAbs(control.rect.x - control.modal_rect.x, current.rect.x - current.modal_rect.x, 0.1);
+                try std.testing.expectApproxEqAbs(control.rect.w, current.rect.w, 0.1);
+                try std.testing.expectApproxEqAbs(control.rect.h, current.rect.h, 0.1);
+                try std.testing.expectApproxEqAbs(control.modal_rect.y + control.modal_rect.h - control.rect.y - control.rect.h, current.modal_rect.y + current.modal_rect.h - current.rect.y - current.rect.h, 0.1);
+            }
             // Tab reaches every action, including offline submission despite the invalid draft.
             var visited: [AccountEditorFrame.labels.len]bool = @splat(false);
             const tab_steps = window.window.tab_index_prev.items.len + 1;

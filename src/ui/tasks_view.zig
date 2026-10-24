@@ -93,8 +93,8 @@ fn drawRow(task: *tasks.Task, options: Options) !bool {
             try std.fmt.allocPrint(arena, "{s} · {s} · {d}", .{ stateName(task.state), stageName(progress.stage), progress.completed })
     else
         stateName(task.state);
-    dvui.labelNoFmt(@src(), status, .{}, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-status", .{task.id}), .rect = .{ .x = 0, .y = theme.spacing.row_gap + title_height, .w = details_width, .h = small.textHeight() }, .font = small, .color_text = .{ .color = if (task.state == .failed) theme.danger else theme.muted }, .padding = R.all(0), .margin = R.all(0) });
-    dvui.progress(@src(), .{ .percent = if (task.state == .succeeded) 1 else fraction(progress), .color = if (task.state == .failed) theme.danger else null }, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-progress", .{task.id}), .rect = .{ .x = 0, .y = height - theme.spacing.list_row_padding, .w = details_width, .h = theme.style.feedback.compact_progress_height }, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .corners = .all(theme.style.feedback.compact_progress_height / 2) });
+    dvui.labelNoFmt(@src(), status, .{}, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-status", .{task.id}), .rect = .{ .x = 0, .y = theme.spacing.row_gap + title_height, .w = details_width, .h = small.textHeight() }, .font = small, .color_text = .{ .color = if (task.state == .failed) theme.colors.danger else theme.colors.muted }, .padding = R.all(0), .margin = R.all(0) });
+    dvui.progress(@src(), .{ .percent = if (task.state == .succeeded) 1 else fraction(progress), .color = if (task.state == .failed) theme.colors.danger else null }, .{ .tag = try std.fmt.allocPrint(arena, "task-{d}-progress", .{task.id}), .rect = .{ .x = 0, .y = height - theme.spacing.list_row_padding, .w = details_width, .h = theme.style.feedback.compact_progress_height }, .padding = R.all(0), .margin = R.all(0), .border = R.all(0), .corners = .all(theme.style.feedback.compact_progress_height / 2) });
     const side = theme.sizing.task_icon_button;
     const bounds: R = .{ .x = @max(0, width - side), .y = (height - side) / 2, .w = side, .h = side };
     if (task.state == .queued or task.state == .running)
@@ -146,7 +146,7 @@ pub fn drawWithOptions(registry: *tasks.Registry, options: Options) !void {
         dvui.labelNoFmt(@src(), "任务", .{}, .{ .tag = "task-heading", .font = theme.headingFont(), .expand = .horizontal, .padding = R.all(0), .margin = .{ .h = if (options.compact) theme.spacing.detail_gap else theme.spacing.row_gap } });
         const total = count.active + count.recent;
         if (total == 0) {
-            dvui.labelNoFmt(@src(), "暂无任务", .{}, .{ .color_text = .{ .color = theme.muted }, .padding = R.all(0), .margin = R.all(0) });
+            dvui.labelNoFmt(@src(), "暂无任务", .{}, .{ .color_text = .{ .color = theme.colors.muted }, .padding = R.all(0), .margin = R.all(0) });
         } else {
             const height = rowHeight(options);
             const size = viewportSize(total, height, options);

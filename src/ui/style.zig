@@ -1,28 +1,102 @@
-//! Shared Vela design tokens. Keep visual constants here; widgets own layout and behavior.
+//! Shared Vela design tokens. Widgets own layout and behavior.
+const std = @import("std");
 const dvui = @import("dvui");
+const appearance = @import("../core/appearance.zig");
 
-pub const colors = struct {
-    pub const background = dvui.Color.fromHex("191F1D");
-    pub const surface = dvui.Color.fromHex("252D29");
-    pub const inset = dvui.Color.fromHex("202823");
-    pub const sidebar = dvui.Color.fromHex("202823");
-    pub const selected_surface = dvui.Color.fromHex("2B362F");
-    pub const pressed_surface = dvui.Color.fromHex("38483C");
-    pub const outline = dvui.Color.fromHex("36453B");
-    pub const control_outline = dvui.Color.fromHex("73877A");
-    pub const foreground = dvui.Color.fromHex("EDF1EA");
-    pub const muted = dvui.Color.fromHex("B3BFB4");
-    pub const accent = dvui.Color.fromHex("A8C49C");
-    pub const accent_border = dvui.Color.fromHex("87A77B");
-    pub const on_accent = dvui.Color.fromHex("182318");
-    pub const selected_text = dvui.Color.fromHex("C0D9B5");
-    pub const danger = dvui.Color.fromHex("E7A29B");
-    pub const warning = dvui.Color.fromHex("D9BD86");
-    pub const transparent = dvui.Color.fromHex("00000000");
-    pub const signal_inactive = dvui.Color.fromHex("455149");
-    pub const log_match = dvui.Color.fromHex("323D35");
-    pub const log_fatal = dvui.Color.fromHex("FF7E89");
+pub const Palette = struct {
+    background: dvui.Color,
+    surface: dvui.Color,
+    inset: dvui.Color,
+    sidebar: dvui.Color,
+    selected_surface: dvui.Color,
+    pressed_surface: dvui.Color,
+    outline: dvui.Color,
+    control_outline: dvui.Color,
+    foreground: dvui.Color,
+    muted: dvui.Color,
+    accent: dvui.Color,
+    accent_border: dvui.Color,
+    on_accent: dvui.Color,
+    selected_text: dvui.Color,
+    danger: dvui.Color,
+    warning: dvui.Color,
+    transparent: dvui.Color,
+    signal_inactive: dvui.Color,
+    log_match: dvui.Color,
+    log_fatal: dvui.Color,
+
+    pub fn fromSettings(settings: appearance.Settings) Palette {
+        const source = appearance.palette(settings.preset);
+        var result: Palette = undefined;
+        inline for (@typeInfo(Palette).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "transparent")) {
+                @field(result, name) = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+            } else {
+                @field(result, name) = rgb(@field(source, name));
+            }
+        }
+        result.background = rgb(settings.background_color);
+        inline for (.{ "surface", "inset", "sidebar" }) |name| {
+            @field(result, name) = materialColor(@field(result, name), settings.panel_opacity, .control);
+        }
+        result.selected_surface = materialColor(result.selected_surface, settings.panel_opacity, .selected);
+        result.log_match = materialColor(result.log_match, settings.panel_opacity, .selected);
+        result.pressed_surface = materialColor(result.pressed_surface, settings.panel_opacity, .panel);
+        return result;
+    }
 };
+
+pub fn rgb(value: u32) dvui.Color {
+    return .{ .r = @truncate(value >> 16), .g = @truncate(value >> 8), .b = @truncate(value), .a = 255 };
+}
+
+/// Nested surfaces use less tint than the panel behind them. Foreground colors
+/// stay opaque; selected and pressed fills add contrast without a solid patch.
+pub const Material = enum { panel, control, selected };
+
+pub fn materialColor(base: dvui.Color, percent: u8, material: Material) dvui.Color {
+    const opacity = @as(f32, @floatFromInt(@min(percent, 100))) / 100;
+    const selected = opacity * opacity;
+    const alpha = switch (material) {
+        .panel => opacity,
+        .selected => selected,
+        .control => selected * selected,
+    };
+    var result = base;
+    result.a = @intFromFloat(@round(@as(f32, @floatFromInt(base.a)) * alpha));
+    return result;
+}
+
+test "panel opacity keeps foregrounds solid and nested surfaces light" {
+    for (appearance.presets) |preset| {
+        const full_opacity = Palette.fromSettings(.{ .preset = preset });
+        for ([_]u8{ 60, 80, 100 }) |percent| {
+            const actual = Palette.fromSettings(.{ .preset = preset, .panel_opacity = percent });
+            inline for (.{ "background", "foreground", "muted", "accent", "accent_border", "on_accent", "selected_text", "outline", "control_outline", "danger", "warning" }) |name| {
+                try std.testing.expectEqual(@field(full_opacity, name), @field(actual, name));
+            }
+            inline for (.{ "surface", "inset", "sidebar", "selected_surface", "pressed_surface", "log_match" }) |name| {
+                const before = @field(full_opacity, name);
+                const after = @field(actual, name);
+                try std.testing.expectEqual(before.r, after.r);
+                try std.testing.expectEqual(before.g, after.g);
+                try std.testing.expectEqual(before.b, after.b);
+                if (percent == 100) try std.testing.expectEqual(before, after);
+            }
+            if (percent < 100) {
+                try std.testing.expect(actual.surface.a < actual.selected_surface.a);
+                try std.testing.expect(actual.selected_surface.a < actual.pressed_surface.a);
+                const panel = @as(f32, @floatFromInt(percent)) / 100;
+                const nested = @as(f32, @floatFromInt(actual.surface.a)) / 255;
+                try std.testing.expect(panel + (1 - panel) * nested < panel + 0.1);
+            }
+            try std.testing.expectEqual(actual.selected_surface.a, actual.log_match.a);
+            try std.testing.expectEqual(@as(u8, 0), actual.transparent.a);
+        }
+    }
+}
+
+pub var colors: Palette = Palette.fromSettings(.{});
 
 pub const typography = struct {
     pub const body: f32 = 16;
@@ -122,11 +196,6 @@ pub const sizing = struct {
     pub const selected_border: f32 = 1.5;
     pub const control_padding_x = spacing.control_padding_x;
     pub const control_padding_y = spacing.control_padding_y;
-    pub const control_radius: f32 = 12;
-    pub const card_radius: f32 = 16;
-    pub const panel_radius: f32 = 20;
-    pub const sidebar_radius: f32 = 24;
-    pub const modal_radius: f32 = 24;
     pub const panel_padding = spacing.panel_padding;
     pub const panel_compact_padding = spacing.panel_compact_padding;
     pub const selection_diameter: f32 = 20;

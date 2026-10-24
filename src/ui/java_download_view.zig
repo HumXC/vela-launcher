@@ -61,7 +61,7 @@ fn text(src: std.builtin.SourceLocation, value: []const u8, muted: bool) void {
         .padding = R.all(0),
         .margin = R.all(0),
         .font = if (muted) theme.captionFont() else theme.bodyFont(),
-        .color_text = if (muted) .{ .color = theme.muted } else null,
+        .color_text = if (muted) .{ .color = theme.colors.muted } else null,
         .background = false,
     });
     defer layout.deinit();
@@ -109,7 +109,7 @@ fn selectors(ui: *Ui, locked: bool) void {
             lockedValue(@src(), "发行商", vendorName(ui.vendor), "java-download-vendor");
         } else {
             var vendor_index: usize = if (ui.vendor == .azul) 0 else 1;
-            if (components.dropdownStyled(@src(), "发行商", &.{ "Azul Zulu CA", "Microsoft OpenJDK" }, .{ .choice = &vendor_index }, .{}, .{ .tag = "java-download-vendor", .margin = R.all(0) })) {
+            if (components.dropdown(@src(), "发行商", &.{ "Azul Zulu CA", "Microsoft OpenJDK" }, .{ .choice = &vendor_index }, .{}, .{ .tag = "java-download-vendor", .margin = R.all(0) })) {
                 ui.vendor = if (vendor_index == 0) .azul else .microsoft;
                 if (!java_download.supported(ui.vendor, ui.major)) ui.major = 21;
             }
@@ -132,7 +132,7 @@ fn selectors(ui: *Ui, locked: bool) void {
                     break;
                 }
             }
-            if (components.dropdownStyled(@src(), "版本", labels[0..major_values.len], .{ .choice = &major_index }, .{}, .{ .tag = "java-download-major", .margin = R.all(0) })) ui.major = major_values[major_index];
+            if (components.dropdown(@src(), "版本", labels[0..major_values.len], .{ .choice = &major_index }, .{}, .{ .tag = "java-download-major", .margin = R.all(0) })) ui.major = major_values[major_index];
         }
     }
 }
@@ -200,14 +200,14 @@ fn status(snapshot: java_download_controller.Snapshot, cancel_requested: bool) v
             }
         },
         .complete => {
-            if (snapshot.installed == null) feedback(@src(), "处理已结束，但没有已下载的 Java 运行环境。", theme.warning);
+            if (snapshot.installed == null) feedback(@src(), "处理已结束，但没有已下载的 Java 运行环境。", theme.colors.warning);
         },
         .canceled => text(@src(), "已取消下载", true),
         .failed => {
             if (snapshot.failure) |err| {
-                feedback(@src(), frameFmt("下载失败：{s}", .{@errorName(err)}), theme.danger);
+                feedback(@src(), frameFmt("下载失败：{s}", .{@errorName(err)}), theme.colors.danger);
             } else {
-                feedback(@src(), "下载失败", theme.danger);
+                feedback(@src(), "下载失败", theme.colors.danger);
             }
         },
     }
@@ -218,13 +218,13 @@ fn status(snapshot: java_download_controller.Snapshot, cancel_requested: bool) v
     if (snapshot.installed) |installed| {
         gap(@src(), theme.spacing.card_gap);
         if (snapshot.probe_failure != null or installed.status == .unusable) {
-            feedback(@src(), "已下载，但 Java 不可用；文件已保留。", theme.warning);
+            feedback(@src(), "已下载，但 Java 不可用；文件已保留。", theme.colors.warning);
         } else if (installed.status == .installed_unverified) {
-            feedback(@src(), "已下载，尚未验证；不能作为可用 Java。", theme.warning);
+            feedback(@src(), "已下载，尚未验证；不能作为可用 Java。", theme.colors.warning);
         } else if (snapshot.registered) {
             text(@src(), "下载完成，Java 已验证并添加到管理列表。", false);
         } else {
-            feedback(@src(), "已下载并验证，但未添加到 Java 管理列表。", theme.warning);
+            feedback(@src(), "已下载并验证，但未添加到 Java 管理列表。", theme.colors.warning);
         }
         gap(@src(), theme.spacing.row_gap);
         text(@src(), "保留目录", true);
@@ -233,8 +233,8 @@ fn status(snapshot: java_download_controller.Snapshot, cancel_requested: bool) v
         text(@src(), "Java 路径", true);
         text(@src(), installed.java_path, true);
     }
-    if (snapshot.probe_failure) |err| feedback(@src(), frameFmt("Java 验证失败：{s}", .{@errorName(err)}), theme.danger);
-    if (snapshot.registration_failure) |err| feedback(@src(), frameFmt("添加到管理列表失败：{s}", .{@errorName(err)}), theme.danger);
+    if (snapshot.probe_failure) |err| feedback(@src(), frameFmt("Java 验证失败：{s}", .{@errorName(err)}), theme.colors.danger);
+    if (snapshot.registration_failure) |err| feedback(@src(), frameFmt("添加到管理列表失败：{s}", .{@errorName(err)}), theme.colors.danger);
 }
 
 /// Reset presentation admission before drawing any page. Navigation does not cancel work.
@@ -264,8 +264,8 @@ pub fn drawActions(ui: *Ui, controller: *java_download_controller.Controller, en
     const busy = snapshot.phase == .running or ui.pending != null;
     const supported = if (controller.hostPlatform()) |_| true else |_| false;
     if (snapshot.phase == .running) {
-        if (components.button(@src(), "取消下载", .{ .enabled = enabled and !ui.cancel_requested, .gravity_x = 1, .placement = .footer, .tag = "java-download-cancel" })) return .cancel;
-    } else if (components.button(@src(), "下载 Java", .{ .enabled = enabled and !busy and supported, .primary = true, .gravity_x = 1, .placement = .footer, .tag = "java-download-start", .tooltip = platform_hint })) return .start;
+        if (components.button(@src(), "取消下载", .{ .standalone = true, .enabled = enabled and !ui.cancel_requested, .gravity_x = 1, .placement = .footer, .tag = "java-download-cancel" })) return .cancel;
+    } else if (components.button(@src(), "下载 Java", .{ .standalone = true, .enabled = enabled and !busy and supported, .primary = true, .gravity_x = 1, .placement = .footer, .tag = "java-download-start", .tooltip = platform_hint })) return .start;
     return .none;
 }
 
@@ -283,9 +283,9 @@ fn drawBody(ui: *Ui, controller: *java_download_controller.Controller, enabled: 
     const busy = snapshot.phase == .running or ui.pending != null;
     selectors(ui, !enabled or busy);
     if (controller.hostPlatform()) |_| {} else |err| {
-        feedback(@src(), frameFmt("当前平台不受支持：{s}", .{@errorName(err)}), theme.warning);
+        feedback(@src(), frameFmt("当前平台不受支持：{s}", .{@errorName(err)}), theme.colors.warning);
     }
-    if (ui.failure) |err| feedback(@src(), frameFmt("无法开始下载：{s}", .{@errorName(err)}), theme.danger);
+    if (ui.failure) |err| feedback(@src(), frameFmt("无法开始下载：{s}", .{@errorName(err)}), theme.colors.danger);
     status(snapshot, ui.cancel_requested);
 }
 

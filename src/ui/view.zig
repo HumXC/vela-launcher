@@ -13,6 +13,7 @@ const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
 const task_registry = @import("../core/tasks.zig");
 const settings_view = @import("settings_view.zig");
+const appearance_view = @import("appearance_view.zig");
 const cf_credentials_controller = @import("curseforge_credentials_controller.zig");
 const java_download_controller = @import("java_download_controller.zig");
 const java_download_view = @import("java_download_view.zig");
@@ -173,6 +174,7 @@ pub const Services = struct {
     configuration: *config.Store,
     tasks: *task_registry.Registry,
     settings: *settings_view.Ui,
+    appearance: *appearance_view.Ui,
     cf_credentials: ?*cf_credentials_controller.Controller = null,
     cf_credentials_failure: ?anyerror = null,
     java_download: *java_download_controller.Controller,
@@ -255,7 +257,12 @@ fn discardInactivePickers(model: *const state.Model, java_ui: *java_view.Ui, ser
 }
 
 pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Manager, java_ui: *java_view.Ui, launcher: *launch.Controller, services: Services) !void {
+    services.appearance.allow_mutations = services.allow_mutations;
+    appearance_view.beginFrame(services.appearance, services.configuration);
+    theme.applyAppearance(appearance_view.visibleSettings(services.appearance, services.configuration));
     theme.applyTypography();
+    const canvas_bounds = dvui.parentGet().data().contentRect();
+    appearance_view.drawBackground(services.appearance, services.configuration, canvas_bounds);
     if (services.mods) |controller| if (services.content) |backend| controller.tick(backend);
     discardInactivePickers(model, java_ui, services);
     if (services.allow_mutations) services.worlds_ui.setPageActive(model.panel == .worlds);
@@ -293,7 +300,7 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
         const sidebar_width = if (instance_panel) &model.instance_sidebar_width else &model.sidebar_width;
         const initial_width = if (instance_panel) boundedInstanceSidebarWidth(sidebar_width.*, available) else if (model.panel == .logs) boundedLogsSidebarWidth(sidebar_width.*, available) else boundedSidebarWidth(sidebar_width.*, available);
         var split = initial_width / available;
-        const root = dvui.paned(@src(), .{ .direction = .horizontal, .collapsed_size = 0, .split_ratio = &split, .handle_size = 8 }, .{ .expand = .both, .background = true, .color_fill = .{ .color = theme.background }, .margin = R.all(0), .padding = R.all(0), .label = .{ .text = "调整侧栏宽度" } });
+        const root = dvui.paned(@src(), .{ .direction = .horizontal, .collapsed_size = 0, .split_ratio = &split, .handle_size = 8 }, .{ .expand = .both, .background = false, .margin = R.all(0), .padding = R.all(0), .label = .{ .text = "调整侧栏宽度" } });
         defer root.deinit();
         const resized_width = if (instance_panel) boundedInstanceSidebarWidth(split * available, available) else if (model.panel == .logs) boundedLogsSidebarWidth(split * available, available) else boundedSidebarWidth(split * available, available);
         split = resized_width / available;
@@ -370,6 +377,8 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
     } else discardJavaIntents(java_ui, services.java_download_ui);
     if (!gates.worlds) try worlds_view.drawModal(services.worlds_ui, services.configuration.snapshot(), services.worlds);
     if (services.instances_ui) |ui| guardInstanceLeave(model, ui, &pending);
+    appearance_view.guardNavigation(services.appearance, &pending, services.configuration);
+    try appearance_view.dialogs(services.appearance, services.configuration);
     if (pending) |msg| {
         const selection_allowed = !gates.instances and model.panel == .versions;
         const transition_allowed = switch (msg) {
@@ -377,7 +386,10 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
             .start => !gates.instances and !gates.content and !services.java_download.isDeleting(),
             else => true,
         };
-        if (transition_allowed) state.transition(model, msg);
+        if (transition_allowed) {
+            state.transition(model, msg);
+            dvui.refresh(null, @src(), null);
+        }
         switch (msg) {
             .start => if (!gates.instances and !gates.content and !services.java_download.isDeleting()) {
                 startGame(manager, launcher, services);
@@ -496,6 +508,7 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
             }
         }
     }
+    appearance_view.finish(services.appearance, services.configuration);
 }
 
 fn defaultInstallerJava(runtimes: []const java.Runtime) ?[]const u8 {
@@ -616,10 +629,10 @@ fn sidebar(model: *const state.Model, pending: *?state.Msg, document: *const con
         const text_height = name_font.textSize(name).h + theme.style.cards.sidebar_account_text_gap + kind_font.textSize(kind).h;
         const row_height = @max(theme.style.cards.sidebar_account_height - 2 * theme.style.cards.sidebar_account_padding_y, text_height);
         var player: dvui.ButtonWidget = undefined;
-        player.init(@src(), .{}, .{ .tag = "sidebar-player", .expand = .horizontal, .min_size_content = .{ .h = row_height }, .max_size_content = .width(0), .padding = .{ .x = theme.style.cards.sidebar_account_padding_x - 1, .w = theme.style.cards.sidebar_account_padding_x - 1, .y = theme.style.cards.sidebar_account_padding_y - 1, .h = theme.style.cards.sidebar_account_padding_y - 1 }, .margin = R.all(0), .border = R.all(1), .corners = .all(theme.sizing.card_radius), .color_fill = .{ .color = theme.sidebar }, .color_border = .{ .color = theme.outline }, .label = .{ .text = model.labels.choosePlayer } });
+        player.init(@src(), .{ .draw_focus = false }, .{ .tag = "sidebar-player", .expand = .horizontal, .min_size_content = .{ .h = row_height }, .max_size_content = .width(0), .padding = .{ .x = theme.style.cards.sidebar_account_padding_x - 1, .w = theme.style.cards.sidebar_account_padding_x - 1, .y = theme.style.cards.sidebar_account_padding_y - 1, .h = theme.style.cards.sidebar_account_padding_y - 1 }, .margin = R.all(0), .border = R.all(1), .corners = .all(theme.cardRadius()), .color_fill = .{ .color = theme.colors.sidebar }, .color_border = .{ .color = dvui.Color.transparent }, .label = .{ .text = model.labels.choosePlayer } });
         defer player.deinit();
         player.processEvents();
-        player.drawBackground();
+        theme.surface.buttonBackground(&player);
         {
             const identity = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .min_size_content = .{ .h = row_height }, .padding = R.all(0), .margin = R.all(0) });
             defer identity.deinit();
@@ -635,7 +648,7 @@ fn sidebar(model: *const state.Model, pending: *?state.Msg, document: *const con
             gap(@src(), theme.spacing.detail_gap);
             components.hint(@src(), kind);
         }
-        player.drawFocus();
+        theme.drawCardOutline(player.data(), player.focused());
         if (player.clicked()) pending.* = if (model.panel == .players) .back else .open_players;
     }
     gap(@src(), theme.style.cards.sidebar_identity_gap);
@@ -724,6 +737,7 @@ fn content(model: *state.Model, snapshot: games.Snapshot, pending: *?state.Msg, 
             else
                 try settings_view.draw(services.settings),
             .game => tools.moreContent(model, pending),
+            .theme => try appearance_view.draw(services.appearance, services.configuration),
         },
 
         .java => if (!gates.java) java_view.drawPage(java_ui, manager, services.java_download_ui, services.java_download) else components.hint(@src(), "游戏或实例创建任务进行中，Java 配置暂不可更改"),
@@ -781,7 +795,7 @@ fn drawStartFooter(model: *const state.Model, process: launch.Snapshot, pending:
     var start: dvui.ButtonWidget = undefined;
     const launch_width = @min(theme.sizing.home_launch_width, bounds.w);
     const geometry = theme.controlGeometry(@max(font.lineHeight(), font.textSize(start_label).h), footer_height, launch_width, theme.sizing.control_padding_x, theme.sizing.control_border);
-    start.init(@src(), .{ .grayed = disabled }, theme.controlOptions(@max(font.lineHeight(), font.textSize(start_label).h)).override(.{ .tag = start_tag, .label = .{ .text = start_label }, .font = font, .rect = .{ .x = @max(0, bounds.w - launch_width), .y = 0, .w = launch_width, .h = footer_height }, .style = .highlight, .color_fill = if (disabled) .{ .color = theme.surface } else null, .min_size_content = geometry.content, .padding = geometry.padding, .margin = R.all(0), .tab_index = if (disabled) 0 else null }));
+    start.init(@src(), .{ .grayed = disabled }, theme.controlOptions(@max(font.lineHeight(), font.textSize(start_label).h)).override(.{ .tag = start_tag, .label = .{ .text = start_label }, .font = font, .rect = .{ .x = @max(0, bounds.w - launch_width), .y = 0, .w = launch_width, .h = footer_height }, .style = .highlight, .color_fill = if (disabled) .{ .color = theme.panelColor(theme.colors.surface) } else null, .min_size_content = geometry.content, .padding = geometry.padding, .margin = R.all(0), .tab_index = if (disabled) 0 else null }));
     defer start.deinit();
     if (disabled) {
         if (start.data().accesskit_node()) |node| {
@@ -791,10 +805,9 @@ fn drawStartFooter(model: *const state.Model, process: launch.Snapshot, pending:
         }
     }
     if (!disabled) start.processEvents();
-    start.drawBackground();
+    theme.buttonBackground(&start, .{ .material = disabled });
     // Keep the disabled label legible instead of using ButtonWidget's averaged text color.
-    dvui.labelNoFmt(@src(), start_label, .{ .align_x = 0.5, .align_y = 0.5 }, start.style().override(.{ .color_text = if (disabled) .{ .color = theme.muted } else null, .gravity_x = 0.5, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0) }));
-    if (!disabled) start.drawFocus();
+    dvui.labelNoFmt(@src(), start_label, .{ .align_x = 0.5, .align_y = 0.5 }, start.style().override(.{ .color_text = if (disabled) .{ .color = theme.colors.muted } else null, .gravity_x = 0.5, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0) }));
     if (!disabled and start.clicked()) pending.* = .start;
 }
 
@@ -807,14 +820,14 @@ fn pickerHeader(src: std.builtin.SourceLocation, name: []const u8, back: []const
 fn choice(src: std.builtin.SourceLocation, id: u32, name: []const u8, detail: []const u8, current: bool, current_label: []const u8) bool {
     var item: dvui.ButtonWidget = undefined;
     const item_height = dvui.themeGet().font_body.textSize(name).h + theme.captionFont().textSize(detail).h + theme.spacing.detail_gap;
-    item.init(src, .{}, .{ .id_extra = id, .expand = .horizontal, .min_size_content = .{ .h = item_height }, .padding = R.all(theme.spacing.panel_padding), .margin = .{ .h = theme.spacing.card_gap }, .border = R.all(1), .style = .control, .color_border = if (current) .{ .color = theme.accent } else null, .label = .{ .text = name } });
+    item.init(src, .{}, theme.panelButtonOptions(.{ .id_extra = id, .expand = .horizontal, .min_size_content = .{ .h = item_height }, .padding = R.all(theme.spacing.panel_padding), .margin = .{ .h = theme.spacing.card_gap }, .border = R.all(1), .style = .control, .color_border = if (current) .{ .color = theme.colors.accent } else null, .label = .{ .text = name } }, false));
     defer item.deinit();
     item.processEvents();
-    item.drawBackground();
+    theme.buttonBackground(&item, .{ .material = true });
     {
         const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .min_size_content = .{ .h = item_height } });
         defer row.deinit();
-        if (current) dvui.labelNoFmt(@src(), current_label, .{}, .{ .gravity_x = 1, .gravity_y = 0.5, .color_text = .{ .color = theme.accent }, .padding = R.all(0), .margin = .{ .x = theme.spacing.card_gap }, .background = false });
+        if (current) dvui.labelNoFmt(@src(), current_label, .{}, .{ .gravity_x = 1, .gravity_y = 0.5, .color_text = .{ .color = theme.colors.accent }, .padding = R.all(0), .margin = .{ .x = theme.spacing.card_gap }, .background = false });
         {
             const text = dvui.box(@src(), .{}, .{ .expand = .horizontal, .min_size_content = .{ .h = item_height } });
             defer text.deinit();
@@ -823,7 +836,6 @@ fn choice(src: std.builtin.SourceLocation, id: u32, name: []const u8, detail: []
             dvui.labelNoFmt(@src(), detail, .{}, item.style().override(.{ .font = theme.captionFont(), .padding = R.all(0), .margin = R.all(0), .background = false }));
         }
     }
-    item.drawFocus();
     return item.clicked();
 }
 

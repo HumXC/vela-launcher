@@ -1,22 +1,126 @@
 const dvui = @import("dvui");
 const fonts = @import("fonts.zig");
-/// Compatibility facade for existing callers; style.zig is the single token source.
+const appearance = @import("../core/appearance.zig");
+const background = @import("background_image.zig");
+pub const surface = @import("surface.zig");
 pub const style = @import("style.zig");
-pub const background = style.colors.background;
-pub const surface = style.colors.surface;
-pub const sidebar = style.colors.sidebar;
-pub const selected_surface = style.colors.selected_surface;
-pub const outline = style.colors.outline;
-pub const control_outline = style.colors.control_outline;
-pub const foreground = style.colors.foreground;
-pub const muted = style.colors.muted;
-pub const accent = style.colors.accent;
-pub const selected_text = style.colors.selected_text;
-pub const danger = style.colors.danger;
-pub const warning = style.colors.warning;
+pub const colors = &style.colors;
 pub const typography = style.typography;
 pub const spacing = style.spacing;
 pub const sizing = style.sizing;
+
+var backdrop_image: ?*background.Image = null;
+var backdrop_settings: appearance.Settings = .{};
+var backdrop_screen: dvui.RectScale = .{ .r = .{}, .s = 1 };
+
+/// Frame-borrowed image; the editor retains its pixels until rendering finishes.
+pub fn setPanelBackdrop(image: ?*background.Image, settings: appearance.Settings, screen: dvui.RectScale) void {
+    backdrop_image = image;
+    backdrop_settings = settings;
+    backdrop_screen = screen;
+}
+
+/// Install a panel before painting its background, so material coverage is applied once.
+pub fn panel(src: @import("std").builtin.SourceLocation, init_options: dvui.BoxWidget.InitOptions, options: dvui.Options) *dvui.BoxWidget {
+    const widget = dvui.widgetAlloc(dvui.BoxWidget);
+    widget.init(src, init_options, options);
+    panelBackground(widget.data(), .{});
+    return widget;
+}
+
+fn hasBackdrop(data: *dvui.WidgetData) bool {
+    return backdrop_image != null and backdrop_settings.panel_blur > 0 and backdrop_settings.panel_opacity < 100 and backdrop_settings.background_mode == .image and data.visible() and (data.options.background orelse false);
+}
+
+/// Material fill only; the owner paints its border/focus exactly once.
+pub fn panelFill(data: *dvui.WidgetData, state: dvui.Options) void {
+    if (!data.visible()) return;
+    const region = data.backgroundRectScale();
+    const corners = data.options.cornersGet();
+    const color = state.color_fill orelse data.options.color(.fill);
+    if (!hasBackdrop(data)) {
+        surface.fill(region, corners, color);
+        return;
+    }
+    var material = surface.Material.start(region, corners) orelse {
+        surface.fill(region, corners, color);
+        return;
+    };
+    defer material.finish();
+    var settings = backdrop_settings;
+    settings.image_blur = @max(settings.image_blur, settings.panel_blur);
+    background.drawRegion(backdrop_image.?, settings, backdrop_screen, material.bounds(), .{});
+    surface.fill(material.bounds(), .{}, color);
+}
+
+pub fn panelBackground(data: *dvui.WidgetData, state: dvui.Options) void {
+    if (!hasBackdrop(data)) {
+        data.borderAndBackground(.{ .fill_color = state.color_fill });
+        return;
+    }
+    data.borderAndBackground(.{ .fill_color = .{ .color = dvui.Color.transparent } });
+    panelFill(data, state);
+}
+
+pub fn buttonBackground(button: *dvui.ButtonWidget, options: struct { material: bool = false }) void {
+    const data = button.data();
+    if (!options.material or !hasBackdrop(data)) {
+        surface.buttonBackground(button);
+        return;
+    }
+    const original_border = data.options.color_border;
+    data.options.color_border = .{ .color = dvui.Color.transparent };
+    data.borderAndBackground(.{ .fill_color = .{ .color = dvui.Color.transparent } });
+    data.options.color_border = original_border;
+    panelFill(data, button.style());
+    surface.buttonOutline(button);
+}
+
+/// Draw a single resolved contour for uniform-radius cards; focus shares selection emphasis.
+pub fn drawCardOutline(data: *dvui.WidgetData, active: bool) void {
+    surface.outline(data, if (active) 2 else data.options.borderGet().x, .{ .color = if (active) colors.accent else colors.outline });
+}
+
+/// Foreground content inherits font and text state, never the parent's fill.
+/// TextLayout renders explicit color_fill behind each run even with background=false.
+pub fn foregroundOptions(base: dvui.Options) dvui.Options {
+    var result = base;
+    result.background = false;
+    result.color_fill = null;
+    result.color_fill_hover = null;
+    result.color_fill_press = null;
+    return result;
+}
+
+test "foreground style clears run backgrounds while preserving text state" {
+    const testing = @import("std").testing;
+    const base: dvui.Options = .{
+        .background = true,
+        .style = .highlight,
+        .color_fill = .{ .color = dvui.Color.white },
+        .color_fill_hover = .{ .color = dvui.Color.black },
+        .color_fill_press = .{ .color = dvui.Color.white },
+        .color_text = .{ .color = dvui.Color.black },
+    };
+    const actual = foregroundOptions(base);
+    try testing.expectEqual(false, actual.background.?);
+    try testing.expect(actual.color_fill == null);
+    try testing.expect(actual.color_fill_hover == null);
+    try testing.expect(actual.color_fill_press == null);
+    try testing.expectEqual(base.color_text, actual.color_text);
+    try testing.expectEqual(base.style, actual.style);
+    try testing.expect(base.color_fill != null);
+}
+
+/// Independent solid-palette buttons use panel strength; active accents stay solid.
+pub fn panelButtonOptions(base: dvui.Options, preserve_accent: bool) dvui.Options {
+    if (preserve_accent) return base;
+    return base.override(.{
+        .color_fill = .{ .color = panelColor(base.color(.fill).toColor()) },
+        .color_fill_hover = .{ .color = panelColor(base.color(.fill_hover).toColor()) },
+        .color_fill_press = .{ .color = panelColor(base.color(.fill_press).toColor()) },
+    });
+}
 
 pub fn bodyFont() dvui.Font {
     return dvui.themeGet().font_body;
@@ -91,11 +195,12 @@ pub fn textEntryGeometry(text_height: f32, outer_width: f32) ControlGeometry {
 pub fn controlOptions(line_height: f32) dvui.Options {
     const geometry = controlGeometry(line_height, sizing.control_height, 0, sizing.control_padding_x, sizing.control_border);
     return .{
+        .style = .control,
         .font = bodyFont(),
         .min_size_content = geometry.content,
         .padding = geometry.padding,
         .border = .all(sizing.control_border),
-        .corners = .all(sizing.control_radius),
+        .corners = .all(controlRadius()),
     };
 }
 
@@ -131,18 +236,62 @@ pub fn filterGeometry(available_width: f32, labels: []const []const u8) FilterGe
     return .{ .gap = gap, .padding_x = @min(sizing.control_padding_x, @max(0, (spare - gap * count) / (2 * count))) };
 }
 
+var current_radius: f32 = 12;
+var current_panel_opacity: u8 = 100;
+
+pub fn controlRadius() f32 {
+    return current_radius;
+}
+pub fn cardRadius() f32 {
+    return if (current_radius == 0) 0 else current_radius + 4;
+}
+pub fn panelRadius() f32 {
+    return if (current_radius == 0) 0 else current_radius + 8;
+}
+pub fn sidebarRadius() f32 {
+    return if (current_radius == 0) 0 else current_radius + 12;
+}
+pub fn modalRadius() f32 {
+    return sidebarRadius();
+}
+
+pub fn panelColor(base: dvui.Color) dvui.Color {
+    var result = base;
+    // Palette surfaces already carry inner-control alpha. An outer panel uses
+    // the original swatch at its own opacity, rather than multiplying it again.
+    result.a = 255;
+    return style.materialColor(result, current_panel_opacity, .panel);
+}
+
+fn applyColors(value: *dvui.Theme) void {
+    value.fill = colors.background;
+    value.text = colors.foreground;
+    value.border = colors.control_outline;
+    value.focus = colors.selected_text;
+    value.window = .{ .fill = panelColor(colors.background) };
+    value.control = .{ .fill = colors.surface, .fill_hover = colors.selected_surface, .fill_press = colors.pressed_surface };
+    value.highlight = .{ .fill = colors.accent, .text = colors.on_accent };
+}
+
+pub fn applyAppearance(settings: appearance.Settings) void {
+    backdrop_image = null;
+    style.colors = style.Palette.fromSettings(settings);
+    current_radius = @floatFromInt(settings.corner_radius);
+    current_panel_opacity = settings.panel_opacity;
+    var value = dvui.themeGet();
+    value.dark = settings.preset != .frost;
+    applyColors(&value);
+    dvui.currentWindow().themeSet(value);
+}
+
 pub fn install(win: *dvui.Window) void {
-    // Hover and unhover colors switch immediately without DVUI interpolation.
+    style.colors = style.Palette.fromSettings(.{});
+    current_radius = 12;
+    current_panel_opacity = 100;
     dvui.hover_fade_secs = 0;
     var value = dvui.Theme.builtin.adwaita_dark;
     value.name = "Vela";
-    value.fill = background;
-    value.text = foreground;
-    value.border = control_outline;
-    value.focus = selected_text;
-    value.window = .{ .fill = surface };
-    value.control = .{ .fill = surface, .fill_hover = selected_surface, .fill_press = style.colors.pressed_surface };
-    value.highlight = .{ .fill = accent, .text = style.colors.on_accent };
+    applyColors(&value);
     value.font_body = .find(.{ .family = fonts.family, .size = typography.body, .line_height_factor = typography.body_line_height });
     value.font_heading = value.font_body.withSize(typography.heading);
     value.font_title = value.font_body.withSize(typography.title);

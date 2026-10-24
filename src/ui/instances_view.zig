@@ -802,16 +802,16 @@ fn wizardButtonEvents(control: *dvui.ButtonWidget, enabled: bool) void {
     if (enabled) control.processEvents() else control.processHover();
 }
 
-fn wizardButtonState(control: *dvui.ButtonWidget, enabled: bool) void {
+fn wizardButtonState(control: *dvui.ButtonWidget, enabled: bool, material: bool) void {
     wizardButtonEvents(control, enabled);
-    control.drawBackground();
+    theme.buttonBackground(control, .{ .material = material });
 }
 
 fn wizardTab(src: std.builtin.SourceLocation, name: []const u8, tag: []const u8, selected: bool, enabled: bool, horizontal_padding: f32, gap: f32) bool {
     var control: dvui.ButtonWidget = undefined;
     const font = theme.bodyFont();
     const geometry = theme.controlGeometry(@max(font.lineHeight(), font.textSize(name).h), metrics.control_height, 0, horizontal_padding, theme.sizing.control_border);
-    control.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, theme.controlOptions(@max(font.lineHeight(), font.textSize(name).h)).override(.{
+    control.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, theme.panelButtonOptions(theme.controlOptions(@max(font.lineHeight(), font.textSize(name).h)).override(.{
         .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, tag))),
         .tag = tag,
         .label = .{ .text = name },
@@ -819,13 +819,14 @@ fn wizardTab(src: std.builtin.SourceLocation, name: []const u8, tag: []const u8,
         .padding = geometry.padding,
         .margin = .{ .w = gap, .h = if (dvui.windowRect().h < 480) theme.spacing.detail_gap else theme.spacing.row_gap },
         .style = if (selected and enabled) .highlight else .control,
+        .color_fill_hover = if (!enabled) .{ .color = theme.colors.surface } else null,
+        .color_fill_press = if (!enabled) .{ .color = theme.colors.surface } else null,
         .tab_index = if (enabled) null else 0,
-    }));
+    }), selected and enabled));
     defer control.deinit();
-    wizardButtonState(&control, enabled);
+    wizardButtonState(&control, enabled, !(selected and enabled));
     if (control.data().accesskit_node()) |node| dvui.AccessKit.nodeSetSelected(node, selected);
     dvui.labelNoFmt(@src(), name, .{}, control.style().override(.{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, tag))), .font = theme.fontSized(metrics.control_font), .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .background = false }));
-    if (enabled) control.drawFocus();
     return enabled and control.clicked();
 }
 
@@ -864,7 +865,7 @@ fn wizardLoading(src: std.builtin.SourceLocation, tag: []const u8, name: []const
         .margin = R.all(0),
         .border = R.all(0),
         .background = false,
-        .color_text = .{ .color = theme.muted },
+        .color_text = .{ .color = theme.colors.muted },
     });
 }
 
@@ -875,7 +876,7 @@ fn releaseDate(release_time: []const u8) []const u8 {
 
 fn wizardVersionRow(src: std.builtin.SourceLocation, key: []const u8, name: []const u8, release_time: []const u8, selected: bool, enabled: bool) bool {
     var control: dvui.ButtonWidget = undefined;
-    control.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, .{
+    control.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, theme.panelButtonOptions(.{
         .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, key))),
         .tag = key,
         .label = .{ .text = name },
@@ -886,15 +887,15 @@ fn wizardVersionRow(src: std.builtin.SourceLocation, key: []const u8, name: []co
         .padding = .{ .x = metrics.card_padding_x, .w = metrics.card_padding_x, .y = metrics.card_padding_y, .h = metrics.card_padding_y },
         .margin = R.all(0),
         .border = R.all(1),
-        .corners = .all(theme.sizing.panel_radius),
-        .color_border = if (selected) .{ .color = theme.accent } else null,
-        .color_fill = .{ .color = theme.surface },
-        .color_fill_hover = .{ .color = if (enabled) theme.selected_surface else theme.surface },
-        .color_fill_press = .{ .color = if (enabled) theme.style.colors.pressed_surface else theme.surface },
+        .corners = .all(theme.panelRadius()),
+        .color_border = if (selected) .{ .color = theme.colors.accent } else null,
+        .color_fill = .{ .color = theme.colors.surface },
+        .color_fill_hover = .{ .color = if (enabled) theme.colors.selected_surface else theme.colors.surface },
+        .color_fill_press = .{ .color = if (enabled) theme.style.colors.pressed_surface else theme.colors.surface },
         .tab_index = if (enabled) null else 0,
-    });
+    }, false));
     defer control.deinit();
-    wizardButtonState(&control, enabled);
+    wizardButtonState(&control, enabled, true);
     if (control.data().accesskit_node()) |node| dvui.AccessKit.nodeSetSelected(node, selected);
     {
         const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .h = metrics.card_height - 2 * metrics.card_padding_y - 2 }, .padding = R.all(0), .margin = R.all(0), .background = false });
@@ -914,14 +915,13 @@ fn wizardVersionRow(src: std.builtin.SourceLocation, key: []const u8, name: []co
             });
         }
         const date = releaseDate(release_time);
-        if (date.len > 0) dvui.labelNoFmt(@src(), date, .{}, .{ .tag = fmt("{s}-date", .{key}), .font = theme.captionFont(), .gravity_x = 1, .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.card_gap }, .color_text = .{ .color = theme.muted }, .background = false });
+        if (date.len > 0) dvui.labelNoFmt(@src(), date, .{}, .{ .tag = fmt("{s}-date", .{key}), .font = theme.captionFont(), .gravity_x = 1, .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.card_gap }, .color_text = .{ .color = theme.colors.muted }, .background = false });
         const details = dvui.box(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .background = false });
         defer details.deinit();
-        const title = dvui.textLayout(@src(), .{ .break_lines = false }, control.style().override(.{ .tag = fmt("{s}-name", .{key}), .font = theme.headingFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0), .background = false }));
+        const title = dvui.textLayout(@src(), .{ .break_lines = false }, theme.foregroundOptions(control.style()).override(.{ .tag = fmt("{s}-name", .{key}), .font = theme.headingFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0), .background = false }));
         title.addText(components.ellipsize(name, theme.headingFont(), details.data().contentRect().w), .{});
         title.deinit();
     }
-    if (enabled) control.drawFocus();
     return enabled and control.clicked();
 }
 
@@ -957,19 +957,21 @@ fn wizardFooterButton(src: std.builtin.SourceLocation, name: []const u8, tag: []
         .label = .{ .text = name },
         .rect = .{ .x = if (primary) @max(0, available - width_limit) else 0, .y = 0, .w = width_limit, .h = metrics.control_height },
         .style = if (primary and enabled) .highlight else .control,
+        .color_fill = if (primary and enabled) null else .{ .color = theme.panelColor(theme.colors.surface) },
+        .color_fill_hover = if (primary and enabled) null else .{ .color = theme.panelColor(if (enabled) theme.colors.selected_surface else theme.colors.surface) },
+        .color_fill_press = if (primary and enabled) null else .{ .color = theme.panelColor(if (enabled) theme.colors.pressed_surface else theme.colors.surface) },
         .tab_index = if (enabled) null else 0,
     }));
     defer control.deinit();
-    wizardButtonState(&control, enabled);
-    var label_style = control.style();
+    wizardButtonState(&control, enabled, !(primary and enabled));
+    var label_style = theme.foregroundOptions(control.style());
     // Keep disabled labels readable after ButtonWidget averages grayed colors.
-    if (!enabled) label_style.color_text = .{ .color = theme.muted };
+    if (!enabled) label_style.color_text = .{ .color = theme.colors.muted };
     const bounds = control.data().contentRect();
     const text_size = font.textSize(name);
     const label = dvui.textLayout(@src(), .{ .break_lines = false }, label_style.override(.{ .tag = fmt("{s}-label", .{tag}), .font = font, .rect = .{ .x = @max(0, (bounds.w - text_size.w) / 2), .y = @max(0, (bounds.h - text_size.h) / 2), .w = @min(bounds.w, text_size.w), .h = text_size.h }, .padding = R.all(0), .margin = R.all(0), .background = false }));
     label.addText(name, .{});
     label.deinit();
-    if (enabled) control.drawFocus();
     return enabled and control.clicked();
 }
 
@@ -1014,7 +1016,7 @@ fn drawAcquisition(ui: *Ui, doc: *const config.Document, manager: *manager_modul
             .version => "1/3",
             .loader => "2/3",
             .confirm => "3/3",
-        }, .{}, .{ .tag = "instance-wizard-prefix", .role = .label, .tab_index = 0, .font = theme.titleFont(), .color_text = .{ .color = theme.muted }, .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.row_gap }, .background = false });
+        }, .{}, .{ .tag = "instance-wizard-prefix", .role = .label, .tab_index = 0, .font = theme.titleFont(), .color_text = .{ .color = theme.colors.muted }, .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.row_gap }, .background = false });
         const title = dvui.textLayout(@src(), .{ .break_lines = true, .process_events_in_deinit = false }, .{ .tag = "instance-wizard-title", .role = .label, .tab_index = 0, .font = theme.titleFont(), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0), .background = false });
         title.addText(switch (ui.create_step) {
             .version => "选择 Minecraft 版本",
@@ -1045,8 +1047,8 @@ fn drawAcquisition(ui: *Ui, doc: *const config.Document, manager: *manager_modul
             const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .tag = "instance-wizard-version-list", .expand = .both, .background = false, .padding = R.all(0), .margin = R.all(0), .border = R.all(0) });
             defer scroll.deinit();
             if (catalogue.failure) |err| {
-                components.text(@src(), fmt("版本列表：{s}", .{@errorName(err)}), theme.muted);
-                if (components.button(@src(), "重试", .{ .enabled = !locked })) ui.catalogue_requested = true;
+                components.text(@src(), fmt("版本列表：{s}", .{@errorName(err)}), theme.colors.muted);
+                if (components.button(@src(), "重试", .{ .standalone = true, .enabled = !locked })) ui.catalogue_requested = true;
             }
             if (ui.version_filter == .old) for (catalogue.available) |version| {
                 if (std.mem.startsWith(u8, version.kind, "old_") and !supportedMinecraft(version.id)) {
@@ -1069,7 +1071,7 @@ fn drawAcquisition(ui: *Ui, doc: *const config.Document, manager: *manager_modul
                 if (wizardVersionRow(@src(), key, version.id, version.release_time, selected, !locked)) ui.queue(.choose_base, version.id);
                 _ = dvui.spacer(@src(), .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, key))), .min_size_content = .{ .h = metrics.card_gap } });
             }
-            if (count == 0 and catalogue.phase != .loading) components.text(@src(), if (catalogue.available.len == 0) "暂无版本，请刷新列表" else "没有匹配的版本", theme.muted);
+            if (count == 0 and catalogue.phase != .loading) components.text(@src(), if (catalogue.available.len == 0) "暂无版本，请刷新列表" else "没有匹配的版本", theme.colors.muted);
         },
         .loader => {
             const loaders = manager.loaderSnapshot();
@@ -1091,8 +1093,8 @@ fn drawAcquisition(ui: *Ui, doc: *const config.Document, manager: *manager_modul
             defer scroll.deinit();
             if (matches) if (loaders.failure) |err| {
                 if (err != error.NonPublicAddress) {
-                    components.text(@src(), fmt("加载器目录：{s}", .{@errorName(err)}), theme.muted);
-                    if (components.button(@src(), "重试", .{ .enabled = !locked })) {
+                    components.text(@src(), fmt("加载器目录：{s}", .{@errorName(err)}), theme.colors.muted);
+                    if (components.button(@src(), "重试", .{ .standalone = true, .enabled = !locked })) {
                         ui.queue(.load_loaders, null);
                         if (ui.pending) |*p| p.force_refresh = true;
                     }
@@ -1110,7 +1112,7 @@ fn drawAcquisition(ui: *Ui, doc: *const config.Document, manager: *manager_modul
                 }
                 _ = dvui.spacer(@src(), .{ .id_extra = @as(usize, @truncate(std.hash.Wyhash.hash(0, key))), .min_size_content = .{ .h = metrics.card_gap } });
             };
-            if (count == 0 and loaders.phase != .working) components.text(@src(), if (matches and loaders.entries.len != 0) "没有匹配的版本" else "此 Minecraft 版本暂无可用加载器版本，可继续使用原版。", theme.muted);
+            if (count == 0 and loaders.phase != .working) components.text(@src(), if (matches and loaders.entries.len != 0) "没有匹配的版本" else "此 Minecraft 版本暂无可用加载器版本，可继续使用原版。", theme.colors.muted);
         },
         .confirm => {
             const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .tag = "instance-wizard-confirm-body", .expand = .both, .background = false, .padding = R.all(0), .margin = R.all(0), .border = R.all(0) });
@@ -1119,18 +1121,18 @@ fn drawAcquisition(ui: *Ui, doc: *const config.Document, manager: *manager_modul
             validateName(doc, text(&ui.draft.name), null) catch |err| components.text(@src(), switch (err) {
                 error.DuplicateInstanceName => "同名实例已存在，请选择其他名称。",
                 else => "请输入有效的实例名称，不能包含路径分隔符或保留名称。",
-            }, theme.danger);
+            }, theme.colors.danger);
             const summary_inset_y = if (dvui.windowRect().h < 480 or scroll.data().contentRect().w < 360) theme.spacing.panel_compact_padding else theme.spacing.panel_padding;
-            const summary = dvui.box(@src(), .{}, .{
+            const summary = theme.panel(@src(), .{}, .{
                 .tag = "instance-wizard-summary-card",
                 .expand = .horizontal,
                 .max_size_content = .width(0),
                 .padding = .{ .x = theme.spacing.panel_padding, .w = theme.spacing.panel_padding, .y = summary_inset_y, .h = summary_inset_y },
                 .margin = R.all(0),
                 .border = R.all(1),
-                .corners = .all(theme.sizing.panel_radius),
+                .corners = .all(theme.panelRadius()),
                 .background = true,
-                .color_fill = .{ .color = theme.surface },
+                .color_fill = .{ .color = theme.panelColor(theme.colors.surface) },
             });
             defer summary.deinit();
             wizardSummary(@src(), "instance-wizard-summary-minecraft", fmt("Minecraft: {s}", .{ui.draft.base orelse ""}));
@@ -1155,7 +1157,7 @@ fn wizardSummary(src: std.builtin.SourceLocation, tag: []const u8, value: []cons
         .font = theme.fontSized(metrics.control_font),
         .expand = .horizontal,
         .max_size_content = .width(0),
-        .color_text = .{ .color = theme.muted },
+        .color_text = .{ .color = theme.colors.muted },
         .padding = R.all(0),
         .margin = .{ .h = theme.spacing.row_gap },
         .background = false,
@@ -1197,9 +1199,11 @@ fn javaPicker(ui: *Ui, src: std.builtin.SourceLocation, registered_java: []const
     settingsFieldLabel(src, "Java", "instance-settings-java-label");
     const choice = javaChoice(text(&ui.draft.java_path), registered_java);
     const label = if (choice) |index| if (index == 0) "自动选择" else fmt("Java {d} · {s}", .{ registered_java[index - 1].major, registered_java[index - 1].vendor }) else "保留现有 Java 绑定";
+    // A disabled picker keeps the dropdown line leading, not TextEntry glyph padding.
+    const control_options = theme.controlOptions(@max(theme.bodyFont().lineHeight(), theme.bodyFont().textSize(label).h));
     if (enabled) {
         var picker: dvui.DropdownWidget = undefined;
-        picker.init(src, .{ .selected_index = choice, .label = if (choice != null) label else null, .placeholder = "保留现有 Java 绑定" }, theme.controlOptions(@max(theme.bodyFont().lineHeight(), theme.bodyFont().textSize(label).h)).override(.{ .tag = "instance-settings-java", .label = .{ .text = "Java" }, .expand = .horizontal, .min_size_content = .{ .h = theme.sizing.control_height }, .max_size_content = .width(0), .id_extra = 1, .margin = R.all(0) }));
+        picker.init(src, .{ .selected_index = choice, .label = if (choice != null) label else null, .placeholder = "保留现有 Java 绑定" }, control_options.override(.{ .tag = "instance-settings-java", .label = .{ .text = "Java" }, .expand = .horizontal, .min_size_content = .{ .h = theme.sizing.control_height }, .max_size_content = .width(0), .id_extra = 1, .margin = R.all(0) }));
         defer picker.deinit();
         dvui.tag("instance-settings-java-control", .{ .id = picker.menuItem.data().id, .rect = picker.menuItem.data().borderRectScale().r, .visible = picker.menuItem.data().visible() });
         if (dvui.focusedWidgetId() == picker.menuItem.data().id) {
@@ -1219,21 +1223,21 @@ fn javaPicker(ui: *Ui, src: std.builtin.SourceLocation, registered_java: []const
     } else {
         // DropdownWidget.init processes events itself; a disabled control must not call it.
         var control: dvui.ButtonWidget = undefined;
-        control.init(src, .{ .grayed = true, .draw_focus = false }, components.entryOptions("Java", .{}).override(.{ .tag = "instance-settings-java", .id_extra = 1, .role = .combo_box, .tab_index = 0, .margin = R.all(0) }));
+        control.init(src, .{ .grayed = true, .draw_focus = false }, control_options.override(.{ .tag = "instance-settings-java", .label = .{ .text = "Java" }, .expand = .horizontal, .max_size_content = .width(0), .id_extra = 1, .role = .combo_box, .tab_index = 0, .margin = R.all(0) }));
         dvui.tag("instance-settings-java-control", .{ .id = control.data().id, .rect = control.data().borderRectScale().r, .visible = control.data().visible() });
         defer control.deinit();
-        wizardButtonState(&control, false);
-        dvui.labelNoFmt(@src(), label, .{}, control.style().override(.{ .font = theme.bodyFont(), .color_text = .{ .color = theme.muted }, .padding = R.all(0), .margin = .{ .w = theme.spacing.row_gap }, .gravity_y = 0.5, .expand = .horizontal, .background = false }));
+        wizardButtonState(&control, false, false);
+        dvui.labelNoFmt(@src(), label, .{}, control.style().override(.{ .font = theme.bodyFont(), .color_text = .{ .color = theme.colors.muted }, .padding = R.all(0), .margin = .{ .w = theme.spacing.row_gap }, .gravity_y = 0.5, .expand = .horizontal, .background = false }));
         dvui.icon(@src(), "dropdown_triangle", dvui.entypo.chevron_small_down, .{}, control.style().override(.{ .gravity_x = 1, .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .role = .none, .background = false }));
     }
-    if (choice == null) components.text(@src(), if (std.mem.eql(u8, text(&ui.draft.java_path), text(&ui.draft.original_java_path))) "已保存的 Java 不在已登记列表中（可能已隐藏或移除）。保留现有绑定，或选择已登记的运行时。" else "所选 Java 已不在已登记列表中（可能已隐藏或移除）。保留当前选择，或重新选择运行时。", theme.muted);
-    if (registered_java.len == 0) components.text(@src(), "暂无已登记的 Java，请先在 Java 管理中添加。", theme.muted);
+    if (choice == null) components.text(@src(), if (std.mem.eql(u8, text(&ui.draft.java_path), text(&ui.draft.original_java_path))) "已保存的 Java 不在已登记列表中（可能已隐藏或移除）。保留现有绑定，或选择已登记的运行时。" else "所选 Java 已不在已登记列表中（可能已隐藏或移除）。保留当前选择，或重新选择运行时。", theme.colors.muted);
+    if (registered_java.len == 0) components.text(@src(), "暂无已登记的 Java，请先在 Java 管理中添加。", theme.colors.muted);
 }
 
 fn installedEntry(ui: *Ui, src: std.builtin.SourceLocation, name: []const u8, tag: []const u8, buffer: []u8, numeric: bool, enabled: bool) void {
     settingsFieldLabel(src, name, fmt("{s}-label", .{tag}));
     var input: dvui.TextEntryWidget = undefined;
-    input.init(src, .{ .text = .{ .buffer = buffer } }, components.entryOptions(name, .{ .tag = tag, .gap_after = 0 }).override(.{ .id_extra = 1, .tab_index = if (enabled) null else 0, .color_text = if (enabled) null else .{ .color = theme.muted } }));
+    input.init(src, .{ .text = .{ .buffer = buffer } }, components.entryOptions(name, .{ .tag = tag, .gap_after = 0 }).override(.{ .id_extra = 1, .tab_index = if (enabled) null else 0, .color_text = if (enabled) null else .{ .color = theme.colors.muted } }));
     defer input.deinit();
     if (!enabled) if (input.data().accesskit_node()) |node| dvui.AccessKit.nodeSetDisabled(node);
     if (enabled) input.processEvents();
@@ -1249,15 +1253,14 @@ fn installedDebug(ui: *Ui, src: std.builtin.SourceLocation, enabled: bool) void 
     var control: dvui.ButtonWidget = undefined;
     control.init(src, .{ .grayed = !enabled, .draw_focus = enabled }, .{ .tag = "instance-settings-debug", .label = .{ .text = "调试启动" }, .role = .ak_switch, .expand = .horizontal, .gravity_y = 0.5, .max_size_content = .width(0), .min_size_content = .{ .h = metrics.control_height }, .padding = R.all(0), .border = R.all(0), .margin = R.all(0), .background = false, .tab_index = if (enabled) null else 0 });
     defer control.deinit();
-    wizardButtonState(&control, enabled);
+    wizardButtonState(&control, enabled, false);
     if (enabled and control.clicked()) ui.draft.debug_launch = !ui.draft.debug_launch;
     if (control.data().accesskit_node()) |node| dvui.AccessKit.nodeSetToggled(node, if (ui.draft.debug_launch) .ak_true else .ak_false);
-    dvui.labelNoFmt(@src(), "调试启动", .{}, .{ .tag = "instance-settings-debug-label", .font = theme.bodyFont(), .expand = .horizontal, .gravity_y = 0.5, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .w = theme.sizing.switch_width + theme.spacing.row_gap }, .color_text = if (enabled) null else .{ .color = theme.muted }, .role = .none, .tab_index = 0 });
-    const track = dvui.box(@src(), .{}, .{ .tag = "instance-settings-debug-switch", .rect = .{ .x = @max(0, control.data().contentRect().w - theme.sizing.switch_width), .y = (metrics.control_height - theme.sizing.switch_height) / 2, .w = theme.sizing.switch_width, .h = theme.sizing.switch_height }, .padding = R.all(0), .margin = R.all(0), .corners = .all(theme.sizing.switch_height / 2), .border = R.all(0), .background = true, .color_fill = .{ .color = if (ui.draft.debug_launch) theme.accent else theme.muted }, .role = .none, .tab_index = 0 });
-    const knob = dvui.box(@src(), .{}, .{ .tag = "instance-settings-debug-knob", .rect = .{ .x = if (ui.draft.debug_launch) theme.sizing.switch_width - theme.sizing.switch_inset - theme.sizing.switch_knob else theme.sizing.switch_inset, .y = theme.sizing.switch_inset, .w = theme.sizing.switch_knob, .h = theme.sizing.switch_knob }, .padding = R.all(0), .margin = R.all(0), .background = true, .border = R.all(0), .corners = .all(theme.sizing.switch_knob / 2), .color_fill = .{ .color = theme.foreground }, .role = .none, .tab_index = 0 });
+    dvui.labelNoFmt(@src(), "调试启动", .{}, .{ .tag = "instance-settings-debug-label", .font = theme.bodyFont(), .expand = .horizontal, .gravity_y = 0.5, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .w = theme.sizing.switch_width + theme.spacing.row_gap }, .color_text = if (enabled) null else .{ .color = theme.colors.muted }, .role = .none, .tab_index = 0 });
+    const track = dvui.box(@src(), .{}, .{ .tag = "instance-settings-debug-switch", .rect = .{ .x = @max(0, control.data().contentRect().w - theme.sizing.switch_width), .y = (metrics.control_height - theme.sizing.switch_height) / 2, .w = theme.sizing.switch_width, .h = theme.sizing.switch_height }, .padding = R.all(0), .margin = R.all(0), .corners = .all(theme.sizing.switch_height / 2), .border = R.all(0), .background = true, .color_fill = .{ .color = if (ui.draft.debug_launch) theme.colors.accent else theme.colors.muted }, .role = .none, .tab_index = 0 });
+    const knob = dvui.box(@src(), .{}, .{ .tag = "instance-settings-debug-knob", .rect = .{ .x = if (ui.draft.debug_launch) theme.sizing.switch_width - theme.sizing.switch_inset - theme.sizing.switch_knob else theme.sizing.switch_inset, .y = theme.sizing.switch_inset, .w = theme.sizing.switch_knob, .h = theme.sizing.switch_knob }, .padding = R.all(0), .margin = R.all(0), .background = true, .border = R.all(0), .corners = .all(theme.sizing.switch_knob / 2), .color_fill = .{ .color = theme.colors.foreground }, .role = .none, .tab_index = 0 });
     knob.deinit();
     track.deinit();
-    if (enabled) control.drawFocus();
     if (enabled and dvui.focusedWidgetId() == control.data().id) {
         ui.form_focus = @backingInt(control.data().id);
         ui.form_subwindow = @backingInt(dvui.focusedSubwindowId());
@@ -1312,15 +1315,14 @@ fn deleteModalButton(src: std.builtin.SourceLocation, name: []const u8, tag: []c
     }));
     defer control.deinit();
     if (enabled and focus_on_entry) dvui.focusWidget(control.data().id, null, null);
-    wizardButtonState(&control, enabled);
-    var label_style = control.style();
-    if (!enabled) label_style.color_text = .{ .color = theme.muted };
+    wizardButtonState(&control, enabled, false);
+    var label_style = theme.foregroundOptions(control.style());
+    if (!enabled) label_style.color_text = .{ .color = theme.colors.muted };
     const bounds = control.data().contentRect();
     const text_size = font.textSize(name);
     const label = dvui.textLayout(@src(), .{ .break_lines = false }, label_style.override(.{ .tag = fmt("{s}-label", .{tag}), .font = font, .rect = .{ .x = @max(0, (bounds.w - text_size.w) / 2), .y = @max(0, (bounds.h - text_size.h) / 2), .w = @min(bounds.w, text_size.w), .h = text_size.h }, .padding = R.all(0), .margin = R.all(0), .background = false }));
     label.addText(name, .{});
     label.deinit();
-    if (enabled) control.drawFocus();
     return enabled and control.clicked();
 }
 
@@ -1330,7 +1332,7 @@ fn deleteModalText(src: std.builtin.SourceLocation, tag: []const u8, message: []
         .role = .label,
         .tab_index = 0,
         .font = if (heading) theme.headingFont() else theme.bodyFont(),
-        .color_text = .{ .color = if (heading) theme.accent else theme.muted },
+        .color_text = .{ .color = if (heading) theme.colors.accent else theme.colors.muted },
         .expand = .horizontal,
         .max_size_content = .width(0),
         .padding = R.all(0),
@@ -1452,7 +1454,7 @@ fn drawFormFailure(ui: *const Ui, tag: []const u8) void {
     if (taskFailureOwned(ui)) return;
     const err = ui.failure orelse return;
     if (err == error.Canceled) return;
-    const layout = dvui.textLayout(@src(), .{}, .{ .tag = tag, .role = .label, .tab_index = 0, .font = theme.bodyFont(), .expand = .horizontal, .max_size_content = .width(0), .color_text = .{ .color = theme.danger }, .padding = R.all(0), .margin = .{ .h = theme.spacing.detail_gap }, .background = false });
+    const layout = dvui.textLayout(@src(), .{}, .{ .tag = tag, .role = .label, .tab_index = 0, .font = theme.bodyFont(), .expand = .horizontal, .max_size_content = .width(0), .color_text = .{ .color = theme.colors.danger }, .padding = R.all(0), .margin = .{ .h = theme.spacing.detail_gap }, .background = false });
     layout.addText(failureMessage(err), .{});
     layout.deinit();
 }
@@ -1466,7 +1468,7 @@ fn taskLabel(src: std.builtin.SourceLocation, tag: []const u8, value: []const u8
         .tag = tag,
         .label = .{ .text = value },
         .font = if (heading) theme.headingFont() else taskFont(),
-        .color_text = .{ .color = theme.muted },
+        .color_text = .{ .color = theme.colors.muted },
         .expand = .horizontal,
         .max_size_content = .width(0),
         .padding = R.all(0),
@@ -1483,7 +1485,7 @@ fn taskText(src: std.builtin.SourceLocation, tag: []const u8, value: []const u8)
         .role = .label,
         .tab_index = 0,
         .font = taskFont(),
-        .color_text = .{ .color = theme.muted },
+        .color_text = .{ .color = theme.colors.muted },
         .expand = .horizontal,
         .max_size_content = .width(0),
         .padding = R.all(0),
@@ -1574,7 +1576,7 @@ fn drawTaskPopup(ui: *Ui, _: bool) void {
                 .tag = "instance-task-speed",
                 .label = .{ .text = speed },
                 .font = taskFont(),
-                .color_text = .{ .color = theme.muted },
+                .color_text = .{ .color = theme.colors.muted },
                 .expand = .none,
                 .padding = R.all(0),
                 .margin = .{ .x = 8, .h = 3 },
@@ -1605,7 +1607,7 @@ fn drawTaskPopup(ui: *Ui, _: bool) void {
         const row = dvui.box(@src(), .{}, .{ .id_extra = index, .tag = fmt("instance-task-file-{d}", .{index}), .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .h = 8 }, .background = false });
         defer row.deinit();
         taskLabel(@src(), fmt("instance-task-file-name-{d}", .{index}), task_view.basename(if (file.path().len > 0) file.path() else file.name()), false);
-        dvui.progress(@src(), .{ .percent = task_view.fraction(file.received, file.total), .color = theme.accent }, .{
+        dvui.progress(@src(), .{ .percent = task_view.fraction(file.received, file.total), .color = theme.colors.accent }, .{
             .tag = fmt("instance-task-file-progress-{d}", .{index}),
             .label = .{ .text = if (details.stage == .verifying) "文件校验进度" else "文件下载进度" },
             .expand = .horizontal,
@@ -1615,7 +1617,7 @@ fn drawTaskPopup(ui: *Ui, _: bool) void {
             .margin = R.all(0),
             .border = R.all(0),
             .corners = .all(2),
-            .color_fill = .{ .color = theme.background },
+            .color_fill = .{ .color = theme.colors.inset },
             .tab_index = 0,
         });
         if (file.failure) |err| if (err != error.Canceled and (ui.task.failure == null or ui.task.failure.? != err)) taskText(@src(), fmt("instance-task-file-failure-{d}", .{index}), taskError(err));
@@ -1653,8 +1655,8 @@ pub fn drawModal(ui: *Ui, enabled: bool) void {
     defer body.deinit();
     const information = components.modalSection(@src(), .{ .min_height = 68, .gap_after = 0 });
     defer information.deinit();
-    components.text(@src(), "当前实例有未保存的更改。保存后继续，或放弃更改。", theme.muted);
-    if (ui.failure) |err| components.text(@src(), fmt("保存未完成：{s}", .{@errorName(err)}), theme.accent);
+    components.text(@src(), "当前实例有未保存的更改。保存后继续，或放弃更改。", theme.colors.muted);
+    if (ui.failure) |err| components.text(@src(), fmt("保存未完成：{s}", .{@errorName(err)}), theme.colors.accent);
 }
 
 fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Manager, registered_java: []const java_module.Runtime, enabled: bool) void {
@@ -1672,7 +1674,7 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Man
         {
             const actions = dvui.box(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = .{ .y = theme.spacing.group_gap, .h = theme.spacing.group_gap }, .background = false });
             defer actions.deinit();
-            if (ui.draft.id != null and components.button(@src(), "资源管理", .{ .tag = "instance-manage-mods", .enabled = editable, .expand = true, .placement = .footer })) ui.manage_requested = true;
+            if (ui.draft.id != null and components.button(@src(), "资源管理", .{ .standalone = true, .tag = "instance-manage-mods", .enabled = editable, .expand = true, .placement = .footer })) ui.manage_requested = true;
         }
         {
             const available = dvui.parentGet().data().contentRect().w;
@@ -1709,7 +1711,7 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Man
                 installedDebug(ui, @src(), editable);
             }
         }
-        if (components.button(@src(), "删除", .{ .tag = "instance-settings-delete", .expand = true, .placement = .footer, .enabled = editable, .destructive = true })) {
+        if (components.button(@src(), "删除", .{ .standalone = true, .tag = "instance-settings-delete", .expand = true, .placement = .footer, .enabled = editable, .destructive = true })) {
             // Restore the actual trigger, rather than an older entry that would scroll into view.
             if (dvui.tagGet("instance-settings-delete")) |trigger| {
                 ui.form_focus = @backingInt(trigger.id);
@@ -1720,7 +1722,7 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Man
         return;
     }
     if (ui.mode == .rename and ui.rename_confirmed) {
-        components.text(@src(), fmt("确认将「{s}」重命名为「{s}」？", .{ text(&ui.draft.original_name), text(&ui.draft.name) }), theme.accent);
+        components.text(@src(), fmt("确认将「{s}」重命名为「{s}」？", .{ text(&ui.draft.original_name), text(&ui.draft.name) }), theme.colors.accent);
         const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0) });
         if (!locked and components.iconButton(@src(), "确认重命名", dvui.entypo.check, .{})) ui.queue(.confirm, null);
         if (!locked and components.iconButton(@src(), "取消重命名", dvui.entypo.cross, .{})) ui.queue(.close, null);
@@ -1728,7 +1730,7 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Man
         return;
     }
     if (locked) {
-        components.text(@src(), fmt("{s}", .{text(&ui.draft.name)}), theme.muted);
+        components.text(@src(), fmt("{s}", .{text(&ui.draft.name)}), theme.colors.muted);
         return;
     }
     if (ui.mode == .rename) {
@@ -1768,33 +1770,32 @@ fn instanceSidebarRow(src: std.builtin.SourceLocation, key: []const u8, name: []
         .padding = geometry.padding,
         .margin = .{ .h = bottom_gap },
         .border = R.all(theme.sizing.control_border),
-        .corners = .all(theme.sizing.control_radius),
-        .color_border = .{ .color = if (options.selected) theme.accent else theme.outline },
-        .color_fill = .{ .color = if (options.selected) theme.selected_surface else theme.sidebar },
-        .color_fill_hover = .{ .color = theme.selected_surface },
-        .color_fill_press = .{ .color = theme.selected_surface },
-        .color_text = if (options.selected) .{ .color = theme.selected_text } else null,
+        .corners = .all(theme.controlRadius()),
+        .color_border = .{ .color = if (options.selected) theme.colors.accent else theme.colors.outline },
+        .color_fill = .{ .color = if (options.selected) theme.colors.selected_surface else theme.colors.sidebar },
+        .color_fill_hover = .{ .color = if (options.enabled or options.selected) theme.colors.selected_surface else theme.colors.sidebar },
+        .color_fill_press = .{ .color = if (options.enabled) theme.colors.pressed_surface else if (options.selected) theme.colors.selected_surface else theme.colors.sidebar },
+        .color_text = if (options.selected) .{ .color = theme.colors.selected_text } else null,
         .tab_index = if (options.enabled) null else 0,
     });
     defer control.deinit();
     wizardButtonEvents(&control, options.enabled);
-    control.drawBackground();
+    theme.surface.buttonBackground(&control);
     if (control.data().accesskit_node()) |node| dvui.AccessKit.nodeSetSelected(node, options.selected);
     {
         const row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .max_size_content = .width(0), .min_size_content = .{ .h = content_height }, .padding = R.all(0), .margin = R.all(0), .background = false });
         defer row.deinit();
         if (options.icon) |asset| dvui.icon(@src(), name, asset, .{}, control.style().override(.{ .min_size_content = dvui.Size.all(theme.sizing.sidebar_icon), .max_size_content = .size(dvui.Size.all(theme.sizing.sidebar_icon)), .gravity_y = 0.5, .padding = R.all(0), .margin = .{ .w = theme.spacing.control_padding_x }, .role = .none }));
-        const title = dvui.textLayout(@src(), .{ .break_lines = false }, control.style().override(.{ .font = font, .expand = .horizontal, .max_size_content = .width(0), .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .background = false }));
+        const title = dvui.textLayout(@src(), .{ .break_lines = false }, theme.foregroundOptions(control.style()).override(.{ .font = font, .expand = .horizontal, .max_size_content = .width(0), .gravity_y = 0.5, .padding = R.all(0), .margin = R.all(0), .background = false }));
         title.addText(name, .{});
         title.deinit();
     }
-    if (options.enabled) control.drawFocus();
     components.tooltip(src, control.data().id, control.data().borderRectScale().r, name);
     return options.enabled and control.clicked();
 }
 
 pub fn sidebarPanel(src: std.builtin.SourceLocation) *dvui.BoxWidget {
-    return dvui.box(src, .{}, .{ .tag = "instance-sidebar", .expand = .both, .padding = R.all(metrics.sidebar_padding), .margin = .{ .x = theme.spacing.page_margin, .y = theme.spacing.page_margin, .h = theme.spacing.page_margin }, .corners = .all(theme.sizing.sidebar_radius), .background = true, .color_fill = .{ .color = theme.sidebar } });
+    return theme.panel(src, .{}, .{ .tag = "instance-sidebar", .expand = .both, .padding = R.all(metrics.sidebar_padding), .margin = .{ .x = theme.spacing.page_margin, .y = theme.spacing.page_margin, .h = theme.spacing.page_margin }, .corners = .all(theme.sidebarRadius()), .background = true, .color_fill = .{ .color = theme.panelColor(theme.colors.sidebar) } });
 }
 
 pub fn sidebarHeading(src: std.builtin.SourceLocation) void {
@@ -1816,7 +1817,7 @@ pub fn drawSidebar(ui: *Ui, store: *config.Store, manager: *manager_module.Manag
     _ = dvui.separator(@src(), .{ .tag = "instance-sidebar-separator", .expand = .horizontal, .margin = .{ .y = theme.spacing.sidebar_separator_before, .h = theme.spacing.sidebar_separator_after } });
     const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .tag = "instance-sidebar-list", .expand = .both, .background = false, .padding = R.all(0), .margin = R.all(0), .border = R.all(0) });
     defer scroll.deinit();
-    if (doc.instances.len == 0) components.text(@src(), "暂无实例", theme.muted);
+    if (doc.instances.len == 0) components.text(@src(), "暂无实例", theme.colors.muted);
     for (doc.instances) |instance| {
         const selected = if (doc.selected_instance) |id| std.mem.eql(u8, id, instance.id) else false;
         if (instanceSidebarRow(@src(), instance.id, instance.name, .{ .selected = selected and ui.mode != .create, .enabled = allowed }, theme.spacing.sidebar_action_gap, true)) queueSidebarAction(ui, .select, instance.id, busy, enabled);
@@ -1894,7 +1895,7 @@ pub fn drawWithEnabled(ui: *Ui, store: *config.Store, manager: *manager_module.M
     if (ui.mode == .create) {
         drawAcquisition(ui, doc, manager, catalogue, enabled);
     } else if (ui.mode != .none) drawEditor(ui, doc, manager, registered_java, enabled);
-    if (selected == null and ui.mode == .none) components.text(@src(), if (doc.instances.len == 0) "暂无实例" else "未选择实例", theme.muted);
+    if (selected == null and ui.mode == .none) components.text(@src(), if (doc.instances.len == 0) "暂无实例" else "未选择实例", theme.colors.muted);
 }
 
 test "deletion confirmation dismissal preserves dirty draft ownership and form focus" {

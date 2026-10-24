@@ -102,7 +102,23 @@ const Frame = struct {
         var retained_mesh: std.ArrayList(dvui.Rect.Physical) = .empty;
         for (commands.items) |command| switch (command.cmd) {
             .text => |text| try retained_text.append(a, .{ .value = try a.dupe(u8, text.text), .rect = text.rs.r, .clip = command.clip }),
-            .triangles => |mesh| try retained_mesh.append(a, mesh.tri.bounds),
+            .triangles => |mesh| {
+                // TVG meshes include transparent AA fringe vertices in tri.bounds.
+                // Observe the painted core, so an invisible edge cannot change icon size.
+                var visible_bounds: ?dvui.Rect.Physical = null;
+                for (mesh.tri.vertexes) |vertex| {
+                    if (vertex.col.a == 0) continue;
+                    if (visible_bounds) |*bounds| {
+                        const right = @max(bounds.x + bounds.w, vertex.pos.x);
+                        const bottom = @max(bounds.y + bounds.h, vertex.pos.y);
+                        bounds.x = @min(bounds.x, vertex.pos.x);
+                        bounds.y = @min(bounds.y, vertex.pos.y);
+                        bounds.w = right - bounds.x;
+                        bounds.h = bottom - bounds.y;
+                    } else visible_bounds = .{ .x = vertex.pos.x, .y = vertex.pos.y };
+                }
+                if (visible_bounds) |bounds| try retained_mesh.append(a, bounds);
+            },
             .pathFillConvex => |fill| {
                 if (fill.path.points.len == 0) continue;
                 var top_left = fill.path.points[0];
@@ -186,10 +202,12 @@ const Frame = struct {
         var window = try dvui.testing.init(.{ .window_size = size });
         defer window.deinit();
         window.backend.size_pixels = .{ .w = size.w, .h = size.h };
-        var value = dvui.Theme.builtin.adwaita_dark;
-        value.font_body = value.font_body.withSize(font_size);
-        value.font_heading = value.font_body.withSize(18);
-        value.font_title = value.font_body.withSize(24);
+        // Interpret the font-size matrix as design EM pixels, like production.
+        window.window.themeSet(dvui.Theme.builtin.adwaita_dark);
+        var value = dvui.themeGet();
+        value.font_body = theme.fontSized(font_size);
+        value.font_heading = theme.fontSized(theme.typography.heading);
+        value.font_title = theme.fontSized(theme.typography.title);
         window.window.themeSet(value);
         try seed(80);
         try dvui.testing.settle(draw);
@@ -499,9 +517,10 @@ fn checkMore(_: *dvui.testing) !void {
     for (capture.widgets.items) |widget| if (std.mem.eql(u8, widget.name orelse "", "Button") and std.mem.eql(u8, widget.src_fn, "moreContent")) {
         cards += 1;
     };
-    try std.testing.expectEqual(@as(usize, 4), cards);
+    const expected_cards = [_][]const u8{ "实例管理", "资源管理", "存档管理", "Java 管理", "服务器" };
+    try std.testing.expectEqual(expected_cards.len, cards);
     try std.testing.expect(!Frame.hasText("游戏日志"));
-    for ([_][]const u8{ "实例管理", "存档管理", "Java 管理", "服务器" }) |label| try std.testing.expect(Frame.hasText(label));
+    for (expected_cards) |label| try std.testing.expect(Frame.hasText(label));
 }
 
 test "UI layout logs More game cards omit the logs entry" {

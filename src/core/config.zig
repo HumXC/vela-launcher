@@ -4,6 +4,7 @@ const std = @import("std");
 const windows_fs = @import("windows_durable_fs.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
+pub const appearance = @import("appearance.zig");
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const max_json = 4 * 1024 * 1024;
@@ -60,6 +61,7 @@ pub const Settings = struct {
 pub const Document = struct {
     schema_version: u32 = 1,
     settings: Settings = .{},
+    appearance: appearance.Settings = .{},
     instances: []const Instance = &.{},
     servers: []const Server = &.{},
     accounts: []const Account = &.{},
@@ -122,6 +124,7 @@ fn containsId(comptime T: type, items: []const T, id: []const u8) bool {
 
 fn validate(doc: Document) !void {
     if (doc.schema_version != 1) return error.UnsupportedSchemaVersion;
+    try appearance.validate(doc.appearance);
     if (!validMemory(doc.settings.default_memory_mb)) return error.InvalidMemory;
     if (doc.settings.download_connections == 0 or doc.settings.download_connections > 64) return error.InvalidDownloadConnections;
     if (!validText(doc.settings.microsoft_client_id, 4096, true)) return error.InvalidClientId;
@@ -250,6 +253,7 @@ pub const Store = struct {
     file: []const u8,
     state: std.json.Parsed(Document),
     publication_uncertain: bool = false,
+    initial_defaults: bool = false,
     windows_root: ?windows_fs.Root = null,
     writer: ?RootWriter = null,
 
@@ -273,7 +277,7 @@ pub const Store = struct {
         errdefer a.free(file);
         const stat = Dir.cwd().statFile(io, file, .{}) catch |err| switch (err) {
             error.FileNotFound => {
-                return .{ .a = a, .io = io, .root = owned_root, .file = file, .state = try initDefaults(a), .writer = writer };
+                return .{ .a = a, .io = io, .root = owned_root, .file = file, .state = try initDefaults(a), .writer = writer, .initial_defaults = true };
             },
             else => return err,
         };
@@ -298,7 +302,7 @@ pub const Store = struct {
         errdefer a.free(file);
         var loaded = windows_fs.load(&capability, a, "config.json", max_json) catch |err| return windowsError(err);
         defer if (loaded) |*bytes| bytes.deinit();
-        return .{ .a = a, .io = io, .root = root, .file = file, .state = if (loaded) |bytes| try parse(a, bytes.bytes) else try initDefaults(a), .windows_root = capability, .publication_uncertain = capability.publication_uncertain };
+        return .{ .a = a, .io = io, .root = root, .file = file, .state = if (loaded) |bytes| try parse(a, bytes.bytes) else try initDefaults(a), .windows_root = capability, .publication_uncertain = capability.publication_uncertain, .initial_defaults = loaded == null };
     }
 
     /// Separate from read-only init. App calls this before any worker or consumer.
@@ -357,6 +361,8 @@ pub const Store = struct {
         };
         self.state.deinit();
         self.state = next;
+        self.publication_uncertain = false;
+        self.initial_defaults = false;
     }
 
     /// Reloads only an existing valid disk document, never defaults or a draft.
@@ -376,6 +382,7 @@ pub const Store = struct {
             self.state.deinit();
             self.state = next;
             self.publication_uncertain = false;
+            self.initial_defaults = false;
             return;
         }
         if (builtin.os.tag == .windows) return error.UnsupportedDurability;
@@ -390,6 +397,34 @@ pub const Store = struct {
         self.state.deinit();
         self.state = next;
         self.publication_uncertain = false;
+        self.initial_defaults = false;
+    }
+
+    /// Explicit recovery may durably recreate the known initial baseline only when
+    /// this Store has never loaded or successfully published a saved document.
+    /// Existing configurations always use the normal reconciliation contract.
+    pub fn recover(self: *Store) !void {
+        if (!self.initial_defaults) return self.reconcile();
+        self.publication_uncertain = true;
+        try self.recheckWriter();
+        if (self.windows_root) |*root| {
+            var loaded = (windows_fs.load(root, self.a, "config.json", max_json) catch |err| return windowsError(err));
+            if (loaded) |*bytes| {
+                bytes.deinit();
+                return self.reconcile();
+            }
+        } else {
+            if (Dir.cwd().statFile(self.io, self.file, .{})) |_| {
+                return self.reconcile();
+            } else |err| if (err != error.FileNotFound) return err;
+        }
+        const bytes = try serialize(self.a, self.state.value);
+        defer self.a.free(bytes);
+        if (self.windows_root) |*root| {
+            windows_fs.reconcile(root, "config.json", bytes, .none) catch |err| return windowsError(err);
+        } else try self.save(bytes);
+        self.publication_uncertain = false;
+        self.initial_defaults = false;
     }
 
     fn recheckWriter(self: *Store) !void {
@@ -1309,4 +1344,84 @@ test "root writer lock substitution rejects config writes without changing snaps
     try std.testing.expectError(error.RootWriterLockChanged, store.update(.{ .settings = .{ .download_connections = 17 } }));
     try std.testing.expectEqual(@as(u16, 8), store.snapshot().settings.download_connections);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, ".vela/config.json", .{}));
+}
+
+test "appearance owns its image path and survives settings updates and reload" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer a.free(root);
+    var store = try Store.init(a, io, root);
+    defer store.deinit();
+    const image_path = try a.dupe(u8, ".vela/backgrounds/背景.webp");
+    defer a.free(image_path);
+    try store.update(.{ .appearance = .{ .preset = .mist, .background_mode = .image, .background_color = 0x192129, .image_path = image_path, .image_layout = .fit, .image_blur = 8, .image_dimming = 35, .corner_radius = 20, .panel_opacity = 75, .panel_blur = 8 } });
+    @memset(image_path, 'x');
+    try std.testing.expectEqualStrings(".vela/backgrounds/背景.webp", store.snapshot().appearance.image_path.?);
+    var next = store.snapshot().*;
+    next.settings.download_connections = 17;
+    try store.update(next);
+    try store.reconcile();
+    const saved = store.snapshot();
+    try std.testing.expectEqual(appearance.Preset.mist, saved.appearance.preset);
+    try std.testing.expectEqual(appearance.BackgroundMode.image, saved.appearance.background_mode);
+    try std.testing.expectEqual(@as(u32, 0x192129), saved.appearance.background_color);
+    try std.testing.expectEqualStrings(".vela/backgrounds/背景.webp", saved.appearance.image_path.?);
+    try std.testing.expectEqual(appearance.ImageLayout.fit, saved.appearance.image_layout);
+    try std.testing.expectEqual(@as(u8, 8), saved.appearance.image_blur);
+    try std.testing.expectEqual(@as(u8, 35), saved.appearance.image_dimming);
+    try std.testing.expectEqual(@as(u8, 20), saved.appearance.corner_radius);
+    try std.testing.expectEqual(@as(u8, 75), saved.appearance.panel_opacity);
+    try std.testing.expectEqual(@as(u8, 8), saved.appearance.panel_blur);
+    try std.testing.expectEqual(@as(u16, 17), saved.settings.download_connections);
+}
+
+test "first appearance save recovers its initial baseline after a staging failure" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer a.free(root);
+    var store = try Store.init(a, io, root);
+    defer store.deinit();
+    const directory = try Dir.cwd().createDirPathOpen(io, std.fs.path.dirname(store.file).?, .{ .open_options = .{ .iterate = true } });
+    defer directory.close(io);
+    defer _ = std.os.linux.fchmod(directory.handle, 0o700);
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.fchmod(directory.handle, 0o555));
+    const next: Document = .{ .appearance = .{ .preset = .frost } };
+    try std.testing.expectError(error.AccessDenied, store.update(next));
+    try std.testing.expect(store.publicationUncertain());
+    try std.testing.expectEqual(appearance.Preset.moss, store.snapshot().appearance.preset);
+    try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, store.file, .{}));
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.fchmod(directory.handle, 0o700));
+    try store.recover();
+    try std.testing.expectEqual(appearance.Preset.moss, store.snapshot().appearance.preset);
+    try store.update(next);
+    try store.reconcile();
+    try std.testing.expectEqual(appearance.Preset.frost, store.snapshot().appearance.preset);
+}
+
+test "initial baseline recovery never recreates a previously saved missing document" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer a.free(root);
+    {
+        var original = try Store.init(a, io, root);
+        defer original.deinit();
+        try original.update(.{ .appearance = .{ .preset = .frost } });
+    }
+    var store = try Store.init(a, io, root);
+    defer store.deinit();
+    try Dir.cwd().deleteFile(io, store.file);
+    try std.testing.expectError(error.FileNotFound, store.recover());
+    try std.testing.expect(store.publicationUncertain());
+    try std.testing.expectEqual(appearance.Preset.frost, store.snapshot().appearance.preset);
 }

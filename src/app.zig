@@ -18,6 +18,7 @@ const window_control = @import("ui/window_control.zig");
 const lifecycle = @import("core/lifecycle.zig");
 const shutdown_view = @import("ui/shutdown_view.zig");
 const settings_view = @import("ui/settings_view.zig");
+const appearance_view = @import("ui/appearance_view.zig");
 const java_download_controller = @import("ui/java_download_controller.zig");
 const java_download_view = @import("ui/java_download_view.zig");
 const server_manager = @import("ui/server_manager.zig");
@@ -77,6 +78,7 @@ var launcher: game_launch.Controller = undefined;
 var paths: instance_paths.Paths = undefined;
 var configuration: config.Store = undefined;
 var settings_ui: settings_view.Ui = undefined;
+var appearance_ui: appearance_view.Ui = undefined;
 var java_download: java_download_controller.Controller = undefined;
 var java_download_ui: java_download_view.Ui = undefined;
 var servers: server_manager.Manager = undefined;
@@ -221,6 +223,9 @@ pub fn init(win: *dvui.Window) !void {
     observed_instances = instanceFingerprint(configuration.snapshot());
     settings_ui = try settings_view.Ui.init(main_init.gpa, configuration.snapshot().settings);
     errdefer settings_ui.deinit();
+    appearance_ui = try appearance_view.Ui.init(main_init.gpa, main_init.io, configuration.snapshot().appearance);
+    errdefer appearance_ui.deinit();
+    appearance_ui.picker = &picker;
     tasks = task_registry.Registry.init(main_init.gpa);
     errdefer tasks.deinit();
     cf_credentials = null;
@@ -341,6 +346,7 @@ pub fn deinit(win: *dvui.Window) void {
         if (acceptance_enabled) acceptance.accountsJoined();
         if (cf_credentials) |*controller| controller.deinit();
         cf_credentials = null;
+        appearance_ui.deinit();
         settings_ui.deinit();
         java_ui.deinit();
         picker.deinit();
@@ -469,6 +475,7 @@ fn frameActive() !dvui.App.Result {
         .configuration = &configuration,
         .tasks = &tasks,
         .settings = &settings_ui,
+        .appearance = &appearance_ui,
         .cf_credentials = if (cf_credentials) |*controller| controller else null,
         .cf_credentials_failure = cf_credentials_failure,
         .java_download = &java_download,
@@ -494,7 +501,9 @@ fn frameActive() !dvui.App.Result {
         return .close;
     }
     const active = activeBackgroundCount();
-    if (window.takeCloseRequested()) {
+    var close_ready = appearance_view.takeClose(&appearance_ui);
+    if (window.takeCloseRequested()) close_ready = appearance_view.guardClose(&appearance_ui);
+    if (close_ready) {
         if (try applyWindowActions(policy.closeRequested(active))) {
             try window.checkNativeDisplay();
             return .close;
@@ -658,6 +667,9 @@ test {
     _ = @import("core/java_download_service_tests.zig");
     _ = @import("ui/tasks_view.zig");
     _ = @import("ui/settings_view.zig");
+    _ = appearance_view;
+    _ = @import("ui/background_image.zig");
+    _ = @import("core/appearance.zig");
     _ = java_download_controller;
     _ = java_download_view;
     _ = server_manager;

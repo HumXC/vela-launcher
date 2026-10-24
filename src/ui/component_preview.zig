@@ -238,7 +238,7 @@ pub const Context = struct {
 
     pub fn draw(self: *Context) void {
         if (self.scene != .controls and self.scene != .@"selection-card") {
-            const background = dvui.box(@src(), .{}, .{ .expand = .both, .color_fill = .{ .color = theme.background }, .padding = .all(24), .margin = .all(0), .background = true });
+            const background = dvui.box(@src(), .{}, .{ .expand = .both, .color_fill = .{ .color = theme.colors.background }, .padding = .all(24), .margin = .all(0), .background = true });
             background.deinit();
         }
         switch (self.scene) {
@@ -264,11 +264,11 @@ pub const Context = struct {
         }
         const body = components.scrollBody(@src());
         defer body.deinit();
-        components.text(@src(), self.data.message orelse if (self.variant == .@"long-text") long_message else "这里直接显示 mock 内容，可用于核对弹窗文字、间距和操作区域。", if (self.variant == .@"error") theme.danger else theme.foreground);
+        components.text(@src(), self.data.message orelse if (self.variant == .@"long-text") long_message else "这里直接显示 mock 内容，可用于核对弹窗文字、间距和操作区域。", if (self.variant == .@"error") theme.colors.danger else theme.colors.foreground);
     }
 
     fn drawControls(self: *Context) void {
-        const body = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(24), .background = true, .color_fill = .{ .color = theme.background } });
+        const body = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(24), .background = true, .color_fill = .{ .color = theme.colors.background } });
         defer body.deinit();
         const scroll = components.scrollBody(@src());
         defer scroll.deinit();
@@ -278,13 +278,13 @@ pub const Context = struct {
         if (components.field(@src(), "实例名称", &self.name_buffer, .{ .enabled = enabled, .tag = "mock-name" })) self.record(.changed);
         const choices = [_][]const u8{ "自动选择 Java", "Java 21 · 本机运行时", "Java 17 · 启动器运行时" };
         if (enabled) {
-            if (components.dropdown(@src(), "Java", &choices, .{ .choice = &self.choice }, .{})) self.record(.changed);
+            if (components.dropdown(@src(), "Java", &choices, .{ .choice = &self.choice }, .{}, .{})) self.record(.changed);
         } else {
             _ = components.button(@src(), choices[self.choice], .{ .enabled = false, .expand = true });
         }
         if (components.checkbox(@src(), &self.check, "调试启动", enabled)) self.record(.changed);
         if (components.toggle(@src(), &self.selected, "启用开关", enabled)) self.record(.changed);
-        if (self.variant == .@"error") components.text(@src(), self.data.message orelse "输入内容无效，请检查名称与内存设置。", theme.danger);
+        if (self.variant == .@"error") components.text(@src(), self.data.message orelse "输入内容无效，请检查名称与内存设置。", theme.colors.danger);
         const actions = components.toolbar(@src());
         defer actions.deinit();
         if (components.button(@src(), "保存", .{ .primary = true, .enabled = enabled, .tag = "mock-save" })) self.record(.submit);
@@ -292,7 +292,7 @@ pub const Context = struct {
     }
 
     fn drawCard(self: *Context) void {
-        const body = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(24), .background = true, .color_fill = .{ .color = theme.background } });
+        const body = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(24), .background = true, .color_fill = .{ .color = theme.colors.background } });
         defer body.deinit();
         if (components.selectionCard(@src(), "mock-card", self.data.name orelse if (self.variant == .@"long-text") long_name else "晨光生存", .{ .width = 440, .height = 136, .selected = self.selected, .enabled = self.variant != .disabled, .description = self.data.description orelse "Minecraft 1.21.4 · Fabric", .signal = .good, .status = "0/20 · 42 ms", .tag = "mock-card" })) {
             self.selected = !self.selected;

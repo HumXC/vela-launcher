@@ -146,7 +146,7 @@ fn drawCredentials(ui: *Ui, snapshot: credential_controller.Snapshot, settings: 
     components.fieldLabel(@src(), "CurseForge API 密钥");
     const action = components.formActions(@src(), .{ .save_label = "保存密钥", .save_enabled = ui.key_pending == null and keyAllowed(.save_key, snapshot, content_busy, store_uncertain) and ui.key_editor.readyForSave() });
     if (action == .cancel) ui.key_discard_queued = true;
-    components.text(@src(), if (configured) "已配置" else "未配置", theme.muted);
+    components.text(@src(), if (configured) "已配置" else "未配置", theme.colors.muted);
     const result = ui.key_editor.draw(@src(), components.entryOptions("CurseForge API 密钥", .{}));
     if (result.edited) ui.key_failure = null;
     if (result.cancel) ui.key_discard_queued = true;
@@ -154,8 +154,8 @@ fn drawCredentials(ui: *Ui, snapshot: credential_controller.Snapshot, settings: 
         ui.key_failure = err;
     };
     switch (result.status) {
-        .invalid_input => components.text(@src(), "密钥含无效字符", theme.danger),
-        .too_long => components.text(@src(), "密钥超过 512 字节", theme.danger),
+        .invalid_input => components.text(@src(), "密钥含无效字符", theme.colors.danger),
+        .too_long => components.text(@src(), "密钥超过 512 字节", theme.colors.danger),
         else => {},
     }
     {
@@ -171,7 +171,7 @@ fn drawCredentials(ui: *Ui, snapshot: credential_controller.Snapshot, settings: 
         };
     }
     if (ui.confirm_remove) {
-        components.text(@src(), "确认移除 CurseForge API 密钥？", theme.danger);
+        components.text(@src(), "确认移除 CurseForge API 密钥？", theme.colors.danger);
         switch (components.formActions(@src(), .{ .save_label = "确认移除 API 密钥", .cancel_label = "取消移除", .save_enabled = configured and ui.key_pending == null and keyAllowed(.remove_key, snapshot, content_busy, store_uncertain) })) {
             .save => ui.requestKey(.remove_key, snapshot, content_busy, store_uncertain) catch |err| {
                 ui.key_failure = err;
@@ -181,23 +181,23 @@ fn drawCredentials(ui: *Ui, snapshot: credential_controller.Snapshot, settings: 
         }
     }
     if (store_uncertain or snapshot.commit_uncertain) {
-        components.text(@src(), "配置持久化状态待确认", theme.danger);
+        components.text(@src(), "配置持久化状态待确认", theme.colors.danger);
     } else if (snapshot.cleanup_pending) {
-        components.text(@src(), "凭据变更已保存，清理尚未完成", theme.danger);
+        components.text(@src(), "凭据变更已保存，清理尚未完成", theme.colors.danger);
     } else if (snapshot.recovery_required) {
-        components.text(@src(), "凭据状态需要恢复", theme.danger);
+        components.text(@src(), "凭据状态需要恢复", theme.colors.danger);
     } else if (snapshot.publication_pending) {
-        components.text(@src(), "正在保存凭据配置", theme.muted);
+        components.text(@src(), "正在保存凭据配置", theme.colors.muted);
     } else if (snapshot.busy) {
-        components.text(@src(), "正在处理凭据", theme.muted);
+        components.text(@src(), "正在处理凭据", theme.colors.muted);
     } else if (snapshot.committed) {
-        components.text(@src(), if (configured) "密钥配置已保存" else "密钥已移除", theme.muted);
+        components.text(@src(), if (configured) "密钥配置已保存" else "密钥已移除", theme.colors.muted);
     }
     const failure: ?anyerror = if (ui.key_failure) |err| err else snapshot.failure;
     if (failure) |err| {
         var buffer: [256]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, "凭据操作失败（{s}）", .{@errorName(err)}) catch "凭据操作失败";
-        components.text(@src(), message, theme.danger);
+        components.text(@src(), message, theme.colors.danger);
     }
 }
 
@@ -279,14 +279,14 @@ fn drawPage(ui: *Ui, controller: ?*credential_controller.Controller, settings: c
                 components.fieldLabel(@src(), "CurseForge API 密钥");
                 var buffer: [256]u8 = undefined;
                 const message = std.fmt.bufPrint(&buffer, "密钥不可用（{s}）", .{@errorName(err)}) catch "密钥不可用";
-                components.text(@src(), message, theme.danger);
+                components.text(@src(), message, theme.colors.danger);
             }
         }
         if (ui.failure) |failure| {
             const text = try std.fmt.allocPrint(dvui.currentWindow().arena(), "{s}（{s}）", .{ failureText(failure), @errorName(failure) });
-            components.text(@src(), text, theme.danger);
+            components.text(@src(), text, theme.colors.danger);
         } else if (ui.saved) {
-            components.text(@src(), "已保存", theme.accent);
+            components.text(@src(), "已保存", theme.colors.accent);
         }
     }
 }

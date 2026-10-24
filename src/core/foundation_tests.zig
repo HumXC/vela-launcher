@@ -2,6 +2,7 @@ const std = @import("std");
 
 test {
     std.testing.refAllDecls(@import("config.zig"));
+    std.testing.refAllDecls(@import("appearance.zig"));
     std.testing.refAllDecls(@import("instances.zig"));
     std.testing.refAllDecls(@import("tasks.zig"));
     std.testing.refAllDecls(@import("logs.zig"));

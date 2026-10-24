@@ -183,10 +183,10 @@ pub fn draw(src: std.builtin.SourceLocation, state: *State, current: local.Kind,
         .padding = .all(0),
         .margin = .all(0),
         .border = .all(1),
-        .corners = .all(12),
-        .color_border = .{ .color = if (state.mode == .pinned and enabled) theme.selected_text else theme.control_outline },
-        .color_fill = .{ .color = if (state.mode != .closed and enabled) theme.selected_surface else theme.sidebar },
-        .color_fill_hover = .{ .color = theme.selected_surface },
+        .corners = .all(theme.controlRadius()),
+        .color_border = .{ .color = if (state.mode == .pinned and enabled) theme.colors.selected_text else theme.colors.control_outline },
+        .color_fill = .{ .color = if (state.mode != .closed and enabled) theme.colors.selected_surface else theme.colors.sidebar },
+        .color_fill_hover = .{ .color = theme.colors.selected_surface },
         .tab_index = if (enabled) null else 0,
     });
     state.trigger_id = control.data().id;
@@ -291,17 +291,16 @@ pub fn draw(src: std.builtin.SourceLocation, state: *State, current: local.Kind,
             dvui.AccessKit.nodeRemoveAction(node, .focus);
         }
     }
-    control.data().options.color_fill = .{ .color = if (state.mode != .closed and enabled) theme.selected_surface else theme.sidebar };
-    control.data().options.color_border = .{ .color = if (state.mode == .pinned and enabled) theme.selected_text else theme.control_outline };
-    control.drawBackground();
+    control.data().options.color_fill = .{ .color = if (state.mode != .closed and enabled) theme.colors.selected_surface else theme.colors.sidebar };
+    control.data().options.color_border = .{ .color = if (state.mode == .pinned and enabled) theme.colors.selected_text else theme.colors.control_outline };
+    theme.surface.buttonBackground(&control);
     const width = control.data().contentRect().w;
     const height = control.data().contentRect().h;
-    text(@src(), "资源类型", .{ .x = 15, .w = 72, .h = height }, theme.bodyFont(), if (enabled) theme.foreground else theme.muted);
+    text(@src(), "资源类型", .{ .x = 15, .w = 72, .h = height }, theme.bodyFont(), if (enabled) theme.colors.foreground else theme.colors.muted);
     const title = titles[indexOf(current)];
     const title_width = theme.captionFont().textSize(title).w;
-    text(@src(), title, .{ .x = @max(87, width - 47 - title_width), .w = title_width, .h = height }, theme.captionFont(), theme.muted);
-    icon(@src(), "展开资源类型", dvui.entypo.chevron_small_right, .{ .x = width - 31, .y = (height - 16) / 2, .w = 16, .h = 16 }, if (enabled) theme.foreground else theme.muted);
-    if (enabled) control.drawFocus();
+    text(@src(), title, .{ .x = @max(87, width - 47 - title_width), .w = title_width, .h = height }, theme.captionFont(), theme.colors.muted);
+    icon(@src(), "展开资源类型", dvui.entypo.chevron_small_right, .{ .x = width - 31, .y = (height - 16) / 2, .w = 16, .h = 16 }, if (enabled) theme.colors.foreground else theme.colors.muted);
     const trigger_id = control.data().id;
     control.deinit();
 
@@ -320,14 +319,16 @@ pub fn draw(src: std.builtin.SourceLocation, state: *State, current: local.Kind,
         .role = .menu,
         .label = .{ .text = "资源类型" },
         .border = .all(scale),
-        .corners = .all(12 * scale),
+        .corners = .all(theme.controlRadius() * scale),
         .padding = .all(8 * scale),
         .margin = .all(0),
-        .background = true,
-        .color_fill = .{ .color = theme.surface },
-        .color_border = .{ .color = theme.control_outline },
+        .background = false,
+        .color_fill = .{ .color = theme.panelColor(theme.colors.surface) },
+        .color_border = .{ .color = theme.colors.control_outline },
     });
     defer floating.deinit();
+    floating.data().options.background = true;
+    theme.panelFill(floating.data(), .{});
     state.menu_id = floating.data().id;
     const content_width = floating.data().contentRect().w / scale;
     for (kinds, 0..) |kind, i| {
@@ -341,8 +342,8 @@ pub fn draw(src: std.builtin.SourceLocation, state: *State, current: local.Kind,
             .padding = .all(0),
             .margin = .all(0),
             .border = .all(0),
-            .corners = .all(8),
-            .color_fill = .{ .color = if (kind == current) theme.selected_surface else theme.surface },
+            .corners = .all(theme.controlRadius()),
+            .color_fill = .{ .color = if (kind == current) theme.colors.selected_surface else theme.colors.surface },
             .color_fill_hover = .{ .color = theme.style.colors.pressed_surface },
         });
         state.item_ids[i] = item.data().id;
@@ -360,10 +361,9 @@ pub fn draw(src: std.builtin.SourceLocation, state: *State, current: local.Kind,
         }
         item.processEvents();
         if (item.data().accesskit_node()) |node| dvui.AccessKit.nodeSetSelected(node, kind == current);
-        item.drawBackground();
-        text(@src(), titles[i], .{ .x = 16, .w = @max(0, content_width - 56), .h = 48 }, theme.bodyFont(), if (kind == current) theme.selected_text else theme.foreground);
-        if (kind == current) icon(@src(), "当前类型", dvui.entypo.check, .{ .x = content_width - 32, .y = 16, .w = 16, .h = 16 }, theme.accent);
-        item.drawFocus();
+        theme.surface.buttonBackground(&item);
+        text(@src(), titles[i], .{ .x = 16, .w = @max(0, content_width - 56), .h = 48 }, theme.bodyFont(), if (kind == current) theme.colors.selected_text else theme.colors.foreground);
+        if (kind == current) icon(@src(), "当前类型", dvui.entypo.check, .{ .x = content_width - 32, .y = 16, .w = 16, .h = 16 }, theme.colors.accent);
         const chosen = item.clicked();
         item.deinit();
         if (chosen) {
@@ -483,7 +483,7 @@ test "resource menu focus routes click and keyboard events in one frame" {
                     }
                 }
                 button.processEvents();
-                button.drawBackground();
+                theme.surface.buttonBackground(&button);
             }
             return .ok;
         }
@@ -586,4 +586,85 @@ test "resource menu focus routes click and keyboard events in one frame" {
     try std.testing.expectEqual(Mode.closed, Fixture.state.mode);
     try std.testing.expectEqual(Fixture.foreign_id.?, dvui.focusedSubwindowId());
     try std.testing.expect(Fixture.chosen == null);
+}
+
+test "UI layout resource menu surfaces follow live radius including square corners at physical scales" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    const Fixture = struct {
+        var state: State = .{};
+        var radius: u8 = 0;
+        var current: local.Kind = .mod;
+        var fills: usize = 0;
+        var rounded_fills: usize = 0;
+
+        fn frame() !dvui.App.Result {
+            const win = dvui.currentWindow();
+            theme.install(win);
+            theme.applyAppearance(.{ .corner_radius = radius });
+            theme.applyTypography();
+            defer theme.applyAppearance(.{});
+            var commands: std.ArrayList(dvui.RenderCommand) = .empty;
+            defer commands.deinit(win.arena());
+            const previous_commands = win.defer_render_cmds;
+            const previous_after = win.defer_render_cmds_after;
+            const previous_rendering = win.render_target.rendering;
+            win.defer_render_cmds = &commands;
+            win.defer_render_cmds_after = &commands;
+            win.render_target.rendering = false;
+            defer {
+                win.defer_render_cmds = previous_commands;
+                win.defer_render_cmds_after = previous_after;
+                win.render_target.rendering = previous_rendering;
+            }
+            {
+                const box = dvui.box(@src(), .{}, .{ .rect = .{ .x = 20, .y = 100, .w = 220, .h = 48 }, .padding = .all(0), .margin = .all(0) });
+                defer box.deinit();
+                _ = draw(@src(), &state, current, true);
+            }
+            // FloatingWidget owns a native subwindow command queue.
+            for (win.subwindows.stack.items) |*subwindow| {
+                try commands.appendSlice(win.arena(), subwindow.render_cmds.items);
+                try commands.appendSlice(win.arena(), subwindow.render_cmds_after.items);
+            }
+            fills = 0;
+            rounded_fills = 0;
+            for (commands.items) |command| switch (command.cmd) {
+                .pathFillConvex => |fill| {
+                    fills += 1;
+                    if (fill.path.points.len > 4) rounded_fills += 1;
+                },
+                else => {},
+            };
+            return .ok;
+        }
+    };
+    for ([_]f32{ 1, 2 }) |scale| {
+        var window = try dvui.testing.init(.{ .window_size = .{ .w = 800, .h = 600 } });
+        defer window.deinit();
+        window.backend.size_pixels = .{ .w = 800 * scale, .h = 600 * scale };
+        Fixture.state = .{ .mode = .pinned };
+        for ([_]u8{ 0, 20, 0 }) |radius| {
+            Fixture.radius = radius;
+            for ([_]local.Kind{ .mod, .resourcepack, .shader }) |kind| {
+                Fixture.current = kind;
+                errdefer std.debug.print("Resource menu surfaces: scale={d}, radius={d}, kind={s}, mode={s}, fills={d}, rounded={d}\n", .{ scale, radius, @tagName(kind), @tagName(Fixture.state.mode), Fixture.fills, Fixture.rounded_fills });
+                try dvui.testing.settle(Fixture.frame);
+                // Trigger, popup and the selected row paint surfaces; transparent idle rows do not.
+                try std.testing.expect(Fixture.fills >= 3);
+                if (radius == 0) {
+                    try std.testing.expectEqual(@as(usize, 0), Fixture.rounded_fills);
+                } else try std.testing.expect(Fixture.rounded_fills >= 3);
+                const trigger = try dvui.testing.tagGet("resource-type-button");
+                const popup = try dvui.testing.tagGet("resource-type-menu");
+                try std.testing.expectApproxEqAbs(220 * scale, trigger.rect.w, 0.1);
+                try std.testing.expectApproxEqAbs(200 * scale, popup.rect.w, 0.1);
+                for ([_][]const u8{ "resource-type-mod", "resource-type-resourcepack", "resource-type-shader" }) |tag| {
+                    const item = try dvui.testing.tagGet(tag);
+                    try std.testing.expect(item.visible);
+                    try std.testing.expect(popup.rect.contains(item.rect.topLeft()));
+                    try std.testing.expect(popup.rect.contains(item.rect.bottomRight()));
+                }
+            }
+        }
+    }
 }

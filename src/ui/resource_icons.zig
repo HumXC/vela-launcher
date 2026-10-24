@@ -256,8 +256,8 @@ fn now(io: std.Io) i64 {
 }
 
 pub fn draw(src: std.builtin.SourceLocation, bitmap: ?*const Bitmap, size: f32, rect: ?dvui.Rect) void {
-    const options: dvui.Options = .{ .rect = rect, .min_size_content = .all(size), .max_size_content = .size(.all(size)), .padding = .all(0), .margin = .{ .w = if (rect == null) 16 else 0 }, .corners = .all(theme.sizing.control_radius), .gravity_y = 0.5 };
+    const options: dvui.Options = .{ .rect = rect, .min_size_content = .all(size), .max_size_content = .size(.all(size)), .padding = .all(0), .margin = .{ .w = if (rect == null) 16 else 0 }, .corners = .all(theme.controlRadius()), .gravity_y = 0.5 };
     if (bitmap) |pixels| {
-        _ = dvui.image(src, .{ .source = .{ .pixelsPMA = .{ .rgba = @constCast(pixels)[0..], .width = side, .height = side, .invalidation = .bytes } } }, options);
-    } else dvui.icon(src, "资源图标", dvui.entypo.archive, .{}, options.override(.{ .color_text = .{ .color = theme.accent } }));
+        _ = @import("surface.zig").image(src, .{ .source = .{ .pixelsPMA = .{ .rgba = @constCast(pixels)[0..], .width = side, .height = side, .invalidation = .bytes } } }, options);
+    } else dvui.icon(src, "资源图标", dvui.entypo.archive, .{}, options.override(.{ .color_text = .{ .color = theme.colors.accent } }));
 }
