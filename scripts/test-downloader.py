@@ -87,6 +87,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 time.sleep(0.05)
             self.close_connection = True
+        elif path == "/stalled":
+            self.send_response(200)
+            self.send_header("Content-Length", "1")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            time.sleep(4)
+            self.wfile.write(b"x")
+            self.close_connection = True
         elif path == "/etag":
             if self.headers.get("If-None-Match") == ETAG:
                 self.reply(304, headers={"ETag": ETAG})

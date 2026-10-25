@@ -8,6 +8,59 @@ const c = curl.libcurl;
 const Allocator = std.mem.Allocator;
 const capacity = 256;
 
+/// A deliberately narrow grammar, independent of upstream provider validation.
+/// Only percent-encoded filename bytes are accepted; decoded separators, nested
+/// escapes and dot segments cannot change the credential's path scope.
+fn credentialUrlAllowed(url: []const u8) bool {
+    const prefix = "https://edge.forgecdn.net/files/";
+    if (url.len > 8192 or !std.mem.startsWith(u8, url, prefix)) return false;
+    for (url) |byte| if (byte <= 32 or byte >= 127 or byte == 0x5c or byte == '?' or byte == '#') return false;
+    var parts = std.mem.splitScalar(u8, url[prefix.len..], '/');
+    for (0..2) |_| {
+        const number = parts.next() orelse return false;
+        if (number.len == 0) return false;
+        for (number) |byte| if (!std.ascii.isDigit(byte)) return false;
+    }
+    const filename = parts.next() orelse return false;
+    if (filename.len == 0 or parts.next() != null) return false;
+    var decoded: [8192]u8 = undefined;
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < filename.len) {
+        const byte = if (filename[index] == '%') blk: {
+            if (filename.len - index < 3) return false;
+            const value = std.fmt.parseInt(u8, filename[index + 1 ..][0..2], 16) catch return false;
+            index += 3;
+            break :blk value;
+        } else blk: {
+            const value = filename[index];
+            index += 1;
+            break :blk value;
+        };
+        if (byte < 32 or byte == 127 or byte == '/' or byte == 0x5c or byte == '%' or byte == '?' or byte == '#') return false;
+        decoded[count] = byte;
+        count += 1;
+    }
+    return !std.mem.eql(u8, decoded[0..count], ".") and !std.mem.eql(u8, decoded[0..count], "..");
+}
+
+fn validateCredentialRequest(request: Request) error{InvalidCredentialScope}!void {
+    const key = request.curseforge_download_key orelse return;
+    if (!credentialUrlAllowed(request.url) or !request.https_only or request.follow_redirects or
+        !request.require_public_address or request.cache_path != null) return error.InvalidCredentialScope;
+    if (request.proxy) |proxy| if (proxy.len != 0) return error.InvalidCredentialScope;
+    if (key.len == 0 or key.len > 4096) return error.InvalidCredentialScope;
+    for (key) |byte| if (byte < 33 or byte > 126) return error.InvalidCredentialScope;
+}
+
+fn wipeHeaders(head: *c.curl_slist) void {
+    var node: ?*c.curl_slist = head;
+    while (node) |entry| {
+        if (entry.data != null) std.crypto.secureZero(u8, std.mem.span(entry.data));
+        node = entry.next;
+    }
+}
+
 fn timeoutAsLong(timeout_ms: u32) error{InvalidTimeout}!c_long {
     return std.math.cast(c_long, timeout_ms) orelse error.InvalidTimeout;
 }
@@ -36,6 +89,8 @@ pub const Progress = struct {
 };
 pub const Request = struct {
     url: []const u8,
+    /// Borrowed only until submit returns. Never cached; scoped to the official CDN.
+    curseforge_download_key: ?[]const u8 = null,
     output: union(enum) { file: []const u8, json, bytes } = .bytes,
     expected_sha1: ?[20]u8 = null,
     expected_size: ?u64 = null,
@@ -49,7 +104,11 @@ pub const Request = struct {
     proxy: ?[]const u8 = null,
     /// PEM trust for both the origin and HTTPS proxy. Null loads native trust.
     ca_bundle: ?[]const u8 = null,
+    /// Zero disables the application transfer deadline and explicit connection budget.
     timeout_ms: u32 = 120_000,
+    /// Abort if throughput remains below one byte/second for this many seconds.
+    /// Zero disables this optional protection.
+    stall_timeout_seconds: u32 = 0,
     /// Prevent initial or redirected requests from using plaintext HTTP.
     https_only: bool = false,
     /// Disable redirects for provider-pinned or otherwise sensitive transfers.
@@ -66,6 +125,7 @@ pub const Task = struct {
     service: *Service,
     request: Request,
     url: [:0]u8,
+    curseforge_download_key: ?[]u8 = null,
     proxy: ?[:0]u8 = null,
     ca: ?[:0]u8 = null,
     destination: ?[]u8 = null,
@@ -123,7 +183,15 @@ pub const Task = struct {
         self.release_requested = true;
         _ = c.curl_multi_wakeup(s.multi);
     }
+    fn clearCredential(self: *Task) void {
+        if (self.curseforge_download_key) |key| {
+            std.crypto.secureZero(u8, key);
+            self.service.allocator.free(key);
+            self.curseforge_download_key = null;
+        }
+    }
     fn finish(self: *Task, failure: ?anyerror, result: ?Result) void {
+        self.clearCredential();
         const s = self.service;
         s.mutex.lockUncancelable(s.io);
         defer s.mutex.unlock(s.io);
@@ -167,6 +235,7 @@ pub const Service = struct {
         return s;
     }
     pub fn submit(self: *Service, request: Request) !*Task {
+        try validateCredentialRequest(request);
         _ = try timeoutAsLong(request.timeout_ms);
         if (request.require_public_address) {
             if (request.proxy) |proxy| if (proxy.len != 0) return error.UnsupportedProxyWithPublicAddressGuard;
@@ -193,6 +262,10 @@ pub const Service = struct {
         errdefer a.destroy(t);
         t.* = .{ .service = self, .request = request, .url = try a.dupeSentinel(u8, request.url, 0), .temp = undefined };
         errdefer a.free(t.url);
+        // Do not retain the borrowed secret even in the copied Request.
+        t.request.curseforge_download_key = null;
+        t.curseforge_download_key = if (request.curseforge_download_key) |key| try a.dupe(u8, key) else null;
+        errdefer t.clearCredential();
         t.destination = switch (request.output) {
             .file => |p| try a.dupe(u8, p),
             else => null,
@@ -232,6 +305,8 @@ pub const Service = struct {
         self.allocator.destroy(self);
     }
     fn destroyTask(self: *Service, t: *Task) void {
+        self.detach(t);
+        t.clearCredential();
         if (t.parsed) |p| p.deinit();
         if (t.cache_meta) |p| p.deinit();
         t.body.deinit(self.allocator);
@@ -376,7 +451,7 @@ pub const Service = struct {
                             t.finish(err, null);
                         } else if (code != c.CURLE_OK) {
                             self.cleanup(t);
-                            t.finish(error.TransferFailed, null);
+                            t.finish(if (code == c.CURLE_OPERATION_TIMEDOUT) error.TimedOut else error.TransferFailed, null);
                         } else if (t.status != 200 and t.status != 304) {
                             self.cleanup(t);
                             t.finish(error.HttpStatus, null);
@@ -417,6 +492,8 @@ pub const Service = struct {
         try set(e, c.CURLOPT_REDIR_PROTOCOLS_STR, protocols);
         try set(e, c.CURLOPT_TIMEOUT_MS, try timeoutAsLong(t.request.timeout_ms));
         try set(e, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_long, @min(t.request.timeout_ms, 30_000)));
+        try set(e, c.CURLOPT_LOW_SPEED_LIMIT, @as(c_long, if (t.request.stall_timeout_seconds == 0) 0 else 1));
+        try set(e, c.CURLOPT_LOW_SPEED_TIME, try timeoutAsLong(t.request.stall_timeout_seconds));
         try set(e, c.CURLOPT_WRITEFUNCTION, &writeCallback);
         try set(e, c.CURLOPT_WRITEDATA, t);
         try set(e, c.CURLOPT_HEADERFUNCTION, &headerCallback);
@@ -453,6 +530,19 @@ pub const Service = struct {
                 try set(e, c.CURLOPT_HTTPHEADER, t.headers);
             }
         };
+        if (t.curseforge_download_key) |key| {
+            var scoped = t.request;
+            scoped.url = t.url;
+            scoped.curseforge_download_key = key;
+            try validateCredentialRequest(scoped);
+            const header = try std.fmt.allocPrintSentinel(self.allocator, "x-api-key: {s}", .{key}, 0);
+            defer {
+                std.crypto.secureZero(u8, header);
+                self.allocator.free(header);
+            }
+            t.headers = c.curl_slist_append(null, header.ptr) orelse return error.OutOfMemory;
+            try set(e, c.CURLOPT_HTTPHEADER, t.headers);
+        }
         if (c.curl_multi_add_handle(self.multi, e) != c.CURLM_OK) return error.CurlMulti;
         self.mutex.lockUncancelable(self.io);
         t.progress = .{ .phase = .downloading };
@@ -467,6 +557,8 @@ pub const Service = struct {
             t.easy = null;
         }
         if (t.headers) |h| {
+            // libcurl owns these allocations, but its free does not erase secrets.
+            wipeHeaders(h);
             c.curl_slist_free_all(h);
             t.headers = null;
         }
@@ -666,4 +758,169 @@ test "first download bytes produce speed before the regular sampling interval" {
     const speed = task.progress.bytes_per_second;
     _ = progressCallback(&task, 100, 50, 0, 0);
     try std.testing.expectEqual(speed, task.progress.bytes_per_second);
+}
+
+// These fixtures intentionally have no worker or network thread: curl handles
+// are configured exactly as production, but curl_multi_perform is never called.
+fn credentialFixtureRequest() Request {
+    return .{ .url = "https://edge.forgecdn.net/files/1234/56/Example%20Mod.jar", .curseforge_download_key = "fixture-only-key", .https_only = true, .follow_redirects = false, .require_public_address = true };
+}
+
+fn credentialAllocationFixture(a: Allocator) !void {
+    const multi = c.curl_multi_init() orelse return error.CurlInit;
+    defer _ = c.curl_multi_cleanup(multi);
+    var service: Service = .{ .allocator = a, .io = std.testing.io, .multi = multi, .max_active = 1 };
+    var request = credentialFixtureRequest();
+    request.ca_bundle = "fixture-ca-never-opened";
+    request.proxy = "";
+    const task = try service.submit(request);
+    defer service.destroyTask(task);
+    try service.start(task);
+    try std.testing.expectEqualStrings("x-api-key: fixture-only-key", std.mem.span(task.headers.?.data));
+    try std.testing.expect(task.headers.?.next == null);
+}
+
+test "credential submit and curl header construction clean up every allocator failure" {
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, credentialAllocationFixture, .{});
+}
+
+test "credential scope rejects URL ambiguities and unsafe transfer options before enqueue" {
+    // An undefined curl handle proves rejected submissions do not touch curl.
+    var service: Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1 };
+    const invalid_urls = [_][]const u8{
+        "http://edge.forgecdn.net/files/1/2/a.jar",
+        "https://media.forgecdn.net/files/1/2/a.jar",
+        "https://edge.forgecdn.net.evil.invalid/files/1/2/a.jar",
+        "https://edge.forgecdn.net@evil.invalid/files/1/2/a.jar",
+        "https://user@edge.forgecdn.net/files/1/2/a.jar",
+        "https://edge.forgecdn.net:443/files/1/2/a.jar",
+        "https://EDGE.forgecdn.net/files/1/2/a.jar",
+        "https://edge.forgecdn.net./files/1/2/a.jar",
+        "https://edge%2eforgecdn.net/files/1/2/a.jar",
+        "https://edge.forgecdn.net/files/1/2/a.jar?api-key=fixture",
+        "https://edge.forgecdn.net/files/1/2/a.jar#fragment",
+        "https://edge.forgecdn.net/files/1/2/../a.jar",
+        "https://edge.forgecdn.net/files/1/2/%2e%2e",
+        "https://edge.forgecdn.net/files/1/2/%2fsecret",
+        "https://edge.forgecdn.net/files/1/2/%5csecret",
+        "https://edge.forgecdn.net/files/1/2/%252fsecret",
+        "https://edge.forgecdn.net/files/1/2/%00secret",
+        "https://edge.forgecdn.net/files/1/2/%0dsecret",
+        "https://edge.forgecdn.net/files/1/2/%3fsecret",
+        "https://edge.forgecdn.net/files/1/2/%",
+        "https://edge.forgecdn.net/files/1/2/%a",
+        "https://edge.forgecdn.net/files/1/2/%zz",
+        "https://edge.forgecdn.net/files/1/2/",
+        "https://edge.forgecdn.net/files/1//a.jar",
+        "https://edge.forgecdn.net/files/%31/2/a.jar",
+        "https://edge.forgecdn.net/files/1/2/a.jar/extra",
+    };
+    for (invalid_urls) |url| {
+        var request = credentialFixtureRequest();
+        request.url = url;
+        try std.testing.expectError(error.InvalidCredentialScope, service.submit(request));
+    }
+    for (0..5) |option| {
+        var request = credentialFixtureRequest();
+        switch (option) {
+            0 => request.https_only = false,
+            1 => request.follow_redirects = true,
+            2 => request.require_public_address = false,
+            3 => request.proxy = "http://127.0.0.1:8080",
+            4 => request.cache_path = "must-not-create-cache",
+            else => unreachable,
+        }
+        try std.testing.expectError(error.InvalidCredentialScope, service.submit(request));
+    }
+    const oversized: [4097]u8 = @splat('x');
+    for ([_][]const u8{ "", "line\rbreak", "line\nbreak", "nul\x00byte", "tab\tbyte", "space key", &oversized }) |key| {
+        var request = credentialFixtureRequest();
+        request.curseforge_download_key = key;
+        try std.testing.expectError(error.InvalidCredentialScope, service.submit(request));
+    }
+    for (service.tasks) |task| try std.testing.expect(task == null);
+}
+
+test "credential copy survives caller mutation and is removed on success failure cancellation and destruction" {
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    const multi = c.curl_multi_init() orelse return error.CurlInit;
+    defer _ = c.curl_multi_cleanup(multi);
+    var audit: CredentialWipeAudit = .{};
+    var service: Service = .{ .allocator = audit.allocator(), .io = std.testing.io, .multi = multi, .max_active = 1 };
+    for (0..5) |scenario| {
+        var borrowed = "fixture-only-key".*;
+        var request = credentialFixtureRequest();
+        request.curseforge_download_key = &borrowed;
+        request.ca_bundle = "fixture-ca-never-opened";
+        const task = try service.submit(request);
+        defer {
+            service.tasks[0] = null;
+            service.destroyTask(task);
+        }
+        try std.testing.expect(task.request.curseforge_download_key == null);
+        try std.testing.expect(task.curseforge_download_key.?.ptr != &borrowed);
+        @memset(&borrowed, 'z');
+        try std.testing.expectEqualStrings("fixture-only-key", task.curseforge_download_key.?);
+        if (scenario == 4) continue; // queued destruction, without finish
+        if (scenario != 3) {
+            try service.start(task);
+            try std.testing.expectEqualStrings("x-api-key: fixture-only-key", std.mem.span(task.headers.?.data));
+        }
+        if (scenario >= 2) task.cancel();
+        service.cleanup(task);
+        task.finish(if (scenario == 1) error.HttpStatus else null, .{ .bytes = "fixture" });
+        try std.testing.expect(task.curseforge_download_key == null);
+        try std.testing.expect(task.headers == null);
+        try std.testing.expect(task.easy == null);
+        try std.testing.expectEqual(if (scenario >= 2) Phase.canceled else if (scenario == 1) Phase.failed else Phase.complete, task.snapshot().progress.phase);
+    }
+    try std.testing.expectEqual(@as(usize, 8), audit.secret_frees);
+    try std.testing.expect(audit.wiped);
+}
+
+test "curl credential header list bytes are zeroed before libcurl frees them" {
+    var headers: *c.curl_slist = c.curl_slist_append(null, "x-api-key: fixture-only-key") orelse return error.OutOfMemory;
+    defer c.curl_slist_free_all(headers);
+    headers = c.curl_slist_append(headers, "another fixture header") orelse return error.OutOfMemory;
+    const first = std.mem.span(headers.data);
+    const second = std.mem.span(headers.next.*.data);
+    wipeHeaders(headers);
+    for (first) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (second) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+const CredentialWipeAudit = struct {
+    secret_frees: usize = 0,
+    wiped: bool = true,
+    fn allocator(self: *CredentialWipeAudit) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+    }
+    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+        return std.testing.allocator.rawAlloc(len, alignment, address);
+    }
+    fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+        const self: *CredentialWipeAudit = @ptrCast(@alignCast(ctx));
+        // Fixture key and formatted header have unique allocation sizes.
+        if (bytes.len == "fixture-only-key".len or bytes.len == "x-api-key: fixture-only-key".len + 1) {
+            self.secret_frees += 1;
+            // Allocator.free poisons after secureZero in debug/safe modes.
+            const expected: u8 = if (@import("builtin").mode == .debug or @import("builtin").mode == .safe) 0xaa else 0;
+            for (bytes) |byte| if (byte != expected) {
+                self.wiped = false;
+            };
+        }
+        std.testing.allocator.rawFree(bytes, alignment, address);
+    }
+};
+
+test "owned key and temporary header are wiped on destruction" {
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    var audit: CredentialWipeAudit = .{};
+    try credentialAllocationFixture(audit.allocator());
+    try std.testing.expectEqual(@as(usize, 2), audit.secret_frees);
+    try std.testing.expect(audit.wiped);
 }

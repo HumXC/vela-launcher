@@ -31,10 +31,10 @@ pub const metrics = struct {
     pub const check_icon = theme.sizing.selection_icon;
 };
 
-pub const Mode = enum { none, create, options, rename, delete_confirm };
+pub const Mode = enum { none, create, packs, options, rename, delete_confirm };
 pub const CreateStep = enum { version, loader, confirm };
 pub const VersionFilter = enum { release, snapshot, old };
-pub const Action = enum { create, edit, ask_rename, ask_delete, select, submit, confirm, close, cancel, close_task, retry_publication, choose_base, choose_loader_kind, choose_loader, load_loaders, next_step, previous_step, save_navigation, discard_navigation, cancel_navigation, leave };
+pub const Action = enum { create, packs, edit, ask_rename, ask_delete, select, submit, confirm, close, cancel, close_task, retry_publication, choose_base, choose_loader_kind, choose_loader, load_loaders, next_step, previous_step, save_navigation, discard_navigation, cancel_navigation, leave };
 const Pending = struct { action: Action, text: ?[]u8 = null, kind: config.Loader = .vanilla, force_refresh: bool = false };
 pub const Draft = struct {
     id: ?[]u8 = null,
@@ -263,7 +263,7 @@ fn replaceOwned(a: Allocator, target: *?[]u8, borrowed: []const u8) !void {
 
 fn isNavigation(action: Action) bool {
     return switch (action) {
-        .select, .create, .edit, .ask_rename, .leave => true,
+        .select, .create, .packs, .edit, .ask_rename, .leave => true,
         else => false,
     };
 }
@@ -339,6 +339,11 @@ fn perform(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !void {
 fn performDirect(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !void {
     const doc = store.snapshot();
     switch (p.action) {
+        .packs => {
+            if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
+            ui.reset();
+            ui.mode = .packs;
+        },
         .create => {
             if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
             var draft: Draft = .{};
@@ -1814,13 +1819,14 @@ pub fn drawSidebar(ui: *Ui, store: *config.Store, manager: *manager_module.Manag
     const busy = manager.isBusy() or manager.snapshot().phase == .awaiting_publication;
     const allowed = sidebarEnabled(ui, busy, enabled);
     if (components.sidebarAction(@src(), "new-instance", "新建实例", .{ .icon = dvui.entypo.plus, .selected = ui.mode == .create, .enabled = allowed })) queueSidebarAction(ui, .create, null, busy, enabled);
+    if (components.sidebarAction(@src(), "get-modpacks", "获取整合包", .{ .selected = ui.mode == .packs, .enabled = allowed })) queueSidebarAction(ui, .packs, null, busy, enabled);
     _ = dvui.separator(@src(), .{ .tag = "instance-sidebar-separator", .expand = .horizontal, .margin = .{ .y = theme.spacing.sidebar_separator_before, .h = theme.spacing.sidebar_separator_after } });
     const scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .tag = "instance-sidebar-list", .expand = .both, .background = false, .padding = R.all(0), .margin = R.all(0), .border = R.all(0) });
     defer scroll.deinit();
     if (doc.instances.len == 0) components.text(@src(), "暂无实例", theme.colors.muted);
     for (doc.instances) |instance| {
         const selected = if (doc.selected_instance) |id| std.mem.eql(u8, id, instance.id) else false;
-        if (instanceSidebarRow(@src(), instance.id, instance.name, .{ .selected = selected and ui.mode != .create, .enabled = allowed }, theme.spacing.sidebar_action_gap, true)) queueSidebarAction(ui, .select, instance.id, busy, enabled);
+        if (instanceSidebarRow(@src(), instance.id, instance.name, .{ .selected = selected and ui.mode != .create and ui.mode != .packs, .enabled = allowed }, theme.spacing.sidebar_action_gap, true)) queueSidebarAction(ui, .select, instance.id, busy, enabled);
     }
 }
 

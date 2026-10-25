@@ -361,30 +361,35 @@ fn drawCard(ui: *Ui, row: Row, width: f32, list: bool) void {
         .color_fill_press = .{ .color = theme.panelColor(theme.colors.surface) },
     });
     defer card.deinit();
-    card.processHover();
-    theme.buttonBackground(&card, .{ .material = true });
+    const visible = !card.data().borderRectScale().r.intersect(dvui.clipGet()).empty();
     if (card.data().accesskit_node()) |node| dvui.AccessKit.nodeSetSelected(node, selected);
-    if (selected or card.hovered() or card.focused()) {
-        if (infoButton(ui, .{ .x = @max(0, content_width - 24), .y = if (list) (content_height - 24) / 2 else content_height - 24, .w = 24, .h = 24 }, entry.path)) ui.openInfo(entry.path) catch |err| {
-            ui.failure = err;
-        };
-    }
-    const title_font = theme.fontSized(18);
-    var buffer: [16]u8 = undefined;
-    const date = local_time.format(&buffer, entry.mtime_ms) orelse "未知";
-    if (list) {
-        localIcon(ui, entry.icon_png, 32, .{ .y = (content_height - 32) / 2, .w = 32, .h = 32 }, entry.enabled);
-        const usable = @max(0, content_width - 32 - 44);
-        const title_w = usable * 0.44;
-        const version_w = usable * 0.24;
-        rowLabel(@src(), entry.name, title_font, .{ .x = 44, .y = 0, .w = @max(0, title_w - 8), .h = content_height }, theme.colors.foreground);
-        versionCaption(@src(), entry.version orelse "版本未知", entry.enabled, .{ .x = 44 + title_w, .w = @max(0, version_w - 8), .h = content_height });
-        rowLabel(@src(), date, theme.fontSized(14), .{ .x = 44 + title_w + version_w, .w = usable - title_w - version_w, .h = content_height }, theme.colors.muted);
-    } else {
-        localIcon(ui, entry.icon_png, 48, .{ .w = 48, .h = 48 }, entry.enabled);
-        rowLabel(@src(), entry.name, title_font, .{ .x = 64, .w = @max(0, content_width - 64), .h = 28 }, theme.colors.foreground);
-        versionCaption(@src(), entry.version orelse "版本未知", entry.enabled, .{ .x = 64, .y = 36, .w = @max(0, content_width - 64), .h = 24 });
-        caption(@src(), date, theme.fontSized(14), .{ .y = 64, .w = @max(0, content_width - 32), .h = 20 });
+    // Keep each fixed-size card registered for layout, keyboard navigation and locate.
+    // Offscreen artwork must not evict visible icons from the bounded decode cache.
+    if (visible or card.focused()) {
+        card.processHover();
+        theme.buttonBackground(&card, .{ .material = true });
+        if (selected or card.hovered() or card.focused()) {
+            if (infoButton(ui, .{ .x = @max(0, content_width - 24), .y = if (list) (content_height - 24) / 2 else content_height - 24, .w = 24, .h = 24 }, entry.path)) ui.openInfo(entry.path) catch |err| {
+                ui.failure = err;
+            };
+        }
+        const title_font = theme.fontSized(18);
+        var buffer: [16]u8 = undefined;
+        const date = local_time.format(&buffer, entry.mtime_ms) orelse "未知";
+        if (list) {
+            localIcon(ui, entry.icon_png, 32, .{ .y = (content_height - 32) / 2, .w = 32, .h = 32 }, entry.enabled);
+            const usable = @max(0, content_width - 32 - 44);
+            const title_w = usable * 0.44;
+            const version_w = usable * 0.24;
+            rowLabel(@src(), entry.name, title_font, .{ .x = 44, .y = 0, .w = @max(0, title_w - 8), .h = content_height }, theme.colors.foreground);
+            versionCaption(@src(), entry.version orelse "版本未知", entry.enabled, .{ .x = 44 + title_w, .w = @max(0, version_w - 8), .h = content_height });
+            rowLabel(@src(), date, theme.fontSized(14), .{ .x = 44 + title_w + version_w, .w = usable - title_w - version_w, .h = content_height }, theme.colors.muted);
+        } else {
+            localIcon(ui, entry.icon_png, 48, .{ .w = 48, .h = 48 }, entry.enabled);
+            rowLabel(@src(), entry.name, title_font, .{ .x = 64, .w = @max(0, content_width - 64), .h = 28 }, theme.colors.foreground);
+            versionCaption(@src(), entry.version orelse "版本未知", entry.enabled, .{ .x = 64, .y = 36, .w = @max(0, content_width - 64), .h = 24 });
+            caption(@src(), date, theme.fontSized(14), .{ .y = 64, .w = @max(0, content_width - 32), .h = 20 });
+        }
     }
     // Children receive events first so clicking info never also selects/toggles the card.
     card.processEvents();
@@ -405,7 +410,7 @@ fn drawCard(ui: *Ui, row: Row, width: f32, list: bool) void {
             ui.locate_path = null;
         }
     }
-    components.tooltip(@src(), card.data().id, card.data().borderRectScale().r, frameFmt("{s}\n{s}{s}", .{ entry.name, entry.path, if (entry.parse_failure != null) "\n元数据读取失败" else "" }));
+    if (visible) components.tooltip(@src(), card.data().id, card.data().borderRectScale().r, frameFmt("{s}\n{s}{s}", .{ entry.name, entry.path, if (entry.parse_failure != null) "\n元数据读取失败" else "" }));
 }
 fn versionCaption(src: std.builtin.SourceLocation, value: []const u8, enabled: bool, rect: R) void {
     if (enabled) return rowLabel(src, value, theme.bodyFont(), rect, theme.colors.muted);
@@ -562,5 +567,64 @@ test "mods view drawing declarations compile" {
     if (render) {
         draw(&ui, .{});
         drawDialogs(&ui, .{});
+    }
+}
+
+test "UI layout large mods lists only touch visible icons during resize and locate" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    const Fixture = struct {
+        var ui: Ui = undefined;
+        var rows: [256]Row = undefined;
+        fn frame() !dvui.App.Result {
+            draw(&ui, .{ .rows = &rows });
+            return .ok;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entries: [256]local.Entry = undefined;
+    for (&entries, &Fixture.rows, 0..) |*entry, *row, i| {
+        const path = try std.fmt.allocPrint(a, "mod-{d:0>4}.jar", .{i});
+        // Unique invalid artwork also exercises the cache's negative entries.
+        entry.* = .{ .path = path, .physical_path = path, .name = path, .icon_png = path };
+        row.* = .{ .entry = entry };
+    }
+    for ([_]bool{ true, false }) |list| {
+        Fixture.ui = try Ui.init(std.testing.allocator);
+        defer Fixture.ui.deinit();
+        Fixture.ui.list = list;
+        Fixture.ui.acquisition.icons = @import("resource_icons.zig").Manager.init(std.testing.allocator, std.testing.io);
+        var window = try dvui.testing.init(.{ .window_size = .{ .w = 1000, .h = 720 } });
+        defer window.deinit();
+        for ([_]f32{ 1000, 620, 1280 }) |width| {
+            window.backend.size = .{ .w = width, .h = 720 };
+            window.backend.size_pixels = .{ .w = width, .h = 720 };
+            try dvui.testing.settle(Fixture.frame);
+            const before = Fixture.ui.acquisition.icons.?.clock;
+            _ = try dvui.testing.step(Fixture.frame);
+            const visits = Fixture.ui.acquisition.icons.?.clock - before;
+            try std.testing.expect(visits > 0);
+            try std.testing.expect(visits < 48);
+        }
+        const first_y = (try dvui.testing.tagGet("mods-row-mod-0000.jar")).rect.y;
+        try dvui.testing.moveTo("mods-row-mod-0000.jar");
+        for (0..8) |_| {
+            _ = try window.window.addEventMouseWheel(-96, .vertical, null);
+            const start_clock = Fixture.ui.acquisition.icons.?.clock;
+            _ = try dvui.testing.step(Fixture.frame);
+            try std.testing.expect(Fixture.ui.acquisition.icons.?.clock - start_clock < 48);
+        }
+        try dvui.testing.settle(Fixture.frame);
+        try std.testing.expect((try dvui.testing.tagGet("mods-row-mod-0000.jar")).rect.y < first_y);
+        Fixture.ui.locate_path = try std.testing.allocator.dupe(u8, entries[255].path);
+        Fixture.ui.locate_settle = 2;
+        try dvui.testing.settle(Fixture.frame);
+        try std.testing.expect(Fixture.ui.locate_path == null);
+        const last = try dvui.testing.tagGet("mods-row-mod-0255.jar");
+        try std.testing.expect(last.rect.y < 720 and last.rect.y + last.rect.h > 0);
+        const before = Fixture.ui.acquisition.icons.?.clock;
+        _ = try dvui.testing.step(Fixture.frame);
+        try std.testing.expect(Fixture.ui.acquisition.icons.?.clock - before < 48);
     }
 }

@@ -31,6 +31,34 @@ fn success(t: *dl.Task) !dl.Snapshot {
     return state;
 }
 
+test "credential scope rejection never dispatches to local fixture or follows its redirect" {
+    const base = try baseUrl();
+    defer a.free(base);
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    const service = try dl.Service.init(a, io, 1);
+    defer service.deinit();
+    const blocked_url = try url(base, "/credential-must-not-dispatch");
+    defer a.free(blocked_url);
+    const redirect_url = try url(base, "/redirect");
+    defer a.free(redirect_url);
+    for ([_][]const u8{ blocked_url, redirect_url }) |target| {
+        try std.testing.expectError(error.InvalidCredentialScope, service.submit(.{
+            .url = target,
+            .curseforge_download_key = "fixture-only-key",
+            .https_only = true,
+            .follow_redirects = false,
+            .require_public_address = true,
+        }));
+    }
+    const stats_url = try url(base, "/stats");
+    defer a.free(stats_url);
+    const stats = try service.submit(.{ .url = stats_url, .output = .json });
+    defer stats.release() catch unreachable;
+    const counts = (try success(stats)).result.?.json.object;
+    try expect(counts.get("/credential-must-not-dispatch") == null);
+}
+
 test "HTTPS-only requests never dispatch plaintext HTTP" {
     const base = try baseUrl();
     defer a.free(base);
@@ -307,7 +335,7 @@ test "unknown length, timeout, relative file paths and path exclusion" {
     const slow = try url(base, "/slow");
     defer a.free(slow);
     const timeout = try s.submit(.{ .url = slow, .timeout_ms = 50 });
-    try eq(error.TransferFailed, (try wait(timeout)).failure.?);
+    try eq(error.TimedOut, (try wait(timeout)).failure.?);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const relative = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/relative.bin", .{tmp.sub_path});
@@ -462,4 +490,24 @@ test "client installation stays in its stage across source and instance name col
     const counts = (try success(task)).result.?.json.object;
     try eq(@as(i64, 2), counts.get("/instance-client/jar").?.integer);
     try eq(@as(i64, 2), counts.get("/instance-client/index").?.integer);
+}
+
+test "streamed transfers without a total deadline complete but stalled connections time out" {
+    const base = try baseUrl();
+    defer a.free(base);
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    const service = try dl.Service.init(a, io, 1);
+    defer service.deinit();
+    const slow = try url(base, "/slow");
+    defer a.free(slow);
+    const healthy = try service.submit(.{ .url = slow, .timeout_ms = 0, .stall_timeout_seconds = 1 });
+    defer healthy.release() catch unreachable;
+    const result = try success(healthy);
+    try eq(@as(usize, 256 * 1024), result.result.?.bytes.len);
+    const stalled = try url(base, "/stalled");
+    defer a.free(stalled);
+    const blocked = try service.submit(.{ .url = stalled, .timeout_ms = 0, .stall_timeout_seconds = 1 });
+    defer blocked.release() catch unreachable;
+    try eq(error.TimedOut, (try wait(blocked)).failure.?);
 }

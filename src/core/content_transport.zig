@@ -19,6 +19,9 @@ pub const Adapter = struct {
     pub const Options = struct {
         http: http.Options = .{},
         allow_curseforge: bool = false,
+        /// Worker-only secret, borrowed only until initWithOptions returns.
+        /// The adapter owns a private copy and securely erases it at deinit.
+        curseforge_download_key: ?[]const u8 = null,
         /// Explicit test transport for metadata and downloads; never falls back to real HTTP.
         /// The returned response owns its body and records its owning allocator.
         fixture_http: ?HttpFunction = null,
@@ -32,6 +35,7 @@ pub const Adapter = struct {
     cancel: ?*const CancelToken,
     connections: u16,
     allow_curseforge: bool,
+    curseforge_download_key: ?[]u8,
     client: http.Client,
     fixture_http: ?HttpFunction,
     fixture_context: ?*anyopaque,
@@ -64,12 +68,22 @@ pub const Adapter = struct {
             hosts[i] = try a.dupe(u8, host);
             copied += 1;
         }
+        const key = if (options.curseforge_download_key) |value| blk: {
+            if (value.len == 0 or value.len > 512) return error.InvalidCredential;
+            for (value) |byte| if (byte < 33 or byte > 126) return error.InvalidCredential;
+            break :blk try a.dupe(u8, value);
+        } else null;
+        errdefer if (key) |owned| {
+            std.crypto.secureZero(u8, owned);
+            a.free(owned);
+        };
         return .{
             .allocator = a,
             .io = io,
             .cancel = cancel,
             .connections = connections,
             .allow_curseforge = options.allow_curseforge,
+            .curseforge_download_key = key,
             .client = try http.Client.init(a, io, options.http),
             .fixture_http = options.fixture_http,
             .fixture_context = options.fixture_context,
@@ -81,6 +95,10 @@ pub const Adapter = struct {
         // Client's libcurl global reference outlives the streaming service.
         if (self.service) |service| service.deinit();
         self.client.deinit();
+        if (self.curseforge_download_key) |key| {
+            std.crypto.secureZero(u8, key);
+            self.allocator.free(key);
+        }
         for (self.approved_download_hosts) |host| self.allocator.free(host);
         self.allocator.free(self.approved_download_hosts);
         self.* = undefined;
@@ -158,12 +176,14 @@ pub const Adapter = struct {
         const download: downloader.Request = .{
             .url = request.url,
             .output = .{ .file = request.absolute_path },
+            .curseforge_download_key = self.downloadKey(request.url),
             .expected_sha1 = request.expected_sha1,
             .expected_size = request.expected_size,
             .max_bytes = std.math.cast(usize, request.max_bytes) orelse return error.BodyTooLarge,
             .proxy = self.client.proxy,
             .ca_bundle = self.client.ca_path,
-            .timeout_ms = 120_000,
+            // Progress and cancellation remain user-controlled for large pack files.
+            .timeout_ms = 0,
             .https_only = true,
             .follow_redirects = false,
             .require_public_address = true,
@@ -202,9 +222,12 @@ pub const Adapter = struct {
 
     fn fetchFixture(self: *Adapter, io: std.Io, request: install.FetchRequest, execute: HttpFunction) !void {
         const limit = std.math.cast(usize, request.max_bytes) orelse return error.BodyTooLarge;
+        const key = self.downloadKey(request.url);
+        const headers: [1]http.Header = .{.{ .name = "x-api-key", .value = key orelse "" }};
         const bounded: http.Request = .{
             .url = request.url,
-            .headers = &.{},
+            .headers = if (key != null) &headers else &.{},
+            .sensitive = key != null,
             .max_response_bytes = limit,
             .timeout_ms = 120_000,
             .deadline_ns = request.deadline_ns,
@@ -281,6 +304,14 @@ pub const Adapter = struct {
         try fs.cancelled(io, request.cancel, request.deadline_ns);
     }
 
+    fn downloadKey(self: *const Adapter, url: []const u8) ?[]const u8 {
+        if (!self.allow_curseforge or !curseforgeDownloadUrlAllowed(url)) return null;
+        for (self.approved_download_hosts) |host| {
+            if (std.mem.eql(u8, host, "edge.forgecdn.net")) return self.curseforge_download_key;
+        }
+        return null;
+    }
+
     fn approvedUrl(self: *const Adapter, url: []const u8) bool {
         // Syntactic public-host rules and exact approval complement the HTTP and
         // downloader resolved-peer guard; neither substitutes for that guard.
@@ -291,6 +322,42 @@ pub const Adapter = struct {
         return false;
     }
 };
+
+/// Separate from metadata credentialScopeAllowed: download credentials must never
+/// broaden the api.curseforge.com metadata scope. Only server-returned URLs enter here.
+pub fn curseforgeDownloadUrlAllowed(url: []const u8) bool {
+    if (!providers.safeHttpsUrl(url)) return false;
+    const prefix = "https://edge.forgecdn.net/files/";
+    if (!std.mem.startsWith(u8, url, prefix)) return false;
+    const uri = std.Uri.parse(url) catch return false;
+    if (uri.query != null) return false;
+    var parts = std.mem.splitScalar(u8, url[prefix.len..], '/');
+    for (0..2) |_| {
+        const number = parts.next() orelse return false;
+        if (number.len == 0) return false;
+        for (number) |byte| if (!std.ascii.isDigit(byte)) return false;
+    }
+    const filename = parts.next() orelse return false;
+    if (filename.len == 0 or parts.next() != null) return false;
+    var decoded: [providers.max_string_bytes]u8 = undefined;
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < filename.len) {
+        const byte = if (filename[index] == '%') blk: {
+            const value = std.fmt.parseInt(u8, filename[index + 1 ..][0..2], 16) catch return false;
+            index += 3;
+            break :blk value;
+        } else blk: {
+            const value = filename[index];
+            index += 1;
+            break :blk value;
+        };
+        if (byte < 32 or byte == 127 or byte == '/' or byte == '\\' or byte == '%' or byte == '?' or byte == '#') return false;
+        decoded[count] = byte;
+        count += 1;
+    }
+    return !std.mem.eql(u8, decoded[0..count], ".") and !std.mem.eql(u8, decoded[0..count], "..");
+}
 
 fn validateProviderRequest(request: providers.Request) !void {
     if (request.follow_redirects) return error.RedirectsDisabled;

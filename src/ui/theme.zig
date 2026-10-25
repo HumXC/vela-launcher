@@ -20,6 +20,19 @@ pub fn setPanelBackdrop(image: ?*background.Image, settings: appearance.Settings
     backdrop_screen = screen;
 }
 
+/// Queue before modal paint; execution captures every already composited lower layer.
+pub fn modalBackdrop(region: dvui.RectScale, corners: dvui.CornerRect) void {
+    // The testing backend intentionally has no pixel capture capability.
+    if (comptime dvui.Backend.support_read_pixels) {
+        if (backdrop_settings.panel_blur == 0 or backdrop_settings.panel_opacity == 100) return;
+        dvui.currentWindow().addRenderCommand(.{ .backdrop = .{
+            .region = region,
+            .corners = corners,
+            .radius = @floatFromInt(backdrop_settings.panel_blur),
+        } }, false);
+    }
+}
+
 /// Install a panel before painting its background, so material coverage is applied once.
 pub fn panel(src: @import("std").builtin.SourceLocation, init_options: dvui.BoxWidget.InitOptions, options: dvui.Options) *dvui.BoxWidget {
     const widget = dvui.widgetAlloc(dvui.BoxWidget);

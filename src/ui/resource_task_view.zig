@@ -11,9 +11,8 @@ const theme = @import("theme.zig");
 fn fmt(comptime pattern: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(dvui.currentWindow().arena(), pattern, args) catch "";
 }
-fn text(src: std.builtin.SourceLocation, value: []const u8, font: dvui.Font, rect: dvui.Rect, color: dvui.Color) void {
-    dvui.labelNoFmt(src, components.ellipsize(value, font, @max(0, rect.w)), .{}, .{ .rect = rect, .font = font, .padding = .all(0), .margin = .all(0), .background = false, .color_text = .{ .color = color } });
-}
+const task_style = @import("download_task_style.zig");
+const text = task_style.text;
 fn fileProgress(ui: *state.Ui, path: []const u8) ?*const tasks.File {
     if (ui.task_details) |*details| for (details.files[0..@min(details.file_count, details.files.len)]) |*file| {
         if (std.mem.eql(u8, file.name(), std.fs.path.basename(path))) return file;
@@ -45,28 +44,17 @@ fn item(ui: *state.Ui, path: []const u8, version: ?providers.Version, primary: b
     const complete = percent >= 1;
     const status = if (ui.task_state == .succeeded) "已安装" else if (failed) "下载失败" else if (complete) "已下载" else if (ui.task_state == .canceled) "已取消" else if (ui.task_state == .failed) "未应用" else if (progress != null) (if (progress.?.total != null) fmt("下载中 · {d:.0}%", .{percent * 100}) else "下载中") else "等待下载";
     const color = if (failed) theme.colors.danger else if (!complete and (ui.task_state == .failed or ui.task_state == .canceled)) theme.colors.muted else theme.colors.accent;
-    const row = components.bentoPanel(@src(), .{ .id_extra = index, .expand = .horizontal, .min_size_content = .height(72), .max_size_content = .width(0), .padding = .all(15), .margin = .{ .y = if (index == 0) 0 else 12 }, .corners = .all(theme.cardRadius()), .color_fill = .{ .color = theme.style.colors.inset }, .color_border = .{ .color = theme.colors.outline } });
-    defer row.deinit();
-    const width = row.data().contentRect().w;
-    const badge_width = @min(148, width * 0.4);
-    text(@src(), name, theme.headingFont(), .{ .w = @max(0, width - badge_width - 16), .h = 28 }, theme.colors.foreground);
-    text(@src(), fmt("{s} · {s}", .{ if (version) |value| value.name else std.fs.path.basename(path), if (primary) "主资源" else "依赖资源" }), theme.fontSized(14), .{ .y = 32, .w = width, .h = 24 }, theme.colors.muted);
-    {
-        const badge = dvui.box(@src(), .{}, .{ .rect = .{ .x = width - badge_width, .y = -4, .w = badge_width, .h = 32 }, .padding = .{ .x = 7, .w = 7, .y = 4, .h = 4 }, .margin = .all(0), .border = .all(1), .corners = .all(theme.controlRadius()), .background = true, .color_fill = .{ .color = theme.style.colors.inset }, .color_border = .{ .color = theme.colors.outline } });
-        defer badge.deinit();
-        dvui.labelNoFmt(@src(), status, .{}, .{ .font = theme.fontSized(14), .padding = .all(0), .margin = .all(0), .gravity_x = 0.5, .gravity_y = 0.5, .color_text = .{ .color = color } });
-    }
-    dvui.progress(@src(), .{ .percent = percent, .color = color }, .{ .rect = .{ .y = 64, .w = width, .h = 8 }, .min_size_content = .height(8), .padding = .all(0), .margin = .all(0), .corners = .all(4), .tag = fmt("resource-task-file-{d}", .{index}) });
+    task_style.fileCard(index, name, fmt("{s} · {s}", .{ if (version) |value| value.name else std.fs.path.basename(path), if (primary) "主资源" else "依赖资源" }), status, percent, color, fmt("resource-task-file-{d}", .{index}));
 }
 pub fn draw(ui: *state.Ui, snapshot: content.Snapshot, allowed: bool, comptime failureText: anytype) void {
-    const modal = components.modalPanel(@src(), "下载与安装", 560, null);
+    const modal = components.modalPanel(@src(), "下载与安装", task_style.modal_height, null);
     defer modal.deinit();
-    const rect = dvui.parentGet().data().contentRect();
-    const width = rect.w;
-    const footer_y = @max(0, rect.h - 48);
-    const compact = rect.h < 440;
-    const body_y: f32 = if (compact) 124 else 152;
-    const hint_y = if (compact) footer_y else @max(152, footer_y - 72);
+    const layout = task_style.Layout.current();
+    const width = layout.width;
+    const footer_y = layout.footer_y;
+    const compact = layout.compact;
+    const body_y = layout.body_y;
+    const hint_y = layout.hint_y;
     const failed = ui.task_state == .failed;
     const status_color = if (failed) theme.colors.danger else if (ui.task_state == .succeeded) theme.colors.accent else theme.colors.muted;
     text(@src(), "下载与安装", theme.fontSized(24), .{ .w = width, .h = 36 }, if (failed) theme.colors.danger else theme.colors.foreground);

@@ -1254,9 +1254,10 @@ fn fixedModalPanel(src: std.builtin.SourceLocation, name: []const u8, requested_
     const inset = if (viewport.h < style.layout.compact_height) style.layout.compact_modal_padding else style.spacing.modal_padding;
     // InitOptions.rect is read every frame; Options.rect is only read on open.
     // Allocate in the frame arena because deinit writes back to this pointer.
-    const rect = dvui.widgetAlloc(R);
+    const rect = dvui.currentWindow().arena().create(R) catch @panic("OOM");
     rect.* = .{ .x = viewport.x + (viewport.w - width) / 2, .y = viewport.y + (viewport.h - height) / 2, .w = width, .h = height };
-    const window = dvui.floatingWindow(src, .{ .rect = rect, .modal = true, .modal_alpha = 120, .open_flag = open_flag, .resize = .none, .window_avoid = .none }, .{
+    const window = dvui.widgetAlloc(dvui.FloatingWindowWidget);
+    window.init(src, .{ .rect = rect, .modal = true, .modal_alpha = 120, .open_flag = open_flag, .resize = .none, .window_avoid = .none, .stay_above_parent_window = true }, .{
         .id_extra = id_extra,
         .min_size_content = .{ .w = @max(0, width - 2 * inset), .h = @max(0, height - 2 * inset) },
         .max_size_content = .{ .w = @max(0, width - 2 * inset), .h = @max(0, height - 2 * inset) },
@@ -1269,6 +1270,9 @@ fn fixedModalPanel(src: std.builtin.SourceLocation, name: []const u8, requested_
         .color_border = .{ .color = theme.colors.control_outline },
         .label = .{ .text = name },
     });
+    window.processEventsBefore();
+    theme.modalBackdrop(window.data().rectScale(), window.options.cornersGet());
+    window.drawBackground();
     // FloatingWindow defaults to dragging on all unused panel space.
     window.dragAreaSet(.{});
     if (open_flag) |flag| {

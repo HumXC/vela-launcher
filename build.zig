@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
     // options to SDL with names unsupported by the pinned SDL build script.
     const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3 });
     const dvui = dvui_dep.module("dvui_sdl3");
+    @import("build-support/dvui_backdrop.zig").apply(b, dvui);
     dvui.linkLibrary(sdl.artifact("SDL3"));
     @import("build-support/sdl_software.zig").apply(b, dvui);
     @import("build-support/webp.zig").link(b, target, optimize, dvui);
@@ -99,6 +100,18 @@ pub fn build(b: *std.Build) void {
     preview_tests_module.addImport("test_allocations", test_allocations);
     const preview_tests = b.addTest(.{ .root_module = preview_tests_module, .filters = &.{"component preview"} });
     b.step("test-ui-preview", "Test mock data, states and intent-only interactions").dependOn(&b.addRunArtifact(preview_tests).step);
+    const modal_pixels = b.addExecutable(.{ .name = "vela-modal-backdrop-pixels", .root_module = cloneAppModule(b, app_mod, b.path("src/ui_modal_backdrop_pixels.zig")) });
+    const modal_pixels_step = b.step("test-modal-backdrop-pixels", "Test native modal backdrop z-order and pixels on OpenGL and software");
+    const modal_gl = b.addRunArtifact(modal_pixels);
+    modal_gl.setEnvironmentVariable("SDL_VIDEODRIVER", "offscreen");
+    modal_gl.setEnvironmentVariable("SDL_AUDIODRIVER", "dummy");
+    modal_gl.setEnvironmentVariable("SDL_RENDER_DRIVER", "opengl");
+    const modal_software = b.addRunArtifact(modal_pixels);
+    modal_software.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
+    modal_software.setEnvironmentVariable("SDL_AUDIODRIVER", "dummy");
+    modal_software.setEnvironmentVariable("SDL_RENDER_DRIVER", "software");
+    modal_software.step.dependOn(&modal_gl.step);
+    modal_pixels_step.dependOn(&modal_software.step);
     const surface_pixels = b.addExecutable(.{ .name = "vela-surface-pixels", .root_module = cloneAppModule(b, app_mod, b.path("src/ui_surface_pixels.zig")) });
     b.step("build-ui-pixels", "Build native surface pixel regression for graphics-driver checks").dependOn(&b.addInstallArtifact(surface_pixels, .{}).step);
     const surface_pixels_run = b.addRunArtifact(surface_pixels);
@@ -441,6 +454,22 @@ pub fn build(b: *std.Build) void {
     const instance_creation_controller_run = runTestWithFixture(b, java_process_fixture_install, instance_creation_controller_tests);
     b.step("test-ordinary-creation", "Test ordinary instance prerequisites and publication ownership").dependOn(&instance_creation_controller_run.step);
     test_step.dependOn(&instance_creation_controller_run.step);
+    const pack_download_auth_tests = b.addTest(.{ .name = "test-pack-download-auth", .root_module = cloneAppModule(b, app_mod, b.path("src/pack_download_auth_tests.zig")) });
+    const pack_download_auth_run = runTestWithFixture(b, java_process_fixture_install, pack_download_auth_tests);
+    b.step("test-pack-download-auth", "Test scoped pack download credentials").dependOn(&pack_download_auth_run.step);
+    test_step.dependOn(&pack_download_auth_run.step);
+    const pack_source_tests = b.addTest(.{ .name = "test-pack-source", .root_module = cloneAppModule(b, app_mod, b.path("src/pack_source_authorization_tests.zig")) });
+    const pack_source_run = runTestWithFixture(b, java_process_fixture_install, pack_source_tests);
+    b.step("test-pack-source", "Test pack source policy and file authorization").dependOn(&pack_source_run.step);
+    test_step.dependOn(&pack_source_run.step);
+    const pack_install_tests = b.addTest(.{ .name = "test-pack-install", .root_module = cloneAppModule(b, app_mod, b.path("src/pack_install_controller_tests.zig")) });
+    const pack_install_run = runTestWithFixture(b, java_process_fixture_install, pack_install_tests);
+    b.step("test-pack-install", "Test private-stage pack creation").dependOn(&pack_install_run.step);
+    test_step.dependOn(&pack_install_run.step);
+    const pack_tests = b.addTest(.{ .name = "test-packs", .root_module = cloneAppModule(b, app_mod, b.path("src/pack_tests.zig")) });
+    const pack_run = runTestWithFixture(b, java_process_fixture_install, pack_tests);
+    b.step("test-packs", "Test independent modpack discovery and creation").dependOn(&pack_run.step);
+    test_step.dependOn(&pack_run.step);
     const gui_fixture_tests = b.addTest(.{
         .name = "test-gui-fixture",
         .root_module = cloneAppModule(b, app_mod, b.path("src/gui_acceptance.zig")),
@@ -472,6 +501,10 @@ pub fn build(b: *std.Build) void {
         metadata_tests,
         content_ui_tests,
         instance_creation_controller_tests,
+        pack_tests,
+        pack_install_tests,
+        pack_source_tests,
+        pack_download_auth_tests,
         gui_fixture_tests,
     }) |test_compile| test_compile.root_module.addImport("test_allocations", test_allocations);
 }

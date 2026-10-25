@@ -40,6 +40,7 @@ comptime {
     _ = @import("ui/card_grid_layout_tests.zig");
     _ = @import("ui/logs_layout_tests.zig");
     _ = @import("ui/surface_layout_tests.zig");
+    _ = @import("ui/pack_layout_tests.zig");
 }
 const accounts_view = @import("ui/accounts_view.zig");
 const accounts_manager = @import("ui/accounts_manager.zig");

@@ -2334,7 +2334,7 @@ test "prepared genuine owner rejects root id name generation loader environment 
     }
     wrong_case = null;
     const data = f.instance_data.prepared.?;
-    var request: instances_manager.CreateRequest = .{ .root = target.root, .instance = .{ .id = target.instance_id, .name = target.instance_name, .minecraft_version = instance_fixture.base_id, .loader = .forge, .loader_version = instance_fixture.forge_id }, .lease = f.instance_manager.lease, .installer_java = data.java8_path, .prepared = &proof, .prepared_generation = target.generation };
+    var request: instances_manager.CreateRequest = .{ .root = target.root, .instance = .{ .id = target.instance_id, .name = target.instance_name, .minecraft_version = instance_fixture.base_id, .loader = .forge, .loader_version = instance_fixture.forge_id }, .lease = f.instance_manager.lease, .installer_java = data.java8_path, .metadata = .{ .loader = .{ .owner = &proof, .generation = target.generation } } };
     checkpoint = .missing_probes;
     try std.testing.expectError(error.FixtureMissingJavaProbe, instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel }));
     const runner = f.instance_data.runner();
@@ -2386,7 +2386,7 @@ test "prepared genuine owner rejects root id name generation loader environment 
     checkpoint = .fresh_preparation;
     var fresh_proof = try instance_fixture.prepareProof(&f.instance_data, a, io, target, &cancel);
     defer fresh_proof.deinit();
-    request.prepared = &fresh_proof;
+    request.metadata = .{ .loader = .{ .owner = &fresh_proof, .generation = target.generation } };
     try std.testing.expectError(error.FixtureMissingJavaProbe, instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel }));
     checkpoint = .canceled_probe;
     cancel.store(true, .release);

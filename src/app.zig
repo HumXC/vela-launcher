@@ -97,6 +97,7 @@ var content: content_manager.Manager = undefined;
 var mods: mods_controller.Controller = undefined;
 var mods_ui: mods_view.Ui = undefined;
 var ordinary_creation: instance_creation_controller.Controller = undefined;
+var packs: @import("ui/pack_page.zig").Page = undefined;
 var fatal_frame_error: ?anyerror = null;
 var cf_credentials: ?cf_credentials_controller.Controller = null;
 var cf_credentials_failure: ?anyerror = null;
@@ -308,6 +309,9 @@ pub fn init(win: *dvui.Window) !void {
     mods_ui.acquisition.picker = &picker;
     ordinary_creation = try instance_creation_controller.Controller.init(main_init.gpa, main_init.io, paths.root, .{ .task_registry = &tasks });
     errdefer ordinary_creation.deinit(creationServices());
+    packs = try @import("ui/pack_page.zig").Page.init(main_init.gpa, main_init.io, &paths, &tasks);
+    errdefer packs.deinit(creationServices());
+    packs.ui.picker_service = &picker;
     try window.init(win);
     errdefer window.deinit();
     try fonts.install(win);
@@ -325,6 +329,7 @@ pub fn deinit(win: *dvui.Window) void {
     _ = win;
     if (library_initialized) {
         if (acceptance_enabled) acceptance.beforeDestroy();
+        packs.deinit(creationServices());
         ordinary_creation.deinit(creationServices());
         window.deinit();
         launcher.deinit();
@@ -423,16 +428,18 @@ fn frameActive() !dvui.App.Result {
             };
         } else library.cancelPreview();
     } else library.cancelPreview();
-    if (!ordinary_creation.ownsJavaDiscovery()) java.tick();
+    packs.syncActive(model.panel == .instances and instances_ui.mode == .packs, creationServices());
+    if (!ordinary_creation.ownsJavaDiscovery() and !packs.installer.ownsJavaDiscovery()) java.tick();
     launcher.tick();
     leases.tick();
-    if (!ordinary_creation.ownsJavaDownload()) java_download.tick(&java);
+    if (!ordinary_creation.ownsJavaDownload() and !packs.installer.ownsJavaDownload()) java_download.tick(&java);
     servers.tick();
     world_manager.tick();
     avatars.tick();
     accounts.tick(&configuration);
-    if (!ordinary_creation.ownsInstancesPublication()) instance_manager.tick();
+    if (!ordinary_creation.ownsInstancesPublication() and !packs.installer.ownsInstancesPublication()) instance_manager.tick();
     ordinary_creation.tickWithMutations(creationServices(), policy.shutdown == .none);
+    packs.tick(creationServices(), policy.shutdown == .none);
     content.tick();
     if (cf_credentials) |*controller| controller.tick(&configuration);
     const fingerprint = instanceFingerprint(configuration.snapshot());
@@ -449,12 +456,12 @@ fn frameActive() !dvui.App.Result {
         if (instance_paths.findById(configuration.snapshot(), id)) |instance| _ = model.active_game.set(instance.name);
     }
     try library.setDownloadConnections(configuration.snapshot().settings.download_connections);
-    if (!view.ordinaryCreationPinned(&ordinary_creation)) {
+    if (!view.ordinaryCreationPinned(&ordinary_creation) and !packs.pinned()) {
         try java_download.setDownloadConnections(configuration.snapshot().settings.download_connections);
         instance_manager.setDownloadConnections(configuration.snapshot().settings.download_connections);
         try content.setDownloadConnections(configuration.snapshot().settings.download_connections);
     }
-    if (!view.ordinaryCreationPinned(&ordinary_creation) and !content.isBusy() and !content.snapshot().recovery_required) {
+    if (!view.ordinaryCreationPinned(&ordinary_creation) and !packs.pinned() and !content.isBusy() and !content.snapshot().recovery_required) {
         const settings = configuration.snapshot().settings;
         var cf_policy: content_manager.CurseForgePolicy = .{
             .enabled = settings.curseforge_enabled and !configuration.publicationUncertain() and cf_credentials != null and !cfCredentialsLease(),
@@ -462,6 +469,7 @@ fn frameActive() !dvui.App.Result {
         };
         if (settings.curseforge_credential_ref) |reference| cf_policy.credential_ref = reference[0..32].*;
         try content.setCurseForgePolicy(cf_policy);
+        try packs.configure(.{ .enabled = cf_policy.enabled, .terms_approved = cf_policy.terms_approved, .credential_ref = cf_policy.credential_ref }, settings.download_connections);
     }
     if (try synchronizeGameLifecycle()) {
         try window.checkNativeDisplay();
@@ -471,6 +479,7 @@ fn frameActive() !dvui.App.Result {
     avatars.sync(configuration.snapshot(), policy.shutdown == .none) catch {};
     try view.draw(&model, &library, &java, &java_ui, &launcher, .{
         .ordinary_creation = &ordinary_creation,
+        .packs = &packs,
         .allow_mutations = policy.shutdown == .none,
         .configuration = &configuration,
         .tasks = &tasks,
@@ -530,7 +539,7 @@ fn frameActive() !dvui.App.Result {
         return .close;
     }
     dvui.currentWindow().backend.impl.log_events = false;
-    if (phase == .loading or java.isSearching() or java_download.isBusy() or servers.isBusy() or world_manager.snapshot().worker_active or accounts.snapshot().busy or instance_manager.isBusy() or content.isBusy() or cfCredentialsBusy() or view.ordinaryCreationPinned(&ordinary_creation) or launch_phase == .preparing or launch_phase == .running or policy.shutdown != .none) dvui.refresh(null, @src(), null);
+    if (phase == .loading or java.isSearching() or java_download.isBusy() or servers.isBusy() or world_manager.snapshot().worker_active or accounts.snapshot().busy or instance_manager.isBusy() or content.isBusy() or cfCredentialsBusy() or view.ordinaryCreationPinned(&ordinary_creation) or packs.busy() or launch_phase == .preparing or launch_phase == .running or policy.shutdown != .none) dvui.refresh(null, @src(), null);
     if (acceptance_enabled and !tasks.hasActive()) tasks.pruneFinished(0);
     if (acceptance_enabled) try acceptance.afterFrame(.{
         .startup_idle = model.panel == .home and active == 0 and tasks.tasks().len == 0 and phase == .complete and !java.isSearching() and !java_download.isBusy() and !servers.isBusy() and !world_manager.snapshot().worker_active and world_manager.snapshot().failure == null and !accounts.snapshot().busy and !instance_manager.isBusy() and !content.isBusy() and content.snapshot().failure == null and !cfCredentialsBusy() and !view.ordinaryCreationPinned(&ordinary_creation),
@@ -554,12 +563,12 @@ fn checkJavaForCreation(_: ?*anyopaque) !void {
 
 fn checkOwnedJavaDeletion(_: ?*anyopaque) !void {
     const phase = launcher.snapshot().phase;
-    if (phase == .preparing or phase == .running or instance_manager.isBusy() or view.ordinaryCreationPinned(&ordinary_creation)) return error.JavaInUse;
+    if (phase == .preparing or phase == .running or instance_manager.isBusy() or view.ordinaryCreationPinned(&ordinary_creation) or packs.pinned()) return error.JavaInUse;
 }
 
 fn reserveLaunch(_: ?*anyopaque, instance_name: []const u8) !void {
     try checkJavaForCreation(null);
-    if (view.ordinaryCreationPinned(&ordinary_creation)) return error.InstanceBusy;
+    if (view.ordinaryCreationPinned(&ordinary_creation) or packs.pinned()) return error.InstanceBusy;
     leases.tick();
     const instance = instance_paths.findByName(configuration.snapshot(), instance_name) orelse return error.InstanceNotConfigured;
     try leases.reserveLaunch(instance.id);
@@ -611,6 +620,7 @@ fn activeBackgroundCount() usize {
     if (world_manager.snapshot().worker_active and world_manager.snapshot().loading) count += 1;
     if (accounts.snapshot().busy) count += 1;
     if (view.ordinaryCreationPinned(&ordinary_creation)) count += 1;
+    if (packs.busy()) count += 1;
     if (picker.isBusy()) count += 1;
     return count;
 }
@@ -629,6 +639,7 @@ fn applyWindowActions(actions: lifecycle.Actions) !bool {
         java_view.discardPicker(&java_ui);
         picker.beginShutdown();
         ordinary_creation.cancel(creationServices());
+        packs.cancel(creationServices());
         for (tasks.tasks()) |task| _ = tasks.cancel(task.id);
         library.cancel();
         java.cancelSearch();

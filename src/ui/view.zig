@@ -190,6 +190,7 @@ pub const Services = struct {
     task_viewport_height: ?f32 = null,
     instances: ?*instances_manager.Manager = null,
     instances_ui: ?*instances_view.Ui = null,
+    packs: ?*@import("pack_page.zig").Page = null,
     content: ?*content_manager.Manager = null,
     mods: ?*mods_controller.Controller = null,
     mods_ui: ?*mods_view.Ui = null,
@@ -219,7 +220,8 @@ fn dispatchGates(phase: ?instance_creation_controller.Phase, owns_instances: boo
 
 fn serviceGates(services: Services) DispatchGates {
     const controller = services.ordinary_creation;
-    return dispatchGates(if (controller) |value| value.snapshot().phase else null, if (controller) |value| value.ownsInstancesPublication() else false, if (controller) |value| value.ownsJavaDiscovery() or value.ownsJavaDownload() else false, services.allow_mutations);
+    const pack_pinned = if (services.packs) |packs| packs.pinned() else false;
+    return dispatchGates(if (controller) |value| value.snapshot().phase else null, pack_pinned or (if (controller) |value| value.ownsInstancesPublication() else false), pack_pinned or (if (controller) |value| value.ownsJavaDiscovery() or value.ownsJavaDownload() else false), services.allow_mutations and !pack_pinned);
 }
 
 fn gatedTaskActionAllowed(action: ?instances_view.Action, allow_mutations: bool) bool {
@@ -350,6 +352,7 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
         };
         if (root.showSecond()) try content(model, snapshot, &pending, &command, manager, java_ui, launcher, services);
     }
+    if (services.packs) |packs| @import("pack_view.zig").dialogs(&packs.ui, try packs.presentation(dvui.currentWindow().arena()), services.allow_mutations);
     if (model.panel == .mods) if (services.mods) |controller| if (services.mods_ui) |ui| if (services.content) |backend| try mods_page.dialogs(model, services.configuration.snapshot(), controller, ui, backend, !gates.content);
     if (services.instances_ui) |ui| if (ui.manage_requested) {
         ui.manage_requested = false;
@@ -361,7 +364,7 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
     if (services.instances_ui) |ui| {
         if (services.instances) |manager_| {
             ui.creation_presented = if (services.ordinary_creation) |controller| controller.presentsCreation(manager_) else false;
-            instances_view.syncTaskSnapshot(ui, if (ui.creation_presented) services.ordinary_creation.?.creationSnapshot() else manager_.snapshot());
+            if (!(if (services.packs) |packs| packs.installer.presentsCreation(manager_) else false)) instances_view.syncTaskSnapshot(ui, if (ui.creation_presented) services.ordinary_creation.?.creationSnapshot() else manager_.snapshot());
         }
         instances_view.drawModal(ui, !gates.instances);
     }
@@ -508,6 +511,7 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
             }
         }
     }
+    if (services.packs) |packs| if (services.instances_ui) |ui| if (creationServices(services, manager)) |bound| packs.finish(model, ui, bound, services.allow_mutations and !ordinaryCreationPinned(services.ordinary_creation));
     appearance_view.finish(services.appearance, services.configuration);
 }
 
@@ -748,7 +752,12 @@ fn content(model: *state.Model, snapshot: games.Snapshot, pending: *?state.Msg, 
         .worlds => try worlds_view.drawWithEnabled(services.worlds_ui, services.configuration.snapshot(), services.worlds, !gates.worlds),
         .logs => try services.logs.draw(launcher),
         .instances => if (services.instances) |manager_| {
-            if (services.instances_ui) |ui| instances_view.drawWithEnabled(ui, services.configuration, manager_, snapshot, manager.entries(), !gates.instances);
+            if (services.instances_ui) |ui| {
+                if (ui.mode == .packs and services.packs != null) {
+                    const packs = services.packs.?;
+                    @import("pack_view.zig").draw(&packs.ui, try packs.presentation(dvui.currentWindow().arena()), services.allow_mutations and !ordinaryCreationPinned(services.ordinary_creation));
+                } else instances_view.drawWithEnabled(ui, services.configuration, manager_, snapshot, manager.entries(), !gates.instances);
+            }
         },
     }
 }

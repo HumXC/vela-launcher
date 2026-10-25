@@ -1,0 +1,200 @@
+//! Atomic pack installation and UI ownership regression suite.
+test {
+    _ = @import("ui/pack_install_controller.zig");
+    _ = @import("core/pack_install.zig");
+    _ = @import("pack_source_integration_tests.zig");
+    _ = @import("pack_page_tests.zig");
+    _ = @import("pack_live_tests.zig");
+}
+const std = @import("std");
+const backend = @import("core/pack_install.zig");
+const packs = @import("core/pack_import.zig");
+const fs = @import("core/content_fs.zig");
+const config = @import("core/config.zig");
+const fixtures = @import("pack_install_fixture.zig");
+const a = std.testing.allocator;
+const io = std.testing.io;
+const row: config.Instance = .{ .id = "pack", .name = "Pack", .minecraft_version = "1.21.1" };
+
+test "atomic pack precommit assembles overrides privately and receipt publication is idempotent" {
+    var fixture = try fixtures.Fixture.init();
+    defer fixture.deinit();
+    try fixtures.zip(fixture.tmp.dir, "pack.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = fixtures.index }, .{ .path = "overrides/config/options.txt", .bytes = "verified" } });
+    const archive = try fixture.path("pack.mrpack");
+    defer a.free(archive);
+    var cancel: backend.CancelToken = .init(false);
+    var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel);
+    defer inspection.deinit();
+    defer inspection.cleanup(io) catch {};
+    const stage = try fs.descend(fixture.tmp.dir, io, ".minecraft/versions/private-stage", true);
+    defer stage.close(io);
+    const stage_path = try fixture.path(".minecraft/versions/private-stage");
+    defer a.free(stage_path);
+    var request: backend.Request = .{ .paths = &fixture.paths, .inspection = &inspection, .instance = row };
+    try backend.precommit(&request, a, io, stage_path, &cancel);
+    const bytes = try stage.readFileAlloc(io, "config/options.txt", a, .limited(100));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("verified", bytes);
+    try stage.access(io, ".vela/pack-content.json", .{});
+    try std.testing.expect(try fs.inspectEntry(stage, io, ".vela-pack-work") == null);
+    const versions = try fs.descend(fixture.tmp.dir, io, ".minecraft/versions", false);
+    defer versions.close(io);
+    try std.testing.expect(try fs.inspectEntry(versions, io, "Pack") == null);
+    const manifest_path = try fixture.paths.instanceManifest(row.id);
+    defer a.free(manifest_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, manifest_path, .{}));
+    try versions.renamePreserve("private-stage", versions, "Pack", io);
+    var actual = row;
+    actual.origin = .{ .kind = inspection.pack.identity.provider, .project_id = inspection.pack.identity.project_id, .version_id = inspection.pack.identity.version_id };
+    try backend.publishManifest(a, io, &fixture.paths, actual);
+    try backend.publishManifest(a, io, &fixture.paths, actual);
+    try std.Io.Dir.cwd().access(io, manifest_path, .{});
+}
+
+test "atomic pack cancellation and game collision never publish final instance" {
+    var fixture = try fixtures.Fixture.init();
+    defer fixture.deinit();
+    try fixtures.zip(fixture.tmp.dir, "pack.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = fixtures.index }, .{ .path = "overrides/config/options.txt", .bytes = "pack" } });
+    const archive = try fixture.path("pack.mrpack");
+    defer a.free(archive);
+    var cancel: backend.CancelToken = .init(false);
+    var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel);
+    defer inspection.deinit();
+    defer inspection.cleanup(io) catch {};
+    const stage = try fs.descend(fixture.tmp.dir, io, ".minecraft/versions/private-stage", true);
+    defer stage.close(io);
+    const stage_path = try fixture.path(".minecraft/versions/private-stage");
+    defer a.free(stage_path);
+    var request: backend.Request = .{ .paths = &fixture.paths, .inspection = &inspection, .instance = row };
+    cancel.store(true, .release);
+    try std.testing.expectError(error.Canceled, backend.precommit(&request, a, io, stage_path, &cancel));
+    cancel.store(false, .release);
+    const directory = try fs.child(stage, io, "config", true, false);
+    defer directory.close(io);
+    try fs.write(directory, io, "options.txt", "game-owned");
+    try std.testing.expectError(error.PackGameCollision, backend.precommit(&request, a, io, stage_path, &cancel));
+    try std.testing.expect(try fs.inspectEntry(stage, io, ".vela") == null);
+    const bytes = try fs.read(a, directory, io, "options.txt", 100);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("game-owned", bytes);
+    const final = try fixture.paths.instanceDirectory("Pack");
+    defer a.free(final);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, final, .{}));
+}
+
+test "atomic pack controller declaration surface" {
+    std.testing.refAllDecls(@import("ui/pack_install_controller.zig").Controller);
+}
+
+test "optional decisions are explicit and manual substitutes retain original hash validation" {
+    for ([_]bool{ false, true }) |valid| {
+        var fixture = try fixtures.Fixture.init();
+        defer fixture.deinit();
+        try fixtures.zip(fixture.tmp.dir, "source.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = "{\"formatVersion\":1,\"game\":\"minecraft\",\"versionId\":\"v1\",\"name\":\"Offline Pack\",\"dependencies\":{\"minecraft\":\"1.21.1\"},\"files\":[{\"path\":\"mods/example.jar\",\"hashes\":{\"sha1\":\"fc19318dd13128ce14344d066510a982269c241b\",\"sha512\":\"10259bfe1a41058e4671d05a3b962b774c4b16946b4040bc055059d1859d5f15ec4d7f01ca3f7561632d00add6122d337022a151174e5b9cebf430254b8e9fa7\"},\"fileSize\":4,\"downloads\":[\"https://cdn.modrinth.com/data/example/versions/v1/example.jar\"],\"env\":{\"client\":\"optional\",\"server\":\"optional\"}}]}" }});
+        const archive = try fixture.path("source.mrpack");
+        defer a.free(archive);
+        var cancel: backend.CancelToken = .init(false);
+        var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel);
+        defer inspection.deinit();
+        defer inspection.cleanup(io) catch {};
+        const stage = try fs.descend(fixture.tmp.dir, io, "stage", true);
+        defer stage.close(io);
+        const stage_path = try fixture.path("stage");
+        defer a.free(stage_path);
+        var request: backend.Request = .{ .paths = &fixture.paths, .inspection = &inspection, .instance = row };
+        try std.testing.expectError(error.OptionalDecisionRequired, backend.precommit(&request, a, io, stage_path, &cancel));
+        try fixture.tmp.dir.writeFile(io, .{ .sub_path = "manual.jar", .data = if (valid) "good" else "evil" });
+        const manual_path = try fixture.path("manual.jar");
+        defer a.free(manual_path);
+        request.optional = &.{.{ .path = "mods/example.jar", .include = true }};
+        request.manual_files = &.{.{ .path = "mods/example.jar", .source_absolute_path = manual_path }};
+        if (valid) {
+            try backend.precommit(&request, a, io, stage_path, &cancel);
+            const bytes = try stage.readFileAlloc(io, "mods/example.jar", a, .limited(10));
+            defer a.free(bytes);
+            try std.testing.expectEqualStrings("good", bytes);
+        } else {
+            try std.testing.expectError(error.HashMismatch, backend.precommit(&request, a, io, stage_path, &cancel));
+            try std.testing.expect(try fs.inspectEntry(stage, io, "mods") == null);
+            try std.testing.expect(try fs.inspectEntry(stage, io, ".vela") == null);
+            try std.testing.expect(try fs.inspectEntry(stage, io, ".vela-pack-work") == null);
+        }
+    }
+}
+
+test "canceling completed inspection before publication discards its late result and private copy" {
+    for ([_]bool{ false, true }) |already_ready| {
+        var fixture = try fixtures.Fixture.init();
+        defer fixture.deinit();
+        try fixtures.zip(fixture.tmp.dir, "source.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = fixtures.index }});
+        const archive = try fixture.path("source.mrpack");
+        defer a.free(archive);
+        var controller = try @import("ui/pack_install_controller.zig").Controller.init(a, io, &fixture.paths, .{});
+        defer controller.deinit(undefined);
+        try controller.inspectLocal(archive);
+        const job = controller.core.job.?;
+        job.thread.?.join();
+        job.thread = null;
+        const private_copy = try a.dupe(u8, job.inspection.?.stage_absolute_path);
+        defer a.free(private_copy);
+        if (already_ready) {
+            controller.tick(undefined);
+            try std.testing.expectEqual(.ready, controller.snapshot().phase);
+        }
+        controller.cancel(undefined);
+        controller.tick(undefined);
+        try std.testing.expectEqual(.canceled, controller.snapshot().phase);
+        try std.testing.expect(controller.snapshot().pack_plan == null);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, private_copy, .{}));
+    }
+}
+
+test "pack Forge dependencies from both providers resolve exact catalog coordinates" {
+    const manifest = @import("core/content_manifest.zig");
+    const loaders = @import("core/loaders/root.zig");
+    const adapt = @import("core/pack_loader_version.zig").normalize;
+    var catalog = try loaders.parseCatalog(a, .forge, "1.20.1", "{\"1.20.1\":[\"1.20.1-47.4.10\"]}");
+    defer catalog.deinit();
+    for ([_]bool{ false, true }) |curseforge| {
+        for ([_][]const u8{ "47.4.10", "1.20.1-47.4.10", "1.20.2-47.4.10" }) |dependency| {
+            const bytes = if (curseforge)
+                try std.fmt.allocPrint(a, "{{\"manifestVersion\":1,\"manifestType\":\"minecraftModpack\",\"name\":\"Pack\",\"version\":\"2.3\",\"minecraft\":{{\"version\":\"1.20.1\",\"modLoaders\":[{{\"id\":\"forge-{s}\",\"primary\":true}}]}},\"files\":[],\"overrides\":\"overrides\"}}", .{dependency})
+            else
+                try std.fmt.allocPrint(a, "{{\"formatVersion\":1,\"game\":\"minecraft\",\"versionId\":\"2.3\",\"name\":\"Pack\",\"dependencies\":{{\"minecraft\":\"1.20.1\",\"forge\":\"{s}\"}},\"files\":[]}}", .{dependency});
+            defer a.free(bytes);
+            var plan = if (curseforge)
+                try manifest.parseCurseForgePack(a, bytes, .{ .provider = .curseforge, .project_id = "1", .version_id = "2" })
+            else
+                try manifest.parseMrpack(a, bytes, .{ .provider = .modrinth, .project_id = "pack", .version_id = "v2" }, .client);
+            defer plan.deinit();
+            if (std.mem.startsWith(u8, dependency, "1.20.2-")) {
+                try std.testing.expectError(error.LoaderVersionMismatch, adapt(a, plan.value.loader, plan.value.minecraft_version, plan.value.loader_version));
+                try std.testing.expectError(error.UnsupportedLoaderVersion, catalog.value.validate(.{ .kind = .forge, .base_id = "1.20.1", .loader_id = dependency }));
+                continue;
+            }
+            const version = (try adapt(a, plan.value.loader, plan.value.minecraft_version, plan.value.loader_version)).?;
+            defer a.free(version);
+            const selection: loaders.Selection = .{ .kind = .forge, .base_id = plan.value.minecraft_version, .loader_id = version };
+            try std.testing.expectEqualStrings("1.20.1-47.4.10", (try catalog.value.validate(selection)).id);
+            try std.testing.expectError(error.CatalogMismatch, catalog.value.validate(.{ .kind = .forge, .base_id = "1.20.2", .loader_id = version }));
+        }
+    }
+}
+
+test "pack loader adaptation preserves modern loader contracts and legacy NeoForge" {
+    const adapt = @import("core/pack_loader_version.zig").normalize;
+    const loaders = @import("core/loaders/root.zig");
+    var catalog = try loaders.parseCatalog(a, .neoforge, "1.20.1", "{\"versions\":[\"1.20.1-47.1.106\"]}");
+    defer catalog.deinit();
+    for ([_][]const u8{ "47.1.106", "1.20.1-47.1.106" }) |input| {
+        const version = (try adapt(a, .neoforge, "1.20.1", input)).?;
+        defer a.free(version);
+        _ = try catalog.value.validate(.{ .kind = .neoforge, .base_id = "1.20.1", .loader_id = version });
+    }
+    for ([_]config.Loader{ .fabric, .quilt, .neoforge, .vanilla }) |kind| {
+        const version = (try adapt(a, kind, "1.21.1", "21.1.80-beta")).?;
+        defer a.free(version);
+        try std.testing.expectEqualStrings("21.1.80-beta", version);
+        try std.testing.expectEqual(null, try adapt(a, kind, "1.21.1", null));
+    }
+}

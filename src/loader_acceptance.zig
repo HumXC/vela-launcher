@@ -276,7 +276,11 @@ fn runInner(init: std.process.Init, o: Options, report: *Report) anyerror!void {
             prepared = try loader_install.prepareMetadata(a, io, .{ .root = paths.root, .instance_id = instance.id, .instance_name = instance.name, .generation = 1, .selection = .{ .kind = std.meta.stringToEnum(loaders.Kind, @tagName(o.kind)).?, .base_id = o.base, .loader_id = o.version.? }, .environment = env, .vanilla = .{ .version_id = o.base, .manifest = manifest.value, .cancel = &flag }, .fetcher = .{ .context = &vanilla_fetch, .fetch = OfficialMetadata.get } }, .{ .cancel = &flag, .deadline_ms = nowMilliseconds(@constCast(&io)) + 300_000, .context = @constCast(&io), .now_ms = nowMilliseconds });
             report.required_java_major = prepared.?.requirements.runtime_major;
             if (report.required_java_major.? != runtime.major) return error.JavaMajorMismatch;
-            try manager.startCreatePreparedWithJava(instance, &prepared.?, 1, o.installer_java);
+            try manager.startCreation(.{
+                .instance = instance,
+                .metadata = .{ .loader = .{ .owner = &prepared.?, .generation = 1 } },
+                .installer_java = if (o.installer_java) |path| .{ .path = path } else .none,
+            });
         }
         report.phase = "installing";
         try save(a, io, o.report, report.*);

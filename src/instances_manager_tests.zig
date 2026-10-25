@@ -59,6 +59,7 @@ const Fixture = struct {
     observed_prepared: ?*const loader_install.PreparedMetadata = null,
     observed_vanilla_prepared: ?*const metadata_loader.PreparedVanilla = null,
     observed_generation: u64 = 0,
+    observed_precommit: ?loader_install.Precommit = null,
     fn acquire(raw: ?*anyopaque, _: []const u8) !void {
         const self: *Fixture = @ptrCast(@alignCast(raw.?));
         if (self.held.swap(true, .acq_rel)) return error.InstanceBusy;
@@ -79,9 +80,18 @@ const Fixture = struct {
     }
     fn run(raw: ?*anyopaque, alloc: std.mem.Allocator, worker_io: std.Io, request: module.CreateRequest, control: module.Control) !module.Installed {
         const self: *Fixture = @ptrCast(@alignCast(raw.?));
-        self.observed_prepared = request.prepared;
-        self.observed_vanilla_prepared = request.vanilla_prepared;
-        self.observed_generation = request.prepared_generation;
+        self.observed_precommit = request.precommit;
+        switch (request.metadata) {
+            .unprepared => {},
+            .loader => |prepared| {
+                self.observed_prepared = prepared.owner;
+                self.observed_generation = prepared.generation;
+            },
+            .vanilla => |prepared| {
+                self.observed_vanilla_prepared = prepared.owner;
+                self.observed_generation = prepared.generation;
+            },
+        }
         if (self.telemetry) if (control.task) |task| {
             var details: tasks.Details = .{ .stage = .downloading, .completed = 0, .total = 2, .received = 64, .total_bytes = 128, .bytes_per_second = 512 };
             var path = [_]u8{ '/', 't', '/', 'l', 'i', 'b', '.', 'j', 'a', 'r' };
@@ -1055,11 +1065,50 @@ const PreparedFixture = struct {
     }
 };
 fn expectPreparedRejected(manager: *module.Manager, fixture: *Fixture, registry: *tasks.Registry, instance: Instance, owner: *const loader_install.PreparedMetadata, generation: u64, expected: anyerror) !void {
-    try std.testing.expectError(expected, manager.startCreatePrepared(instance, owner, generation));
+    try std.testing.expectError(expected, manager.startCreation(.{ .instance = instance, .metadata = .{ .loader = .{ .owner = owner, .generation = generation } } }));
     try std.testing.expect(manager.active == null and manager.pending == null);
     try std.testing.expect(!fixture.held.load(.acquire) and !fixture.entered.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), fixture.releases);
     try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
+}
+
+test "creation request freezes hook per job and clears it after JOIN without leaking into retry" {
+    const Hook = struct {
+        fn run(_: ?*anyopaque, _: std.mem.Allocator, _: std.Io, _: []const u8, _: *const std.atomic.Value(bool)) !void {}
+    };
+    var env = try Environment.init();
+    defer env.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{ .failure = error.FixtureFailure };
+    fixture.blocked.store(true, .release);
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+    defer manager.deinit();
+    manager.setInstaller(fixture.installer());
+    var first_context: u8 = 1;
+    var rejected_context: u8 = 2;
+    var request: module.CreationRequest = .{ .instance = example, .precommit = .{ .context = &first_context, .run = Hook.run } };
+    try manager.startCreation(request);
+    try waitEntered(&fixture);
+    request.precommit = .{ .context = &rejected_context, .run = Hook.run };
+    try std.testing.expectError(error.Busy, manager.startCreation(request));
+    try std.testing.expect(manager.active.?.precommit.?.context == @as(?*anyopaque, @ptrCast(&first_context)));
+    try std.testing.expect(fixture.observed_precommit.?.context == @as(?*anyopaque, @ptrCast(&first_context)));
+    fixture.blocked.store(false, .release);
+    try settle(&manager);
+    try std.testing.expect(manager.published.?.precommit == null);
+    try std.testing.expect(manager.published.?.publish_pack_manifest);
+    try std.testing.expectEqual(error.FixtureFailure, manager.snapshot().failure.?);
+
+    // Rejection and failed work cannot leave a hook on the manager for a retry.
+    fixture.failure = null;
+    try manager.startCreate(example);
+    try settle(&manager);
+    try std.testing.expect(fixture.observed_precommit == null);
+    try std.testing.expect(manager.pending.?.precommit == null);
+    try std.testing.expect(!manager.pending.?.publish_pack_manifest);
+    try manager.publish(&env.store);
+    try std.testing.expectEqual(@as(usize, 1), env.store.snapshot().instances.len);
 }
 
 test "creation admission blocks every create variant before allocation lease task or borrowed owner and permits retry" {
@@ -1102,9 +1151,9 @@ test "creation admission blocks every create variant before allocation lease tas
             defer manager.allocator = a;
             try std.testing.expectError(error.JavaDeletionBusy, switch (variant) {
                 .ordinary => manager.startCreate(example),
-                .prepared => manager.startCreatePrepared(prepared_example, &prepared, 7),
-                .prepared_java => manager.startCreatePreparedWithJava(prepared_example, &prepared, 7, "/installer/java"),
-                .vanilla => manager.startCreateVanillaPrepared(example, &vanilla, 7),
+                .prepared => manager.startCreation(.{ .instance = prepared_example, .metadata = .{ .loader = .{ .owner = &prepared, .generation = 7 } } }),
+                .prepared_java => manager.startCreation(.{ .instance = prepared_example, .metadata = .{ .loader = .{ .owner = &prepared, .generation = 7 } }, .installer_java = .{ .path = "/installer/java" } }),
+                .vanilla => manager.startCreation(.{ .instance = example, .metadata = .{ .vanilla = .{ .owner = &vanilla, .generation = 7 } }, .installer_java = .none }),
             });
         }
         try std.testing.expectEqual(@as(usize, 1), admission.checks);
@@ -1123,9 +1172,9 @@ test "creation admission blocks every create variant before allocation lease tas
         admission.blocked = false;
         try switch (variant) {
             .ordinary => manager.startCreate(example),
-            .prepared => manager.startCreatePrepared(prepared_example, &prepared, 7),
-            .prepared_java => manager.startCreatePreparedWithJava(prepared_example, &prepared, 7, "/installer/java"),
-            .vanilla => manager.startCreateVanillaPrepared(example, &vanilla, 7),
+            .prepared => manager.startCreation(.{ .instance = prepared_example, .metadata = .{ .loader = .{ .owner = &prepared, .generation = 7 } } }),
+            .prepared_java => manager.startCreation(.{ .instance = prepared_example, .metadata = .{ .loader = .{ .owner = &prepared, .generation = 7 } }, .installer_java = .{ .path = "/installer/java" } }),
+            .vanilla => manager.startCreation(.{ .instance = example, .metadata = .{ .vanilla = .{ .owner = &vanilla, .generation = 7 } }, .installer_java = .none }),
         };
         try waitEntered(&fixture);
         try std.testing.expectEqual(@as(usize, 2), admission.checks);
@@ -1134,18 +1183,18 @@ test "creation admission blocks every create variant before allocation lease tas
         const active = manager.active.?;
         switch (variant) {
             .ordinary => {
-                try std.testing.expect(active.prepared == null and active.vanilla_prepared == null);
+                try std.testing.expect(active.metadata == .unprepared);
                 try std.testing.expectEqualStrings("/default/java", active.installer_java.?);
             },
             .prepared, .prepared_java => {
-                try std.testing.expect(active.prepared.? == &prepared and fixture.observed_prepared.? == &prepared);
-                try std.testing.expectEqual(@as(u64, 7), active.prepared_generation);
+                try std.testing.expect(active.metadata.loader.owner == &prepared and fixture.observed_prepared.? == &prepared);
+                try std.testing.expectEqual(@as(u64, 7), active.metadata.loader.generation);
                 try std.testing.expectEqualStrings(if (variant == .prepared_java) "/installer/java" else "/default/java", active.installer_java.?);
             },
             .vanilla => {
-                try std.testing.expect(active.vanilla_prepared.? == &vanilla and fixture.observed_vanilla_prepared.? == &vanilla);
+                try std.testing.expect(active.metadata.vanilla.owner == &vanilla and fixture.observed_vanilla_prepared.? == &vanilla);
                 try std.testing.expect(active.installer_java == null);
-                try std.testing.expectEqual(@as(u64, 7), active.prepared_generation);
+                try std.testing.expectEqual(@as(u64, 7), active.metadata.vanilla.generation);
             },
         }
         // Existing ownership still wins over the live admission callback.
@@ -1154,8 +1203,8 @@ test "creation admission blocks every create variant before allocation lease tas
         fixture.blocked.store(false, .release);
         try settle(&manager);
         const joined = manager.pending.?;
-        try std.testing.expect(joined.future == null and joined.prepared == null and joined.vanilla_prepared == null);
-        try std.testing.expectEqual(@as(u64, 0), joined.prepared_generation);
+        try std.testing.expect(joined.future == null and joined.metadata == .unprepared);
+        try std.testing.expect(joined.precommit == null);
         try manager.publish(&env.store);
         try std.testing.expect(!fixture.held.load(.acquire));
         try std.testing.expectEqual(@as(usize, 1), fixture.releases);
@@ -1240,11 +1289,11 @@ test "prepared create borrows metadata through JOIN owns request and explicit Ja
     request.minecraft_version = &version;
     request.loader_version = &loader_version;
     request.java_path = &runtime_java;
-    try manager.startCreatePreparedWithJava(request, &prepared, 7, &installer_java);
+    try manager.startCreation(.{ .instance = request, .metadata = .{ .loader = .{ .owner = &prepared, .generation = 7 } }, .installer_java = .{ .path = &installer_java } });
     try waitEntered(&fixture);
     try std.testing.expect(fixture.observed_prepared.? == &prepared);
     try std.testing.expectEqual(@as(u64, 7), fixture.observed_generation);
-    try std.testing.expect(manager.active.?.prepared.? == &prepared);
+    try std.testing.expect(manager.active.?.metadata.loader.owner == &prepared);
     @memset(&name, 'x');
     @memset(&version, 'x');
     @memset(&loader_version, 'x');
@@ -1254,15 +1303,15 @@ test "prepared create borrows metadata through JOIN owns request and explicit Ja
     fixture.blocked.store(false, .release);
     try settle(&manager);
     try std.testing.expectEqual(module.Phase.awaiting_publication, manager.snapshot().phase);
-    try std.testing.expect(manager.pending.?.future == null and manager.pending.?.prepared == null);
-    try std.testing.expectEqual(@as(u64, 0), manager.pending.?.prepared_generation);
+    try std.testing.expect(manager.pending.?.future == null and manager.pending.?.metadata == .unprepared);
+    try std.testing.expect(manager.pending.?.precommit == null);
     try std.testing.expectEqualStrings("/installer8/java", std.mem.sliceTo(&fixture.observed_java, 0));
     try std.testing.expectEqualStrings("/runtime17/java", manager.pending.?.request.java_path.?);
     // Only after JOIN: manager must not own or access metadata during publication.
     prepared.deinit();
     owner_live = false;
     try manager.publish(&env.store);
-    try std.testing.expect(manager.published.?.prepared == null);
+    try std.testing.expect(manager.published.?.metadata == .unprepared);
     const saved = env.store.snapshot().instances[0];
     try std.testing.expectEqualStrings("Owned", saved.name);
     try std.testing.expectEqualStrings("1.20.1", saved.minecraft_version);
@@ -1272,7 +1321,7 @@ test "prepared create borrows metadata through JOIN owns request and explicit Ja
     try std.testing.expectEqual(@as(usize, 2), source.loader_calls);
 }
 
-test "prepared create JOIN clears borrow on cancellation failure recovery and explicit null has no Java fallback" {
+test "prepared create JOIN clears borrow on cancellation failure recovery and Java none has no fallback" {
     var env = try Environment.init();
     defer env.deinit();
     var source: PreparedFixture = .{};
@@ -1290,15 +1339,15 @@ test "prepared create JOIN clears borrow on cancellation failure recovery and ex
         try manager.setDefaultJava("/default/java");
         var request = prepared_example;
         request.java_path = "/runtime/java";
-        try manager.startCreatePreparedWithJava(request, &prepared, 7, null);
+        try manager.startCreation(.{ .instance = request, .metadata = .{ .loader = .{ .owner = &prepared, .generation = 7 } }, .installer_java = .none });
         try waitEntered(&fixture);
         if (failure != null and failure.? == error.Canceled) manager.cancel();
         fixture.blocked.store(false, .release);
         try settle(&manager);
         try std.testing.expect(manager.active == null);
         if (manager.pending) |job| {
-            try std.testing.expect(job.future == null and job.prepared == null and job.installer_java == null);
-            try std.testing.expectEqual(@as(u64, 0), job.prepared_generation);
+            try std.testing.expect(job.future == null and job.metadata == .unprepared and job.installer_java == null);
+            try std.testing.expect(job.precommit == null);
         }
         try std.testing.expectEqualStrings("", std.mem.sliceTo(&fixture.observed_java, 0));
         if (failure) |err| {
@@ -1328,7 +1377,7 @@ test "prepared metadata owner remains valid after active manager teardown JOIN" 
     var manager_live = true;
     defer if (manager_live) manager.deinit();
     manager.setInstaller(fixture.installer());
-    try manager.startCreatePrepared(prepared_example, &prepared, 7);
+    try manager.startCreation(.{ .instance = prepared_example, .metadata = .{ .loader = .{ .owner = &prepared, .generation = 7 } } });
     try waitEntered(&fixture);
     manager.deinit();
     manager_live = false;
@@ -1338,14 +1387,14 @@ test "prepared metadata owner remains valid after active manager teardown JOIN" 
 }
 
 fn expectVanillaRejected(manager: *module.Manager, fixture: *Fixture, registry: *tasks.Registry, instance: Instance, owner: *const metadata_loader.PreparedVanilla, generation: u64, expected: anyerror) !void {
-    try std.testing.expectError(expected, manager.startCreateVanillaPrepared(instance, owner, generation));
+    try std.testing.expectError(expected, manager.startCreation(.{ .instance = instance, .metadata = .{ .vanilla = .{ .owner = owner, .generation = generation } }, .installer_java = .none }));
     try std.testing.expect(manager.active == null and manager.pending == null);
     try std.testing.expect(!fixture.held.load(.acquire) and !fixture.entered.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), fixture.releases);
     try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
 }
 
-test "vanilla prepared create rejects wrong kind identity environment stale tampered and conflicting proofs" {
+test "vanilla prepared create rejects wrong kind identity environment stale and tampered proofs" {
     var env = try Environment.init();
     defer env.deinit();
     var registry = tasks.Registry.init(a);
@@ -1383,13 +1432,7 @@ test "vanilla prepared create rejects wrong kind identity environment stale tamp
     borrowed_copy = prepared;
     borrowed_copy.replay_digest[0] ^= 1;
     try expectVanillaRejected(&manager, &fixture, &registry, example, &borrowed_copy, 7, error.PreparedMetadataChanged);
-    // The production entry must reject this before even touching either owner or lease.
-    const production = module.productionInstaller();
-    var loader_owner: loader_install.PreparedMetadata = undefined;
-    var canceled: std.atomic.Value(bool) = .init(false);
-    try std.testing.expectError(error.ConflictingPreparedMetadata, production.run(production.context, a, io, .{ .root = env.root, .instance = example, .lease = fixture.lease(), .prepared = &loader_owner, .vanilla_prepared = &prepared, .prepared_generation = 7 }, .{ .cancel = &canceled }));
-    try std.testing.expect(!fixture.held.load(.acquire) and !fixture.entered.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), fixture.rechecks);
+    // Conflicting vanilla/loader proofs are unrepresentable in CreationMetadata.
 }
 
 test "vanilla prepared create clones final request borrows through JOIN and publishes after owner teardown" {
@@ -1414,20 +1457,20 @@ test "vanilla prepared create clones final request borrows through JOIN and publ
     request.id = &id;
     request.name = &name;
     request.minecraft_version = &version;
-    try manager.startCreateVanillaPrepared(request, &prepared, 7);
+    try manager.startCreation(.{ .instance = request, .metadata = .{ .vanilla = .{ .owner = &prepared, .generation = 7 } }, .installer_java = .none });
     try waitEntered(&fixture);
     try std.testing.expect(fixture.observed_prepared == null);
     try std.testing.expect(fixture.observed_vanilla_prepared.? == &prepared);
     try std.testing.expectEqual(@as(u64, 7), fixture.observed_generation);
-    try std.testing.expect(manager.active.?.vanilla_prepared.? == &prepared);
+    try std.testing.expect(manager.active.?.metadata.vanilla.owner == &prepared);
     @memset(&id, 'x');
     @memset(&name, 'x');
     @memset(&version, 'x');
     fixture.blocked.store(false, .release);
     try settle(&manager);
     const job = manager.pending.?;
-    try std.testing.expect(job.future == null and job.prepared == null and job.vanilla_prepared == null);
-    try std.testing.expect(job.installer_java == null and job.prepared_generation == 0);
+    try std.testing.expect(job.future == null and job.metadata == .unprepared);
+    try std.testing.expect(job.installer_java == null and job.precommit == null);
     prepared.deinit();
     owner_live = false;
     try manager.publish(&env.store);
@@ -1436,7 +1479,7 @@ test "vanilla prepared create clones final request borrows through JOIN and publ
     try std.testing.expectEqualStrings(example.name, saved.name);
     try std.testing.expectEqualStrings(example.minecraft_version, saved.minecraft_version);
     try std.testing.expectEqual(config.Loader.vanilla, saved.loader);
-    try std.testing.expect(manager.published.?.vanilla_prepared == null);
+    try std.testing.expect(manager.published.?.metadata == .unprepared);
     try std.testing.expectEqual(@as(usize, 1), source.vanilla_calls);
     try std.testing.expectEqual(@as(usize, 0), source.loader_calls);
 }
@@ -1457,7 +1500,7 @@ test "vanilla prepared cancellation failure recovery and active teardown JOIN re
         var manager_live = true;
         defer if (manager_live) manager.deinit();
         manager.setInstaller(fixture.installer());
-        try manager.startCreateVanillaPrepared(example, &prepared, 7);
+        try manager.startCreation(.{ .instance = example, .metadata = .{ .vanilla = .{ .owner = &prepared, .generation = 7 } }, .installer_java = .none });
         try waitEntered(&fixture);
         if (index == failures.len) {
             manager.deinit();
@@ -1470,8 +1513,8 @@ test "vanilla prepared cancellation failure recovery and active teardown JOIN re
             try std.testing.expect(manager.active == null);
             try std.testing.expectEqual(failures[index], manager.snapshot().failure.?);
             if (manager.pending) |job| {
-                try std.testing.expect(job.future == null and job.prepared == null and job.vanilla_prepared == null);
-                try std.testing.expectEqual(@as(u64, 0), job.prepared_generation);
+                try std.testing.expect(job.future == null and job.metadata == .unprepared);
+                try std.testing.expect(job.precommit == null);
             }
             if (failures[index] == error.RecoveryRequired) {
                 try std.testing.expect(manager.pending != null and fixture.held.load(.acquire));
@@ -1539,17 +1582,17 @@ test "instance cancelAndJoin joins active prepared workers without destroying ca
         defer manager.deinit();
         manager.setInstaller(fixture.installer());
         if (use_vanilla) {
-            try manager.startCreateVanillaPrepared(example, &vanilla, 7);
+            try manager.startCreation(.{ .instance = example, .metadata = .{ .vanilla = .{ .owner = &vanilla, .generation = 7 } }, .installer_java = .none });
         } else {
-            try manager.startCreatePrepared(prepared_example, &prepared, 7);
+            try manager.startCreation(.{ .instance = prepared_example, .metadata = .{ .loader = .{ .owner = &prepared, .generation = 7 } } });
         }
         try waitEntered(&fixture);
         manager.cancelAndJoin();
         try std.testing.expect(manager.active == null and manager.pending == null);
         const job = manager.published.?;
         try std.testing.expect(job.done.load(.acquire));
-        try std.testing.expect(job.future == null and job.prepared == null and job.vanilla_prepared == null);
-        try std.testing.expectEqual(@as(u64, 0), job.prepared_generation);
+        try std.testing.expect(job.future == null and job.metadata == .unprepared);
+        try std.testing.expect(job.precommit == null);
         try std.testing.expectEqual(error.Canceled, manager.snapshot().failure.?);
         try std.testing.expect(!fixture.held.load(.acquire) and !registry.hasActive());
         try std.testing.expectEqual(@as(usize, 1), fixture.releases);
@@ -1575,13 +1618,13 @@ test "instance cancelAndJoin retains late successful publication and recovery de
         var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
         defer manager.deinit();
         manager.setInstaller(fixture.installer());
-        try manager.startCreatePrepared(prepared_example, &prepared, 7);
+        try manager.startCreation(.{ .instance = prepared_example, .metadata = .{ .loader = .{ .owner = &prepared, .generation = 7 } } });
         try waitWorkerDone(&manager);
         const job = manager.active.?;
         manager.cancelAndJoin();
         try std.testing.expect(manager.active == null);
-        try std.testing.expect(job.future == null and job.prepared == null and job.vanilla_prepared == null);
-        try std.testing.expectEqual(@as(u64, 0), job.prepared_generation);
+        try std.testing.expect(job.future == null and job.metadata == .unprepared);
+        try std.testing.expect(job.precommit == null);
         if (failure != null and failure.? == error.FixtureFailure) {
             try std.testing.expect(manager.pending == null and manager.published.? == job);
             try std.testing.expect(!fixture.held.load(.acquire));

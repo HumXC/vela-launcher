@@ -29,7 +29,15 @@ pub const Lease = struct {
     recheck: *const fn (?*anyopaque, []const u8) anyerror!void,
     release: *const fn (?*anyopaque, []const u8) void,
 };
+/// Worker-only extension. Context remains immutable until installer JOIN.
+/// Runs after game verification and before the final directory becomes visible.
+pub const Precommit = struct {
+    context: ?*anyopaque,
+    run: *const fn (?*anyopaque, A, std.Io, []const u8, *const std.atomic.Value(bool)) anyerror!void,
+};
+
 pub const Options = struct {
+    precommit: ?Precommit = null,
     root: []const u8,
     instance_id: []const u8,
     instance_name: []const u8,
@@ -719,6 +727,11 @@ const Context = struct {
             const source = try c.join(ctx.g, ctx.stage, artifact.path);
             const expected = artifact.sha1 orelse try digestFile(ctx, source);
             try publishLibrary(ctx, source, try c.join(ctx.g, ctx.minecraft, artifact.path), expected, artifact.size);
+        }
+        if (ctx.options.precommit) |hook| {
+            try ctx.control.check();
+            try hook.run(hook.context, ctx.a, ctx.io, ctx.stage, ctx.control.cancel orelse return error.MissingCancellationToken);
+            try ctx.control.check();
         }
         const stage_dir = try files.directory(ctx.io, ctx.stage, false);
         defer stage_dir.close(ctx.io);

@@ -342,10 +342,14 @@ pub fn prepareProof(self: *Context, a: A, io: Io, target: loader_install.Metadat
 pub fn validateRequest(self: *Context, a: A, io: Io, request: instances_manager.CreateRequest, control: instances_manager.Control) !metadata.Owned(loaders.recipes.Recipe) {
     try control.check();
     const data = self.prepared orelse return error.FixtureMetadataUnavailable;
-    const proof = request.prepared orelse return error.MissingPreparedMetadata;
+    const prepared = switch (request.metadata) {
+        .loader => |value| value,
+        else => return error.MissingPreparedMetadata,
+    };
+    const proof = prepared.owner;
     const loader_id = request.instance.loader_version orelse return error.PreparedMetadataMismatch;
     if (request.instance.loader != .forge or !std.mem.eql(u8, request.root, data.root)) return error.PreparedMetadataMismatch;
-    const target: loader_install.MetadataTarget = .{ .root = request.root, .instance_id = request.instance.id, .instance_name = request.instance.name, .generation = request.prepared_generation, .selection = .{ .kind = .forge, .base_id = request.instance.minecraft_version, .loader_id = loader_id }, .environment = try environment() };
+    const target: loader_install.MetadataTarget = .{ .root = request.root, .instance_id = request.instance.id, .instance_name = request.instance.name, .generation = prepared.generation, .selection = .{ .kind = .forge, .base_id = request.instance.minecraft_version, .loader_id = loader_id }, .environment = try environment() };
     try proof.validateBinding(a, io, target);
     const expected_installer = try zipBytes(a, &.{ .{ .path = "install_profile.json", .bytes = profile_bytes }, .{ .path = "forge-universal.jar", .bytes = data.library_bytes } });
     defer a.free(expected_installer);
@@ -504,7 +508,7 @@ fn syntheticInstall(raw: ?*anyopaque, a: A, io: Io, request: instances_manager.C
     const self = try Context.from(raw);
     // Explicit opt-in controlled task: real Manager/Task, inert bytes, private root.
     if (std.c.getenv("VELA_FIXTURE_INSTANCE_TASK") != null) return controlledTaskInstall(a, io, request, control);
-    self.proof_borrowed.store(request.prepared != null, .release);
+    self.proof_borrowed.store(request.metadata == .loader, .release);
     defer {
         self.proof_borrowed.store(false, .release);
         self.installer_exited.store(true, .release);

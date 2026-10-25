@@ -20,6 +20,8 @@ const A = std.mem.Allocator;
 const Io = std.Io;
 
 pub const Request = struct {
+    /// Non-null only for staged extensions; context outlives cancellation + JOIN.
+    precommit: ?loader.Precommit = null,
     preparation_generation: u64,
     instance: config.Instance,
     environment: metadata.rules.Environment,
@@ -595,10 +597,15 @@ const Core = struct {
         if (job.installer_major != null) try self.exactSelection(.installer, job.installer_path.?);
         const row = job.request.instance;
         const proof = if (job.proof) |*owned| owned else return error.MissingPreparedMetadata;
-        switch (proof.*) {
-            .vanilla => |*owner| try services.instances.startCreateVanillaPrepared(row, owner, job.request.preparation_generation),
-            .loader => |*owner| try services.instances.startCreatePreparedWithJava(row, owner, job.request.preparation_generation, job.installer_path),
-        }
+        try services.instances.startCreation(.{
+            .instance = row,
+            .metadata = switch (proof.*) {
+                .vanilla => |*owner| .{ .vanilla = .{ .owner = owner, .generation = job.request.preparation_generation } },
+                .loader => |*owner| .{ .loader = .{ .owner = owner, .generation = job.request.preparation_generation } },
+            },
+            .installer_java = if (job.installer_path) |path| .{ .path = path } else .none,
+            .precommit = job.request.precommit,
+        });
         job.instance_task_id = services.instances.snapshot().task_id;
         self.instance_owned = true;
         self.phase = .creating;
@@ -641,7 +648,7 @@ pub const Controller = struct {
         if (services.java.isSearching()) return error.JavaDiscoveryBusy;
         if (services.java_download.isBusy()) return error.JavaDownloadBusy;
         const row = request.instance;
-        if (row.origin != null) return error.InvalidOrdinaryCreation;
+        if (row.origin != null and request.precommit == null) return error.InvalidOrdinaryCreation;
         try services.instances.checkCreationAdmission(row);
         if (!config.validId(row.id) or !config.validId(row.name)) return error.UnsafeInstance;
         if (row.id.len > 502) return error.InvalidInstallerKey;
@@ -671,6 +678,10 @@ pub const Controller = struct {
         core.stopping = false;
         core.role = null;
         core.discovered = false;
+    }
+    pub fn startExtended(self: *Controller, row: config.Instance, precommit: loader.Precommit, services: Services) !void {
+        if (self.core.last_generation == std.math.maxInt(u64)) return error.IdExhausted;
+        try self.start(.{ .instance = row, .preparation_generation = self.core.last_generation + 1, .environment = try hostEnvironment(), .precommit = precommit }, services);
     }
     pub fn startOrdinary(self: *Controller, row: config.Instance, services: Services) !void {
         if (self.core.last_generation == std.math.maxInt(u64)) return error.IdExhausted;
@@ -1024,8 +1035,11 @@ const Fixture = struct {
     fn install(raw: ?*anyopaque, a: A, io: Io, install_request: instances_manager.CreateRequest, _: instances_manager.Control) !instances_manager.Installed {
         const self: *Fixture = @ptrCast(@alignCast(raw.?));
         self.create_count += 1;
-        const proof = install_request.vanilla_prepared orelse return error.FixtureMissingVanillaProof;
-        try proof.validateBinding(a, io, .{ .root = install_request.root, .instance_id = install_request.instance.id, .instance_name = install_request.instance.name, .version_id = install_request.instance.minecraft_version, .generation = install_request.prepared_generation, .environment = try hostEnvironment() });
+        const prepared = switch (install_request.metadata) {
+            .vanilla => |value| value,
+            else => return error.FixtureMissingVanillaProof,
+        };
+        try prepared.owner.validateBinding(a, io, .{ .root = install_request.root, .instance_id = install_request.instance.id, .instance_name = install_request.instance.name, .version_id = install_request.instance.minecraft_version, .generation = prepared.generation, .environment = try hostEnvironment() });
         try self.tmp.dir.createDirPath(io, ".minecraft/versions/Display Name");
         try self.tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Display Name/committed.marker", .data = "committed" });
         try self.tmp.dir.createDirPath(io, ".vela/jdks");
@@ -1242,13 +1256,17 @@ test "ordinary Fabric and Quilt creation uses registered Java 21 without an inst
         fn install(raw: ?*anyopaque, a: A, io: Io, request: instances_manager.CreateRequest, control: instances_manager.Control) !instances_manager.Installed {
             try control.check();
             const fixture: *Fixture = @ptrCast(@alignCast(raw.?));
-            const proof = request.prepared orelse return error.MissingPreparedMetadata;
+            const prepared = switch (request.metadata) {
+                .loader => |value| value,
+                else => return error.MissingPreparedMetadata,
+            };
+            const proof = prepared.owner;
             const kind: loaders.Kind = switch (request.instance.loader) {
                 .fabric => .fabric,
                 .quilt => .quilt,
                 else => return error.InvalidLoader,
             };
-            try proof.validateBinding(a, io, .{ .root = request.root, .instance_id = request.instance.id, .instance_name = request.instance.name, .generation = request.prepared_generation, .selection = .{ .kind = kind, .base_id = request.instance.minecraft_version, .loader_id = request.instance.loader_version.? }, .environment = try hostEnvironment() });
+            try proof.validateBinding(a, io, .{ .root = request.root, .instance_id = request.instance.id, .instance_name = request.instance.name, .generation = prepared.generation, .selection = .{ .kind = kind, .base_id = request.instance.minecraft_version, .loader_id = request.instance.loader_version.? }, .environment = try hostEnvironment() });
             try std.testing.expectEqual(@as(u64, 21), proof.requirements.runtime_major);
             try std.testing.expectEqual(@as(u64, 0), proof.requirements.installer_major);
             try std.testing.expect(request.installer_java == null);
@@ -1319,8 +1337,8 @@ test "ordinary gate freezes preparation then resumes and explicit shutdown retai
     try std.testing.expect(fixture.instances.pending != null and fixture.instances.active == null);
     try std.testing.expect(fixture.leased);
     try std.testing.expectEqual(namespace_token, fixture.instances.pending.?.namespace_token);
-    try std.testing.expect(fixture.instances.pending.?.prepared == null);
-    try std.testing.expect(fixture.instances.pending.?.vanilla_prepared == null);
+    try std.testing.expect(fixture.instances.pending.?.metadata == .unprepared);
+    try std.testing.expect(fixture.instances.pending.?.precommit == null);
 }
 
 test "ordinary wrong manual Java fails before artifacts and retry receives fresh task generation" {
@@ -1544,8 +1562,8 @@ test "ordinary coordinator shutdown joins create clears borrowed proof but prese
     value.deinit(fixture.services());
     live = false;
     try std.testing.expect(fixture.instances.pending != null);
-    try std.testing.expect(fixture.instances.pending.?.vanilla_prepared == null);
-    try std.testing.expect(fixture.instances.pending.?.prepared == null);
+    try std.testing.expect(fixture.instances.pending.?.metadata == .unprepared);
+    try std.testing.expect(fixture.instances.pending.?.precommit == null);
     try std.testing.expect(fixture.leased);
     try std.testing.expectEqual(@as(usize, 0), fixture.store.snapshot().instances.len);
 }

@@ -4,6 +4,7 @@
 //! and clean owned stages on the worker before releasing the reservation.
 const std = @import("std");
 const config = @import("config.zig");
+const pack_loader_version = @import("pack_loader_version.zig");
 const instances = @import("instances.zig");
 const manifest = @import("content_manifest.zig");
 const providers = @import("content_providers.zig");
@@ -14,7 +15,8 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 pub const CancelToken = std.atomic.Value(bool);
 const stage_directory = "pack-imports";
-const archive_limit = 2 * 1024 * 1024 * 1024;
+/// Shared compressed archive cap for online downloads and local imports.
+pub const archive_limit: u64 = 2 * 1024 * 1024 * 1024;
 
 pub const Inspection = struct {
     arena: std.heap.ArenaAllocator,
@@ -114,7 +116,7 @@ pub fn prepareInspected(a: Allocator, io: Io, paths: *const instances.Paths, ins
     const extracted = try fs.openAbsolute(io, extracted_path);
     defer extracted.close(io);
     try validatePackTargets(a, io, extracted, inspection.pack, instance.name, cancel);
-    try compatible(instance, inspection.pack);
+    try compatible(a, instance, inspection.pack);
     var next = try inspectArchive(a, io, paths, inspection.archive_absolute_path, inspection.provider, inspection.source_sha256, cancel);
     var owned = true;
     defer if (owned) next.deinit();
@@ -206,7 +208,7 @@ fn finishPrepare(io: Io, instance: config.Instance, inspection: *Inspection, can
     const extracted = try fs.openAbsolute(io, extracted_path);
     defer extracted.close(io);
     try validatePackTargets(aa, io, extracted, inspection.pack, instance.name, cancel);
-    try compatible(instance, inspection.pack);
+    try compatible(aa, instance, inspection.pack);
     const identity = inspection.pack.identity;
     var files: std.ArrayList(manifest.InstallFile) = .empty;
     try files.appendSlice(aa, parsed.value.files);
@@ -250,12 +252,10 @@ fn records(a: Allocator, files: []const manifest.InstallFile) ![]const manifest.
     for (files, result) |file, *record| record.* = file.record;
     return result;
 }
-fn compatible(instance: config.Instance, pack: manifest.PackPlan) !void {
+fn compatible(a: Allocator, instance: config.Instance, pack: manifest.PackPlan) !void {
     if (!std.mem.eql(u8, instance.minecraft_version, pack.minecraft_version)) return error.MinecraftVersionMismatch;
     if (instance.loader != pack.loader) return error.LoaderMismatch;
-    if (instance.loader_version) |version| {
-        if (pack.loader_version == null or !std.mem.eql(u8, version, pack.loader_version.?)) return error.LoaderVersionMismatch;
-    } else if (pack.loader_version != null) return error.LoaderVersionMismatch;
+    if (!try pack_loader_version.equivalent(a, instance.loader, instance.minecraft_version, instance.loader_version, pack.loader_version)) return error.LoaderVersionMismatch;
 }
 fn safeTarget(path: []const u8) !void {
     try manifest.checkedPathForInstance(path, null);
