@@ -435,12 +435,11 @@ fn verify(io: Io, path: []const u8, release: *const RuntimeRelease, hooks: Hooks
 pub fn ServiceTransport(comptime Service: type) type {
     return struct {
         service: *Service,
-        io: Io,
         const Self = @This();
         pub fn transport(self: *Self) Transport {
             return .{ .context = self, .get = get, .download = download };
         }
-        fn wait(self: *Self, task: anytype, hooks: Hooks, phase: Phase) !void {
+        fn wait(_: *Self, task: anytype, hooks: Hooks, phase: Phase) !void {
             var canceled = false;
             while (true) {
                 hooks.check() catch {
@@ -461,12 +460,10 @@ pub fn ServiceTransport(comptime Service: type) type {
                 }
                 // Drain accepted task cancellation before release, even when Io
                 // itself was canceled. No live Task or Service borrower escapes.
-                self.io.sleep(.fromMilliseconds(5), .awake) catch {
+                task.wait() catch {
                     canceled = true;
                     task.cancel();
-                    const protection = self.io.swapCancelProtection(.blocked);
-                    self.io.sleep(.fromMilliseconds(5), .awake) catch {};
-                    _ = self.io.swapCancelProtection(protection);
+                    task.join();
                 };
             }
         }

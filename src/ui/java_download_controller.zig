@@ -47,6 +47,7 @@ pub const OwnedDeleteAdmission = struct {
 };
 pub const Options = struct {
     root: []const u8,
+    download_budget: *downloader.Budget,
     task_registry: ?*tasks.Registry = null,
     download_connections: u16 = 8,
     // Optional fixture boundaries. Contexts must outlive the active job.
@@ -259,8 +260,8 @@ pub const Controller = struct {
     published_delete: ?*DeleteJob = null,
     delete_phase: Phase = .idle,
 
-    pub fn init(a: Allocator, io: Io, root: []const u8) !Controller {
-        return initWithOptions(a, io, .{ .root = root });
+    pub fn init(a: Allocator, io: Io, root: []const u8, download_budget: *downloader.Budget) !Controller {
+        return initWithOptions(a, io, .{ .root = root, .download_budget = download_budget });
     }
     pub fn initWithOptions(a: Allocator, io: Io, options: Options) !Controller {
         _ = try platformFor(builtin.os.tag, builtin.cpu.arch);
@@ -275,7 +276,7 @@ pub const Controller = struct {
         if (options.task_registry == null) registry.* = tasks.Registry.init(a);
         try curl.globalInit();
         errdefer curl.globalDeinit();
-        const service = try downloader.Service.init(worker_allocator, io, options.download_connections);
+        const service = try downloader.Service.init(worker_allocator, io, options.download_budget, options.download_connections);
         return .{
             .allocator = a,
             .io = io,
@@ -398,7 +399,7 @@ pub const Controller = struct {
         if (self.isBusy()) return error.Busy;
         if (!backend.supported(request.vendor, request.major)) return error.UnsupportedRelease;
         if (self.service.max_active != self.download_connections) {
-            const replacement = try downloader.Service.init(worker_allocator, self.io, self.download_connections);
+            const replacement = try downloader.Service.init(worker_allocator, self.io, self.service.budget, self.download_connections);
             self.service.deinit();
             self.service = replacement;
         }
@@ -410,7 +411,7 @@ pub const Controller = struct {
             .platform = try self.hostPlatform(),
             .download_connections = self.download_connections,
             .task = null,
-            .service_adapter = .{ .service = self.service, .io = self.io },
+            .service_adapter = .{ .service = self.service },
             .extractor = self.fixture_extractor,
             .probe = self.probe,
         };
@@ -656,7 +657,9 @@ test "archive transfer details follow child transport through extraction and pru
     var manager = try java.Manager.init(a, io, root);
     defer manager.deinit();
     var fixture: Fixture = .{ .mode = .wait_download };
-    var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+    var budget_660 = try downloader.Budget.init(std.testing.io, 64);
+    defer budget_660.deinit();
+    var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_660, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
     defer controller.deinit();
     try controller.start(.{ .vendor = .microsoft, .major = 21 });
     const task = controller.active.?.task.?;
@@ -727,7 +730,9 @@ test "verified archive transfer stays complete when extraction fails or is cance
         var manager = try java.Manager.init(a, io, root);
         defer manager.deinit();
         var fixture: Fixture = .{ .mode = .wait_download, .extract_failure = !cancel };
-        var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+        var budget_731 = try downloader.Budget.init(std.testing.io, 64);
+        defer budget_731.deinit();
+        var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_731, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
         defer controller.deinit();
         try controller.start(.{ .vendor = .microsoft, .major = 21 });
         try awaitFlag(&fixture.transfer_entered);
@@ -765,7 +770,9 @@ test "archive failure and cancellation retain measured file details after join a
         var manager = try java.Manager.init(a, io, root);
         defer manager.deinit();
         var fixture: Fixture = .{ .mode = if (cancel) .wait_download else .fail_download, .unknown_total = cancel };
-        var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+        var budget_769 = try downloader.Budget.init(std.testing.io, 64);
+        defer budget_769.deinit();
+        var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_769, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
         defer controller.deinit();
         try controller.start(.{ .vendor = .microsoft, .major = 21 });
         const task = controller.active.?.task.?;
@@ -814,7 +821,9 @@ test "joined downloaded results register only verified identity and survive regi
         var manager = try java.Manager.init(a, io, root);
         defer manager.deinit();
         var fixture: Fixture = .{ .mode = mode };
-        var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+        var budget_818 = try downloader.Budget.init(std.testing.io, 64);
+        defer budget_818.deinit();
+        var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_818, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
         defer controller.deinit();
         try std.testing.expectEqual(@as(usize, 0), fixture.requests.load(.acquire));
         try controller.start(.{ .vendor = .microsoft, .major = 21 });
@@ -853,7 +862,9 @@ test "download cancellation joins worker before registry finish and prune" {
     var manager = try java.Manager.init(a, io, root);
     defer manager.deinit();
     var fixture: Fixture = .{ .mode = .wait_metadata };
-    var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+    var budget_857 = try downloader.Budget.init(std.testing.io, 64);
+    defer budget_857.deinit();
+    var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_857, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
     defer controller.deinit();
     try controller.start(.{ .vendor = .microsoft, .major = 21 });
     const task = controller.active.?.task.?;
@@ -896,7 +907,9 @@ test "shutdown stops independent probe without rewriting committed download" {
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var fixture: Fixture = .{ .mode = .wait_probe };
-    var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+    var budget_900 = try downloader.Budget.init(std.testing.io, 64);
+    defer budget_900.deinit();
+    var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_900, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
     var deinitialized = false;
     defer if (!deinitialized) controller.deinit();
     try controller.start(.{ .vendor = .microsoft, .major = 21 });
@@ -932,7 +945,9 @@ test "registration persistence failure preserves usable installation and manager
     defer manager.deinit();
     try tmp.dir.createDirPath(io, ".vela/java.json");
     var fixture: Fixture = .{};
-    var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+    var budget_936 = try downloader.Budget.init(std.testing.io, 64);
+    defer budget_936.deinit();
+    var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_936, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
     defer controller.deinit();
     try controller.start(.{ .vendor = .microsoft, .major = 21 });
     const task = controller.active.?.task.?;
@@ -973,16 +988,22 @@ test "download connection limits validate and apply only to future jobs" {
     const root = try fixtureRoot(&tmp);
     defer a.free(root);
     for ([_]u16{ 0, 65 }) |connections| {
-        try std.testing.expectError(error.InvalidDownloadConnections, Controller.initWithOptions(a, io, .{ .root = root, .download_connections = connections }));
+        var invalid_budget = try downloader.Budget.init(io, 64);
+        defer invalid_budget.deinit();
+        try std.testing.expectError(error.InvalidDownloadConnections, Controller.initWithOptions(a, io, .{ .download_budget = &invalid_budget, .root = root, .download_connections = connections }));
     }
     for ([_]u16{ 1, 64 }) |connections| {
-        var boundary = try Controller.initWithOptions(a, io, .{ .root = root, .download_connections = connections });
+        var boundary_budget = try downloader.Budget.init(io, 64);
+        defer boundary_budget.deinit();
+        var boundary = try Controller.initWithOptions(a, io, .{ .download_budget = &boundary_budget, .root = root, .download_connections = connections });
         defer boundary.deinit();
         try std.testing.expectEqual(connections, boundary.download_connections);
         try std.testing.expectEqual(@as(usize, connections), boundary.service.max_active);
     }
     var fixture: Fixture = .{ .mode = .wait_metadata };
-    var controller = try Controller.initWithOptions(a, io, .{ .root = root, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+    var budget = try downloader.Budget.init(io, 64);
+    defer budget.deinit();
+    var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget, .root = root, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
     defer controller.deinit();
     var manager = try java.Manager.init(a, io, root);
     defer manager.deinit();
@@ -1023,7 +1044,9 @@ test "download cancelAndJoin synchronously cancels active work and leaves owners
     var manager = try java.Manager.init(a, io, root);
     defer manager.deinit();
     var fixture: Fixture = .{ .mode = .wait_metadata };
-    var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+    var budget_1027 = try downloader.Budget.init(std.testing.io, 64);
+    defer budget_1027.deinit();
+    var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_1027, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
     defer controller.deinit();
     const state = manager.state;
     controller.cancelAndJoin(&manager);
@@ -1062,7 +1085,9 @@ test "download cancelAndJoin stops independent probe but retains committed JDK a
     var manager = try java.Manager.init(a, io, root);
     defer manager.deinit();
     var fixture: Fixture = .{ .mode = .wait_probe };
-    var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+    var budget_1066 = try downloader.Budget.init(std.testing.io, 64);
+    defer budget_1066.deinit();
+    var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_1066, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
     defer controller.deinit();
     try controller.start(.{ .vendor = .microsoft, .major = 21 });
     const job = controller.active.?;
@@ -1105,7 +1130,9 @@ test "download cancelAndJoin consumes late success and registration failures thr
         if (fail_registration) try tmp.dir.createDirPath(io, ".vela/java.json");
         const state = manager.state;
         var fixture: Fixture = .{ .mode = .good };
-        var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+        var budget_1109 = try downloader.Budget.init(std.testing.io, 64);
+        defer budget_1109.deinit();
+        var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_1109, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
         defer controller.deinit();
         try controller.start(.{ .vendor = .microsoft, .major = 21 });
         const job = controller.active.?;
@@ -1152,7 +1179,9 @@ test "owned delete validates receipts and paths, preserves links, joins before p
         var manager = try java.Manager.init(a, io, root);
         defer manager.deinit();
         var fixture: Fixture = .{};
-        var controller = try Controller.initWithOptions(a, io, .{ .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
+        var budget_1156 = try downloader.Budget.init(std.testing.io, 64);
+        defer budget_1156.deinit();
+        var controller = try Controller.initWithOptions(a, io, .{ .download_budget = &budget_1156, .root = root, .task_registry = &registry, .transport = fixture.transport(), .extractor = fixture.extractor(), .probe = fixture.probe() });
         defer controller.deinit();
         try controller.start(.{ .vendor = .microsoft, .major = 21 });
         try awaitController(&controller, &manager);
@@ -1326,7 +1355,10 @@ test "owned delete admission rejects before ownership allocation tasks or filesy
     defer manager.deinit();
     var fixture: Fixture = .{};
     var admission: Admission = .{};
+    var budget_1330 = try downloader.Budget.init(std.testing.io, 64);
+    defer budget_1330.deinit();
     var controller = try Controller.initWithOptions(a, io, .{
+        .download_budget = &budget_1330,
         .root = root,
         .task_registry = &registry,
         .transport = fixture.transport(),

@@ -211,7 +211,9 @@ test "UI layout Home Choose Game and Choose Account reserve Start and preserve n
     defer ordinary_creation.deinit(undefined);
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var java_download = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
+    var download_budget_214 = try @import("core/downloader.zig").Budget.init(std.testing.io, 8);
+    defer download_budget_214.deinit();
+    var java_download = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .download_budget = &download_budget_214, .root = root, .task_registry = &registry });
     defer java_download.deinit();
     for (0..23) |_| {
         const task = try registry.create(.java_scan, "Fixture Java runtime scan with a long wrapped task title");
@@ -759,7 +761,9 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
     defer launcher.deinit();
     var java_ui = java_view.Ui.init(a);
     defer java_ui.deinit();
-    var download = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
+    var download_budget_762 = try @import("core/downloader.zig").Budget.init(std.testing.io, 8);
+    defer download_budget_762.deinit();
+    var download = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .download_budget = &download_budget_762, .root = root, .task_registry = &registry });
     defer download.deinit();
     var download_ui = java_download_view.Ui.init(a);
     defer download_ui.deinit();
@@ -2003,7 +2007,9 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
     defer manager.deinit();
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
+    var download_budget_2006 = try @import("core/downloader.zig").Budget.init(std.testing.io, 8);
+    defer download_budget_2006.deinit();
+    var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .download_budget = &download_budget_2006, .root = root, .task_registry = &registry });
     defer controller.deinit();
     JavaFrame.controller = &controller;
     JavaFrame.manager = &manager;
@@ -2153,7 +2159,9 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
     defer manager.deinit();
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
+    var download_budget_2156 = try @import("core/downloader.zig").Budget.init(std.testing.io, 8);
+    defer download_budget_2156.deinit();
+    var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .download_budget = &download_budget_2156, .root = root, .task_registry = &registry });
     defer controller.deinit();
     JavaFrame.controller = &controller;
     JavaFrame.labels[@backingInt(JavaFrame.Text.visible_path)] = visible_path;
@@ -2368,7 +2376,9 @@ test "UI layout Java removing all registered runtimes keeps a new scan in local 
     try manager.addDownloaded(runtime);
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
+    var download_budget_2371 = try @import("core/downloader.zig").Budget.init(std.testing.io, 8);
+    defer download_budget_2371.deinit();
+    var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .download_budget = &download_budget_2371, .root = root, .task_registry = &registry });
     defer controller.deinit();
     var download_ui = java_download_view.Ui.init(a);
     defer download_ui.deinit();
@@ -2435,7 +2445,9 @@ test "UI layout Java folder browse queues after draft edits and blocks stale com
     defer manager.deinit();
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
-    var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .root = root, .task_registry = &registry });
+    var download_budget_2438 = try @import("core/downloader.zig").Budget.init(std.testing.io, 8);
+    defer download_budget_2438.deinit();
+    var controller = try java_download_controller.Controller.initWithOptions(a, std.testing.io, .{ .download_budget = &download_budget_2438, .root = root, .task_registry = &registry });
     defer controller.deinit();
     var download_ui = java_download_view.Ui.init(a);
     defer download_ui.deinit();

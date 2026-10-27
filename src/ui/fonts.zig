@@ -20,15 +20,14 @@ pub fn install(win: *dvui.Window) !void {
         try load(init.gpa, init.io, path)
     else
         discover(init.gpa, init.io, init.environ_map) catch |err| {
-            std.log.warn("No automatic CJK UI font available ({t}); keeping DVUI default font. VELA_FONT_PATH can select a font", .{err});
-            return;
+            std.log.err("No system UI font available ({t}); install a CJK font or set VELA_FONT_PATH", .{err});
+            return err;
         };
     defer init.gpa.free(loaded.path);
     win.addFont(family, loaded.bytes, init.gpa) catch |err| {
         init.gpa.free(loaded.bytes);
-        if (explicit != null) return err;
-        std.log.warn("Cannot register CJK UI font {s} ({t}); keeping DVUI default font", .{ loaded.path, err });
-        return;
+        std.log.err("Cannot register UI font {s} ({t}); select a valid font with VELA_FONT_PATH", .{ loaded.path, err });
+        return err;
     };
     std.log.info("Loaded CJK UI font {s}", .{loaded.path});
 }

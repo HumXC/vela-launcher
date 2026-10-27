@@ -15,6 +15,9 @@ const R = dvui.Rect;
 pub const Row = struct { entry: *const local.Entry, managed: bool = false };
 pub const Snapshot = struct {
     rows: []const Row = &.{},
+    /// Changes whenever entry membership, order or searchable/sortable data changes.
+    /// Unversioned transient snapshots are rebuilt on every use.
+    inventory: ?InventoryVersion = null,
     busy: bool = false,
     failure: ?anyerror = null,
     can_mutate: bool = false,
@@ -33,8 +36,62 @@ pub const Intent = union(enum) {
 pub const Filter = enum { all, enabled, disabled };
 pub const Sort = enum { name_ascending, name_descending, newest, oldest };
 
+pub const InventoryVersion = struct { source: usize, revision: u64 };
+
+const DerivedRows = struct {
+    indices: []usize = &.{},
+    count: usize = 0,
+    version: ?InventoryVersion = null,
+    search: [513]u8 = @splat(0),
+    kind: local.Kind = .mod,
+    filter: Filter = .all,
+    sort: Sort = .name_ascending,
+    rebuilds: usize = 0,
+
+    fn deinit(self: *DerivedRows, a: A) void {
+        a.free(self.indices);
+        self.* = .{};
+    }
+
+    fn get(self: *DerivedRows, ui: *const Ui, snapshot: Snapshot) ![]const usize {
+        if (snapshot.inventory) |version| if (self.version) |previous| {
+            if (std.meta.eql(version, previous) and self.indices.len == snapshot.rows.len and
+                self.kind == ui.kind and self.filter == ui.filter and self.sort == ui.sort and
+                std.mem.eql(u8, &self.search, &ui.search)) return self.indices[0..self.count];
+        };
+        // Invalidate before allocation: a failed rebuild must never expose stale indices.
+        self.version = null;
+        if (self.indices.len != snapshot.rows.len) {
+            const next = try ui.allocator.alloc(usize, snapshot.rows.len);
+            ui.allocator.free(self.indices);
+            self.indices = next;
+        }
+        self.count = 0;
+        for (snapshot.rows, 0..) |row, index| if (matches(ui, row)) {
+            self.indices[self.count] = index;
+            self.count += 1;
+        };
+        const Order = struct {
+            rows: []const Row,
+            sort: Sort,
+            fn before(context: @This(), lhs: usize, rhs: usize) bool {
+                return lessThan(context.sort, context.rows[lhs], context.rows[rhs]);
+            }
+        };
+        std.mem.sort(usize, self.indices[0..self.count], Order{ .rows = snapshot.rows, .sort = ui.sort }, Order.before);
+        self.search = ui.search;
+        self.kind = ui.kind;
+        self.filter = ui.filter;
+        self.sort = ui.sort;
+        self.version = snapshot.inventory;
+        self.rebuilds +%= 1;
+        return self.indices[0..self.count];
+    }
+};
+
 pub const Ui = struct {
     allocator: A,
+    derived: DerivedRows = .{},
     acquisition: resource_download.Ui,
     resource_menu: resource_menu.State = .{},
     resource_menu_route: resource_download.Route = .local,
@@ -58,6 +115,7 @@ pub const Ui = struct {
     pub fn deinit(self: *Ui) void {
         self.clearIntent();
         self.acquisition.deinit();
+        self.derived.deinit(self.allocator);
         if (self.selected_path) |path| self.allocator.free(path);
         if (self.info_path) |path| self.allocator.free(path);
         if (self.locate_path) |path| self.allocator.free(path);
@@ -215,24 +273,18 @@ pub fn draw(ui: *Ui, snapshot: Snapshot) void {
     if (ui.failure) |err| components.text(@src(), frameFmt("操作失败：{s}", .{@errorName(err)}), theme.colors.danger);
     if (snapshot.recovery_required) components.text(@src(), "需要先恢复内容状态，修改操作暂不可用", theme.colors.warning);
     if (snapshot.truncated) components.text(@src(), "目录内容超过扫描上限，当前仅显示部分文件", theme.colors.warning);
-    const visible = dvui.currentWindow().arena().alloc(Row, snapshot.rows.len) catch {
-        ui.failure = error.OutOfMemory;
+    const rows = ui.derived.get(ui, snapshot) catch |err| {
+        ui.failure = err;
         return;
     };
-    var count: usize = 0;
-    for (snapshot.rows) |row| if (matches(ui, row)) {
-        visible[count] = row;
-        count += 1;
-    };
-    const rows = visible[0..count];
-    std.mem.sort(Row, rows, ui.sort, lessThan);
     if (rows.len == 0 and !snapshot.busy and snapshot.failure == null and !snapshot.truncated) components.emptyState(@src(), if (snapshot.rows.len == 0) "此实例尚无本地内容" else "没有符合搜索和筛选条件的内容");
     if (ui.list) {
-        for (rows) |row| drawCard(ui, row, dvui.parentGet().data().contentRect().w, true);
+        for (rows) |index| drawCard(ui, snapshot.rows[index], dvui.parentGet().data().contentRect().w, true);
     } else {
         var grid = card_grid.init(@src(), rows.len, .{ .min_width = 280, .max_columns = 3, .tag = "mods-card-grid" });
         defer grid.deinit();
-        for (rows, 0..) |row, i| {
+        for (rows, 0..) |index, i| {
+            const row = snapshot.rows[index];
             const cell = grid.cell(@src(), i, selectionKey(row.entry.path));
             drawCard(ui, row, grid.cardWidth(i), false);
             cell.deinit();
@@ -541,6 +593,70 @@ test "mods view resolves dependency IDs rather than display names" {
     try std.testing.expectEqualStrings("b.jar", dependencyTarget(&rows, "sodium").?.entry.path);
     try std.testing.expect(dependencyTarget(&rows, "Translated name") == null);
 }
+test "mods derived rows reuse indices and invalidate in-place edits and query changes" {
+    var ui = try Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    var alpha: local.Entry = .{ .path = "a.jar", .physical_path = "a.jar", .name = "Alpha", .mtime_ms = 1 };
+    const beta: local.Entry = .{ .path = "b.jar", .physical_path = "b.jar", .name = "Beta", .mtime_ms = 2 };
+    const rows = [_]Row{ .{ .entry = &beta }, .{ .entry = &alpha } };
+    var snapshot: Snapshot = .{ .rows = &rows, .inventory = .{ .source = 1, .revision = 1 } };
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, try ui.derived.get(&ui, snapshot));
+    const allocation = ui.derived.indices.ptr;
+    for (0..100) |_| _ = try ui.derived.get(&ui, snapshot);
+    try std.testing.expectEqual(@as(usize, 1), ui.derived.rebuilds);
+    try std.testing.expect(allocation == ui.derived.indices.ptr);
+    ui.sort = .newest;
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, try ui.derived.get(&ui, snapshot));
+    ui.filter = .enabled;
+    _ = try ui.derived.get(&ui, snapshot);
+    alpha.enabled = false;
+    snapshot.inventory.?.revision += 1;
+    try std.testing.expectEqualSlices(usize, &.{0}, try ui.derived.get(&ui, snapshot));
+    ui.filter = .all;
+    @memcpy(ui.search[0..5], "ALPHA");
+    try std.testing.expectEqualSlices(usize, &.{1}, try ui.derived.get(&ui, snapshot));
+    ui.kind = .shader;
+    try std.testing.expectEqual(@as(usize, 0), (try ui.derived.get(&ui, snapshot)).len);
+    ui.kind = .mod;
+    @memset(&ui.search, 0);
+    // A new source may reuse the same revision and row count, with different order.
+    const replacement = [_]Row{ .{ .entry = &alpha }, .{ .entry = &beta } };
+    snapshot.rows = &replacement;
+    snapshot.inventory.?.source = 2;
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, try ui.derived.get(&ui, snapshot));
+    // Managed state is read from the current frame, not retained in the cache.
+    const before = ui.derived.rebuilds;
+    _ = try ui.derived.get(&ui, snapshot);
+    try std.testing.expectEqual(before, ui.derived.rebuilds);
+    snapshot.rows = &.{};
+    snapshot.inventory.?.revision += 1;
+    _ = try ui.derived.get(&ui, snapshot);
+    try std.testing.expectEqual(@as(usize, 0), ui.derived.indices.len);
+}
+
+test "mods derived rows failed growth cannot reuse stale cache and releases allocations" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var ui = try Ui.init(failing.allocator());
+    defer ui.deinit();
+    const entry: local.Entry = .{ .path = "a.jar", .physical_path = "a.jar", .name = "Alpha" };
+    const rows = [_]Row{ .{ .entry = &entry }, .{ .entry = &entry } };
+    var snapshot: Snapshot = .{ .rows = rows[0..1], .inventory = .{ .source = 1, .revision = 1 } };
+    _ = try ui.derived.get(&ui, snapshot);
+    snapshot.rows = &rows;
+    snapshot.inventory.?.revision += 1;
+    try std.testing.expectError(error.OutOfMemory, ui.derived.get(&ui, snapshot));
+    try std.testing.expect(ui.derived.version == null);
+    // Returning to a smaller inventory must rebuild, even after the failed allocation.
+    snapshot.rows = rows[0..1];
+    try std.testing.expectEqualSlices(usize, &.{0}, try ui.derived.get(&ui, snapshot));
+    try std.testing.expectEqual(@as(usize, 2), ui.derived.rebuilds);
+    // Without a version contract even identical slice addresses must not hit cache.
+    snapshot.inventory = null;
+    _ = try ui.derived.get(&ui, snapshot);
+    _ = try ui.derived.get(&ui, snapshot);
+    try std.testing.expectEqual(@as(usize, 4), ui.derived.rebuilds);
+}
+
 test "mods view search state filter and deterministic sort" {
     var ui = try Ui.init(std.testing.allocator);
     defer ui.deinit();
@@ -576,7 +692,7 @@ test "UI layout large mods lists only touch visible icons during resize and loca
         var ui: Ui = undefined;
         var rows: [256]Row = undefined;
         fn frame() !dvui.App.Result {
-            draw(&ui, .{ .rows = &rows });
+            draw(&ui, .{ .rows = &rows, .inventory = .{ .source = 1, .revision = 1 } });
             return .ok;
         }
     };
@@ -604,6 +720,7 @@ test "UI layout large mods lists only touch visible icons during resize and loca
             const before = Fixture.ui.acquisition.icons.?.clock;
             _ = try dvui.testing.step(Fixture.frame);
             const visits = Fixture.ui.acquisition.icons.?.clock - before;
+            try std.testing.expectEqual(@as(usize, 1), Fixture.ui.derived.rebuilds);
             try std.testing.expect(visits > 0);
             try std.testing.expect(visits < 48);
         }
@@ -626,5 +743,42 @@ test "UI layout large mods lists only touch visible icons during resize and loca
         const before = Fixture.ui.acquisition.icons.?.clock;
         _ = try dvui.testing.step(Fixture.frame);
         try std.testing.expect(Fixture.ui.acquisition.icons.?.clock - before < 48);
+    }
+}
+
+test "resource cache performance baseline" {
+    const enabled = std.testing.environ.getAlloc(std.testing.allocator, "VELA_RESOURCE_BENCH") catch return error.SkipZigTest;
+    defer std.testing.allocator.free(enabled);
+    const iterations = 200;
+    for ([_]usize{ 256, 1024, 4096 }) |count| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const entries = try a.alloc(local.Entry, count);
+        const rows = try a.alloc(Row, count);
+        for (entries, rows, 0..) |*entry, *row, index| {
+            const name = try std.fmt.allocPrint(a, "mod-{d:0>5}.jar", .{count - index});
+            entry.* = .{ .name = name, .path = name, .physical_path = name };
+            row.* = .{ .entry = entry };
+        }
+        var allocations = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var ui = try Ui.init(allocations.allocator());
+        defer ui.deinit();
+        var snapshot: Snapshot = .{ .rows = rows, .inventory = .{ .source = 1, .revision = 1 } };
+        _ = try ui.derived.get(&ui, snapshot);
+        const before_allocations = allocations.alloc_index;
+        const cached_start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        for (0..iterations) |_| std.mem.doNotOptimizeAway(try ui.derived.get(&ui, snapshot));
+        const cached_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - cached_start;
+        try std.testing.expectEqual(before_allocations, allocations.alloc_index);
+        try std.testing.expectEqual(@as(usize, 1), ui.derived.rebuilds);
+        snapshot.inventory = null;
+        const rebuild_start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        for (0..iterations) |_| std.mem.doNotOptimizeAway(try ui.derived.get(&ui, snapshot));
+        const rebuild_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - rebuild_start;
+        std.debug.print("RESOURCE_BASELINE rows={d} iterations={d} cached_ns={d} rebuild_ns={d} retained_index_bytes={d} cached_allocations=0\n", .{ count, iterations, cached_ns, rebuild_ns, ui.derived.indices.len * @sizeOf(usize) });
+        snapshot.rows = &.{};
+        _ = try ui.derived.get(&ui, snapshot);
+        try std.testing.expectEqual(@as(usize, 0), ui.derived.indices.len);
     }
 }

@@ -74,7 +74,7 @@ fn boundSnapshot(model: *const model_module.Model, doc: *const config.Document, 
     }
     try ui.acquisition.bind(instance, ui.kind);
     ui.acquisition.provider = backend.snapshot().provider;
-    var snapshot = try controller.viewSnapshot(dvui.currentWindow().arena(), backend, allow_mutations);
+    var snapshot = try controller.viewSnapshot(backend, allow_mutations);
     snapshot.title = switch (ui.kind) {
         .mod => instance.name,
         .resourcepack => "资源包",

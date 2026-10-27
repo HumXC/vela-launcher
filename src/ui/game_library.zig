@@ -26,6 +26,8 @@ pub const Options = struct {
     manifest_url: []const u8 = metadata.version_manifest_url,
     cache_root: ?[]const u8 = null,
     download_connections: u16 = 8,
+    /// Required for production requests; fixture-only controllers may omit it.
+    download_budget: ?*dl.Budget = null,
     /// Borrowed immutable adapter context must outlive the controller and joins.
     preview_transport: ?loaders.Transport = null,
 };
@@ -40,6 +42,7 @@ const Job = struct {
     manifest_url: []const u8,
     cache_root: ?[]const u8 = null,
     download_connections: u16 = 8,
+    download_budget: ?*dl.Budget = null,
     thread: ?std.Thread = null,
     canceled: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
@@ -68,6 +71,7 @@ const PreviewJob = struct {
     cache_root: ?[]const u8 = null,
     transport: ?loaders.Transport = null,
     service: ?*dl.Service = null,
+    download_budget: ?*dl.Budget = null,
     thread: ?std.Thread = null,
     canceled: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
@@ -98,7 +102,7 @@ const PreviewJob = struct {
         try self.control().check();
         // Catalogue URLs/hashes are authoritative only for the official manifest.
         if (!std.mem.eql(u8, self.manifest_url, metadata.version_manifest_url)) return error.UntrustedManifestUrl;
-        if (self.transport == null) self.service = try dl.Service.init(worker_allocator, self.io, 1);
+        if (self.transport == null) self.service = try dl.Service.init(worker_allocator, self.io, self.download_budget orelse return error.MissingDownloadBudget, 1);
         defer {
             if (self.service) |service| service.deinit();
             self.service = null;
@@ -158,7 +162,7 @@ const PreviewJob = struct {
         });
         defer {
             task.cancel();
-            while (!dl.terminal(task.snapshot().progress.phase)) self.io.sleep(.fromMilliseconds(10), .awake) catch {};
+            task.join();
             task.release() catch unreachable;
         }
         while (true) {
@@ -172,7 +176,7 @@ const PreviewJob = struct {
                 try self.control().check();
                 return bytes;
             }
-            try self.io.sleep(.fromMilliseconds(10), .awake);
+            try task.wait();
         }
     }
     fn cachePath(self: *PreviewJob, a: std.mem.Allocator, url: []const u8) !?[]u8 {
@@ -205,6 +209,7 @@ pub const Controller = struct {
     manifest_url: []const u8,
     cache_root: ?[]const u8 = null,
     download_connections: u16 = 8,
+    download_budget: ?*dl.Budget = null,
     active: ?*Job = null,
     published: ?*Job = null,
     phase: Phase = .idle,
@@ -238,7 +243,7 @@ pub const Controller = struct {
         } else null;
         errdefer if (cache_root) |path| a.free(path);
         try curl.globalInit();
-        return .{ .allocator = a, .io = io, .root = root, .manifest_url = manifest_url, .cache_root = cache_root, .download_connections = options.download_connections, .preview_transport = options.preview_transport };
+        return .{ .allocator = a, .io = io, .root = root, .manifest_url = manifest_url, .cache_root = cache_root, .download_connections = options.download_connections, .download_budget = options.download_budget, .preview_transport = options.preview_transport };
     }
     pub fn deinit(self: *Controller) void {
         self.cancel();
@@ -355,7 +360,7 @@ pub const Controller = struct {
     fn startPreviewJob(self: *Controller) !void {
         std.debug.assert(self.preview_active == null);
         const job = try worker_allocator.create(PreviewJob);
-        job.* = .{ .io = self.io, .manifest_url = undefined, .version_id = undefined, .generation = self.preview_generation, .transport = self.preview_transport };
+        job.* = .{ .io = self.io, .manifest_url = undefined, .version_id = undefined, .generation = self.preview_generation, .transport = self.preview_transport, .download_budget = self.download_budget };
         errdefer job.destroy();
         const a = job.arena.allocator();
         job.manifest_url = try a.dupe(u8, self.manifest_url);
@@ -402,7 +407,7 @@ pub const Controller = struct {
     }
     fn startJob(self: *Controller, operation: Operation) !void {
         const job = try worker_allocator.create(Job);
-        job.* = .{ .io = self.io, .operation = operation, .root = undefined, .manifest_url = undefined, .download_connections = self.download_connections };
+        job.* = .{ .io = self.io, .operation = operation, .root = undefined, .manifest_url = undefined, .download_budget = self.download_budget, .download_connections = self.download_connections };
         errdefer job.destroy();
         const a = job.arena.allocator();
         job.root = try a.dupe(u8, self.root);
@@ -435,7 +440,7 @@ fn perform(job: *Job) !void {
     switch (job.operation) {
         .refresh_installed => return,
         .catalogue => {
-            const service = try dl.Service.init(worker_allocator, job.io, job.download_connections);
+            const service = try dl.Service.init(worker_allocator, job.io, job.download_budget orelse return error.MissingDownloadBudget, job.download_connections);
             defer service.deinit();
             const bytes = try fetchManifest(job, service);
             defer worker_allocator.free(bytes);
@@ -483,7 +488,7 @@ fn fetchManifest(job: *Job, service: *dl.Service) ![]u8 {
     const task = try service.submit(.{ .url = job.manifest_url, .max_bytes = 64 * 1024 * 1024, .cache_path = cache_path });
     defer {
         task.cancel();
-        while (!dl.terminal(task.snapshot().progress.phase)) job.io.sleep(.fromMilliseconds(10), .awake) catch {};
+        task.join();
         task.release() catch unreachable;
     }
     while (true) {
@@ -494,7 +499,7 @@ fn fetchManifest(job: *Job, service: *dl.Service) ![]u8 {
             if (state.progress.phase != .complete) return error.DownloadFailed;
             return worker_allocator.dupe(u8, state.result.?.bytes);
         }
-        try job.io.sleep(.fromMilliseconds(10), .awake);
+        try task.wait();
     }
 }
 pub fn validateVersionId(id: []const u8) !void {
@@ -979,7 +984,9 @@ test "controller busy cancellation joined shutdown and retry without network" {
     defer tmp.cleanup();
     var path_buffer: [4096]u8 = undefined;
     const len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = path_buffer[0..len], .manifest_url = "invalid://fixture" });
+    var budget = try dl.Budget.init(std.testing.io, 8);
+    defer budget.deinit();
+    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = path_buffer[0..len], .manifest_url = "invalid://fixture", .download_budget = &budget });
     defer controller.deinit();
     try std.testing.expectEqual(Phase.idle, controller.snapshot().phase);
     try controller.loadCatalogue();
@@ -1076,7 +1083,9 @@ test "loopback catalogue results publish only after tick joins the worker" {
     defer std.testing.allocator.free(url);
     var path_buffer: [4096]u8 = undefined;
     const len = try tmp.dir.realPath(io, &path_buffer);
-    var controller = try Controller.initWithOptions(std.testing.allocator, io, .{ .root = path_buffer[0..len], .manifest_url = url });
+    var budget = try dl.Budget.init(io, 1);
+    defer budget.deinit();
+    var controller = try Controller.initWithOptions(std.testing.allocator, io, .{ .root = path_buffer[0..len], .manifest_url = url, .download_budget = &budget });
     defer controller.deinit();
     const thread = try std.Thread.spawn(.{}, CatalogueFixture.serve, .{&fixture});
     defer {

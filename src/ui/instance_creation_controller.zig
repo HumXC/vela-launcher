@@ -8,6 +8,7 @@ const paths_mod = @import("../core/instances.zig");
 const CancelToken = std.atomic.Value(bool);
 const metadata = @import("../core/minecraft/metadata/root.zig");
 const vanilla = @import("../core/minecraft/metadata_loader.zig");
+const preparation = @import("../application/instance_preparation.zig");
 const loader = @import("../core/loaders/install.zig");
 const loaders = @import("../core/loaders/root.zig");
 const http = @import("../core/http_transport.zig");
@@ -128,21 +129,8 @@ fn sameRow(a: config.Instance, b: config.Instance) bool {
         a.min_memory_mb == b.min_memory_mb and a.max_memory_mb == b.max_memory_mb and a.debug_launch == b.debug_launch and
         (if (a.origin) |v| if (b.origin) |w| v.kind == w.kind and textEqual(v.project_id, w.project_id) and textEqual(v.version_id, w.version_id) else false else b.origin == null);
 }
-fn hostEnvironment() !metadata.rules.Environment {
-    return .{ .os_name = switch (builtin.os.tag) {
-        .linux => "linux",
-        .windows => "windows",
-        .macos => "osx",
-        else => return error.UnsupportedPlatform,
-    }, .arch = switch (builtin.cpu.arch) {
-        .x86_64 => "x86_64",
-        .aarch64 => "aarch64",
-        .x86 => "x86",
-        else => return error.UnsupportedArchitecture,
-    } };
-}
 fn checkEnvironment(env: metadata.rules.Environment) !void {
-    const actual = try hostEnvironment();
+    const actual = try preparation.environment();
     if (!textEqual(env.os_name, actual.os_name) or !textEqual(env.arch, actual.arch) or env.os_version.len != 0 or env.features.len != 0 or env.version_matcher != null) return error.PreparedMetadataMismatch;
 }
 fn matchingRow(store: *const config.Store, expected: config.Instance) !config.Instance {
@@ -681,24 +669,26 @@ pub const Controller = struct {
     }
     pub fn startExtended(self: *Controller, row: config.Instance, precommit: loader.Precommit, services: Services) !void {
         if (self.core.last_generation == std.math.maxInt(u64)) return error.IdExhausted;
-        try self.start(.{ .instance = row, .preparation_generation = self.core.last_generation + 1, .environment = try hostEnvironment(), .precommit = precommit }, services);
+        try self.start(.{ .instance = row, .preparation_generation = self.core.last_generation + 1, .environment = try preparation.environment(), .precommit = precommit }, services);
     }
     pub fn startOrdinary(self: *Controller, row: config.Instance, services: Services) !void {
         if (self.core.last_generation == std.math.maxInt(u64)) return error.IdExhausted;
         try services.instances.checkCreationAdmission(row);
-        try self.start(.{ .instance = row, .preparation_generation = self.core.last_generation + 1, .environment = try hostEnvironment() }, services);
+        try self.start(.{ .instance = row, .preparation_generation = self.core.last_generation + 1, .environment = try preparation.environment() }, services);
     }
     pub fn presentsCreation(self: *const Controller, manager: *const instances_manager.Manager) bool {
         return if (self.core.job) |job| manager.snapshot().task_id == job.instance_task_id else false;
     }
-    pub fn ownsInstancesPublication(self: *const Controller) bool {
-        return self.core.instance_owned;
-    }
-    pub fn ownsJavaDownload(self: *const Controller) bool {
-        return self.core.download_token != null;
-    }
-    pub fn ownsJavaDiscovery(self: *const Controller) bool {
-        return self.core.discovery_owned;
+    pub fn ownership(self: *const Controller) @import("../application/creation_runtime.zig").Ownership {
+        return .{
+            .pinned = switch (self.core.phase) {
+                .idle, .complete, .failed, .canceled => false,
+                else => true,
+            },
+            .java_discovery = self.core.discovery_owned,
+            .java_download = self.core.download_token != null,
+            .instances_publication = self.core.instance_owned,
+        };
     }
     pub fn cancel(self: *Controller, _: Services) void {
         self.core.cancelOwned();
@@ -944,6 +934,7 @@ const Fixture = struct {
     java: java_manager.Manager,
     instances: instances_manager.Manager,
     download: downloads.Controller,
+    download_budget: @import("../core/downloader.zig").Budget,
     row: config.Instance = .{ .id = "game", .name = "Display Name", .minecraft_version = "base", .loader = .vanilla, .max_memory_mb = 2048 },
     leased: bool = false,
     metadata_count: usize = 0,
@@ -957,7 +948,8 @@ const Fixture = struct {
         const io = std.testing.io;
         const self = try a.create(Fixture);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .tmp = std.testing.tmpDir(.{}), .root = undefined, .paths = undefined, .registry = tasks.Registry.init(a), .store = undefined, .java = undefined, .instances = undefined, .download = undefined };
+        self.* = .{ .a = a, .tmp = std.testing.tmpDir(.{}), .root = undefined, .paths = undefined, .registry = tasks.Registry.init(a), .store = undefined, .java = undefined, .instances = undefined, .download = undefined, .download_budget = try @import("../core/downloader.zig").Budget.init(io, 8) };
+        errdefer self.download_budget.deinit();
         errdefer self.tmp.cleanup();
         errdefer self.registry.deinit();
         self.root = try self.tmp.dir.realPathFileAlloc(io, ".", a);
@@ -978,6 +970,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture) void {
         self.instances.deinit();
         self.java.deinit();
+        self.download_budget.deinit();
         self.store.deinit();
         self.registry.deinit();
         self.paths.deinit();
@@ -989,7 +982,7 @@ const Fixture = struct {
         return .{ .store = &self.store, .java = &self.java, .java_download = &self.download, .instances = &self.instances };
     }
     fn request(self: *Fixture) !Request {
-        return .{ .instance = self.row, .preparation_generation = 9, .environment = try hostEnvironment() };
+        return .{ .instance = self.row, .preparation_generation = 9, .environment = try preparation.environment() };
     }
     fn controller(self: *Fixture) !Controller {
         return Controller.init(self.a, std.testing.io, self.root, .{ .task_registry = &self.registry, .runner = .{ .context = self, .manifest = catalogue, .fetcher = .{ .context = self, .fetch = fetch }, .probe = probe } });
@@ -1039,7 +1032,7 @@ const Fixture = struct {
             .vanilla => |value| value,
             else => return error.FixtureMissingVanillaProof,
         };
-        try prepared.owner.validateBinding(a, io, .{ .root = install_request.root, .instance_id = install_request.instance.id, .instance_name = install_request.instance.name, .version_id = install_request.instance.minecraft_version, .generation = prepared.generation, .environment = try hostEnvironment() });
+        try prepared.owner.validateBinding(a, io, try preparation.existingVanillaTarget(install_request.root, install_request.instance, prepared.generation));
         try self.tmp.dir.createDirPath(io, ".minecraft/versions/Display Name");
         try self.tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Display Name/committed.marker", .data = "committed" });
         try self.tmp.dir.createDirPath(io, ".vela/jdks");
@@ -1062,7 +1055,7 @@ const Fixture = struct {
     }
     fn advance(self: *Fixture, controller_value: *Controller) void {
         joinPrivate(controller_value);
-        if (controller_value.ownsInstancesPublication()) self.joinInstance();
+        if (controller_value.ownership().instances_publication) self.joinInstance();
         controller_value.tick(self.services());
     }
     fn until(self: *Fixture, controller_value: *Controller, phase: Phase) !void {
@@ -1221,7 +1214,7 @@ test "ordinary creation prepares exact runtime without pack policy or content ad
     try value.startOrdinary(fixture.row, fixture.services());
     const task_id = value.creationSnapshot().task_id.?;
     try std.testing.expect(value.presentsCreation(&fixture.instances));
-    try std.testing.expect(!value.ownsInstancesPublication());
+    try std.testing.expect(!value.ownership().instances_publication);
     try fixture.until(&value, .awaiting_publication);
     try std.testing.expectEqual(@as(usize, 0), fixture.store.snapshot().instances.len);
     try std.testing.expectEqual(@as(usize, 1), fixture.probe_count);
@@ -1266,7 +1259,7 @@ test "ordinary Fabric and Quilt creation uses registered Java 21 without an inst
                 .quilt => .quilt,
                 else => return error.InvalidLoader,
             };
-            try proof.validateBinding(a, io, .{ .root = request.root, .instance_id = request.instance.id, .instance_name = request.instance.name, .generation = prepared.generation, .selection = .{ .kind = kind, .base_id = request.instance.minecraft_version, .loader_id = request.instance.loader_version.? }, .environment = try hostEnvironment() });
+            try proof.validateBinding(a, io, .{ .root = request.root, .instance_id = request.instance.id, .instance_name = request.instance.name, .generation = prepared.generation, .selection = .{ .kind = kind, .base_id = request.instance.minecraft_version, .loader_id = request.instance.loader_version.? }, .environment = try preparation.environment() });
             try std.testing.expectEqual(@as(u64, 21), proof.requirements.runtime_major);
             try std.testing.expectEqual(@as(u64, 0), proof.requirements.installer_major);
             try std.testing.expect(request.installer_java == null);
@@ -1331,7 +1324,7 @@ test "ordinary gate freezes preparation then resumes and explicit shutdown retai
     try std.testing.expectEqual(Phase.cleaning, value.snapshot().phase);
     value.tickWithMutations(fixture.services(), false);
     try std.testing.expectEqual(Phase.canceled, value.snapshot().phase);
-    try std.testing.expect(!value.ownsInstancesPublication());
+    try std.testing.expect(!value.ownership().instances_publication);
     try std.testing.expect(!fixture.registry.hasActive());
     try std.testing.expectEqual(@as(usize, 0), fixture.store.snapshot().instances.len);
     try std.testing.expect(fixture.instances.pending != null and fixture.instances.active == null);
@@ -1371,13 +1364,16 @@ test "ordinary cancellation during metadata joins without starting Java or artif
     var value = try fixture.controller();
     defer value.deinit(fixture.services());
     try value.startOrdinary(fixture.row, fixture.services());
+    try std.testing.expect(value.ownership().pinned);
     value.cancel(fixture.services());
+    try std.testing.expect(value.ownership().pinned);
     for (0..8) |_| fixture.advance(&value);
     try std.testing.expectEqual(Phase.canceled, value.snapshot().phase);
     try std.testing.expect(value.core.job.?.thread == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.probe_count);
     try std.testing.expectEqual(@as(usize, 0), fixture.create_count);
-    try std.testing.expect(!value.ownsJavaDiscovery() and !value.ownsJavaDownload());
+    const released = value.ownership();
+    try std.testing.expect(!released.pinned and !released.java_discovery and !released.java_download and !released.instances_publication);
     try std.testing.expect(!fixture.registry.hasActive());
 }
 
@@ -1494,7 +1490,7 @@ test "ordinary coordinator registered Java cannot resolve or probe while deletio
         try std.testing.expectEqual(@as(usize, 0), fixture.create_count);
         try std.testing.expectEqual(task_count, fixture.registry.tasks().len);
         try std.testing.expectEqual(metadata_requests, fixture.metadata_count);
-        try std.testing.expect(!fixture.java.isSearching() and !value.ownsJavaDownload());
+        try std.testing.expect(!fixture.java.isSearching() and !value.ownership().java_download);
     }
     fixture.download.active_delete = null;
     try value.core.acquireJava(.runtime);
@@ -1529,7 +1525,7 @@ test "ordinary coordinator selected incompatible runtime never falls back or dow
     try std.testing.expectEqual(error.IncompatibleJava, value.snapshot().failure.?);
     try std.testing.expectEqual(@as(usize, 0), fixture.probe_count);
     try std.testing.expectEqual(@as(usize, 0), fixture.create_count);
-    try std.testing.expect(!value.ownsJavaDownload());
+    try std.testing.expect(!value.ownership().java_download);
 }
 
 test "ordinary coordinator fresh probe rejects a registered JVM whose actual major changed" {
@@ -1660,6 +1656,7 @@ const AutoJavaFixture = struct {
 
     fn initialize(self: *AutoJavaFixture, fixture: *Fixture) !void {
         fixture.download = try downloads.Controller.initWithOptions(fixture.a, std.testing.io, .{
+            .download_budget = &fixture.download_budget,
             .root = fixture.root,
             .task_registry = &fixture.registry,
             .transport = .{ .context = self, .get = get, .download = download },

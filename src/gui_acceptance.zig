@@ -240,7 +240,7 @@ pub fn frame() !dvui.App.Result {
         };
     }
     dvui.currentWindow().backend.impl.log_events = false;
-    if (f.library.snapshot().phase == .loading or f.java_manager.isSearching() or f.java_download_controller.isBusy() or f.servers.isBusy() or f.worlds.snapshot().worker_active or f.accounts.snapshot().busy or f.instance_manager.isBusy() or f.content.isBusy() or view.ordinaryCreationPinned(&f.creation_core) or f.cf_credentials.isBusy() or f.shutdown_prompt)
+    if (f.library.snapshot().phase == .loading or f.java_manager.isSearching() or f.java_download_controller.isBusy() or f.servers.isBusy() or f.worlds.snapshot().worker_active or f.accounts.snapshot().busy or f.instance_manager.isBusy() or f.content.isBusy() or f.creation_core.ownership().pinned or f.cf_credentials.isBusy() or f.shutdown_prompt)
         dvui.refresh(null, @src(), null);
     return .ok;
 }
@@ -313,6 +313,7 @@ const FixtureVault = struct {
 const Fixture = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    download_budget: @import("core/downloader.zig").Budget,
     viewport: dvui.Size,
     model: state.Model,
     paths: instances.Paths,
@@ -379,7 +380,7 @@ const Fixture = struct {
             .platform = try controller.hostPlatform(),
             .download_connections = controller.download_connections,
             .task = task,
-            .service_adapter = .{ .service = controller.service, .io = f.io },
+            .service_adapter = .{ .service = controller.service },
             .transport = controller.fixture_transport.?,
             .extractor = controller.fixture_extractor,
             .probe = controller.probe,
@@ -574,7 +575,7 @@ const Fixture = struct {
         f.instance_data.hold_installer.store(hold == .installer, .release);
     }
     fn creationPinned(f: *const Fixture) bool {
-        return view.ordinaryCreationPinned(&f.creation_core);
+        return f.creation_core.ownership().pinned;
     }
 
     // Same ownership and JOIN order as App; no global content selection here.
@@ -587,27 +588,20 @@ const Fixture = struct {
         f.coordinator.tick();
         f.library.tick();
         try seedFixtureCatalogue(f);
-        if (!f.creation_core.ownsJavaDiscovery()) {
-            f.java_manager.tick();
-            f.ticks.java += 1;
-        }
+        const creation_owners = f.creation_core.ownership();
+        if (creation_owners.tickJava(&f.java_manager)) f.ticks.java += 1;
         f.launcher.tick();
-        if (!f.creation_core.ownsJavaDownload()) {
-            f.java_download_controller.tick(&f.java_manager);
-            f.ticks.java_download += 1;
-        }
+        if (creation_owners.tickJavaDownload(&f.java_download_controller, &f.java_manager)) f.ticks.java_download += 1;
         f.servers.tick();
         f.worlds.tick();
         f.accounts.tick(&f.configuration);
-        if (!f.creation_core.ownsInstancesPublication()) {
-            f.instance_manager.tick();
-            f.ticks.instances += 1;
-        }
+        if (creation_owners.tickInstances(&f.instance_manager)) f.ticks.instances += 1;
         f.creation_core.tick(f.creationServices());
         f.ticks.creation_core += 1;
         f.content.tick();
         f.ticks.content += 1;
         f.cf_credentials.tick(&f.configuration);
+        try f.download_budget.setLimit(f.configuration.snapshot().settings.download_connections);
         const snapshot = f.content.snapshot();
         if (!f.creationPinned() and !f.configuration.publicationUncertain()) {
             f.instance_manager.setDownloadConnections(f.configuration.snapshot().settings.download_connections);
@@ -750,6 +744,8 @@ const Fixture = struct {
         if (scene == .@"instance-prepared") try instance_fixture.initPrepared(&f.instance_data, a, io, root);
         f.configuration = try config.Store.init(a, io, root);
         errdefer f.configuration.deinit();
+        f.download_budget = try @import("core/downloader.zig").Budget.init(io, f.configuration.snapshot().settings.download_connections);
+        errdefer f.download_budget.deinit();
         const initial_document = f.configuration.snapshot();
         const fresh_configuration = initial_document.instances.len == 0 and initial_document.accounts.len == 0 and initial_document.servers.len == 0;
         try seedConfiguration(&f.configuration);
@@ -778,6 +774,7 @@ const Fixture = struct {
         const instance_mutation = f.coordinator.mutation(2);
         try seedGames(f);
         f.library = try games.Controller.initWithOptions(a, io, .{
+            .download_budget = &f.download_budget,
             .root = f.paths.minecraft,
             .manifest_url = "fixture-disabled://catalogue",
             .cache_root = f.paths.cache,
@@ -802,6 +799,7 @@ const Fixture = struct {
         errdefer f.appearance.deinit();
         f.appearance.picker = &f.picker;
         f.java_download_controller = try java_download.Controller.initWithOptions(a, io, .{
+            .download_budget = &f.download_budget,
             .root = root,
             .task_registry = &f.registry,
             .transport = .{ .context = f, .get = disabledJavaGet, .download = disabledJavaDownload },
@@ -829,12 +827,12 @@ const Fixture = struct {
         errdefer f.accounts_ui.deinit();
         try seedOfflineAccount(&f.accounts, &f.configuration);
         f.accounts.tick(&f.configuration);
-        f.instance_manager = try instances_manager.Manager.init(a, io, &f.paths, &f.registry, f.coordinator.guard(instance_mutation), .{
+        f.instance_manager = try instances_manager.Manager.initWithOptions(a, io, &f.paths, &f.registry, f.coordinator.guard(instance_mutation), .{
             .context = instance_mutation,
             .acquire = instance_leases.Mutation.acquireCallback,
             .recheck = instance_leases.Mutation.recheckCallback,
             .release = instance_leases.Mutation.releaseCallback,
-        });
+        }, .{ .download_budget = &f.download_budget });
         errdefer f.instance_manager.deinit();
         f.instance_manager.setWorkerRecheck(instance_leases.Mutation.workerRecheckCallback);
         f.instance_manager.setInstaller(if (scene == .@"instance-prepared" or std.c.getenv("VELA_FIXTURE_INSTANCE_TASK") != null) instance_fixture.preparedInstaller(&f.instance_data) else .{ .context = f, .run = disabledInstanceInstall });
@@ -846,7 +844,7 @@ const Fixture = struct {
         f.content = try content_manager.Manager.initOptions(a, io, &f.paths, &f.registry, .{
             .lease = f.instance_data.contentLease(.{ .context = content_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback }, instance_leases.Mutation.workerRecheckCallback),
             .worker_recheck = instance_fixture.Context.workerRecheck,
-            .transport_options = if (isResourcePreview(panel)) .{ .fixture_http = resource_navigation.execute, .fixture_context = &f.resource_http_navigation, .approved_download_hosts = &.{"cdn.modrinth.com"} } else .{ .fixture_http = instance_fixture.Context.denyHttp, .fixture_context = &f.instance_data, .allow_curseforge = false, .approved_download_hosts = &.{} },
+            .transport_options = if (isResourcePreview(panel)) .{ .download_budget = &f.download_budget, .fixture_http = resource_navigation.execute, .fixture_context = &f.resource_http_navigation, .approved_download_hosts = &.{"cdn.modrinth.com"} } else .{ .download_budget = &f.download_budget, .fixture_http = instance_fixture.Context.denyHttp, .fixture_context = &f.instance_data, .allow_curseforge = false, .approved_download_hosts = &.{} },
             .fixture_credential_store = f.cf_vault.store(),
             .fixture_fault = .{ .context = f, .boundary = disabledContentMutation },
         });
@@ -942,6 +940,7 @@ const Fixture = struct {
         f.appearance.deinit();
         f.picker.deinit();
         f.library.deinit();
+        f.download_budget.deinit();
         f.cf_credentials.deinit();
         f.cf_vault.deinit();
         f.settings.deinit();

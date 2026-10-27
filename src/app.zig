@@ -69,6 +69,7 @@ fn start() dvui.App.StartOptions {
 
 var model: state.Model = .{};
 var library: game_library.Controller = undefined;
+var download_budget: @import("core/downloader.zig").Budget = undefined;
 var library_initialized = false;
 var java: java_manager.Manager = undefined;
 var java_ui: java_view.Ui = undefined;
@@ -219,6 +220,8 @@ pub fn init(win: *dvui.Window) !void {
         return err;
     };
     errdefer configuration.deinit();
+    download_budget = try @import("core/downloader.zig").Budget.init(main_init.io, configuration.snapshot().settings.download_connections);
+    errdefer download_budget.deinit();
     if (acceptance_enabled) try acceptance.validateProfile(configuration.snapshot());
     if (@import("builtin").os.tag == .windows) try configuration.prepareStorage();
     observed_instances = instanceFingerprint(configuration.snapshot());
@@ -251,6 +254,7 @@ pub fn init(win: *dvui.Window) !void {
         }
     }
     var library_options: game_library.Options = .{
+        .download_budget = &download_budget,
         .root = paths.minecraft,
         .cache_root = paths.cache,
     };
@@ -264,7 +268,8 @@ pub fn init(win: *dvui.Window) !void {
     java_ui = java_view.Ui.init(main_init.gpa);
     java_ui.picker_service = &picker;
     errdefer java_ui.deinit();
-    var java_options: java_download_controller.Options = if (acceptance_enabled) acceptance.javaOptions(paths.root, &tasks) else .{ .root = paths.root, .task_registry = &tasks };
+    var java_options: java_download_controller.Options = if (acceptance_enabled) acceptance.javaOptions(paths.root, &tasks, &download_budget) else .{ .root = paths.root, .task_registry = &tasks, .download_budget = &download_budget };
+    java_options.download_budget = &download_budget;
     java_options.owned_delete_admission = .{ .check = checkOwnedJavaDeletion };
     java_download = try java_download_controller.Controller.initWithOptions(main_init.gpa, main_init.io, java_options);
     errdefer java_download.deinit();
@@ -285,7 +290,7 @@ pub fn init(win: *dvui.Window) !void {
     errdefer accounts_ui.deinit();
     accounts.tick(&configuration);
     const instance_mutation = leases.mutation(2);
-    instance_manager = try instances_manager.Manager.initWithOptions(main_init.gpa, main_init.io, &paths, &tasks, leases.guard(instance_mutation), .{ .context = instance_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback }, .{ .cache_root = paths.cache });
+    instance_manager = try instances_manager.Manager.initWithOptions(main_init.gpa, main_init.io, &paths, &tasks, leases.guard(instance_mutation), .{ .context = instance_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback }, .{ .cache_root = paths.cache, .download_budget = &download_budget });
     errdefer instance_manager.deinit();
     instance_manager.setWorkerRecheck(instance_leases.Mutation.workerRecheckCallback);
     instance_manager.setCreationAdmission(.{ .check = checkJavaForCreation });
@@ -297,7 +302,7 @@ pub fn init(win: *dvui.Window) !void {
     const content_options: content_manager.Options = .{
         .lease = .{ .context = content_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback },
         .worker_recheck = instance_leases.Mutation.workerRecheckCallback,
-        .transport_options = .{ .allow_curseforge = true },
+        .transport_options = .{ .allow_curseforge = true, .download_budget = &download_budget },
         .allow_curseforge_remote = true,
     };
     content = try content_manager.Manager.initOptions(main_init.gpa, main_init.io, &paths, &tasks, if (acceptance_enabled) acceptance.contentOptions(content_options) else content_options);
@@ -309,7 +314,7 @@ pub fn init(win: *dvui.Window) !void {
     mods_ui.acquisition.picker = &picker;
     ordinary_creation = try instance_creation_controller.Controller.init(main_init.gpa, main_init.io, paths.root, .{ .task_registry = &tasks });
     errdefer ordinary_creation.deinit(creationServices());
-    packs = try @import("ui/pack_page.zig").Page.init(main_init.gpa, main_init.io, &paths, &tasks);
+    packs = try @import("ui/pack_page.zig").Page.init(main_init.gpa, main_init.io, &paths, &tasks, &download_budget);
     errdefer packs.deinit(creationServices());
     packs.ui.picker_service = &picker;
     try window.init(win);
@@ -357,6 +362,7 @@ pub fn deinit(win: *dvui.Window) void {
         picker.deinit();
         java.deinit();
         library.deinit();
+        download_budget.deinit();
         tasks.deinit();
         configuration.deinit();
         paths.deinit();
@@ -429,15 +435,16 @@ fn frameActive() !dvui.App.Result {
         } else library.cancelPreview();
     } else library.cancelPreview();
     packs.syncActive(model.panel == .instances and instances_ui.mode == .packs, creationServices());
-    if (!ordinary_creation.ownsJavaDiscovery() and !packs.installer.ownsJavaDiscovery()) java.tick();
+    const creation_owners = ordinary_creation.ownership().merge(packs.installer.ownership());
+    _ = creation_owners.tickJava(&java);
     launcher.tick();
     leases.tick();
-    if (!ordinary_creation.ownsJavaDownload() and !packs.installer.ownsJavaDownload()) java_download.tick(&java);
+    _ = creation_owners.tickJavaDownload(&java_download, &java);
     servers.tick();
     world_manager.tick();
     avatars.tick();
     accounts.tick(&configuration);
-    if (!ordinary_creation.ownsInstancesPublication() and !packs.installer.ownsInstancesPublication()) instance_manager.tick();
+    _ = creation_owners.tickInstances(&instance_manager);
     ordinary_creation.tickWithMutations(creationServices(), policy.shutdown == .none);
     packs.tick(creationServices(), policy.shutdown == .none);
     content.tick();
@@ -455,13 +462,14 @@ fn frameActive() !dvui.App.Result {
     if (configuration.snapshot().selected_instance) |id| {
         if (instance_paths.findById(configuration.snapshot(), id)) |instance| _ = model.active_game.set(instance.name);
     }
+    try download_budget.setLimit(configuration.snapshot().settings.download_connections);
     try library.setDownloadConnections(configuration.snapshot().settings.download_connections);
-    if (!view.ordinaryCreationPinned(&ordinary_creation) and !packs.pinned()) {
+    if (!ordinary_creation.ownership().merge(packs.installer.ownership()).pinned) {
         try java_download.setDownloadConnections(configuration.snapshot().settings.download_connections);
         instance_manager.setDownloadConnections(configuration.snapshot().settings.download_connections);
         try content.setDownloadConnections(configuration.snapshot().settings.download_connections);
     }
-    if (!view.ordinaryCreationPinned(&ordinary_creation) and !packs.pinned() and !content.isBusy() and !content.snapshot().recovery_required) {
+    if (!ordinary_creation.ownership().merge(packs.installer.ownership()).pinned and !content.isBusy() and !content.snapshot().recovery_required) {
         const settings = configuration.snapshot().settings;
         var cf_policy: content_manager.CurseForgePolicy = .{
             .enabled = settings.curseforge_enabled and !configuration.publicationUncertain() and cf_credentials != null and !cfCredentialsLease(),
@@ -539,10 +547,10 @@ fn frameActive() !dvui.App.Result {
         return .close;
     }
     dvui.currentWindow().backend.impl.log_events = false;
-    if (phase == .loading or java.isSearching() or java_download.isBusy() or servers.isBusy() or world_manager.snapshot().worker_active or accounts.snapshot().busy or instance_manager.isBusy() or content.isBusy() or cfCredentialsBusy() or view.ordinaryCreationPinned(&ordinary_creation) or packs.busy() or launch_phase == .preparing or launch_phase == .running or policy.shutdown != .none) dvui.refresh(null, @src(), null);
+    if (phase == .loading or java.isSearching() or java_download.isBusy() or servers.isBusy() or world_manager.snapshot().worker_active or accounts.snapshot().busy or instance_manager.isBusy() or content.isBusy() or cfCredentialsBusy() or ordinary_creation.ownership().pinned or packs.busy() or launch_phase == .preparing or launch_phase == .running or policy.shutdown != .none) dvui.refresh(null, @src(), null);
     if (acceptance_enabled and !tasks.hasActive()) tasks.pruneFinished(0);
     if (acceptance_enabled) try acceptance.afterFrame(.{
-        .startup_idle = model.panel == .home and active == 0 and tasks.tasks().len == 0 and phase == .complete and !java.isSearching() and !java_download.isBusy() and !servers.isBusy() and !world_manager.snapshot().worker_active and world_manager.snapshot().failure == null and !accounts.snapshot().busy and !instance_manager.isBusy() and !content.isBusy() and content.snapshot().failure == null and !cfCredentialsBusy() and !view.ordinaryCreationPinned(&ordinary_creation),
+        .startup_idle = model.panel == .home and active == 0 and tasks.tasks().len == 0 and phase == .complete and !java.isSearching() and !java_download.isBusy() and !servers.isBusy() and !world_manager.snapshot().worker_active and world_manager.snapshot().failure == null and !accounts.snapshot().busy and !instance_manager.isBusy() and !content.isBusy() and content.snapshot().failure == null and !cfCredentialsBusy() and !ordinary_creation.ownership().pinned,
         .game = launcher.snapshot(),
         .world = world_manager.snapshot(),
         .accounts = accounts.snapshot(),
@@ -563,12 +571,12 @@ fn checkJavaForCreation(_: ?*anyopaque) !void {
 
 fn checkOwnedJavaDeletion(_: ?*anyopaque) !void {
     const phase = launcher.snapshot().phase;
-    if (phase == .preparing or phase == .running or instance_manager.isBusy() or view.ordinaryCreationPinned(&ordinary_creation) or packs.pinned()) return error.JavaInUse;
+    if (phase == .preparing or phase == .running or instance_manager.isBusy() or ordinary_creation.ownership().merge(packs.installer.ownership()).pinned) return error.JavaInUse;
 }
 
 fn reserveLaunch(_: ?*anyopaque, instance_name: []const u8) !void {
     try checkJavaForCreation(null);
-    if (view.ordinaryCreationPinned(&ordinary_creation) or packs.pinned()) return error.InstanceBusy;
+    if (ordinary_creation.ownership().merge(packs.installer.ownership()).pinned) return error.InstanceBusy;
     leases.tick();
     const instance = instance_paths.findByName(configuration.snapshot(), instance_name) orelse return error.InstanceNotConfigured;
     try leases.reserveLaunch(instance.id);
@@ -619,7 +627,7 @@ fn activeBackgroundCount() usize {
     if (servers.isBusy()) count += 1;
     if (world_manager.snapshot().worker_active and world_manager.snapshot().loading) count += 1;
     if (accounts.snapshot().busy) count += 1;
-    if (view.ordinaryCreationPinned(&ordinary_creation)) count += 1;
+    if (ordinary_creation.ownership().pinned) count += 1;
     if (packs.busy()) count += 1;
     if (picker.isBusy()) count += 1;
     return count;

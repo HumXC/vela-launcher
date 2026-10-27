@@ -38,7 +38,9 @@ test "pack online prepare shows a task then confirms or reports failure and canc
         const services: install.Services = .{ .store = &store, .java = undefined, .java_download = undefined, .instances = undefined };
         var registry = @import("core/tasks.zig").Registry.init(a);
         defer registry.deinit();
-        var page = try page_mod.Page.init(a, io, &fixture.paths, &registry);
+        var budget = try @import("core/downloader.zig").Budget.init(io, 8);
+        defer budget.deinit();
+        var page = try page_mod.Page.init(a, io, &fixture.paths, &registry, &budget);
         defer page.deinit(services);
         // Always release the fixture before Page joins its worker, including on assertion failure.
         defer download.release.store(true, .release);
@@ -119,7 +121,9 @@ test "local pack inspection shows failure and cancellation in the task modal and
     const services: install.Services = .{ .store = &store, .java = undefined, .java_download = undefined, .instances = undefined };
     var registry = @import("core/tasks.zig").Registry.init(a);
     defer registry.deinit();
-    var page = try page_mod.Page.init(a, io, &fixture.paths, &registry);
+    var budget = try @import("core/downloader.zig").Budget.init(io, 8);
+    defer budget.deinit();
+    var page = try page_mod.Page.init(a, io, &fixture.paths, &registry, &budget);
     defer page.deinit(services);
     page.ui.active = true;
     page.ui.route = .local;

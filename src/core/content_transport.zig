@@ -18,6 +18,8 @@ pub const HttpFunction = *const fn (?*anyopaque, Allocator, std.Io, http.Request
 pub const Adapter = struct {
     pub const Options = struct {
         http: http.Options = .{},
+        /// Required for production downloads; fixture-only transports need no network budget.
+        download_budget: ?*downloader.Budget = null,
         allow_curseforge: bool = false,
         /// Worker-only secret, borrowed only until initWithOptions returns.
         /// The adapter owns a private copy and securely erases it at deinit.
@@ -34,6 +36,7 @@ pub const Adapter = struct {
     io: std.Io,
     cancel: ?*const CancelToken,
     connections: u16,
+    download_budget: ?*downloader.Budget,
     allow_curseforge: bool,
     curseforge_download_key: ?[]u8,
     client: http.Client,
@@ -82,6 +85,7 @@ pub const Adapter = struct {
             .io = io,
             .cancel = cancel,
             .connections = connections,
+            .download_budget = options.download_budget,
             .allow_curseforge = options.allow_curseforge,
             .curseforge_download_key = key,
             .client = try http.Client.init(a, io, options.http),
@@ -188,7 +192,7 @@ pub const Adapter = struct {
             .follow_redirects = false,
             .require_public_address = true,
         };
-        if (self.service == null) self.service = try downloader.Service.init(self.allocator, self.io, self.connections);
+        if (self.service == null) self.service = try downloader.Service.init(self.allocator, self.io, self.download_budget orelse return error.MissingDownloadBudget, self.connections);
         const task = try self.service.?.submit(download);
         var cancellation: ?anyerror = null;
         while (true) {
@@ -213,9 +217,10 @@ pub const Adapter = struct {
                 task.cancel();
             };
             // Even on cancellation, drain the task before releasing borrowed inputs.
-            io.sleep(.fromMilliseconds(10), .awake) catch |err| {
+            task.wait() catch |err| {
                 cancellation = err;
                 task.cancel();
+                task.join();
             };
         }
     }

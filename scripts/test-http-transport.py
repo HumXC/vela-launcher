@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Run transport integration tests against an ephemeral loopback-only fixture."""
+"""Run transport integration tests against an ephemeral loopback-only fixture.
+
+Usage: python3 scripts/test-http-transport.py [--loader] [zig build options...]
+       python3 scripts/test-http-transport.py --test-exe PATH
+The second form runs an already compiled default Zig test executable.
+"""
+import argparse
 import os
 from pathlib import Path
 import subprocess
@@ -109,7 +115,26 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404)
 
 
-def main():
+def test_command(args=None, *, allow_loader=True):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--test-exe", metavar="PATH", help="run a compiled default Zig test executable without building")
+    if allow_loader:
+        parser.add_argument("--loader", action="store_true", help="also build and run Minecraft tests")
+    options, build_args = parser.parse_known_args(args)
+    loader = getattr(options, "loader", False)
+    if options.test_exe is not None:
+        if build_args or loader:
+            parser.error("--test-exe cannot be combined with --loader or zig build options")
+        # Preserve symlink names and resolve cwd without adding --listen.
+        return [os.path.abspath(options.test_exe)]
+    targets = ["test-http-transport"]
+    if loader:
+        targets.append("test-minecraft")
+    return ["zig", "build", *targets, *build_args]
+
+
+def main(args=None):
+    command = test_command(args)
     root = Path(__file__).resolve().parent.parent
     server = Fixture()
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -120,15 +145,10 @@ def main():
     env["HTTP_PROXY"] = env["http_proxy"] = "http://127.0.0.1:1"
     env["ALL_PROXY"] = env["all_proxy"] = "http://127.0.0.1:1"
     env["NO_PROXY"] = env["no_proxy"] = ""
-    args = sys.argv[1:]
-    targets = ["test-http-transport"]
-    if "--loader" in args:
-        args.remove("--loader")
-        targets.append("test-minecraft")
-    command = ["zig", "build", *targets, *args]
     print("Local HTTP transport fixture: " + env["HTTP_TRANSPORT_TEST_URL"], flush=True)
     try:
-        return subprocess.call(command, cwd=root, env=env)
+        status = subprocess.call(command, cwd=root, env=env)
+        return status if status >= 0 else 128 - status
     except KeyboardInterrupt:
         return 130
     finally:

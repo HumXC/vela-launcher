@@ -104,7 +104,7 @@ pub const Controller = struct {
     }
     pub fn inspect(self: *Controller, source: Source) !void {
         const core = self.core;
-        if (self.isBusy() or core.creation.ownsInstancesPublication()) return error.Busy;
+        if (self.isBusy() or core.creation.ownership().instances_publication) return error.Busy;
         const job = try core.a.create(InspectionJob);
         errdefer core.a.destroy(job);
         var arena: std.heap.ArenaAllocator = .init(core.a);
@@ -136,7 +136,7 @@ pub const Controller = struct {
     }
     pub fn setDecisions(self: *Controller, manual: []const content.ManualFile, optional: []const OptionalChoice) !void {
         const core = self.core;
-        if (self.isBusy() or core.creation.ownsInstancesPublication()) return error.Busy;
+        if (self.isBusy() or core.creation.ownership().instances_publication) return error.Busy;
         if (core.job == null or core.job.?.inspection == null) return error.MissingInspection;
         const pack = core.job.?.inspection.?.pack;
         for (optional, 0..) |choice, i| {
@@ -295,14 +295,10 @@ pub const Controller = struct {
             return core.creation.creationSnapshot().details;
         return pack;
     }
-    pub fn ownsInstancesPublication(self: *const Controller) bool {
-        return self.core.creation.ownsInstancesPublication();
-    }
-    pub fn ownsJavaDownload(self: *const Controller) bool {
-        return self.core.creation.ownsJavaDownload();
-    }
-    pub fn ownsJavaDiscovery(self: *const Controller) bool {
-        return self.core.creation.ownsJavaDiscovery();
+    pub fn ownership(self: *const Controller) @import("../application/creation_runtime.zig").Ownership {
+        var result = self.core.creation.ownership();
+        result.pinned = self.core.phase == .creating or result.instances_publication or result.java_discovery or result.java_download;
+        return result;
     }
     pub fn presentsCreation(self: *const Controller, manager: *const instances.Manager) bool {
         return self.core.started and self.core.creation.presentsCreation(manager);
@@ -365,8 +361,7 @@ test "pack controller cancellation joins inspection without taking shared creati
     controller.core.job.?.thread.?.join();
     controller.core.job.?.thread = null;
     controller.tick(undefined);
-    try std.testing.expect(!controller.ownsInstancesPublication());
-    try std.testing.expect(!controller.ownsJavaDiscovery());
-    try std.testing.expect(!controller.ownsJavaDownload());
+    const released = controller.ownership();
+    try std.testing.expect(!released.pinned and !released.instances_publication and !released.java_discovery and !released.java_download);
     try std.testing.expect(!controller.snapshot().busy);
 }

@@ -3,7 +3,8 @@
 //! Io and allocator must support ordinary concurrent OS threads.
 const std = @import("std");
 const curl = @import("curl");
-const public_network = @import("public_network.zig");
+const support = @import("curl_support.zig");
+pub const Budget = @import("download_budget.zig").Budget;
 const c = curl.libcurl;
 const Allocator = std.mem.Allocator;
 const capacity = 256;
@@ -53,14 +54,6 @@ fn validateCredentialRequest(request: Request) error{InvalidCredentialScope}!voi
     for (key) |byte| if (byte < 33 or byte > 126) return error.InvalidCredentialScope;
 }
 
-fn wipeHeaders(head: *c.curl_slist) void {
-    var node: ?*c.curl_slist = head;
-    while (node) |entry| {
-        if (entry.data != null) std.crypto.secureZero(u8, std.mem.span(entry.data));
-        node = entry.next;
-    }
-}
-
 fn timeoutAsLong(timeout_ms: u32) error{InvalidTimeout}!c_long {
     return std.math.cast(c_long, timeout_ms) orelse error.InvalidTimeout;
 }
@@ -104,7 +97,7 @@ pub const Request = struct {
     proxy: ?[]const u8 = null,
     /// PEM trust for both the origin and HTTPS proxy. Null loads native trust.
     ca_bundle: ?[]const u8 = null,
-    /// Zero disables the application transfer deadline and explicit connection budget.
+    /// Zero disables the total and explicit connection timeouts, not concurrency limits.
     timeout_ms: u32 = 120_000,
     /// Abort if throughput remains below one byte/second for this many seconds.
     /// Zero disables this optional protection.
@@ -138,8 +131,10 @@ pub const Task = struct {
     source: Source = .network,
     http_status: u16 = 0,
     canceled: std.atomic.Value(bool) = .init(false),
+    completion: std.Io.Event = .unset,
     release_requested: bool = false,
     easy: ?*c.CURL = null,
+    budget_held: bool = false,
     headers: ?*c.curl_slist = null,
     file: ?std.Io.File = null,
     owns_temp: bool = false,
@@ -166,6 +161,21 @@ pub const Task = struct {
         defer s.mutex.unlock(s.io);
         return .{ .progress = self.progress, .result = self.result, .failure = self.failure, .source = self.source, .http_status = self.http_status };
     }
+    /// Worker-only wait: completion wakes immediately; the bounded timeout lets
+    /// callers check their external cancellation tokens and publish progress.
+    pub fn wait(self: *Task) std.Io.Cancelable!void {
+        self.completion.waitTimeout(self.service.io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => return error.Canceled,
+        };
+    }
+
+    /// Cleanup wait after cancellation, or when no progress polling is needed.
+    /// The owner must still release the terminal task before destroying Service.
+    pub fn join(self: *Task) void {
+        self.completion.waitUncancelable(self.service.io);
+    }
+
     /// Cancellation is accepted before committing. A committed result wins races.
     pub fn cancel(self: *Task) void {
         const s = self.service;
@@ -200,6 +210,9 @@ pub const Task = struct {
         self.result = if (err == null) result else null;
         self.progress.phase = if (err) |e| (if (e == error.Canceled) .canceled else .failed) else .complete;
         self.progress.eta_seconds = null;
+        self.completion.set(s.io);
+        s.completion_revision +%= 1;
+        s.completed.broadcast(s.io);
     }
 };
 pub const Service = struct {
@@ -210,19 +223,22 @@ pub const Service = struct {
     worker: ?std.Thread = null,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
+    completed: std.Io.Condition = .init,
+    completion_revision: u64 = 0,
     tasks: [capacity]?*Task = @splat(null),
     stopping: std.atomic.Value(bool) = .init(false),
     network_done: bool = false,
     max_active: usize,
+    budget: *Budget,
     ca_bundle: std.ArrayList(u8) = .empty,
     ca_loaded: bool = false,
-    pub fn init(a: Allocator, io: std.Io, max_active: usize) !*Service {
+    pub fn init(a: Allocator, io: std.Io, budget: *Budget, max_active: usize) !*Service {
         if (max_active == 0 or max_active > capacity) return error.InvalidConcurrency;
         const s = try a.create(Service);
         errdefer a.destroy(s);
         const multi = c.curl_multi_init() orelse return error.CurlInit;
         errdefer _ = c.curl_multi_cleanup(multi);
-        s.* = .{ .allocator = a, .io = io, .multi = multi, .max_active = max_active };
+        s.* = .{ .allocator = a, .io = io, .multi = multi, .max_active = max_active, .budget = budget };
         s.worker = try std.Thread.spawn(.{}, work, .{s});
         errdefer {
             s.mutex.lockUncancelable(io);
@@ -234,6 +250,23 @@ pub const Service = struct {
         s.thread = try std.Thread.spawn(.{}, run, .{s});
         return s;
     }
+    /// Capture before scanning a batch so a completion during the scan cannot
+    /// be lost between observing task snapshots and starting the wait.
+    pub fn completionRevision(self: *Service) u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.completion_revision;
+    }
+    pub fn waitForCompletion(self: *Service, observed: u64) std.Io.Cancelable!void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        if (observed != self.completion_revision) return;
+        self.completed.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => return error.Canceled,
+        };
+    }
+
     pub fn submit(self: *Service, request: Request) !*Task {
         try validateCredentialRequest(request);
         _ = try timeoutAsLong(request.timeout_ms);
@@ -369,7 +402,7 @@ pub const Service = struct {
     fn prepare(self: *Service, t: *Task) !void {
         if (t.canceled.load(.acquire)) return error.Canceled;
         if (!self.ca_loaded and t.ca == null) {
-            self.ca_bundle = try curl.allocCABundle(self.allocator, self.io);
+            self.ca_bundle = try @import("curl_support.zig").collectNativeCA(self.allocator, self.io);
             self.ca_loaded = true;
         }
         if (t.destination != null) {
@@ -412,6 +445,8 @@ pub const Service = struct {
             };
             for (list) |item| if (item) |t| {
                 if (t.snapshot().progress.phase != .ready or active >= self.max_active) continue;
+                if (!self.budget.tryAcquire()) continue;
+                t.budget_held = true;
                 self.start(t) catch |err| {
                     self.cleanup(t);
                     t.finish(err, null);
@@ -485,6 +520,8 @@ pub const Service = struct {
         t.callback_error = null;
         try set(e, c.CURLOPT_URL, t.url.ptr);
         try set(e, c.CURLOPT_NOSIGNAL, @as(c_long, 1));
+        // A returned permit must not leave an idle cached connection behind.
+        try set(e, c.CURLOPT_FORBID_REUSE, @as(c_long, 1));
         try set(e, c.CURLOPT_FOLLOWLOCATION, @as(c_long, if (t.request.follow_redirects and !t.request.require_public_address) 1 else 0));
         try set(e, c.CURLOPT_MAXREDIRS, @as(c_long, 10));
         const protocols: [*:0]const u8 = if (t.request.https_only) "https" else "http,https";
@@ -501,26 +538,7 @@ pub const Service = struct {
         try set(e, c.CURLOPT_NOPROGRESS, @as(c_long, 0));
         try set(e, c.CURLOPT_XFERINFOFUNCTION, &progressCallback);
         try set(e, c.CURLOPT_XFERINFODATA, t);
-        if (t.request.require_public_address) {
-            try set(e, c.CURLOPT_OPENSOCKETFUNCTION, &public_network.openSocket);
-            try set(e, c.CURLOPT_FRESH_CONNECT, @as(c_long, 1));
-            try set(e, c.CURLOPT_FORBID_REUSE, @as(c_long, 1));
-            try set(e, c.CURLOPT_OPENSOCKETDATA, &t.callback_error);
-        }
-        try set(e, c.CURLOPT_PROXY, if (t.proxy) |p| p.ptr else @as([*:0]const u8, ""));
-        try set(e, c.CURLOPT_NOPROXY, @as([*:0]const u8, ""));
-        try set(e, c.CURLOPT_SSL_VERIFYPEER, @as(c_long, 1));
-        try set(e, c.CURLOPT_SSL_VERIFYHOST, @as(c_long, 2));
-        try set(e, c.CURLOPT_PROXY_SSL_VERIFYPEER, @as(c_long, 1));
-        try set(e, c.CURLOPT_PROXY_SSL_VERIFYHOST, @as(c_long, 2));
-        if (t.ca) |p| {
-            try set(e, c.CURLOPT_CAINFO, p.ptr);
-            try set(e, c.CURLOPT_PROXY_CAINFO, p.ptr);
-        } else {
-            const blob: c.curl_blob = .{ .data = self.ca_bundle.items.ptr, .len = self.ca_bundle.items.len, .flags = c.CURL_BLOB_NOCOPY };
-            try set(e, c.CURLOPT_CAINFO_BLOB, &blob);
-            try set(e, c.CURLOPT_PROXY_CAINFO_BLOB, &blob);
-        }
+        try support.configure(e, t.proxy orelse "", t.ca, self.ca_bundle.items, t.request.require_public_address, &t.callback_error);
         if (!t.retry_unconditional) if (t.cache_meta) |meta| {
             const value = if (meta.value.etag.len > 0) meta.value.etag else meta.value.modified;
             if (value.len > 0) {
@@ -556,10 +574,13 @@ pub const Service = struct {
             c.curl_easy_cleanup(e);
             t.easy = null;
         }
+        if (t.budget_held) {
+            t.budget_held = false;
+            self.budget.release();
+        }
         if (t.headers) |h| {
             // libcurl owns these allocations, but its free does not erase secrets.
-            wipeHeaders(h);
-            c.curl_slist_free_all(h);
+            support.freeHeaders(h);
             t.headers = null;
         }
         if (t.file) |f| {
@@ -748,7 +769,9 @@ fn progressCallback(userdata: ?*anyopaque, total: c.curl_off_t, now: c.curl_off_
 }
 
 test "first download bytes produce speed before the regular sampling interval" {
-    var service: Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1 };
+    var budget = try Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    var service: Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1, .budget = &budget };
     var url = "https://example.invalid/small.jar".*;
     var task: Task = .{ .service = &service, .request = .{ .url = &url }, .url = &url, .temp = &.{}, .progress = .{ .phase = .downloading }, .last_time = std.Io.Clock.awake.now(std.testing.io).nanoseconds - 10 * std.time.ns_per_ms };
     try std.testing.expectEqual(@as(c_int, 0), progressCallback(&task, 100, 50, 0, 0));
@@ -769,7 +792,9 @@ fn credentialFixtureRequest() Request {
 fn credentialAllocationFixture(a: Allocator) !void {
     const multi = c.curl_multi_init() orelse return error.CurlInit;
     defer _ = c.curl_multi_cleanup(multi);
-    var service: Service = .{ .allocator = a, .io = std.testing.io, .multi = multi, .max_active = 1 };
+    var budget = try Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    var service: Service = .{ .allocator = a, .io = std.testing.io, .multi = multi, .max_active = 1, .budget = &budget };
     var request = credentialFixtureRequest();
     request.ca_bundle = "fixture-ca-never-opened";
     request.proxy = "";
@@ -788,7 +813,9 @@ test "credential submit and curl header construction clean up every allocator fa
 
 test "credential scope rejects URL ambiguities and unsafe transfer options before enqueue" {
     // An undefined curl handle proves rejected submissions do not touch curl.
-    var service: Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1 };
+    var budget = try Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    var service: Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1, .budget = &budget };
     const invalid_urls = [_][]const u8{
         "http://edge.forgecdn.net/files/1/2/a.jar",
         "https://media.forgecdn.net/files/1/2/a.jar",
@@ -849,7 +876,9 @@ test "credential copy survives caller mutation and is removed on success failure
     const multi = c.curl_multi_init() orelse return error.CurlInit;
     defer _ = c.curl_multi_cleanup(multi);
     var audit: CredentialWipeAudit = .{};
-    var service: Service = .{ .allocator = audit.allocator(), .io = std.testing.io, .multi = multi, .max_active = 1 };
+    var budget = try Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    var service: Service = .{ .allocator = audit.allocator(), .io = std.testing.io, .multi = multi, .max_active = 1, .budget = &budget };
     for (0..5) |scenario| {
         var borrowed = "fixture-only-key".*;
         var request = credentialFixtureRequest();
@@ -879,17 +908,6 @@ test "credential copy survives caller mutation and is removed on success failure
     }
     try std.testing.expectEqual(@as(usize, 8), audit.secret_frees);
     try std.testing.expect(audit.wiped);
-}
-
-test "curl credential header list bytes are zeroed before libcurl frees them" {
-    var headers: *c.curl_slist = c.curl_slist_append(null, "x-api-key: fixture-only-key") orelse return error.OutOfMemory;
-    defer c.curl_slist_free_all(headers);
-    headers = c.curl_slist_append(headers, "another fixture header") orelse return error.OutOfMemory;
-    const first = std.mem.span(headers.data);
-    const second = std.mem.span(headers.next.*.data);
-    wipeHeaders(headers);
-    for (first) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
-    for (second) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
 const CredentialWipeAudit = struct {
@@ -923,4 +941,39 @@ test "owned key and temporary header are wiped on destruction" {
     try credentialAllocationFixture(audit.allocator());
     try std.testing.expectEqual(@as(usize, 2), audit.secret_frees);
     try std.testing.expect(audit.wiped);
+}
+
+test "completion notification preserves early and concurrent terminal publication" {
+    const io = std.testing.io;
+    const multi = c.curl_multi_init() orelse return error.CurlInit;
+    defer _ = c.curl_multi_cleanup(multi);
+    var budget = try Budget.init(io, 1);
+    defer budget.deinit();
+    var service: Service = .{ .allocator = std.testing.allocator, .io = io, .multi = multi, .max_active = 1, .budget = &budget };
+    var url = "https://example.invalid/notification".*;
+    var task: Task = .{ .service = &service, .request = .{ .url = &url }, .url = &url, .temp = &.{} };
+    const revision = service.completionRevision();
+    task.finish(error.ChecksumMismatch, null);
+    try service.waitForCompletion(revision);
+    try task.wait();
+    task.join();
+    task.cancel();
+    try std.testing.expectEqual(error.ChecksumMismatch, task.snapshot().failure.?);
+    try std.testing.expect(service.completionRevision() != revision);
+
+    var pending: Task = .{ .service = &service, .request = .{ .url = &url }, .url = &url, .temp = &.{} };
+    const Waiter = struct {
+        fn run(target: *Task, started: *std.Io.Event) void {
+            started.set(target.service.io);
+            target.join();
+        }
+    };
+    var started: std.Io.Event = .unset;
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &pending, &started });
+    defer thread.join();
+    started.waitUncancelable(io);
+    pending.cancel();
+    pending.finish(null, null);
+    try std.testing.expectEqual(Phase.canceled, pending.snapshot().progress.phase);
+    try std.testing.expect(pending.completion.isSet());
 }

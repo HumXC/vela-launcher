@@ -9,6 +9,7 @@ const tools = @import("tools_view.zig");
 const java = @import("java_manager.zig");
 const java_view = @import("java_view.zig");
 const launch = @import("game_launch.zig");
+const launch_instance = @import("../application/launch_instance.zig");
 const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
 const task_registry = @import("../core/tasks.zig");
@@ -200,28 +201,11 @@ pub const Services = struct {
 var launch_error: ?anyerror = null;
 const R = dvui.Rect;
 
-fn phasePinned(phase: ?instance_creation_controller.Phase) bool {
-    return switch (phase orelse return false) {
-        .idle, .complete, .failed, .canceled => false,
-        else => true,
-    };
-}
-
-pub fn ordinaryCreationPinned(controller: ?*const instance_creation_controller.Controller) bool {
-    return phasePinned(if (controller) |value| value.snapshot().phase else null);
-}
-
-const DispatchGates = struct { java: bool, instances: bool, content: bool, worlds: bool };
-
-fn dispatchGates(phase: ?instance_creation_controller.Phase, owns_instances: bool, owns_java: bool, allow_mutations: bool) DispatchGates {
-    const pinned = phasePinned(phase) or !allow_mutations;
-    return .{ .java = pinned or owns_java, .instances = pinned or owns_instances, .content = pinned, .worlds = pinned };
-}
-
-fn serviceGates(services: Services) DispatchGates {
-    const controller = services.ordinary_creation;
-    const pack_pinned = if (services.packs) |packs| packs.pinned() else false;
-    return dispatchGates(if (controller) |value| value.snapshot().phase else null, pack_pinned or (if (controller) |value| value.ownsInstancesPublication() else false), pack_pinned or (if (controller) |value| value.ownsJavaDiscovery() or value.ownsJavaDownload() else false), services.allow_mutations and !pack_pinned);
+fn serviceGates(services: Services) @import("../application/creation_runtime.zig").Gates {
+    const Ownership = @import("../application/creation_runtime.zig").Ownership;
+    const ordinary: Ownership = if (services.ordinary_creation) |controller| controller.ownership() else .{};
+    const pack: Ownership = if (services.packs) |page| page.installer.ownership() else .{};
+    return ordinary.merge(pack).gates(services.allow_mutations);
 }
 
 fn gatedTaskActionAllowed(action: ?instances_view.Action, allow_mutations: bool) bool {
@@ -511,7 +495,7 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
             }
         }
     }
-    if (services.packs) |packs| if (services.instances_ui) |ui| if (creationServices(services, manager)) |bound| packs.finish(model, ui, bound, services.allow_mutations and !ordinaryCreationPinned(services.ordinary_creation));
+    if (services.packs) |packs| if (services.instances_ui) |ui| if (creationServices(services, manager)) |bound| packs.finish(model, ui, bound, services.allow_mutations and !(if (services.ordinary_creation) |controller| controller.ownership().pinned else false));
     appearance_view.finish(services.appearance, services.configuration);
 }
 
@@ -551,59 +535,12 @@ fn startGame(manager: *java.Manager, launcher: *launch.Controller, services: Ser
         dvui.refresh(null, @src(), null);
         return;
     }
-    const selected_id = document.selected_instance orelse {
-        launch_error = error.InstanceNotSelected;
-        return;
-    };
-    const instance = instances.findById(document, selected_id) orelse {
-        launch_error = error.InstanceNotConfigured;
-        return;
-    };
-    const java_path = instance.java_path orelse manager.selectedPath(instance.name) orelse "";
-    const accounts = services.accounts orelse {
-        launch_error = error.NoAccountSelected;
+    const selection = launch_instance.prepare(document, manager, services.accounts) catch |err| {
+        launch_error = err;
         return;
     };
     const main_init = dvui.App.main_init orelse return;
-    const now_ms: u64 = @intCast(@max(0, std.Io.Clock.awake.now(main_init.io).toMilliseconds()));
-    var session = accounts.cloneLaunchSession(main_init.gpa, now_ms) catch |err| {
-        launch_error = err;
-        return;
-    };
-    defer session.deinit();
-    const game_directory = std.fs.path.join(main_init.gpa, &.{ launcher.root, "versions", instance.name }) catch |err| {
-        launch_error = err;
-        return;
-    };
-    defer main_init.gpa.free(game_directory);
-    var endpoint: ?launch.ServerEndpoint = null;
-    if (document.selected_server) |server_id| {
-        for (document.servers) |server| if (std.mem.eql(u8, server.id, server_id)) {
-            if (server.instance_id == null or !std.mem.eql(u8, server.instance_id.?, instance.id)) {
-                launch_error = error.ServerInstanceMismatch;
-                return;
-            }
-            endpoint = .{ .address = server.address, .port = server.port };
-            break;
-        };
-    }
-    launcher.startWithOptions(.{
-        .version = instance.name,
-        .java_path = java_path,
-        .java_major = 0,
-        .username = session.username,
-        .min_memory_mb = instance.min_memory_mb,
-        .max_memory_mb = instance.max_memory_mb orelse document.settings.default_memory_mb,
-    }, .{
-        .resolve_java_from_metadata = true,
-        .java_candidates = manager.entries(),
-        .debug = instance.debug_launch,
-        .instance_directory = game_directory,
-        .instance_id = instance.id,
-        .launcher_root = std.fs.path.dirname(launcher.root),
-        .identity = .{ .name = session.username, .uuid = session.uuid, .access_token = if (session.token) |token| token.bytes else "0", .user_type = if (session.kind == .microsoft) "msa" else "legacy" },
-        .server = endpoint,
-    }) catch |err| {
+    selection.start(main_init.gpa, main_init.io, launcher) catch |err| {
         launch_error = err;
     };
 }
@@ -755,7 +692,7 @@ fn content(model: *state.Model, snapshot: games.Snapshot, pending: *?state.Msg, 
             if (services.instances_ui) |ui| {
                 if (ui.mode == .packs and services.packs != null) {
                     const packs = services.packs.?;
-                    @import("pack_view.zig").draw(&packs.ui, try packs.presentation(dvui.currentWindow().arena()), services.allow_mutations and !ordinaryCreationPinned(services.ordinary_creation));
+                    @import("pack_view.zig").draw(&packs.ui, try packs.presentation(dvui.currentWindow().arena()), services.allow_mutations and !(if (services.ordinary_creation) |controller| controller.ownership().pinned else false));
                 } else instances_view.drawWithEnabled(ui, services.configuration, manager_, snapshot, manager.entries(), !gates.instances);
             }
         },
@@ -908,7 +845,7 @@ test "queued foreign Java commands and cancellation are discarded without replay
     try std.testing.expect(!javaIntents(&ui, &download_ui));
     try std.testing.expect(!download_ui.start_admitted);
     try std.testing.expect(ui.acquisition_open and ui.search_started);
-    const released = dispatchGates(.idle, false, false, true);
+    const released = (@import("../application/creation_runtime.zig").Ownership{}).gates(true);
     try std.testing.expect(!released.java and ui.commands.items.len == 0 and download_ui.pending == null);
 }
 

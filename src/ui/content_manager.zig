@@ -3,7 +3,7 @@
 const std = @import("std");
 const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
-const instance_preparation = @import("instances_manager.zig");
+const instance_preparation = @import("../application/instance_preparation.zig");
 const tasks = @import("../core/tasks.zig");
 const providers = @import("../core/content_providers.zig");
 const credentials = @import("../core/credentials.zig");
@@ -57,6 +57,7 @@ pub const Snapshot = struct {
     dependency_issues: []const providers.DependencyIssue = &.{},
     proposal: ?*const Proposal = null,
     installed: []const manifest.ManagedFile = &.{},
+    installed_revision: u64 = 0,
     transactions: []const []const u8 = &.{},
     report: ?*const install.Report = null,
     busy: bool = false,
@@ -294,6 +295,7 @@ pub const Manager = struct {
     versions_job: ?*Job = null,
     proposal_job: ?*Job = null,
     local_job: ?*Job = null,
+    installed_revision: u64 = 0,
     report_job: ?*Job = null,
     retired_stages: ?*Job = null,
     pending_refresh: bool = false,
@@ -378,6 +380,7 @@ pub const Manager = struct {
     }
     fn clearPublished(self: *Manager) void {
         self.retirePreview(null);
+        self.installed_revision +%= 1;
         inline for (.{ "catalog_job", "versions_job", "local_job", "report_job" }) |field| {
             if (@field(self, field)) |job| job.destroy();
             @field(self, field) = null;
@@ -408,6 +411,7 @@ pub const Manager = struct {
     }
     pub fn snapshot(self: *const Manager) Snapshot {
         var snap: Snapshot = .{ .instance = if (self.pinned) |job| job.instance else if (self.selected) |selected| selected.instance else null, .provider = self.provider, .policy_generation = self.policy_generation, .curseforge_available = self.canResolvePackReferences(), .busy = self.isBusy(), .failure = self.failure };
+        snap.installed_revision = self.installed_revision;
         if (self.catalog_job) |job| if (job.result.catalog) |catalog| {
             snap.catalog = catalog.projects;
         };
@@ -698,6 +702,7 @@ pub const Manager = struct {
                     inline for (.{ "catalog_job", "versions_job", "proposal_job", "local_job", "report_job" }) |name| if (std.mem.eql(u8, field, name)) {
                         if (comptime std.mem.eql(u8, name, "proposal_job")) self.retirePreview(job.stage()) else if (@field(self, name)) |old| old.destroy();
                         @field(self, name) = job;
+                        if (comptime std.mem.eql(u8, name, "local_job")) self.installed_revision +%= 1;
                     };
                     if (committed) {
                         self.retirePreview(null);

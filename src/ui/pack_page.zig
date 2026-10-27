@@ -31,13 +31,14 @@ pub const Page = struct {
     pending_offset: u32 = 0,
     publication_attempted: bool = false,
     download_connections: u16 = 8,
-    pub fn init(a: A, io: std.Io, paths: *const paths_mod.Paths, registry: *tasks.Registry) !Page {
-        var browser = try catalog.Controller.init(a, io, .{ .transport_options = .{ .allow_curseforge = true } });
+    download_budget: *@import("../core/downloader.zig").Budget,
+    pub fn init(a: A, io: std.Io, paths: *const paths_mod.Paths, registry: *tasks.Registry, download_budget: *@import("../core/downloader.zig").Budget) !Page {
+        var browser = try catalog.Controller.init(a, io, .{ .transport_options = .{ .allow_curseforge = true, .download_budget = download_budget } });
         errdefer browser.deinit();
-        const installer = try install.Controller.init(a, io, paths, .{ .creation_options = .{ .task_registry = registry } });
+        const installer = try install.Controller.init(a, io, paths, .{ .creation_options = .{ .task_registry = registry }, .backend_options = .{ .transport_options = .{ .download_budget = download_budget } } });
         var ui = view.Ui.init(a);
         ui.icon_cache = @import("resource_icons.zig").Manager.init(a, io);
-        return .{ .allocator = a, .io = io, .ui = ui, .browser = browser, .installer = installer };
+        return .{ .allocator = a, .io = io, .ui = ui, .browser = browser, .installer = installer, .download_budget = download_budget };
     }
     pub fn deinit(self: *Page, services: install.Services) void {
         self.ui.deinit();
@@ -45,7 +46,7 @@ pub const Page = struct {
         self.installer.deinit(services);
     }
     pub fn pinned(self: *const Page) bool {
-        return self.installer.snapshot().phase == .creating or self.installer.ownsInstancesPublication() or self.installer.ownsJavaDiscovery() or self.installer.ownsJavaDownload();
+        return self.installer.ownership().pinned;
     }
     pub fn busy(self: *const Page) bool {
         return self.installer.isBusy() or self.browser.current != null or self.browser.retired != null or (if (self.ui.icon_cache) |*icons| icons.busy() else false);
@@ -59,7 +60,7 @@ pub const Page = struct {
             self.lookup = .none;
             return; // Retry after tick retires canceled workers without blocking the UI.
         }
-        var replacement = try catalog.Controller.init(self.allocator, self.io, .{ .transport_options = .{ .allow_curseforge = true }, .curseforge = policy });
+        var replacement = try catalog.Controller.init(self.allocator, self.io, .{ .transport_options = .{ .allow_curseforge = true, .download_budget = self.download_budget }, .curseforge = policy });
         errdefer replacement.deinit();
         self.browser.deinit();
         self.browser = replacement;

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Run Zig downloader tests against an isolated loopback HTTP fixture.
 
-Usage: direnv exec . python3 scripts/test-downloader.py [zig build options...]
-Requires Python 3 and the project's Zig toolchain; no third-party Python modules.
+Usage: python3 scripts/test-downloader.py [zig build options...]
+       python3 scripts/test-downloader.py --test-exe PATH
+The second form runs an already compiled default Zig test executable.
+Requires Python 3; only the first form requires the project Zig toolchain.
 """
 
+import argparse
 import collections
 import http.server
 import json
@@ -130,7 +133,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(404, b"not found")
 
 
-def main():
+def test_command(args=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--test-exe", metavar="PATH", help="run a compiled default Zig test executable without building")
+    options, build_args = parser.parse_known_args(args)
+    if options.test_exe is not None:
+        if build_args:
+            parser.error("--test-exe cannot be combined with zig build options")
+        # Preserve symlink names and resolve cwd without adding --listen.
+        return [os.path.abspath(options.test_exe)]
+    return ["zig", "build", "test-downloader", *build_args]
+
+
+def main(args=None):
+    command = test_command(args)
     root = Path(__file__).resolve().parent.parent
     server = Fixture()
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -139,10 +155,10 @@ def main():
     env["DOWNLOADER_TEST_URL"] = "http://127.0.0.1:" + str(server.server_port)
     # Keep local tests independent from the developer's network proxy settings.
     env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
-    command = ["zig", "build", "test-downloader", *sys.argv[1:]]
     print("Local downloader fixture: " + env["DOWNLOADER_TEST_URL"], flush=True)
     try:
-        return subprocess.call(command, cwd=root, env=env)
+        status = subprocess.call(command, cwd=root, env=env)
+        return status if status >= 0 else 128 - status
     except KeyboardInterrupt:
         return 130
     finally:

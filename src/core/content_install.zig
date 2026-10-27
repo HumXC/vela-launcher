@@ -71,6 +71,8 @@ pub const Options = struct {
     cancel: ?*const std.atomic.Value(bool) = null,
     deadline_ns: ?i96 = null,
     fetcher: ?Fetcher = null,
+    /// Required when the production fetcher opens a network transfer.
+    download_budget: ?*downloader.Budget = null,
     proxy: ?[]const u8 = null,
     ca_bundle: ?[]const u8 = null,
     /// Exact trusted hosts, never suffix patterns; non-CDN pack sources need explicit approval.
@@ -348,6 +350,7 @@ const ProductionFetcher = struct {
     allocator: A,
     io: Io,
     service: ?*downloader.Service = null,
+    download_budget: ?*downloader.Budget,
     proxy: ?[]const u8,
     ca_bundle: ?[]const u8,
     fn deinit(self: *ProductionFetcher) void {
@@ -362,7 +365,7 @@ const ProductionFetcher = struct {
         if (self.service == null) {
             try curl.globalInit();
             errdefer curl.globalDeinit();
-            self.service = try downloader.Service.init(self.allocator, self.io, 1);
+            self.service = try downloader.Service.init(self.allocator, self.io, self.download_budget orelse return error.MissingDownloadBudget, 1);
         }
         const task = try self.service.?.submit(.{
             .url = request.url,
@@ -391,9 +394,10 @@ const ProductionFetcher = struct {
                 cancellation = err;
                 task.cancel();
             };
-            Io.sleep(io, .fromMilliseconds(10), .awake) catch |err| {
+            task.wait() catch |err| {
                 cancellation = err;
                 task.cancel();
+                task.join();
             };
         }
     }
@@ -692,7 +696,7 @@ pub fn execute(a: A, io: Io, options: Options) !Report {
     try fs.write(roots.metadata, io, manifest_temp, next_bytes);
     defer roots.metadata.deleteFile(io, manifest_temp) catch {};
     var entries: std.ArrayList(Entry) = .empty;
-    var production: ProductionFetcher = .{ .allocator = a, .io = io, .proxy = options.proxy, .ca_bundle = options.ca_bundle };
+    var production: ProductionFetcher = .{ .allocator = a, .io = io, .proxy = options.proxy, .ca_bundle = options.ca_bundle, .download_budget = options.download_budget };
     defer production.deinit();
     const fetcher = options.fetcher orelse Fetcher{ .context = &production, .fetchToFile = ProductionFetcher.fetchToFile };
     for (options.plan.actions) |action| {

@@ -3,12 +3,6 @@ const std = @import("std");
 const dl = @import("../downloader.zig");
 const tasks = @import("../tasks.zig");
 
-/// Wait for terminal ownership before copying or releasing a downloader handle.
-pub fn join(io: std.Io, task: *dl.Task) void {
-    task.cancel();
-    while (!dl.terminal(task.snapshot().progress.phase)) io.sleep(.fromMilliseconds(10), .awake) catch {};
-}
-
 pub fn file(path: []const u8, snapshot: dl.Snapshot) tasks.File {
     const state: tasks.FileState = switch (snapshot.progress.phase) {
         .queued, .preparing, .ready => .queued,
@@ -144,7 +138,9 @@ test "cleanup joins final partial snapshot and preserves a prior real failure un
     defer _ = curl.libcurl.curl_multi_cleanup(multi);
     // This stack task is never submitted. The only worker publishes a final sample
     // after observing cancellation; no network or filesystem operation is possible.
-    var service: dl.Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = multi, .max_active = 1 };
+    var budget = try dl.Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    var service: dl.Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = multi, .max_active = 1, .budget = &budget };
     var url = "https://example.invalid/partial.jar".*;
     var download: dl.Task = .{ .service = &service, .request = .{ .url = &url }, .url = &url, .temp = &.{}, .progress = .{ .phase = .downloading, .received = 8, .total = 128, .bytes_per_second = 20 } };
     var registry = tasks.Registry.init(std.testing.allocator);
@@ -160,11 +156,13 @@ test "cleanup joins final partial snapshot and preserves a prior real failure un
             task.progress.received = 37;
             task.progress.phase = .canceled;
             task.failure = error.Canceled;
+            task.completion.set(owner.io);
         }
     };
     const worker = try std.Thread.spawn(.{}, Worker.finish, .{&download});
     defer worker.join();
-    join(std.testing.io, &download);
+    download.cancel();
+    download.join();
     single(target, .downloading, &url, download.snapshot());
     const canceled = target.details();
     try std.testing.expectEqual(@as(u64, 37), canceled.received);
@@ -173,7 +171,8 @@ test "cleanup joins final partial snapshot and preserves a prior real failure un
     try std.testing.expectEqual(@as(f64, 0), canceled.bytes_per_second);
     download.progress.phase = .failed;
     download.failure = error.ChecksumMismatch;
-    join(std.testing.io, &download);
+    download.cancel();
+    download.join();
     single(target, .downloading, &url, download.snapshot());
     registry.finish(target, .canceled);
     const failed = target.details();

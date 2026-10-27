@@ -11,6 +11,8 @@ const content = @import("../core/content_install.zig");
 const loader_install = @import("../core/loaders/install.zig");
 const loader_base_install = @import("../core/loaders/base_install.zig");
 const metadata_loader = @import("../core/minecraft/metadata_loader.zig");
+const preparation = @import("../application/instance_preparation.zig");
+const downloader = @import("../core/downloader.zig");
 const A = std.mem.Allocator;
 const Io = std.Io;
 
@@ -70,12 +72,14 @@ pub const CreateRequest = struct {
     lease: content.Lease,
     namespace_token: ?namespace.Token = null,
     download_connections: u16 = 8,
+    download_budget: ?*downloader.Budget = null,
     installer_java: ?[]const u8 = null,
     metadata: CreationMetadata = .unprepared,
 };
 pub const Control = struct {
     cancel: *const std.atomic.Value(bool),
     task: ?*tasks.Task = null,
+    download_budget: ?*downloader.Budget = null,
     /// Immutable manager-owned root, frozen for the lifetime of the worker.
     cache_root: ?[]const u8 = null,
     pub fn check(self: Control) !void {
@@ -128,10 +132,6 @@ pub const Installer = struct {
     context: ?*anyopaque = null,
     run: *const fn (?*anyopaque, A, Io, CreateRequest, Control) anyerror!Installed,
 };
-pub const VanillaPreparationAdapter = struct {
-    context: ?*anyopaque = null,
-    prepare: *const fn (?*anyopaque, A, Io, metadata_loader.VanillaTarget, Control) anyerror!metadata_loader.PreparedVanilla = productionPrepareVanilla,
-};
 pub const CatalogueAdapter = struct {
     context: ?*anyopaque = null,
     fetch: *const fn (?*anyopaque, A, Io, []const u8, config.Loader, Control) anyerror!LoaderCatalogue,
@@ -144,6 +144,8 @@ pub const CacheClock = struct {
 };
 pub const Options = struct {
     cache_root: ?[]const u8 = null,
+    /// Shared owner must outlive this manager and its workers.
+    download_budget: ?*downloader.Budget = null,
     cache_clock: CacheClock = .{},
 };
 const loader_cache_capacity = 8;
@@ -219,6 +221,7 @@ const Job = struct {
     cache_root: ?[]const u8 = null,
     loader_generation: u64 = 0,
     download_connections: u16,
+    download_budget: ?*downloader.Budget = null,
     installer_java: ?[]const u8 = null,
     metadata: CreationMetadata = .unprepared,
     precommit: ?loader_install.Precommit = null,
@@ -254,7 +257,7 @@ const Job = struct {
     }
     fn perform(self: *Job) !void {
         const a = std.heap.page_allocator;
-        const control: Control = .{ .cancel = self.flag(), .task = self.task, .cache_root = self.cache_root };
+        const control: Control = .{ .cancel = self.flag(), .task = self.task, .cache_root = self.cache_root, .download_budget = self.download_budget };
         try control.check();
         // Workers use the frozen waiting checker; the owner lease stays nonblocking.
         var worker_lease = self.lease;
@@ -277,7 +280,7 @@ const Job = struct {
             },
             .creating => {
                 const adapter = self.installer orelse return error.InstallAdapterUnavailable;
-                self.installed = try adapter.run(adapter.context, a, self.io, .{ .root = self.root, .instance = self.request, .lease = worker_lease, .namespace_token = self.namespace_token, .download_connections = self.download_connections, .installer_java = self.installer_java, .metadata = self.metadata, .precommit = self.precommit }, control);
+                self.installed = try adapter.run(adapter.context, a, self.io, .{ .root = self.root, .instance = self.request, .lease = worker_lease, .namespace_token = self.namespace_token, .download_connections = self.download_connections, .download_budget = self.download_budget, .installer_java = self.installer_java, .metadata = self.metadata, .precommit = self.precommit }, control);
                 // Adapter success is a committed transaction: a late token cannot undo it.
             },
             .loading_loaders => {
@@ -309,6 +312,7 @@ pub const Manager = struct {
     installer: ?Installer = null,
     creation_admission: ?CreationAdmission = null,
     download_connections: u16 = 8,
+    download_budget: ?*downloader.Budget = null,
     default_java: ?[]const u8 = null,
     operation: Operation = .none,
     catalogue_adapter: ?CatalogueAdapter = null,
@@ -340,7 +344,7 @@ pub const Manager = struct {
         owned_guard.running_ids = ids;
         const owned_root = try g.dupe(u8, paths.root);
         const cache_root = if (options.cache_root) |root| try g.dupe(u8, root) else null;
-        return .{ .allocator = a, .io = io, .arena = arena, .root = owned_root, .cache_root = cache_root, .cache_clock = options.cache_clock, .registry = registry, .guard = owned_guard, .lease = lease };
+        return .{ .allocator = a, .io = io, .arena = arena, .root = owned_root, .cache_root = cache_root, .download_budget = options.download_budget, .cache_clock = options.cache_clock, .registry = registry, .guard = owned_guard, .lease = lease };
     }
     /// Optional worker checker uses the owner lease context and is frozen per job.
     pub fn setWorkerRecheck(self: *Manager, recheck: ?*const fn (?*anyopaque, []const u8) anyerror!void) void {
@@ -476,7 +480,7 @@ pub const Manager = struct {
             }
             if (force) break;
             const job = try self.allocator.create(Job);
-            job.* = .{ .allocator = self.allocator, .arena = .init(self.allocator), .io = self.io, .root = self.root, .operation = .loading_loaders, .request = request, .guard = self.guard, .lease = self.lease, .installer = null, .catalogue_adapter = null, .download_connections = self.download_connections, .done = .init(true) };
+            job.* = .{ .allocator = self.allocator, .arena = .init(self.allocator), .io = self.io, .root = self.root, .operation = .loading_loaders, .request = request, .guard = self.guard, .lease = self.lease, .installer = null, .catalogue_adapter = null, .download_budget = self.download_budget, .download_connections = self.download_connections, .done = .init(true) };
             errdefer job.destroy();
             job.catalogue = try entry.catalogue.clone(self.allocator);
             job.request.minecraft_version = job.catalogue.?.base;
@@ -526,11 +530,11 @@ pub const Manager = struct {
         errdefer if (namespace_token) |token| token.release();
         switch (proof) {
             .unprepared => {},
-            .loader => |prepared| try prepared.owner.validateBinding(self.allocator, self.io, try metadataTarget(self.root, instance, prepared.generation, try environment())),
-            .vanilla => |prepared| try prepared.owner.validateBinding(self.allocator, self.io, try vanillaTarget(self.root, instance, prepared.generation, try environment())),
+            .loader => |prepared| try prepared.owner.validateBinding(self.allocator, self.io, try metadataTarget(self.root, instance, prepared.generation, try preparation.environment())),
+            .vanilla => |prepared| try prepared.owner.validateBinding(self.allocator, self.io, try preparation.existingVanillaTarget(self.root, instance, prepared.generation)),
         }
         const job = try self.allocator.create(Job);
-        job.* = .{ .allocator = self.allocator, .arena = .init(self.allocator), .io = self.io, .root = self.root, .operation = operation, .request = instance, .guard = self.guard, .lease = self.lease, .worker_recheck = self.worker_recheck, .namespace_token = namespace_token, .installer = self.installer, .catalogue_adapter = self.catalogue_adapter, .download_connections = self.download_connections, .metadata = proof, .precommit = if (creation) |request| request.precommit else null };
+        job.* = .{ .allocator = self.allocator, .arena = .init(self.allocator), .io = self.io, .root = self.root, .operation = operation, .request = instance, .guard = self.guard, .lease = self.lease, .worker_recheck = self.worker_recheck, .namespace_token = namespace_token, .installer = self.installer, .catalogue_adapter = self.catalogue_adapter, .download_budget = self.download_budget, .download_connections = self.download_connections, .metadata = proof, .precommit = if (creation) |request| request.precommit else null };
         job.publish_pack_manifest = job.precommit != null;
         errdefer job.destroy();
         job.request = try cloneInstance(job.arena.allocator(), instance);
@@ -864,10 +868,6 @@ pub fn productionLoaderCatalogue() CatalogueAdapter {
     return .{ .fetch = productionCatalogue };
 }
 
-fn vanillaTarget(root: []const u8, instance: config.Instance, generation: u64, env: @import("../core/minecraft/metadata/root.zig").rules.Environment) !metadata_loader.VanillaTarget {
-    if (instance.loader != .vanilla) return error.InvalidLoader;
-    return .{ .root = root, .instance_id = instance.id, .instance_name = instance.name, .version_id = instance.minecraft_version, .generation = generation, .environment = env };
-}
 fn metadataTarget(root: []const u8, instance: config.Instance, generation: u64, env: @import("../core/minecraft/metadata/root.zig").rules.Environment) !loader_install.MetadataTarget {
     const kind: @import("../core/loaders/root.zig").Kind = switch (instance.loader) {
         .fabric => .fabric,
@@ -877,78 +877,6 @@ fn metadataTarget(root: []const u8, instance: config.Instance, generation: u64, 
         .vanilla => return error.InvalidLoader,
     };
     return .{ .root = root, .instance_id = instance.id, .instance_name = instance.name, .generation = generation, .selection = .{ .kind = kind, .base_id = instance.minecraft_version, .loader_id = instance.loader_version orelse return error.InvalidLoaderVersion }, .environment = env };
-}
-/// Read-only authenticated preparation for registered-instance preflight.
-/// Fetches bounded official manifest and source metadata without changing instance files.
-pub fn prepareExistingVanilla(a: A, io: Io, target: metadata_loader.VanillaTarget, control: Control) !metadata_loader.PreparedVanilla {
-    return productionPrepareVanilla(null, a, io, target, control);
-}
-
-pub fn existingVanillaTarget(root: []const u8, instance: config.Instance, generation: u64) !metadata_loader.VanillaTarget {
-    return vanillaTarget(root, instance, generation, try environment());
-}
-
-fn productionPrepareVanilla(_: ?*anyopaque, a: A, io: Io, target: metadata_loader.VanillaTarget, control: Control) !metadata_loader.PreparedVanilla {
-    const http = @import("../core/http_transport.zig");
-    const metadata = @import("../core/minecraft/metadata/root.zig");
-    try control.check();
-    var client = try http.Client.init(a, io, .{});
-    defer client.deinit();
-    var observer: @import("../core/install/download_details.zig").HttpObserver = .{ .task = control.task, .path = metadata.version_manifest_url };
-    return prepareVanillaInner(a, io, target, control, &client, &observer) catch |err| {
-        observer.fail(err);
-        return err;
-    };
-}
-
-fn prepareVanillaInner(a: A, io: Io, target: metadata_loader.VanillaTarget, control: Control, client: *@import("../core/http_transport.zig").Client, observer: *@import("../core/install/download_details.zig").HttpObserver) !metadata_loader.PreparedVanilla {
-    const metadata = @import("../core/minecraft/metadata/root.zig");
-    var response = try client.execute(.{ .url = metadata.version_manifest_url, .cancel = control.cancel, .max_response_bytes = 16 * 1024 * 1024, .require_public_address = true, .observer = if (control.task != null) observer.observer() else null });
-    defer response.deinit();
-    try control.check();
-    if (response.status != 200) return error.MetadataHttpFailure;
-    var manifest = try metadata.manifest.parseSlice(a, response.body);
-    defer manifest.deinit();
-    const Source = struct {
-        client: *@import("../core/http_transport.zig").Client,
-        control: Control,
-        fn fetch(raw: ?*anyopaque, allocator: A, _: Io, request: metadata_loader.Request) ![]u8 {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            try self.control.check();
-            var detail: @import("../core/install/download_details.zig").HttpObserver = .{ .task = self.control.task, .path = request.url };
-            var result = self.client.execute(.{ .url = request.url, .cancel = self.control.cancel, .max_response_bytes = request.max_bytes, .require_public_address = true, .observer = if (self.control.task != null) detail.observer() else null }) catch |err| {
-                detail.fail(err);
-                return err;
-            };
-            defer result.deinit();
-            try self.control.check();
-            if (result.status != 200) return error.MetadataHttpFailure;
-            return allocator.dupe(u8, result.body);
-        }
-    };
-    var source: Source = .{ .client = client, .control = control };
-    var proof = try metadata_loader.prepareVanilla(a, io, .{ .target = target, .vanilla = .{ .version_id = target.version_id, .manifest = manifest.value, .cancel = control.cancel }, .fetcher = .{ .context = &source, .fetch = Source.fetch } });
-    errdefer proof.deinit();
-    try control.check();
-    return proof;
-}
-
-fn environment() !@import("../core/minecraft/metadata/root.zig").rules.Environment {
-    const target = @import("builtin").target;
-    return .{
-        .os_name = switch (target.os.tag) {
-            .linux => "linux",
-            .windows => "windows",
-            .macos => "osx",
-            else => return error.UnsupportedPlatform,
-        },
-        .arch = switch (target.cpu.arch) {
-            .x86_64 => "x86_64",
-            .aarch64 => "aarch64",
-            .x86 => "x86",
-            else => return error.UnsupportedArchitecture,
-        },
-    };
 }
 fn clockMilliseconds(raw: ?*anyopaque) u64 {
     const io: *const Io = @ptrCast(@alignCast(raw.?));
@@ -970,7 +898,7 @@ fn productionCatalogue(_: ?*anyopaque, a: A, io: Io, base: []const u8, kind: con
     const loaders = @import("../core/loaders/root.zig");
     if (kind == .vanilla) return error.InvalidLoader;
     try control.check();
-    var client = try http_cache.Client.init(a, io, control.cache_root);
+    var client = try http_cache.Client.init(a, io, control.download_budget orelse return error.MissingDownloadBudget, control.cache_root);
     defer client.deinit();
     const loader_kind: loaders.Kind = switch (kind) {
         .fabric => .fabric,
@@ -1006,12 +934,12 @@ fn productionRun(_: ?*anyopaque, a: A, io: Io, request: CreateRequest, control: 
     switch (request.metadata) {
         .unprepared => {},
         .loader => |prepared| {
-            const target = try metadataTarget(request.root, request.instance, prepared.generation, try environment());
+            const target = try metadataTarget(request.root, request.instance, prepared.generation, try preparation.environment());
             try prepared.owner.validateBinding(a, io, target);
             prepared_target = target;
         },
         .vanilla => |prepared| {
-            const target = try vanillaTarget(request.root, request.instance, prepared.generation, try environment());
+            const target = try preparation.existingVanillaTarget(request.root, request.instance, prepared.generation);
             try prepared.owner.validateBinding(a, io, target);
             vanilla_target = target;
         },
@@ -1051,16 +979,15 @@ fn productionStage(a: A, io: Io, request: CreateRequest, control: Control, g: A,
     const serde = @import("../core/minecraft/version_serialize.zig");
     const safe = @import("../core/install/safe_fs.zig");
     const tree = @import("../core/worlds_tree.zig");
-    const downloader = @import("../core/downloader.zig");
     const stage_name = stage_owner.name;
     const stage = stage_owner.directory.?;
     const stage_path = try std.fs.path.join(g, &.{ versions_path, stage_name });
     const natives = try std.fs.path.join(g, &.{ stage_path, "natives" });
-    const service = try downloader.Service.init(a, io, request.download_connections);
+    const service = try downloader.Service.init(a, io, request.download_budget orelse return error.MissingDownloadBudget, request.download_connections);
     defer service.deinit();
     control.report(.metadata, 0, null);
     const prepared_control: ?loaders.Control = if (request.metadata == .loader) loaderControl(&io, control, 30 * 60 * 1000) else null;
-    const base_config: minecraft.Config = .{ .root = minecraft_root, .version_id = request.instance.minecraft_version, .target = .{ .directory_name = stage_name, .name = request.instance.name }, .game_directory = stage_path, .natives_directory = natives, .publish_metadata = false, .namespace_token = namespace_token, .worker_checks = true, .environment = if (prepared_target) |target| target.environment else if (vanilla_target) |target| target.environment else try environment(), .window = request.download_connections, .cancel = control.cancel, .task = control.task };
+    const base_config: minecraft.Config = .{ .root = minecraft_root, .version_id = request.instance.minecraft_version, .target = .{ .directory_name = stage_name, .name = request.instance.name }, .game_directory = stage_path, .natives_directory = natives, .publish_metadata = false, .namespace_token = namespace_token, .worker_checks = true, .environment = if (prepared_target) |target| target.environment else if (vanilla_target) |target| target.environment else try preparation.environment(), .window = request.download_connections, .cancel = control.cancel, .task = control.task };
     var base = switch (request.metadata) {
         .loader => |prepared| try loader_base_install.runPrepared(a, io, service, base_config, prepared.owner, prepared_target.?, prepared_control.?),
         .vanilla => |prepared| try minecraft.runVanillaPrepared(a, io, service, base_config, prepared.owner, vanilla_target.?),

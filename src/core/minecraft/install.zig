@@ -159,13 +159,14 @@ pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
     // Every task handle is terminal before release, including all failure paths.
     defer if (tasks.items.len != 0) {
         for (tasks.items) |pending| pending.task.cancel();
-        for (tasks.items) |pending| telemetry.join(io, pending.task);
+        for (tasks.items) |pending| pending.task.join();
         reportDownloads(config.task, tasks.items, reused + downloaded, plan.value.files.len, received_done, total_bytes_done, null, &recent);
         for (tasks.items) |pending| pending.task.release() catch unreachable;
     };
     try tasks.ensureTotalCapacity(a, config.window);
     var cursor: usize = 0;
     while (cursor < plan.value.files.len or tasks.items.len != 0) {
+        const completion_revision = service.completionRevision();
         try control.check();
         while (cursor < plan.value.files.len and tasks.items.len < config.window) {
             const file = plan.value.files[cursor];
@@ -224,7 +225,7 @@ pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
         }
         if (tasks.items.len != 0) {
             try control.check();
-            try io.sleep(.fromMilliseconds(10), .awake);
+            try service.waitForCompletion(completion_revision);
             try control.check();
         }
     }
@@ -355,7 +356,8 @@ fn fetchBoundedControlled(a: A, io: std.Io, service: *dl.Service, config: Config
     try control.check();
     const task = try service.submit(.{ .url = url, .output = .bytes, .expected_sha1 = sha1, .expected_size = size, .max_bytes = max_bytes, .proxy = config.proxy, .ca_bundle = config.ca_bundle, .cache_path = cache_path });
     defer {
-        telemetry.join(io, task);
+        task.cancel();
+        task.join();
         telemetry.single(config.task, .metadata, url, task.snapshot());
         task.release() catch unreachable;
     }
@@ -373,7 +375,7 @@ fn fetchBoundedControlled(a: A, io: std.Io, service: *dl.Service, config: Config
             return bytes;
         }
         try control.check();
-        try io.sleep(.fromMilliseconds(10), .awake);
+        try task.wait();
         try control.check();
     }
 }
@@ -956,7 +958,9 @@ test "loaded executor consumes independent owners when validation or namespace a
 test "live downloader snapshots aggregate omitted transfers before a file completes" {
     // Only Task.snapshot's coherent mutex/Io path is exercised. No service workers,
     // curl handles, submissions, filesystem artifacts or network exist in this fixture.
-    var service: dl.Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1 };
+    var budget = try dl.Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    var service: dl.Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1, .budget = &budget };
     var url = "https://example.invalid/fixture.jar".*;
     var downloads: [12]dl.Task = undefined;
     var pending: [12]PendingDownload = undefined;
@@ -1043,7 +1047,9 @@ test "active artifact transfers precede recent checks without double-counting fi
     var registry = task_registry.Registry.init(std.testing.allocator);
     defer registry.deinit();
     const target = try registry.create(.game_install, "Mixed install");
-    var service: dl.Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1 };
+    var budget = try dl.Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    var service: dl.Service = .{ .allocator = std.testing.allocator, .io = std.testing.io, .multi = undefined, .max_active = 1, .budget = &budget };
     var url = "https://example.invalid/fixture.jar".*;
     var first: dl.Task = .{ .service = &service, .request = .{ .url = &url }, .url = &url, .temp = &.{}, .progress = .{ .phase = .downloading, .received = 20, .total = 100, .bytes_per_second = 5 } };
     var second: dl.Task = .{ .service = &service, .request = .{ .url = &url }, .url = &url, .temp = &.{}, .progress = .{ .phase = .downloading, .received = 30, .total = 100, .bytes_per_second = 7 } };

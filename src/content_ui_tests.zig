@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const instance_preparation = @import("ui/instances_manager.zig");
+const instance_preparation = @import("application/instance_preparation.zig");
 const metadata_loader = @import("core/minecraft/metadata_loader.zig");
 const game_metadata = @import("core/minecraft/metadata/root.zig");
 const config = @import("core/config.zig");

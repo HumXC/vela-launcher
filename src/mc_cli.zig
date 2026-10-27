@@ -89,7 +89,9 @@ fn run(init: std.process.Init) !void {
     };
     try curl.globalInit();
     defer curl.globalDeinit();
-    const service = try downloader.Service.init(a, io, 16);
+    var budget = try downloader.Budget.init(io, 16);
+    defer budget.deinit();
+    const service = try downloader.Service.init(a, io, &budget, 16);
     defer service.deinit();
     std.debug.print("Installing {s} into {s}\n", .{ args[2], absolute_root });
     var installed = try install.run(a, io, service, .{

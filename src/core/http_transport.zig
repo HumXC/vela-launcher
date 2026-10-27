@@ -5,7 +5,7 @@
 //! bytes (including non-2xx bodies), and deinit wipes them. No cache or logging.
 const std = @import("std");
 const curl = @import("curl");
-const public_network = @import("public_network.zig");
+const support = @import("curl_support.zig");
 const c = curl.libcurl;
 const Allocator = std.mem.Allocator;
 const max_url_bytes = 16 * 1024;
@@ -112,7 +112,7 @@ pub const Client = struct {
         }
         const ca_path = if (options.ca_bundle) |path| try a.dupeSentinel(u8, path, 0) else null;
         errdefer if (ca_path) |path| a.free(path);
-        var ca_pem: std.ArrayList(u8) = if (ca_path == null) try collectNativeCA(a, io) else .empty;
+        var ca_pem: std.ArrayList(u8) = if (ca_path == null) try @import("curl_support.zig").collectNativeCA(a, io) else .empty;
         errdefer ca_pem.deinit(a);
         // Vendored libcurl 8.19 supports thread-safe global init/cleanup. Its
         // global refcount composes with the downloader's app-owned reference.
@@ -159,7 +159,7 @@ pub const Client = struct {
         var current = try self.allocator.dupeSentinel(u8, request.url, 0);
         defer self.allocator.free(current);
         var headers: ?*c.curl_slist = null;
-        defer freeHeaders(headers);
+        defer support.freeHeaders(headers);
         for (request.headers) |header| {
             const line = try std.fmt.allocPrintSentinel(self.allocator, "{s}: {s}", .{ header.name, header.value }, 0);
             defer {
@@ -186,27 +186,7 @@ pub const Client = struct {
             // hop; libcurl itself never automatically follows any redirect.
             try set(easy, c.CURLOPT_PROTOCOLS_STR, @as([*:0]const u8, if (request.allow_http_loopback) "https,http" else "https"));
             try set(easy, c.CURLOPT_REDIR_PROTOCOLS_STR, @as([*:0]const u8, "https"));
-            try set(easy, c.CURLOPT_SSL_VERIFYPEER, @as(c_long, 1));
-            try set(easy, c.CURLOPT_SSL_VERIFYHOST, @as(c_long, 2));
-            try set(easy, c.CURLOPT_PROXY_SSL_VERIFYPEER, @as(c_long, 1));
-            try set(easy, c.CURLOPT_PROXY_SSL_VERIFYHOST, @as(c_long, 2));
-            try set(easy, c.CURLOPT_PROXY, self.proxy.ptr);
-            if (request.require_public_address) {
-                try set(easy, c.CURLOPT_OPENSOCKETFUNCTION, &public_network.openSocket);
-                try set(easy, c.CURLOPT_FRESH_CONNECT, @as(c_long, 1));
-                try set(easy, c.CURLOPT_FORBID_REUSE, @as(c_long, 1));
-                try set(easy, c.CURLOPT_OPENSOCKETDATA, &state.failure);
-            }
-            // Ignore environment NO_PROXY as well when an explicit proxy exists.
-            try set(easy, c.CURLOPT_NOPROXY, @as([*:0]const u8, ""));
-            if (self.ca_path) |path| {
-                try set(easy, c.CURLOPT_CAINFO, path.ptr);
-                try set(easy, c.CURLOPT_PROXY_CAINFO, path.ptr);
-            } else {
-                const blob: c.curl_blob = .{ .data = self.ca_pem.items.ptr, .len = self.ca_pem.items.len, .flags = c.CURL_BLOB_NOCOPY };
-                try set(easy, c.CURLOPT_CAINFO_BLOB, &blob);
-                try set(easy, c.CURLOPT_PROXY_CAINFO_BLOB, &blob);
-            }
+            try support.configure(easy, self.proxy, self.ca_path, self.ca_pem.items, request.require_public_address, &state.failure);
             const remaining = try state.remainingMillis();
             try set(easy, c.CURLOPT_TIMEOUT_MS, remaining);
             try set(easy, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_long, @min(remaining, 30_000)));
@@ -333,37 +313,6 @@ fn resolveRedirect(a: Allocator, base: [:0]const u8, location: []const u8, allow
     const new_uri = std.Uri.parse(url) catch return error.InvalidUrl;
     if (std.ascii.eqlIgnoreCase(old_uri.scheme, "https") and !std.ascii.eqlIgnoreCase(new_uri.scheme, "https")) return error.InsecureRedirect;
     return a.dupeSentinel(u8, url, 0);
-}
-fn freeHeaders(list: ?*c.curl_slist) void {
-    var cursor = list;
-    while (cursor) |node| : (cursor = node.next) std.crypto.secureZero(u8, std.mem.span(node.data));
-    c.curl_slist_free_all(list);
-}
-fn collectNativeCA(a: Allocator, io: std.Io) !std.ArrayList(u8) {
-    var native: std.crypto.Certificate.Bundle = .empty;
-    defer native.deinit(a);
-    try native.rescan(a, io, .now(io, .real));
-    var output: std.ArrayList(u8) = .empty;
-    errdefer output.deinit(a);
-    var iterator = native.map.iterator();
-    while (iterator.next()) |entry| {
-        const der = try std.crypto.Certificate.der.Element.parse(native.bytes.items, entry.value_ptr.*);
-        const bytes = native.bytes.items[entry.value_ptr.*..der.slice.end];
-        const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-        defer a.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, bytes);
-        try output.appendSlice(a, "-----BEGIN CERTIFICATE-----\n");
-        var pos: usize = 0;
-        while (pos < encoded.len) {
-            const end = @min(encoded.len, pos + 64);
-            try output.appendSlice(a, encoded[pos..end]);
-            try output.append(a, '\n');
-            pos = end;
-        }
-        try output.appendSlice(a, "-----END CERTIFICATE-----\n");
-    }
-    if (output.items.len == 0) return error.NoTrustedCertificates;
-    return output;
 }
 
 // Avoid realloc leaving copies of sensitive response bytes in freed buffers.
@@ -808,7 +757,9 @@ test "public-address guard rejects explicit proxies before transfer and queue ad
         .require_public_address = true,
     }));
     const downloader = @import("downloader.zig");
-    const service = try downloader.Service.init(a, std.testing.io, 1);
+    var budget = try downloader.Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    const service = try downloader.Service.init(a, std.testing.io, &budget, 1);
     defer service.deinit();
     try std.testing.expectError(error.UnsupportedProxyWithPublicAddressGuard, service.submit(.{
         .url = "https://example.invalid/",
@@ -828,7 +779,9 @@ test "public-address guard blocks actual resolved loopback sockets in both trans
     var client = try Client.init(a, std.testing.io, .{});
     defer client.deinit();
     const downloader = @import("downloader.zig");
-    const service = try downloader.Service.init(a, std.testing.io, 1);
+    var budget = try downloader.Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    const service = try downloader.Service.init(a, std.testing.io, &budget, 1);
     defer service.deinit();
     const secure = try std.fmt.allocPrint(a, "https{s}/must-not-request", .{base[4..]});
     defer a.free(secure);
@@ -873,7 +826,9 @@ test "guarded downloader cannot reuse an unguarded persistent loopback connectio
     try curl.globalInit();
     defer curl.globalDeinit();
     const downloader = @import("downloader.zig");
-    const service = try downloader.Service.init(a, std.testing.io, 1);
+    var budget = try downloader.Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    const service = try downloader.Service.init(a, std.testing.io, &budget, 1);
     defer service.deinit();
     const ordinary = try fixtureUrl(a, base, "/get");
     defer a.free(ordinary);

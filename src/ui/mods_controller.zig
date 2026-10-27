@@ -44,12 +44,17 @@ pub const Controller = struct {
     directory: ?[]u8 = null,
     kind: local.Kind = .mod,
     generation: u64 = 0,
+    inventory_revision: u64 = 0,
     active: ?*Job = null,
     published: ?local.Snapshot = null,
+    view_rows: []presentation.Row = &.{},
+    view_key: ?ViewKey = null,
     needs_scan: bool = false,
     failure: ?anyerror = null,
     mutation: enum { idle, toggling } = .idle,
     pending_toggle: ?struct { index: usize, enabled: bool, path: []const u8, physical_path: []const u8 } = null,
+
+    const ViewKey = struct { inventory: u64, installed: u64, backend: usize, same: bool };
 
     pub fn init(a: A, io: Io, paths: *const paths_module.Paths) Controller {
         return .{ .allocator = a, .io = io, .paths = paths };
@@ -66,8 +71,12 @@ pub const Controller = struct {
         self.* = undefined;
     }
     fn clearPublished(self: *Controller) void {
+        self.allocator.free(self.view_rows);
+        self.view_rows = &.{};
+        self.view_key = null;
         if (self.published) |*snapshot| snapshot.deinit();
         self.published = null;
+        self.inventory_revision +%= 1;
     }
     pub fn matches(self: *const Controller, instance: config.Instance, kind: local.Kind) bool {
         return self.instance_id != null and self.instance_name != null and self.kind == kind and
@@ -161,25 +170,42 @@ pub const Controller = struct {
             entry.enabled = pending.enabled;
             entry.path = pending.path;
             entry.physical_path = pending.physical_path;
+            self.inventory_revision +%= 1;
         };
     }
     pub fn busy(self: *const Controller) bool {
         return self.active != null or self.needs_scan or self.mutation != .idle;
     }
-    pub fn viewSnapshot(self: *const Controller, a: A, backend: *content.Manager, allow_mutations: bool) !presentation.Snapshot {
+    /// Borrowed until the next controller mutation or snapshot rebuild. Never free rows.
+    pub fn viewSnapshot(self: *Controller, backend: *content.Manager, allow_mutations: bool) !presentation.Snapshot {
         const snapshot = backend.snapshot();
         const same = if (snapshot.instance) |instance| self.instance_id != null and std.mem.eql(u8, self.instance_id.?, instance.id) else false;
         const entries = if (self.published) |published| published.entries else &.{};
-        const rows = try a.alloc(presentation.Row, entries.len);
-        for (entries, rows) |*entry, *row| {
-            row.* = .{ .entry = entry };
-            if (same) for (snapshot.installed) |file| if (std.mem.eql(u8, file.path, logicalPath(entry)) and file.enabled == entry.enabled) {
-                row.managed = true;
-                break;
+        const key: ViewKey = .{ .inventory = self.inventory_revision, .installed = snapshot.installed_revision, .backend = @intFromPtr(backend), .same = same };
+        if (self.view_key == null or !std.meta.eql(self.view_key.?, key)) {
+            self.view_key = null;
+            self.allocator.free(self.view_rows);
+            self.view_rows = &.{};
+            const rows = try self.allocator.alloc(presentation.Row, entries.len);
+            errdefer self.allocator.free(rows);
+            // Borrowed manifest keys exist only during this rebuild.
+            var managed: std.StringHashMapUnmanaged(u2) = .empty;
+            defer managed.deinit(self.allocator);
+            if (same and entries.len != 0) for (snapshot.installed) |file| {
+                const slot = try managed.getOrPut(self.allocator, file.path);
+                if (!slot.found_existing) slot.value_ptr.* = 0;
+                slot.value_ptr.* |= if (file.enabled) @as(u2, 2) else 1;
             };
+            for (entries, rows) |*entry, *row| {
+                const states = managed.get(logicalPath(entry)) orelse 0;
+                row.* = .{ .entry = entry, .managed = states & (if (entry.enabled) @as(u2, 2) else 1) != 0 };
+            }
+            self.view_rows = rows;
+            self.view_key = key;
         }
         return .{
-            .rows = rows,
+            .rows = self.view_rows,
+            .inventory = .{ .source = @intFromPtr(self), .revision = self.inventory_revision },
             .busy = self.busy() or snapshot.busy,
             .failure = self.failure orelse if (same) snapshot.failure else null,
             .can_mutate = allow_mutations and same and !self.busy() and !snapshot.busy and !snapshot.recovery_required,

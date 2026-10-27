@@ -17,7 +17,7 @@ fn wait(t: *dl.Task) !dl.Snapshot {
         const state = t.snapshot();
         if (dl.terminal(state.progress.phase)) return state;
         if (std.Io.Clock.awake.now(io).nanoseconds - start > 10_000_000_000) return error.TestTimeout;
-        try io.sleep(.fromMilliseconds(5), .awake);
+        try t.wait();
     }
 }
 fn success(t: *dl.Task) !dl.Snapshot {
@@ -36,7 +36,9 @@ test "credential scope rejection never dispatches to local fixture or follows it
     defer a.free(base);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const service = try dl.Service.init(a, io, 1);
+    var budget = try dl.Budget.init(io, 1);
+    defer budget.deinit();
+    const service = try dl.Service.init(a, io, &budget, 1);
     defer service.deinit();
     const blocked_url = try url(base, "/credential-must-not-dispatch");
     defer a.free(blocked_url);
@@ -64,7 +66,9 @@ test "HTTPS-only requests never dispatch plaintext HTTP" {
     defer a.free(base);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const service = try dl.Service.init(a, io, 2);
+    var budget = try dl.Budget.init(io, 2);
+    defer budget.deinit();
+    const service = try dl.Service.init(a, io, &budget, 2);
     defer service.deinit();
     const blocked_url = try url(base, "/https-only-must-not-reach-server");
     defer a.free(blocked_url);
@@ -95,7 +99,9 @@ fn pathIn(tmp: *std.testing.TmpDir, name: []const u8) ![]u8 {
 test "service lifecycle and shutdown rejects submissions" {
     try curl.globalInit();
     defer curl.globalDeinit();
-    const s = try dl.Service.init(a, io, 2);
+    var budget = try dl.Budget.init(io, 2);
+    defer budget.deinit();
+    const s = try dl.Service.init(a, io, &budget, 2);
     defer s.deinit();
     const t = try s.submit(.{ .url = "http://127.0.0.1:1/", .timeout_ms = 100 });
     t.cancel();
@@ -108,7 +114,9 @@ test "streamed file SHA1, mismatch preserves destination, redirect body ignored"
     defer a.free(base);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const s = try dl.Service.init(a, io, 3);
+    var budget = try dl.Budget.init(io, 3);
+    defer budget.deinit();
+    const s = try dl.Service.init(a, io, &budget, 3);
     defer s.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -147,7 +155,9 @@ test "HTTP byte count distinguishes rounded catalogue size from exact streamed l
     defer a.free(base);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const service = try dl.Service.init(a, io, 1);
+    var budget = try dl.Budget.init(io, 1);
+    defer budget.deinit();
+    const service = try dl.Service.init(a, io, &budget, 1);
     defer service.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -174,7 +184,9 @@ test "JSON parsing, malformed JSON, limits, HTTP errors and explicit proxy" {
     defer a.free(base);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const s = try dl.Service.init(a, io, 4);
+    var budget = try dl.Budget.init(io, 4);
+    defer budget.deinit();
+    const s = try dl.Service.init(a, io, &budget, 4);
     defer s.deinit();
     const ju = try url(base, "/json");
     defer a.free(ju);
@@ -208,7 +220,9 @@ test "persistent ETag cache, 304 missing and corrupt recovery, modified validato
     const u = try url(base, "/etag");
     defer a.free(u);
     {
-        const s = try dl.Service.init(a, io, 2);
+        var first_budget = try dl.Budget.init(io, 2);
+        defer first_budget.deinit();
+        const s = try dl.Service.init(a, io, &first_budget, 2);
         defer s.deinit();
         const first = try s.submit(.{ .url = u, .output = .json, .cache_path = path });
         try eq(dl.Source.network, (try success(first)).source);
@@ -217,7 +231,9 @@ test "persistent ETag cache, 304 missing and corrupt recovery, modified validato
         try eq(dl.Source.revalidated, hit.source);
         try eq(@as(u16, 304), hit.http_status);
     }
-    const s = try dl.Service.init(a, io, 2);
+    var budget = try dl.Budget.init(io, 1);
+    defer budget.deinit();
+    const s = try dl.Service.init(a, io, &budget, 2);
     defer s.deinit();
     const restart = try s.submit(.{ .url = u, .output = .json, .cache_path = path });
     try eq(dl.Source.revalidated, (try success(restart)).source);
@@ -227,6 +243,7 @@ test "persistent ETag cache, 304 missing and corrupt recovery, modified validato
     try put(path, "corrupt");
     const corrupt = try s.submit(.{ .url = u, .output = .json, .cache_path = path });
     try eq(dl.Source.network, (try success(corrupt)).source);
+    try eq(@as(usize, 0), budget.snapshot().active);
     const modified = try url(base, "/modified");
     defer a.free(modified);
     const m1 = try s.submit(.{ .url = modified, .output = .json, .cache_path = path });
@@ -239,7 +256,9 @@ test "no-store and Vary are not cached; unexpected 304 and truncated transfers f
     defer a.free(base);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const s = try dl.Service.init(a, io, 2);
+    var budget = try dl.Budget.init(io, 2);
+    defer budget.deinit();
+    const s = try dl.Service.init(a, io, &budget, 2);
     defer s.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -264,7 +283,9 @@ test "concurrent transfers, speed ETA, cancellation and shutdown" {
     defer a.free(base);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const s = try dl.Service.init(a, io, 2);
+    var budget = try dl.Budget.init(io, 2);
+    defer budget.deinit();
+    const s = try dl.Service.init(a, io, &budget, 2);
     defer s.deinit();
     const slowurl = try url(base, "/slow");
     defer a.free(slowurl);
@@ -294,7 +315,9 @@ test "concurrent transfers, speed ETA, cancellation and shutdown" {
 test "bounded outstanding task capacity and release reuse" {
     try curl.globalInit();
     defer curl.globalDeinit();
-    const s = try dl.Service.init(a, io, 1);
+    var budget = try dl.Budget.init(io, 1);
+    defer budget.deinit();
+    const s = try dl.Service.init(a, io, &budget, 1);
     defer s.deinit();
     var tasks: [256]*dl.Task = undefined;
     for (&tasks) |*t| {
@@ -324,7 +347,9 @@ test "unknown length, timeout, relative file paths and path exclusion" {
     defer a.free(base);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const s = try dl.Service.init(a, io, 2);
+    var budget = try dl.Budget.init(io, 2);
+    defer budget.deinit();
+    const s = try dl.Service.init(a, io, &budget, 2);
     defer s.deinit();
     const unknown = try url(base, "/unknown-length");
     defer a.free(unknown);
@@ -361,7 +386,9 @@ test "null and empty proxy disable inherited proxies and explicit proxy ignores 
     defer a.free(base);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const service = try dl.Service.init(a, io, 1);
+    var budget = try dl.Budget.init(io, 1);
+    defer budget.deinit();
+    const service = try dl.Service.init(a, io, &budget, 1);
     defer service.deinit();
     const direct_url = try url(base, "/bytes");
     defer a.free(direct_url);
@@ -415,7 +442,9 @@ test "client installation stays in its stage across source and instance name col
     defer a.free(source);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const service = try dl.Service.init(a, io, 2);
+    var budget = try dl.Budget.init(io, 2);
+    defer budget.deinit();
+    const service = try dl.Service.init(a, io, &budget, 2);
     defer service.deinit();
     const preserved = [_]struct { path: []const u8, bytes: []const u8 }{
         .{ .path = "assets/objects/shared-marker", .bytes = "shared assets" },
@@ -497,7 +526,9 @@ test "streamed transfers without a total deadline complete but stalled connectio
     defer a.free(base);
     try curl.globalInit();
     defer curl.globalDeinit();
-    const service = try dl.Service.init(a, io, 1);
+    var budget = try dl.Budget.init(io, 1);
+    defer budget.deinit();
+    const service = try dl.Service.init(a, io, &budget, 1);
     defer service.deinit();
     const slow = try url(base, "/slow");
     defer a.free(slow);
@@ -510,4 +541,79 @@ test "streamed transfers without a total deadline complete but stalled connectio
     const blocked = try service.submit(.{ .url = stalled, .timeout_ms = 0, .stall_timeout_seconds = 1 });
     defer blocked.release() catch unreachable;
     try eq(error.TimedOut, (try wait(blocked)).failure.?);
+}
+
+fn awaitPhase(task: *dl.Task, phase: dl.Phase) !void {
+    const began = std.Io.Clock.awake.now(io).nanoseconds;
+    while (task.snapshot().progress.phase != phase) {
+        if (dl.terminal(task.snapshot().progress.phase)) return error.UnexpectedTerminal;
+        if (std.Io.Clock.awake.now(io).nanoseconds - began > 5 * std.time.ns_per_s) return error.TestTimeout;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+test "shared budget isolates waiting owner cancellation and shutdown" {
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    var budget = try dl.Budget.init(io, 1);
+    defer budget.deinit();
+    // Occupy the only permit without a network dependency, forcing both queues.
+    try expect(budget.tryAcquire());
+    var held = true;
+    defer if (held) budget.release();
+    const first = try dl.Service.init(a, io, &budget, 2);
+    defer first.deinit();
+    const second = try dl.Service.init(a, io, &budget, 2);
+    defer second.deinit();
+    const canceled = try first.submit(.{ .url = "http://127.0.0.1:1/", .timeout_ms = 100 });
+    const survivor = try second.submit(.{ .url = "http://127.0.0.1:1/", .timeout_ms = 100 });
+    try awaitPhase(canceled, .ready);
+    try awaitPhase(survivor, .ready);
+    first.shutdown();
+    try eq(dl.Phase.canceled, (try wait(canceled)).progress.phase);
+    try eq(dl.Phase.ready, survivor.snapshot().progress.phase);
+    try eq(@as(usize, 1), budget.snapshot().active);
+    budget.release();
+    held = false;
+    try eq(dl.Phase.failed, (try wait(survivor)).progress.phase);
+    try eq(@as(usize, 0), budget.snapshot().active);
+}
+
+test "shared services respect lowering and return permits after cancellation and success" {
+    const base = try baseUrl();
+    defer a.free(base);
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    var budget = try dl.Budget.init(io, 2);
+    defer budget.deinit();
+    const first = try dl.Service.init(a, io, &budget, 2);
+    defer first.deinit();
+    const second = try dl.Service.init(a, io, &budget, 2);
+    defer second.deinit();
+    const stalled_url = try url(base, "/stalled");
+    defer a.free(stalled_url);
+    const fast_url = try url(base, "/bytes");
+    defer a.free(fast_url);
+    const left = try first.submit(.{ .url = stalled_url });
+    const right = try second.submit(.{ .url = stalled_url });
+    try awaitPhase(left, .downloading);
+    try awaitPhase(right, .downloading);
+    try eq(@as(usize, 2), budget.snapshot().active);
+    try budget.setLimit(1);
+    const queued = try second.submit(.{ .url = fast_url });
+    try awaitPhase(queued, .ready);
+    left.cancel();
+    try eq(dl.Phase.canceled, (try wait(left)).progress.phase);
+    try eq(@as(usize, 1), budget.snapshot().active);
+    // With one pre-existing permit, the newly lowered limit admits no work.
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try eq(dl.Phase.ready, queued.snapshot().progress.phase);
+    try eq(dl.Phase.downloading, right.snapshot().progress.phase);
+    right.cancel();
+    try eq(dl.Phase.canceled, (try wait(right)).progress.phase);
+    _ = try success(queued);
+    try eq(@as(usize, 0), budget.snapshot().active);
+    // A terminal result wins a late cancellation and consumes no permit.
+    queued.cancel();
+    try eq(dl.Phase.complete, queued.snapshot().progress.phase);
 }

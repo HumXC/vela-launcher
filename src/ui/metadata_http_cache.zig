@@ -16,8 +16,8 @@ pub const Client = struct {
     service: *dl.Service,
     cache_root: ?[]const u8,
 
-    pub fn init(a: A, io: Io, cache_root: ?[]const u8) !Client {
-        return .{ .io = io, .service = try dl.Service.init(a, io, 1), .cache_root = cache_root };
+    pub fn init(a: A, io: Io, download_budget: *dl.Budget, cache_root: ?[]const u8) !Client {
+        return .{ .io = io, .service = try dl.Service.init(a, io, download_budget, 1), .cache_root = cache_root };
     }
     pub fn deinit(self: *Client) void {
         self.service.deinit();
@@ -67,7 +67,8 @@ pub const Client = struct {
         });
         defer {
             // Cancellation is a request, not a JOIN. Copy final bytes before release.
-            @import("../core/install/download_details.zig").join(self.io, task);
+            task.cancel();
+            task.join();
             @import("../core/install/download_details.zig").single(control.task, .metadata, url, task.snapshot());
             task.release() catch unreachable;
         }
@@ -94,7 +95,7 @@ pub const Client = struct {
                 // even though its network response was 304 with no body.
                 return .{ .bytes = bytes, .final_url = final_url, .status = 200 };
             }
-            try self.io.sleep(.fromMilliseconds(5), .awake);
+            try task.wait();
         }
     }
 };
@@ -162,7 +163,9 @@ test "loader HTTP adapter revalidates across restart with ETag and server Last-M
         const conditional_key = try std.fmt.allocPrint(test_a, "{s}:conditional", .{path});
         defer test_a.free(conditional_key);
         const initial = blk: {
-            var first = try Client.init(test_a, test_io, root);
+            var budget_166 = try dl.Budget.init(test_io, 1);
+            defer budget_166.deinit();
+            var first = try Client.init(test_a, test_io, &budget_166, root);
             defer first.deinit();
             const before = try statsCount(&first, base, conditional_key);
             const response = try first.fetch(test_a, url, 4096, testControl(), true);
@@ -174,7 +177,9 @@ test "loader HTTP adapter revalidates across restart with ETag and server Last-M
         const before = initial.before;
         const expected = initial.expected;
         defer test_a.free(expected);
-        var restarted = try Client.init(test_a, test_io, root);
+        var budget_178 = try dl.Budget.init(test_io, 1);
+        defer budget_178.deinit();
+        var restarted = try Client.init(test_a, test_io, &budget_178, root);
         defer restarted.deinit();
         const revalidated = try restarted.fetch(test_a, url, 4096, testControl(), true);
         defer freeResponse(revalidated);
@@ -197,7 +202,9 @@ test "loader HTTP adapter preserves 404 and rejects redirects limits deadline an
     const curl = @import("curl");
     try curl.globalInit();
     defer curl.globalDeinit();
-    var client = try Client.init(test_a, test_io, null);
+    var budget_201 = try dl.Budget.init(test_io, 1);
+    defer budget_201.deinit();
+    var client = try Client.init(test_a, test_io, &budget_201, null);
     defer client.deinit();
     const missing = try fixtureUrl(base, "/loader-adapter-not-found");
     defer test_a.free(missing);

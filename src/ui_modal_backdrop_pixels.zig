@@ -5,7 +5,7 @@ const theme = @import("ui/theme.zig");
 const components = @import("ui/components.zig");
 const surface = @import("ui/surface.zig");
 const appearance = @import("core/appearance.zig");
-pub const dvui_app: dvui.App = .{ .config = .{ .startFn = start }, .frameFn = frame };
+pub const dvui_app: dvui.App = .{ .config = .{ .startFn = start }, .initFn = @import("ui/fonts.zig").install, .frameFn = frame };
 pub const main = dvui.App.main;
 pub const panic = dvui.App.panic;
 pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };

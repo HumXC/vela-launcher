@@ -2579,6 +2579,8 @@ test "manager retains copied live and terminal file details after task dismissal
 const StageFault = @import("core/loaders/tests/stage_owner.zig").FaultIo;
 
 test "instance manager production stage rolls back cancellation open and sync acquisition faults" {
+    var budget = try @import("core/download_budget.zig").Budget.init(io, 8);
+    defer budget.deinit();
     for ([_]StageFault.Mode{ .cancel_create, .fail_open, .fail_sync }) |mode| {
         if (mode == .fail_sync and !@import("core/worlds_tree.zig").directory_sync_supported) continue;
         var env = try Environment.init();
@@ -2598,7 +2600,7 @@ test "instance manager production stage rolls back cancellation open and sync ac
             .fail_sync => error.InputOutput,
             else => unreachable,
         };
-        try std.testing.expectError(expected, installer.run(installer.context, a, fault_io, .{ .root = env.root, .instance = example, .lease = lease }, .{ .cancel = &canceled }));
+        try std.testing.expectError(expected, installer.run(installer.context, a, fault_io, .{ .root = env.root, .instance = example, .lease = lease, .download_budget = &budget }, .{ .cancel = &canceled }));
         try std.testing.expect(fault.created and fault.removed);
         const versions_path = try std.fs.path.join(a, &.{ env.root, ".minecraft", "versions" });
         defer a.free(versions_path);

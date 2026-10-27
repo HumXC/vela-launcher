@@ -167,15 +167,15 @@ pub fn store() credentials.Store {
 pub fn accountOptions(root: []const u8) accounts.Options {
     return .{ .root = root, .fixture = .{ .transport = .{ .ctx = state.?, .kind = .fixture, .supports_post = true, .request = denyAuth }, .store = store(), .entropy = .{ .ctx = state.?, .fill = denyEntropy }, .journal = .{ .ctx = state.?, .stage = denyJournal, .remove = denyJournal, .references = emptyReferences } } };
 }
-pub fn javaOptions(root: []const u8, registry: anytype) java_download.Options {
-    return .{ .root = root, .task_registry = registry, .transport = .{ .context = state.?, .get = denyJavaGet, .download = denyJavaDownload } };
+pub fn javaOptions(root: []const u8, registry: anytype, download_budget: *@import("core/downloader.zig").Budget) java_download.Options {
+    return .{ .root = root, .task_registry = registry, .download_budget = download_budget, .transport = .{ .context = state.?, .get = denyJavaGet, .download = denyJavaDownload } };
 }
 pub fn contentOptions(options: content.Options) content.Options {
     var result = options;
     result.fixture_credential_store = store();
     result.allow_curseforge_remote = false;
     result.curseforge = .{};
-    result.transport_options = .{ .http = .{ .proxy = null, .ca_bundle = state.?.ca }, .allow_curseforge = false, .fixture_http = denyHttp, .fixture_context = state.? };
+    result.transport_options = .{ .http = .{ .proxy = null, .ca_bundle = state.?.ca }, .download_budget = options.transport_options.download_budget, .allow_curseforge = false, .fixture_http = denyHttp, .fixture_context = state.? };
     return result;
 }
 pub fn denyServer(_: A, _: Io, _: config.Server, _: servers.Options) !servers.OwnedStatus {

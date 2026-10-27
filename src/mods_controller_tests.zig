@@ -71,10 +71,12 @@ test "mods controller retires stale inventory and owns selected instance" {
     try std.testing.expectEqual(@as(usize, 1), controller.published.?.entries.len);
     try std.testing.expectEqualStrings("mods/new.jar", controller.published.?.entries[0].path);
     const entries = controller.published.?.entries.ptr;
+    const revision = controller.inventory_revision;
     try controller.toggle(&backend, "mods/new.jar", false);
     try drain(&controller, &backend);
     try std.testing.expect(controller.failure == null);
     try std.testing.expect(entries == controller.published.?.entries.ptr);
+    try std.testing.expect(controller.inventory_revision != revision);
     try std.testing.expect(backend.local_job.?.request == .enabled_toggle);
     try std.testing.expectEqualStrings("mods/new.jar.disabled", controller.published.?.entries[0].path);
     try std.testing.expect(!controller.published.?.entries[0].enabled);
@@ -102,7 +104,8 @@ test "mods controller commits disabled managed jar then reenables physical path"
     defer registry.deinit();
     var backend = try content.Manager.initOptions(a, io, &paths, &registry, .{ .lease = Lease.callbacks(), .transport_options = .{ .fixture_http = noHttp } });
     defer backend.deinit();
-    var controller = controller_module.Controller.init(a, io, &paths);
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    var controller = controller_module.Controller.init(failing.allocator(), io, &paths);
     defer controller.deinit();
     try controller.select(first, .mod, &backend);
     try drain(&controller, &backend);
@@ -115,13 +118,37 @@ test "mods controller commits disabled managed jar then reenables physical path"
     try std.testing.expectEqualStrings("mods/state.jar.disabled", controller.published.?.entries[0].path);
     try std.testing.expect(entries == controller.published.?.entries.ptr);
     try std.testing.expectEqual(@as(usize, 1), controller.published.?.entries.len);
-    const disabled = try controller.viewSnapshot(a, &backend, true);
-    defer a.free(disabled.rows);
+    const disabled = try controller.viewSnapshot(&backend, true);
     try std.testing.expect(disabled.rows[0].managed);
+    try std.testing.expectEqual(controller.inventory_revision, disabled.inventory.?.revision);
+    try std.testing.expectEqual(@intFromPtr(&controller), disabled.inventory.?.source);
+    try std.testing.checkAllAllocationFailures(a, snapshotAllocationFixture, .{ &controller, &backend });
+    const allocations = failing.alloc_index;
+    failing.fail_index = allocations;
+    for (0..100) |_| {
+        const cached = try controller.viewSnapshot(&backend, false);
+        try std.testing.expect(cached.rows.ptr == disabled.rows.ptr);
+        try std.testing.expect(!cached.can_mutate);
+    }
+    try std.testing.expectEqual(allocations, failing.alloc_index);
+    failing.fail_index = std.math.maxInt(usize);
+    const installed_revision = backend.snapshot().installed_revision;
     try controller.toggle(&backend, "mods/state.jar.disabled", true);
     try drain(&controller, &backend);
     try std.testing.expect(controller.failure == null);
     try std.testing.expectEqualStrings("mods/state.jar", controller.published.?.entries[0].path);
+    try std.testing.expect(backend.snapshot().installed_revision != installed_revision);
+    // Failed rebuilding clears borrowed rows; retry must reconstruct current state.
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, controller.viewSnapshot(&backend, true));
+    try std.testing.expectEqual(@as(usize, 0), controller.view_rows.len);
+    failing.fail_index = std.math.maxInt(usize);
+    const enabled = try controller.viewSnapshot(&backend, true);
+    try std.testing.expect(enabled.rows[0].managed and enabled.rows[0].entry.enabled);
+    // Only the backend changes here: local entry pointers/revision are unchanged.
+    try backend.select(null);
+    const detached = try controller.viewSnapshot(&backend, true);
+    try std.testing.expect(!detached.rows[0].managed and !detached.can_mutate);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".minecraft/versions/First/mods/state.jar.disabled", .{}));
     const bytes = try tmp.dir.readFileAlloc(io, ".minecraft/versions/First/mods/state.jar", a, .limited(64));
     defer a.free(bytes);
@@ -139,4 +166,15 @@ test "mods route preserves more and instance entry parents through owned selecti
         try std.testing.expectEqual(state.Category.game, model.category);
         try std.testing.expectEqualStrings("first", model.mods_instance.get());
     }
+}
+
+fn snapshotAllocationFixture(allocator: std.mem.Allocator, source: *controller_module.Controller, backend: *content.Manager) !void {
+    var controller = controller_module.Controller.init(allocator, source.io, source.paths);
+    defer controller.deinit();
+    controller.instance_id = try allocator.dupe(u8, source.instance_id.?);
+    // The fixture borrows immutable entries; its empty arena owns no source data.
+    controller.published = .{ .arena = std.heap.ArenaAllocator.init(allocator), .entries = source.published.?.entries };
+    const snapshot = try controller.viewSnapshot(backend, true);
+    try std.testing.expectEqual(source.published.?.entries.len, snapshot.rows.len);
+    try std.testing.expect(snapshot.rows[0].managed);
 }

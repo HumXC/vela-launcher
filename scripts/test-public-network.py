@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Run public-address guard regressions with zero-contact loopback listeners."""
+"""Run public-address guard regressions with zero-contact loopback listeners.
+
+Usage: python3 scripts/test-public-network.py [zig build options...]
+       python3 scripts/test-public-network.py --test-exe PATH
+PATH is a compiled default HTTP transport Zig test executable.
+"""
 import os
 from pathlib import Path
 import runpy
@@ -34,7 +39,9 @@ class Guarded6(Guarded):
         self.lock = threading.Lock()
 
 
-def main():
+def main(args=None):
+    command = fixture["test_command"](args, allow_loader=False)
+    root = Path(__file__).resolve().parent.parent
     control = fixture["Fixture"]()
     guard = Guarded()
     servers = [control, guard]
@@ -60,7 +67,11 @@ def main():
         env[name] = env["PUBLIC_NETWORK_GUARD_TEST_URL"]
     env["NO_PROXY"] = env["no_proxy"] = ""
     try:
-        status = subprocess.call(["zig", "build", "test-http-transport", *sys.argv[1:]], env=env)
+        status = subprocess.call(command, cwd=root, env=env)
+        if status < 0:
+            status = 128 - status
+    except KeyboardInterrupt:
+        status = 130
     finally:
         for server in servers:
             server.shutdown()

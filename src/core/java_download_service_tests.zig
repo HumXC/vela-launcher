@@ -7,9 +7,11 @@ const java = @import("java_download.zig");
 test "Java Service adapter typechecks real downloader and rejects non HTTP transport" {
     try curl.globalInit();
     defer curl.globalDeinit();
-    const service = try downloader.Service.init(std.testing.allocator, std.testing.io, 1);
+    var budget = try downloader.Budget.init(std.testing.io, 1);
+    defer budget.deinit();
+    const service = try downloader.Service.init(std.testing.allocator, std.testing.io, &budget, 1);
     defer service.deinit();
-    var adapter: java.ServiceTransport(downloader.Service) = .{ .service = service, .io = std.testing.io };
+    var adapter: java.ServiceTransport(downloader.Service) = .{ .service = service };
     const transport = adapter.transport();
     try std.testing.expectError(error.InvalidUrl, transport.get(transport.context, std.testing.allocator, "file:///unused", 4096, .{}));
     const release: java.RuntimeRelease = .{
@@ -32,6 +34,8 @@ test "Java adapter forwards measured downloading rate and keeps exact downloader
         const Task = struct {
             index: usize = 0,
             pub fn cancel(_: *@This()) void {}
+            pub fn wait(_: *@This()) !void {}
+            pub fn join(_: *@This()) void {}
             pub fn release(_: *@This()) !void {}
             pub fn snapshot(self: *@This()) downloader.Snapshot {
                 const index = self.index;
@@ -56,7 +60,7 @@ test "Java adapter forwards measured downloading rate and keeps exact downloader
         }
     };
     var service: FakeService = .{};
-    var adapter: java.ServiceTransport(FakeService) = .{ .service = &service, .io = std.testing.io };
+    var adapter: java.ServiceTransport(FakeService) = .{ .service = &service };
     const transport = adapter.transport();
     var capture: Capture = .{};
     var release: java.RuntimeRelease = .{ .allocator = std.testing.allocator, .vendor = .azul, .major = 21, .platform = .{ .os = .linux, .arch = .x64 }, .version = "21.0.1", .url = "https://cdn.azul.com/zulu/bin/fixture.tar.gz", .archive = .tar_gz, .sha256 = @splat(0), .size = 1000, .size_precision = .azul_rounded_kilobyte };
@@ -89,6 +93,8 @@ test "Java adapter forwards final child bytes on success failure and cancellatio
             cancel_requested: bool = false,
             released: bool = false,
             submitted: bool = false,
+            pub fn wait(_: *@This()) !void {}
+            pub fn join(_: *@This()) void {}
             pub fn cancel(self: *@This()) void {
                 self.cancel_requested = true;
             }
@@ -136,7 +142,7 @@ test "Java adapter forwards final child bytes on success failure and cancellatio
     for ([_]downloader.Phase{ .complete, .failed, .canceled, .complete }, 0..) |phase, index| {
         const hook_cancel = index == 3;
         var service: FakeService = .{ .task = .{ .phase = phase, .total = if (phase == .complete) 106674581 else null } };
-        var adapter: java.ServiceTransport(FakeService) = .{ .service = &service, .io = std.testing.io };
+        var adapter: java.ServiceTransport(FakeService) = .{ .service = &service };
         const transport = adapter.transport();
         var capture: Capture = .{ .task = &service.task, .cancel = hook_cancel };
         const hooks: java.Hooks = .{ .context = &capture, .canceled = Capture.canceled, .progress = Capture.progress };
