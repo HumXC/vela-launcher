@@ -34,10 +34,19 @@ pub fn execute(raw: ?*anyopaque, a: std.mem.Allocator, io: std.Io, request: http
         }
     };
     if (ctx.long_catalog) {
-        if (std.mem.startsWith(u8, request.url, "https://api.modrinth.com/v2/search?")) return .{ .status = 200, .body = try catalog(a), .allocator = a };
+        if (std.mem.startsWith(u8, request.url, "https://api.modrinth.com/v2/search?")) {
+            const body = try catalog(a);
+            return .{ .status = 200, .body = body, .allocator = a, .allocation = body };
+        }
         const prefix = "https://api.modrinth.com/v2/project/";
-        if (std.mem.startsWith(u8, request.url, prefix ++ "preview-") and std.mem.endsWith(u8, request.url, "/version")) return .{ .status = 200, .body = try version(a, request.url[prefix.len .. request.url.len - "/version".len]), .allocator = a };
-        if (std.mem.startsWith(u8, request.url, "https://cdn.modrinth.com/fixture/preview-")) return .{ .status = 200, .body = try a.dupe(u8, base.payload), .allocator = a };
+        if (std.mem.startsWith(u8, request.url, prefix ++ "preview-") and std.mem.endsWith(u8, request.url, "/version")) {
+            const body = try version(a, request.url[prefix.len .. request.url.len - "/version".len]);
+            return .{ .status = 200, .body = body, .allocator = a, .allocation = body };
+        }
+        if (std.mem.startsWith(u8, request.url, "https://cdn.modrinth.com/fixture/preview-")) {
+            const body = try a.dupe(u8, base.payload);
+            return .{ .status = 200, .body = body, .allocator = a, .allocation = body };
+        }
     }
     return base.execute(if (ctx.scenario) |scenario| @ptrCast(scenario) else null, a, io, request);
 }

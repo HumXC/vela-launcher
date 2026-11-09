@@ -2,7 +2,7 @@ const std = @import("std");
 const view = @import("ui/accounts_view.zig");
 const dvui = @import("dvui");
 const config = @import("core/config.zig");
-const accounts_manager = @import("ui/accounts_manager.zig");
+const accounts_manager = @import("application/accounts_manager.zig");
 
 test "accounts view native entrypoints compile" {
     std.mem.doNotOptimizeAway(&view.draw);

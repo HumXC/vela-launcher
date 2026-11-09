@@ -5,15 +5,20 @@ const c = @import("curl").libcurl;
 const public_network = @import("public_network.zig");
 
 /// PEM and the callback error slot remain borrowed until easy cleanup.
-/// Proxy policy is explicit; neither proxy nor NO_PROXY is inherited.
-pub fn configure(easy: *c.CURL, proxy: [:0]const u8, ca_path: ?[:0]const u8, pem: []u8, public_address: bool, failure: *?anyerror) !void {
+/// Route is resolved explicitly for this URL; curl never inherits environment.
+pub fn configure(easy: *c.CURL, route: *const @import("proxy_policy.zig").Route, ca_path: ?[:0]const u8, pem: []u8, public_address: bool, failure: *?anyerror) !void {
     try set(easy, c.CURLOPT_SSL_VERIFYPEER, @as(c_long, 1));
     try set(easy, c.CURLOPT_SSL_VERIFYHOST, @as(c_long, 2));
     try set(easy, c.CURLOPT_PROXY_SSL_VERIFYPEER, @as(c_long, 1));
     try set(easy, c.CURLOPT_PROXY_SSL_VERIFYHOST, @as(c_long, 2));
-    try set(easy, c.CURLOPT_PROXY, proxy.ptr);
+    try set(easy, c.CURLOPT_PROXY, route.proxy.ptr);
     try set(easy, c.CURLOPT_NOPROXY, @as([*:0]const u8, ""));
-    if (public_address) {
+    if (route.username.len != 0) {
+        try set(easy, c.CURLOPT_PROXYUSERNAME, route.username.ptr);
+        try set(easy, c.CURLOPT_PROXYPASSWORD, route.password.ptr);
+        try set(easy, c.CURLOPT_PROXYAUTH, @as(c_long, c.CURLAUTH_ANY));
+    }
+    if (public_address and route.proxy.len == 0) {
         try set(easy, c.CURLOPT_OPENSOCKETFUNCTION, &public_network.openSocket);
         try set(easy, c.CURLOPT_FRESH_CONNECT, @as(c_long, 1));
         try set(easy, c.CURLOPT_FORBID_REUSE, @as(c_long, 1));

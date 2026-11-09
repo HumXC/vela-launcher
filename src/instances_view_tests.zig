@@ -2,7 +2,7 @@
 const std = @import("std");
 const config = @import("core/config.zig");
 const view = @import("ui/instances_view.zig");
-const manager_module = @import("ui/instances_manager.zig");
+const manager_module = @import("application/instances_manager.zig");
 const Phase = manager_module.Phase;
 const FixtureManager = struct {
     phase: Phase = .idle,
@@ -76,15 +76,12 @@ const FixtureManager = struct {
         if (self.fail_start) return error.InstallAdapterUnavailable;
         self.phase = .working;
     }
-    pub fn startRename(self: *FixtureManager, _: config.Instance, name: []const u8) !void {
-        self.renames += 1;
-        capture(&self.captured_name, name);
-        self.phase = .working;
-    }
     pub fn startRenameWithOptions(self: *FixtureManager, original: config.Instance, updated: config.Instance) !void {
         self.rename_options_starts += 1;
         if (self.fail_start) return error.WorkerUnavailable;
-        try self.startRename(original, updated.name);
+        self.renames += 1;
+        capture(&self.captured_name, updated.name);
+        self.phase = .working;
         capture(&self.captured_id, original.id);
         capture(&self.captured_java, updated.java_path orelse "");
         self.captured_min_memory = updated.min_memory_mb;
@@ -327,25 +324,59 @@ test "failed publication is latched until explicit retry without per frame disk 
     try std.testing.expectEqual(view.Mode.none, ui.mode);
     try std.testing.expect(ui.failure == null);
 }
-test "rename is deferred and requires explicit second confirmation" {
+test "settings rename submits once without second confirmation and keeps failures inline" {
     var store = try storeFixture();
     defer store.state.deinit();
     var ui = view.Ui.init(std.testing.allocator);
     defer ui.deinit();
     var manager: FixtureManager = .{};
-    ui.queue(.ask_rename, "first");
+    ui.queue(.edit, "first");
     view.finishWithManager(&ui, &store, &manager);
     capture(&ui.draft.name, "Renamed");
-    ui.queue(.confirm, null);
-    view.finishWithManager(&ui, &store, &manager);
-    try std.testing.expectEqual(error.ConfirmationRequired, ui.failure.?);
     ui.queue(.submit, null);
     view.finishWithManager(&ui, &store, &manager);
-    try std.testing.expect(ui.rename_confirmed);
-    try std.testing.expectEqual(@as(usize, 0), manager.renames);
-    ui.queue(.confirm, null);
+    try std.testing.expectEqual(@as(usize, 1), manager.renames);
+    try std.testing.expect(ui.submitted);
+    ui.queue(.submit, null);
     view.finishWithManager(&ui, &store, &manager);
     try std.testing.expectEqual(@as(usize, 1), manager.renames);
+    manager.phase = .failed;
+    manager.operation = .renaming;
+    manager.task_id = 99;
+    manager.failure = error.InvalidInstallReceipt;
+    view.syncTaskSnapshot(&ui, manager.snapshot());
+    view.finishWithManager(&ui, &store, &manager);
+    try std.testing.expectEqual(error.InvalidInstallReceipt, ui.failure.?);
+    try std.testing.expect(!ui.submitted and !ui.task.visible);
+    try std.testing.expectEqualStrings("Renamed", string(&ui.draft.name));
+}
+
+test "settings rename publication retry stays in form and retains exact task identity" {
+    var store = try storeFixture();
+    defer store.state.deinit();
+    var ui = view.Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    var manager: FixtureManager = .{};
+    ui.queue(.edit, "first");
+    view.finishWithManager(&ui, &store, &manager);
+    capture(&ui.draft.name, "Renamed");
+    ui.queue(.submit, null);
+    view.finishWithManager(&ui, &store, &manager);
+    manager.operation = .renaming;
+    manager.task_id = 100;
+    manager.phase = .awaiting_publication;
+    manager.fail_publish = true;
+    view.syncTaskSnapshot(&ui, manager.snapshot());
+    view.finishWithManager(&ui, &store, &manager);
+    view.syncTaskSnapshot(&ui, manager.snapshot());
+    try std.testing.expect(ui.task_can_retry and ui.submitted and !ui.task.visible);
+    try std.testing.expectEqual(error.DiskFailure, ui.failure.?);
+    manager.fail_publish = false;
+    ui.queue(.retry_publication, null);
+    view.finishWithManager(&ui, &store, &manager);
+    view.syncTaskSnapshot(&ui, manager.snapshot());
+    try std.testing.expect(ui.failure == null and !ui.submitted and !ui.task.visible);
+    try std.testing.expectEqual(@as(usize, 2), manager.publishes);
 }
 fn expectNoBackendCalls(manager: FixtureManager) !void {
     try std.testing.expectEqual(@as(usize, 0), manager.selects);
@@ -882,7 +913,7 @@ test "external minimum memory edit invalidates the saved baseline and retains qu
     try std.testing.expect(manager.saves == 0 and manager.renames == 0);
 }
 
-fn taskSnapshot(id: u64) @import("ui/instances_manager.zig").Snapshot {
+fn taskSnapshot(id: u64) @import("application/instances_manager.zig").Snapshot {
     return .{
         .task_id = id,
         .phase = .working,
@@ -1063,7 +1094,7 @@ test "task terminal states stay visible until manual acknowledgement" {
     var ui = view.Ui.init(std.testing.allocator);
     defer ui.deinit();
     var manager: FixtureManager = .{};
-    for ([_]@import("ui/instances_manager.zig").Phase{ .complete, .failed, .canceled }, 0..) |phase, index| {
+    for ([_]@import("application/instances_manager.zig").Phase{ .complete, .failed, .canceled }, 0..) |phase, index| {
         var snapshot = taskSnapshot(60 + index);
         view.syncTaskSnapshot(&ui, snapshot);
         snapshot.phase = phase;
@@ -1190,7 +1221,7 @@ test "publication retry rejects stale task identity and finishes from a hidden s
 }
 
 const FixturePreflight = struct {
-    value: @import("ui/instances_manager.zig").Snapshot = taskSnapshot(101),
+    value: @import("application/instances_manager.zig").Snapshot = taskSnapshot(101),
     starts: usize = 0,
     publishes: usize = 0,
     cancels: usize = 0,
@@ -1204,7 +1235,7 @@ const FixturePreflight = struct {
         self.value = taskSnapshot(self.value.task_id.? + 1);
         self.value.details = .{ .stage = .metadata };
     }
-    pub fn creationSnapshot(self: *FixturePreflight) @import("ui/instances_manager.zig").Snapshot {
+    pub fn creationSnapshot(self: *FixturePreflight) @import("application/instances_manager.zig").Snapshot {
         return self.value;
     }
     pub fn cancel(self: *FixturePreflight, _: void) void {

@@ -15,6 +15,10 @@ pub const Client = struct {
     io: Io,
     service: *dl.Service,
     cache_root: ?[]const u8,
+    cache_mode: dl.CacheMode = .prefer_cache,
+    /// Intersection of all responses used to construct one catalogue.
+    cache_policy: dl.CachePolicy = .{ .store = true, .fresh_until = std.math.maxInt(i64) },
+    response_count: usize = 0,
 
     pub fn init(a: A, io: Io, download_budget: *dl.Budget, cache_root: ?[]const u8) !Client {
         return .{ .io = io, .service = try dl.Service.init(a, io, download_budget, 1), .cache_root = cache_root };
@@ -60,6 +64,7 @@ pub const Client = struct {
             .url = url,
             .max_bytes = max,
             .cache_path = cache_path,
+            .cache_mode = self.cache_mode,
             .timeout_ms = @intCast(@min(remaining, 30_000)),
             .https_only = !loopback_fixture,
             .follow_redirects = false,
@@ -78,6 +83,9 @@ pub const Client = struct {
             @import("../core/install/download_details.zig").single(control.task, .metadata, url, state);
             if (dl.terminal(state.progress.phase)) {
                 try control.check();
+                self.response_count += 1;
+                self.cache_policy.store = self.cache_policy.store and state.cache_policy.store;
+                self.cache_policy.fresh_until = @min(self.cache_policy.fresh_until, state.cache_policy.fresh_until);
                 if (state.failure) |err| {
                     // Preserve the parser's established absent-catalogue behavior.
                     if (err != error.HttpStatus or state.http_status != 404) return err;

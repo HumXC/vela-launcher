@@ -41,6 +41,7 @@ const Job = struct {
     root: []const u8,
     manifest_url: []const u8,
     cache_root: ?[]const u8 = null,
+    cache_mode: dl.CacheMode = .prefer_cache,
     download_connections: u16 = 8,
     download_budget: ?*dl.Budget = null,
     thread: ?std.Thread = null,
@@ -246,8 +247,7 @@ pub const Controller = struct {
         return .{ .allocator = a, .io = io, .root = root, .manifest_url = manifest_url, .cache_root = cache_root, .download_connections = options.download_connections, .download_budget = options.download_budget, .preview_transport = options.preview_transport };
     }
     pub fn deinit(self: *Controller) void {
-        self.cancel();
-        self.cancelPreview();
+        self.cancelAll();
         if (self.preview_active) |job| {
             job.thread.?.join();
             job.thread = null;
@@ -380,10 +380,13 @@ pub const Controller = struct {
         self.preview_active = job;
     }
     pub fn refreshInstalled(self: *Controller) !void {
-        try self.start(.refresh_installed);
+        try self.start(.refresh_installed, .prefer_cache);
     }
     pub fn loadCatalogue(self: *Controller) !void {
-        try self.start(.catalogue);
+        try self.start(.catalogue, .prefer_cache);
+    }
+    pub fn refreshCatalogue(self: *Controller) !void {
+        try self.start(.catalogue, .revalidate);
     }
     pub fn setDownloadConnections(self: *Controller, connections: u16) !void {
         if (connections == 0 or connections > 64) return error.InvalidDownloadConnections;
@@ -395,9 +398,17 @@ pub const Controller = struct {
             job.canceled.store(true, .release);
         }
     }
-    fn start(self: *Controller, operation: Operation) !void {
+    /// Includes canceled workers until tick has joined them.
+    pub fn isBusy(self: *const Controller) bool {
+        return self.active != null or self.preview_active != null;
+    }
+    pub fn cancelAll(self: *Controller) void {
+        self.cancel();
+        self.cancelPreview();
+    }
+    fn start(self: *Controller, operation: Operation, cache_mode: dl.CacheMode) !void {
         if (self.active != null) return error.Busy;
-        self.startJob(operation) catch |err| {
+        self.startJob(operation, cache_mode) catch |err| {
             self.failure = err;
             self.phase = .failed;
             return err;
@@ -405,9 +416,9 @@ pub const Controller = struct {
         self.failure = null;
         self.phase = .loading;
     }
-    fn startJob(self: *Controller, operation: Operation) !void {
+    fn startJob(self: *Controller, operation: Operation, cache_mode: dl.CacheMode) !void {
         const job = try worker_allocator.create(Job);
-        job.* = .{ .io = self.io, .operation = operation, .root = undefined, .manifest_url = undefined, .download_budget = self.download_budget, .download_connections = self.download_connections };
+        job.* = .{ .io = self.io, .operation = operation, .root = undefined, .manifest_url = undefined, .download_budget = self.download_budget, .download_connections = self.download_connections, .cache_mode = cache_mode };
         errdefer job.destroy();
         const a = job.arena.allocator();
         job.root = try a.dupe(u8, self.root);
@@ -485,7 +496,7 @@ fn manifestCachePath(job: *Job) !?[]u8 {
 fn fetchManifest(job: *Job, service: *dl.Service) ![]u8 {
     const cache_path = try manifestCachePath(job);
     defer if (cache_path) |path| worker_allocator.free(path);
-    const task = try service.submit(.{ .url = job.manifest_url, .max_bytes = 64 * 1024 * 1024, .cache_path = cache_path });
+    const task = try service.submit(.{ .url = job.manifest_url, .max_bytes = 64 * 1024 * 1024, .cache_path = cache_path, .cache_mode = job.cache_mode });
     defer {
         task.cancel();
         task.join();
@@ -1509,6 +1520,36 @@ test "preview replacement queues one worker and ignores canceled late completion
     try controller.previewVersion("parent");
     try std.testing.expectEqual(PreviewPhase.loading, controller.previewSnapshot().phase);
     try waitPreviewTest(&controller);
+}
+
+test "shutdown cancellation remains busy until preview and catalogue workers join" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var fixture: PreviewFixture = .{ .pause = true, .ignore_cancel = true };
+    var controller = try Controller.initWithOptions(std.testing.allocator, std.testing.io, .{ .root = root, .preview_transport = fixture.transport() });
+    defer controller.deinit();
+    defer fixture.release.store(true, .release);
+    try controller.previewVersion("future");
+    try waitPreviewFlag(std.testing.io, &fixture.entered);
+    try std.testing.expectEqual(Phase.idle, controller.snapshot().phase);
+    try std.testing.expect(controller.isBusy());
+    var policy: @import("../core/lifecycle.zig").Policy = .{};
+    const closing = policy.closeRequested(@intFromBool(controller.isBusy()));
+    try std.testing.expect(closing.hide and closing.cancel_background and !closing.prompt_background);
+    controller.cancelAll();
+    try std.testing.expect(controller.preview_active.?.canceled.load(.acquire));
+    try std.testing.expect(controller.isBusy());
+    controller.tick();
+    try std.testing.expect(controller.isBusy());
+    fixture.release.store(true, .release);
+    try waitPreviewFlag(std.testing.io, &controller.preview_active.?.done);
+    try std.testing.expect(controller.isBusy());
+    controller.tick();
+    try std.testing.expect(!controller.isBusy());
+    try std.testing.expect(policy.backgroundJoined().quit);
+    try std.testing.expectEqual(PreviewPhase.idle, controller.previewSnapshot().phase);
 }
 
 test "preview deinit cancels and joins independently of a live catalogue worker" {

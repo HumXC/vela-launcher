@@ -2,7 +2,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("../core/config.zig");
 const servers = @import("../core/servers.zig");
-const server_manager = @import("server_manager.zig");
+const server_manager = @import("../application/server_manager.zig");
 const theme = @import("theme.zig");
 const components = @import("components.zig");
 const server_card = @import("server_card.zig");
@@ -17,7 +17,6 @@ const Draft = struct {
     name: [201]u8 = @splat(0),
     address: [4097]u8 = @splat(0),
     port: [6]u8 = .{ '2', '5', '5', '6', '5', 0 },
-    show_on_home: bool = true,
 
     fn deinit(self: *Draft, a: Allocator) void {
         if (self.id) |id| a.free(id);
@@ -33,7 +32,6 @@ const Draft = struct {
         @memcpy(draft.address[0..server.address.len], server.address);
         @memset(&draft.port, 0);
         _ = try std.fmt.bufPrint(draft.port[0..5], "{d}", .{server.port});
-        draft.show_on_home = server.show_on_home;
         return draft;
     }
     fn value(self: *const Draft) !config.Server {
@@ -45,7 +43,7 @@ const Draft = struct {
         _ = try servers.validateAddress(address, port);
         const name = std.mem.trim(u8, text(&self.name), " \t\r\n");
         if (name.len == 0) return error.InvalidServerName;
-        return .{ .id = self.id orelse return error.InvalidId, .name = name, .address = address, .port = port, .instance_id = self.instance_id, .show_on_home = self.show_on_home };
+        return .{ .id = self.id orelse return error.InvalidId, .name = name, .address = address, .port = port, .instance_id = self.instance_id };
     }
 };
 
@@ -546,12 +544,11 @@ fn apply(ui: *Ui, store: *config.Store, manager: *server_manager.Manager, pendin
 }
 
 test "server drafts own strings preserve exact bindings and validate numeric ports" {
-    var draft = try Draft.fromServer(std.testing.allocator, .{ .id = "server", .name = "Example", .address = "[::1]", .port = 25565, .instance_id = "Instance", .show_on_home = false });
+    var draft = try Draft.fromServer(std.testing.allocator, .{ .id = "server", .name = "Example", .address = "[::1]", .port = 25565, .instance_id = "Instance" });
     defer draft.deinit(std.testing.allocator);
     const server = try draft.value();
     try std.testing.expectEqualStrings("Instance", server.instance_id.?);
     try std.testing.expectEqualStrings("[::1]", server.address);
-    try std.testing.expect(!server.show_on_home);
     draft.port = .{ '0', 0, 0, 0, 0, 0 };
     try std.testing.expectError(error.InvalidPort, draft.value());
     draft.port = .{ 'a', 0, 0, 0, 0, 0 };
@@ -591,8 +588,8 @@ test "home choices include every server and instance mode clears only server sel
     var store = try config.Store.init(a, std.testing.io, root);
     defer store.deinit();
     try store.update(.{ .instances = fixtureInstances, .servers = &.{
-        .{ .id = "visible", .name = "Visible", .address = "127.0.0.1", .instance_id = "One", .show_on_home = true },
-        .{ .id = "hidden", .name = "Hidden", .address = "127.0.0.1", .instance_id = "Two", .show_on_home = false },
+        .{ .id = "visible", .name = "Visible", .address = "127.0.0.1", .instance_id = "One" },
+        .{ .id = "hidden", .name = "Hidden", .address = "127.0.0.1", .instance_id = "Two" },
     }, .selected_server = "hidden", .selected_instance = "Two" });
     var choices = try homeChoices(a, store.snapshot());
     try std.testing.expectEqual(@as(usize, 3), choices.labels.len);
@@ -659,13 +656,11 @@ test "deferred CRUD uses secure stable IDs exact selections and only removes con
     finish(&ui, &store, &manager);
     a.free(ui.draft.instance_id.?);
     ui.draft.instance_id = try a.dupe(u8, "Two");
-    ui.draft.show_on_home = false;
     ui.queue(.save, null);
     finish(&ui, &store, &manager);
     try std.testing.expect(ui.failure == null);
     try std.testing.expectEqualStrings(id, store.snapshot().servers[0].id);
     try std.testing.expectEqualStrings("Two", store.snapshot().selected_instance.?);
-    try std.testing.expect(!store.snapshot().servers[0].show_on_home);
     try std.testing.expectEqual(servers.State.idle, manager.snapshot().state);
     ui.queue(.ask_delete, id);
     finish(&ui, &store, &manager);

@@ -9,7 +9,7 @@ const fs = @import("content_fs.zig");
 pub fn open(a: std.mem.Allocator, io: std.Io, cancel: ?*const transport.CancelToken, connections: u16, options: authorization.Options, curseforge: bool) !transport.Adapter {
     var download = options.transport_options;
     download.curseforge_download_key = null;
-    if (!curseforge) return transport.Adapter.initWithOptions(a, io, cancel, connections, download);
+    if (!curseforge) return transport.Adapter.init(a, io, cancel, connections, download);
     if (!options.policy.enabled or !options.policy.terms_approved or !download.allow_curseforge) return error.ProviderDisabled;
     const reference = options.policy.credential_ref orelse return error.ProviderDisabled;
     if (!credentials.validateReference(&reference)) return error.InvalidReference;
@@ -24,5 +24,5 @@ pub fn open(a: std.mem.Allocator, io: std.Io, cancel: ?*const transport.CancelTo
     defer secret.deinit();
     try fs.cancelled(io, cancel, null);
     download.curseforge_download_key = secret.bytes;
-    return transport.Adapter.initWithOptions(a, io, cancel, connections, download);
+    return transport.Adapter.init(a, io, cancel, connections, download);
 }

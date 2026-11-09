@@ -1,7 +1,7 @@
 //! Path-bound acquisition task presentation; the controller owns all transactions.
 const std = @import("std");
 const dvui = @import("dvui");
-const content = @import("content_manager.zig");
+const content = @import("../application/content_manager.zig");
 const state = @import("resource_download_state.zig");
 const providers = @import("../core/content_providers.zig");
 const tasks = @import("../core/tasks.zig");

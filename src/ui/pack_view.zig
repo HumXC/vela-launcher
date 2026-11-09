@@ -176,6 +176,8 @@ pub fn failureMessage(err: anyerror) []const u8 {
         error.ManualArchiveRequired => "此整合包需要手动下载，请从项目主页下载后选择从文件导入。",
         error.UnresolvedPackReferences => "整合包文件信息尚未解析完成，请检查来源设置后重新读取。",
         error.ManualFileRequired => "请选择所有必需的手动下载文件。",
+        error.ProtectedPath => "整合包包含受保护路径，无法写入。",
+        error.PackGameCollision => "整合包文件与实例已有文件冲突，已停止安装。",
         else => fmt("操作失败：{s}", .{@errorName(err)}),
     };
 }
@@ -264,8 +266,9 @@ fn catalog(ui: *Ui, state: Presentation, ready: bool) void {
             defer action.deinit();
             if (components.button(@src(), "查看详情", .{ .enabled = ready, .min_width = 120, .placement = .footer, .tag = fmt("pack-project-{d}", .{i}) })) ui.queue(.{ .project = i });
         }
-        // Disabled/shutdown frames must not enqueue image jobs after cancellation.
-        const bitmap = projectBitmap(ui, project.icon_url, ready);
+        // Only visible rows request work; disabled frames only reuse presentation pixels.
+        const visible = !card.data().borderRectScale().r.intersect(dvui.clipGet()).empty();
+        const bitmap = projectBitmap(ui, project.icon_url, ready and visible);
         icons.draw(@src(), bitmap, 64, null);
         const info = plain(@src(), .vertical, .{ .margin = .{ .x = 16 } });
         defer info.deinit();
@@ -290,7 +293,8 @@ fn detail(ui: *Ui, state: Presentation, ready: bool) void {
             {
                 const image = plain(@src(), .vertical, .{ .expand = .none, .min_size_content = .width(80), .max_size_content = .width(80), .tag = "pack-detail-icon" });
                 defer image.deinit();
-                icons.draw(@src(), projectBitmap(ui, project.icon_url, ready), 80, null);
+                const visible = !card.data().borderRectScale().r.intersect(dvui.clipGet()).empty();
+                icons.draw(@src(), projectBitmap(ui, project.icon_url, ready and visible), 80, null);
             }
             const info = plain(@src(), .vertical, .{ .margin = .{ .x = 16 } });
             defer info.deinit();
@@ -352,7 +356,8 @@ fn confirmation(ui: *Ui, state: Presentation, ready: bool) void {
         defer card.deinit();
         components.fieldLabel(@src(), "安装内容");
         components.hint(@src(), "必需模组与配置将全部安装。");
-        for (pack.files, 0..) |file, i| {
+        for (0..pack.sourceFileCount()) |i| {
+            const file = pack.sourceFile(i);
             if (file.required) continue;
             var selected = file.selected orelse false;
             if (dvui.checkbox(@src(), &selected, file.record.path, .{ .id_extra = i })) if (ready) ui.queue(.{ .optional = .{ .index = i, .include = selected } });
@@ -374,6 +379,16 @@ fn openPage(ui: *Ui, url: []const u8) void {
     }
     if (!dvui.openURL(.{ .url = url })) ui.failure = error.OpenUrlFailed;
 }
+pub fn failureStage(stage: @import("../core/tasks.zig").Stage) []const u8 {
+    return switch (stage) {
+        .metadata => "获取整合包信息失败",
+        .downloading => "下载失败",
+        .verifying => "文件校验失败",
+        .extracting => "解压或检查整合包失败",
+        .finalizing => "完成安装失败",
+        else => "安装失败",
+    };
+}
 pub fn dialogs(ui: *Ui, state: Presentation, allowed: bool) void {
     if (!ui.task_visible or state.task == .none) return;
     const task_style = @import("download_task_style.zig");
@@ -387,7 +402,7 @@ pub fn dialogs(ui: *Ui, state: Presentation, allowed: bool) void {
     task_style.text(@src(), "下载与安装", theme.fontSized(24), .{ .w = width, .h = 36 }, if (failed) theme.colors.danger else theme.colors.foreground);
     const summary = if (state.pack) |pack| fmt("{s} · {s}", .{ pack.name, pack.version }) else if (ui.project) |project| project.name else "整合包实例";
     task_style.text(@src(), summary, theme.bodyFont(), .{ .y = if (layout.compact) 44 else 52, .w = width, .h = 24 }, theme.colors.muted);
-    task_style.text(@src(), if (failed) (if (layout.compact and failure != null) failureMessage(failure.?) else "安装失败") else state.stage, theme.bodyFont(), .{ .y = if (layout.compact) 76 else 88, .w = width, .h = 24 }, if (failed) theme.colors.danger else if (state.task == .complete) theme.colors.accent else theme.colors.muted);
+    task_style.text(@src(), if (failed) (if (layout.compact and failure != null and state.details.file_count == 0) failureMessage(failure.?) else failureStage(state.details.stage)) else state.stage, theme.bodyFont(), .{ .y = if (layout.compact) 76 else 88, .w = width, .h = 24 }, if (failed) theme.colors.danger else if (state.task == .complete) theme.colors.accent else theme.colors.muted);
     _ = dvui.separator(@src(), .{ .rect = .{ .y = if (layout.compact) 108 else 128, .w = width, .h = 1 }, .padding = .all(0), .margin = .all(0), .color_border = .{ .color = theme.colors.outline } });
     var amount_buffer: [64]u8 = undefined;
     var total_buffer: [64]u8 = undefined;
@@ -402,12 +417,12 @@ pub fn dialogs(ui: *Ui, state: Presentation, allowed: bool) void {
                 .downloading => if (file.total != null) fmt("下载中 · {d:.0}%", .{percent * 100}) else "下载中",
                 .verifying => "校验中",
                 .complete => "已下载",
-                .failed => "下载失败",
+                .failed => failureStage(state.details.stage),
                 .canceled => "已取消",
             };
             const color = if (file.state == .failed) theme.colors.danger else if (file.state == .canceled or file.state == .queued) theme.colors.muted else theme.colors.accent;
             const subtitle = if (file.failure) |err| failureMessage(err) else fmt("{s} / {s} · {s}", .{ metrics.formatBytes(&amount_buffer, file.received) catch "—", if (file.total) |total| metrics.formatBytes(&total_buffer, total) catch "—" else "大小未知", metrics.formatSpeed(&speed_buffer, file.bytes_per_second, file.state == .downloading) catch "—" });
-            task_style.fileCard(index, file.name(), subtitle, status, percent, color, fmt("pack-task-file-{d}", .{index}));
+            task_style.fileCard(index, if (file.failure != null) file.path() else file.name(), subtitle, status, percent, color, fmt("pack-task-file-{d}", .{index}));
         }
         if (state.details.file_count == 0 and state.task == .working) components.hint(@src(), "正在准备文件列表…");
         if (state.details.omitted_files > 0) components.hint(@src(), fmt("另有 {d} 个文件未显示", .{state.details.omitted_files}));

@@ -5,11 +5,17 @@ const config = @import("../core/config.zig");
 const theme = @import("theme.zig");
 const components = @import("components.zig");
 const credentials = @import("../core/credentials.zig");
-const credential_controller = @import("curseforge_credentials_controller.zig");
+const credential_controller = @import("../application/curseforge_credentials_controller.zig");
 const masked_key = @import("curseforge_key_editor.zig");
+const proxy_ui = @import("proxy_settings.zig");
+const proxy_controller = @import("../application/proxy_settings_controller.zig");
 const R = dvui.Rect;
 
-const Command = enum { save, cancel };
+const Field = enum { memory, connections, client_id, game_exit, cf_enabled, cf_terms };
+const EditState = struct { dirty: bool = false, due: i128 = 0, failure: ?anyerror = null };
+fn now() i128 {
+    return if (dvui.current_window != null) dvui.currentWindow().frame_time_ns else 0;
+}
 pub const KeyCommand = enum { save_key, remove_key, recover_key };
 const KeyRequest = struct {
     command: KeyCommand,
@@ -31,7 +37,10 @@ pub const Ui = struct {
     game_exit_behavior: config.GameExitBehavior,
     curseforge_enabled: bool,
     curseforge_terms_approved: bool,
-    pending: ?Command = null,
+    edits: [6]EditState = @splat(.{}),
+    last_focus: ?dvui.Id = null,
+    retry_requested: bool = false,
+    restore_field: ?Field = null,
     failure: ?anyerror = null,
     saved: bool = false,
     key_editor: masked_key.Editor = .{},
@@ -39,9 +48,12 @@ pub const Ui = struct {
     key_failure: ?anyerror = null,
     key_discard_queued: bool = false,
     confirm_remove: bool = false,
+    proxy: proxy_ui.Draft,
+    /// Optional external runtime binding; existing fixtures need not instantiate workers.
+    proxy_controller: ?*proxy_controller.Controller = null,
 
     pub fn init(a: std.mem.Allocator, initial_settings: config.Settings) !Ui {
-        var self: Ui = .{ .a = a, .game_exit_behavior = initial_settings.game_exit_behavior, .curseforge_enabled = initial_settings.curseforge_enabled, .curseforge_terms_approved = initial_settings.curseforge_terms_approved };
+        var self: Ui = .{ .a = a, .game_exit_behavior = initial_settings.game_exit_behavior, .curseforge_enabled = initial_settings.curseforge_enabled, .curseforge_terms_approved = initial_settings.curseforge_terms_approved, .proxy = try proxy_ui.Draft.init(initial_settings.proxy) };
         errdefer self.client_id.deinit(a);
         try self.client_id.appendSlice(a, initial_settings.microsoft_client_id);
         _ = try std.fmt.bufPrint(&self.memory_buffer, "{d}", .{initial_settings.default_memory_mb});
@@ -51,11 +63,18 @@ pub const Ui = struct {
 
     pub fn deinit(self: *Ui) void {
         self.clearKey();
+        self.proxy.deinit();
         self.client_id.deinit(self.a);
         self.client_id = .empty;
-        self.pending = null;
+        self.edits = @splat(.{});
         self.failure = null;
         self.saved = false;
+    }
+
+    /// Navigation/lifecycle hook: clears both kinds of unsaved credential input.
+    pub fn clearSecrets(self: *Ui) void {
+        self.clearKey();
+        self.proxy.clearSecret();
     }
 
     pub fn clearKey(self: *Ui) void {
@@ -91,7 +110,25 @@ pub const Ui = struct {
         self.key_failure = null;
     }
 
-    fn edited(self: *Ui) void {
+    pub fn flush(self: *Ui) void {
+        for (&self.edits) |*state| state.due = 0;
+        self.proxy.flush();
+    }
+
+    pub fn dirty(self: *const Ui) bool {
+        for (self.edits) |state| if (state.dirty) return true;
+        return false;
+    }
+
+    fn retry(self: *Ui) void {
+        self.failure = null;
+        self.retry_requested = true;
+        self.flush();
+    }
+
+    fn edited(self: *Ui, field: Field, delayed: bool) void {
+        self.last_focus = if (dvui.current_window != null) dvui.focusedWidgetId() else null;
+        self.edits[@backingInt(field)] = .{ .dirty = true, .due = now() + (if (delayed) @as(i128, 500 * std.time.ns_per_ms) else 0) };
         self.saved = false;
         self.failure = null;
     }
@@ -147,20 +184,16 @@ fn drawCredentials(ui: *Ui, snapshot: credential_controller.Snapshot, settings: 
     const action = components.formActions(@src(), .{ .save_label = "保存密钥", .save_enabled = ui.key_pending == null and keyAllowed(.save_key, snapshot, content_busy, store_uncertain) and ui.key_editor.readyForSave() });
     if (action == .cancel) ui.key_discard_queued = true;
     components.text(@src(), if (configured) "已配置" else "未配置", theme.colors.muted);
-    const result = ui.key_editor.draw(@src(), components.entryOptions("CurseForge API 密钥", .{}));
-    if (result.edited) ui.key_failure = null;
-    if (result.cancel) ui.key_discard_queued = true;
-    if (!ui.key_discard_queued and (action == .save or result.submit)) ui.requestKey(.save_key, snapshot, content_busy, store_uncertain) catch |err| {
-        ui.key_failure = err;
-    };
-    switch (result.status) {
-        .invalid_input => components.text(@src(), "密钥含无效字符", theme.colors.danger),
-        .too_long => components.text(@src(), "密钥超过 512 字节", theme.colors.danger),
-        else => {},
-    }
-    {
-        const actions = components.toolbar(@src());
-        defer actions.deinit();
+    const result = result: {
+        const row = fieldRow(@src());
+        defer row.deinit();
+        const drawn = ui.key_editor.draw(@src(), components.entryOptions("CurseForge API 密钥", .{ .gap_after = 0 }));
+        if (drawn.edited) ui.key_failure = null;
+        if (drawn.cancel) ui.key_discard_queued = true;
+        if (!ui.key_discard_queued and (action == .save or drawn.submit)) ui.requestKey(.save_key, snapshot, content_busy, store_uncertain) catch |err| {
+            ui.key_failure = err;
+        };
+        _ = dvui.spacer(@src(), .{ .min_size_content = .width(theme.spacing.row_gap) });
         const remove_allowed = configured and ui.key_pending == null and keyAllowed(.remove_key, snapshot, content_busy, store_uncertain);
         if (components.iconButton(@src(), "移除 API 密钥", dvui.entypo.trash, .{ .enabled = remove_allowed })) {
             ui.clearKey();
@@ -169,6 +202,12 @@ fn drawCredentials(ui: *Ui, snapshot: credential_controller.Snapshot, settings: 
         if (components.iconButton(@src(), "恢复凭据状态", dvui.entypo.cw, .{ .enabled = ui.key_pending == null and keyAllowed(.recover_key, snapshot, content_busy, store_uncertain) })) ui.requestKey(.recover_key, snapshot, content_busy, store_uncertain) catch |err| {
             ui.key_failure = err;
         };
+        break :result drawn;
+    };
+    switch (result.status) {
+        .invalid_input => components.text(@src(), "密钥含无效字符", theme.colors.danger),
+        .too_long => components.text(@src(), "密钥超过 512 字节", theme.colors.danger),
+        else => {},
     }
     if (ui.confirm_remove) {
         components.text(@src(), "确认移除 CurseForge API 密钥？", theme.colors.danger);
@@ -221,10 +260,13 @@ fn drawPage(ui: *Ui, controller: ?*credential_controller.Controller, settings: c
     const page = dvui.box(@src(), .{}, .{ .expand = .both, .padding = R.all(0), .margin = R.all(0) });
     defer page.deinit();
     components.title(@src(), "设置");
-    switch (components.formActions(@src(), .{})) {
-        .save => ui.pending = .save,
-        .cancel => ui.pending = .cancel,
-        .none => {},
+    defer {
+        if (ui.last_focus != dvui.focusedWidgetId()) for (&ui.edits) |*state| {
+            state.due = 0;
+        };
+        if (ui.failure == null) for (ui.edits) |state| {
+            if (state.dirty and state.failure == null and state.due > now()) dvui.timer(page.data().id.update("settings-autosave"), 50_000);
+        };
     }
     {
         const scroll = components.scrollBody(@src());
@@ -237,12 +279,26 @@ fn drawPage(ui: *Ui, controller: ?*credential_controller.Controller, settings: c
             {
                 const cell = fields.cell(@src(), 0);
                 defer cell.deinit();
-                if (components.field(@src(), "默认游戏内存（MiB）", &ui.memory_buffer, .{ .gap_after = 0, .digits_only = true, .tag = "默认游戏内存" })) ui.edited();
+                components.fieldLabel(@src(), "默认游戏内存（MiB）");
+                {
+                    const row = fieldRow(@src());
+                    defer row.deinit();
+                    if (components.entry(@src(), "默认游戏内存（MiB）", &ui.memory_buffer, .{ .gap_after = 0, .digits_only = true, .tag = "默认游戏内存" })) ui.edited(.memory, true);
+                    drawFieldReset(ui, .memory);
+                }
+                drawFieldStatus(ui, .memory);
             }
             {
                 const cell = fields.cell(@src(), 1);
                 defer cell.deinit();
-                if (components.field(@src(), "下载连接数", &ui.connections_buffer, .{ .gap_after = 0, .digits_only = true, .tag = "下载连接数" })) ui.edited();
+                components.fieldLabel(@src(), "下载连接数");
+                {
+                    const row = fieldRow(@src());
+                    defer row.deinit();
+                    if (components.entry(@src(), "下载连接数", &ui.connections_buffer, .{ .gap_after = 0, .digits_only = true, .tag = "下载连接数" })) ui.edited(.connections, true);
+                    drawFieldReset(ui, .connections);
+                }
+                drawFieldStatus(ui, .connections);
             }
         }
         {
@@ -253,27 +309,33 @@ fn drawPage(ui: *Ui, controller: ?*credential_controller.Controller, settings: c
             defer modes.deinit();
             if (components.button(@src(), "显示启动器", .{ .primary = ui.game_exit_behavior == .restore_launcher })) {
                 ui.game_exit_behavior = .restore_launcher;
-                ui.edited();
+                ui.edited(.game_exit, false);
             }
             if (components.button(@src(), "退出启动器", .{ .primary = ui.game_exit_behavior == .exit_launcher })) {
                 ui.game_exit_behavior = .exit_launcher;
-                ui.edited();
+                ui.edited(.game_exit, false);
             }
         }
         {
             const panel = components.formPanel(@src(), .{ .tag = "settings-microsoft" });
             defer panel.deinit();
             components.fieldLabel(@src(), "Microsoft 客户端 ID");
-            const entry = dvui.textEntry(@src(), .{ .text = .{ .array_list = .{ .backing = &ui.client_id, .allocator = ui.a, .limit = 4096 } } }, components.entryOptions("Microsoft 客户端 ID", .{ .gap_after = 0 }));
-            if (entry.text_changed) ui.edited();
-            entry.deinit();
+            {
+                const row = fieldRow(@src());
+                defer row.deinit();
+                const entry = dvui.textEntry(@src(), .{ .text = .{ .array_list = .{ .backing = &ui.client_id, .allocator = ui.a, .limit = 4096 } } }, components.entryOptions("Microsoft 客户端 ID", .{ .gap_after = 0 }));
+                if (entry.text_changed) ui.edited(.client_id, true);
+                entry.deinit();
+                drawFieldReset(ui, .client_id);
+            }
+            drawFieldStatus(ui, .client_id);
         }
         {
             const panel = components.formPanel(@src(), .{ .tag = "settings-curseforge" });
             defer panel.deinit();
             const policy_enabled = credential_failure == null and (if (controller) |active| !active.lease() and !content_busy else true);
-            if (components.toggle(@src(), &ui.curseforge_enabled, "CurseForge", policy_enabled)) ui.edited();
-            if (components.checkbox(@src(), &ui.curseforge_terms_approved, "已确认 CurseForge 接入条款", policy_enabled)) ui.edited();
+            if (components.toggle(@src(), &ui.curseforge_enabled, "CurseForge", policy_enabled)) ui.edited(.cf_enabled, false);
+            if (components.checkbox(@src(), &ui.curseforge_terms_approved, "已确认 CurseForge 接入条款", policy_enabled)) ui.edited(.cf_terms, false);
             if (controller) |active| drawCredentials(ui, active.snapshot(), settings, content_busy, store_uncertain);
             if (credential_failure) |err| {
                 components.fieldLabel(@src(), "CurseForge API 密钥");
@@ -282,23 +344,18 @@ fn drawPage(ui: *Ui, controller: ?*credential_controller.Controller, settings: c
                 components.text(@src(), message, theme.colors.danger);
             }
         }
-        if (ui.failure) |failure| {
-            const text = try std.fmt.allocPrint(dvui.currentWindow().arena(), "{s}（{s}）", .{ failureText(failure), @errorName(failure) });
-            components.text(@src(), text, theme.colors.danger);
-        } else if (ui.saved) {
-            components.text(@src(), "已保存", theme.colors.accent);
-        }
+        proxy_ui.draw(&ui.proxy, ui.proxy_controller, settings, store_uncertain);
+        const status = dvui.box(@src(), .{}, .{ .expand = .horizontal, .min_size_content = .height(104), .max_size_content = .height(104) });
+        defer status.deinit();
+        const message = if (ui.failure) |err| try std.fmt.allocPrint(dvui.currentWindow().arena(), "设置未保存（{s}），请重试", .{@errorName(err)}) else if (ui.dirty()) "部分修改尚未保存，请检查输入或等待当前操作完成" else "有效修改将自动保存";
+        components.text(@src(), message, if (ui.failure != null) theme.colors.danger else theme.colors.muted);
+        if (components.button(@src(), "重试保存", .{ .enabled = ui.failure != null })) ui.retry();
     }
 }
 
-/// Store.update is deliberately outside draw: it invalidates borrowed snapshots.
-/// Failure keeps the working copy for retry; Cancel atomically reloads the latest settings.
+/// Publish after drawing, when no view still borrows Store snapshots.
 pub fn finish(ui: *Ui, store: *config.Store) void {
     ui.finishKeyDiscard();
-    if (ui.pending == .cancel) {
-        finishSettings(ui, store, false);
-        return;
-    }
     const unavailable = ui.key_pending != null;
     if (unavailable) ui.clearKey();
     finishSettings(ui, store, false);
@@ -308,17 +365,7 @@ pub fn finish(ui: *Ui, store: *config.Store) void {
 pub fn finishWithCredentials(ui: *Ui, store: *config.Store, controller: *credential_controller.Controller, content_busy: bool) void {
     ui.finishKeyDiscard();
     const policy_locked = controller.lease() or content_busy;
-    if (ui.pending == .cancel) {
-        finishSettings(ui, store, policy_locked);
-        return;
-    }
-    const conflicting = ui.pending != null and ui.key_pending != null;
-    if (conflicting) ui.clearKey();
     finishSettings(ui, store, policy_locked);
-    if (conflicting) {
-        ui.key_failure = error.Busy;
-        return;
-    }
     var request = ui.key_pending orelse return;
     ui.key_pending = null;
     ui.key_editor.reset();
@@ -356,50 +403,144 @@ pub fn finishUnavailable(ui: *Ui, store: *config.Store) void {
     finishSettings(ui, store, true);
 }
 
-fn finishSettings(ui: *Ui, store: *config.Store, preserve_cf_policy: bool) void {
-    const command = ui.pending orelse return;
-    ui.pending = null;
-    ui.saved = false;
-    switch (command) {
-        .cancel => {
-            ui.clearKey();
-            const next = Ui.init(ui.a, store.snapshot().settings) catch |err| {
-                ui.failure = err;
-                return;
-            };
-            ui.deinit();
-            ui.* = next;
+fn fieldRow(src: std.builtin.SourceLocation) *dvui.BoxWidget {
+    return dvui.box(src, .{ .dir = .horizontal }, .{ .expand = .horizontal, .max_size_content = .width(0), .padding = R.all(0), .margin = R.all(0), .background = false });
+}
+
+fn drawFieldReset(ui: *Ui, comptime field: Field) void {
+    _ = dvui.spacer(@src(), .{ .min_size_content = .width(theme.spacing.row_gap) });
+    if (components.iconButton(@src(), "恢复已保存值", dvui.entypo.cw, .{ .enabled = ui.edits[@backingInt(field)].dirty })) ui.restore_field = field;
+}
+
+fn drawFieldStatus(ui: *Ui, comptime field: Field) void {
+    const state = ui.edits[@backingInt(field)];
+    // Clean fields have no footer. The reset button already indicates an unsaved draft.
+    if (state.failure) |err| components.text(@src(), failureText(err), theme.colors.danger);
+}
+
+fn mergeField(ui: *const Ui, field: Field, value: *config.Settings) !bool {
+    switch (field) {
+        .memory => {
+            const parsed = std.fmt.parseInt(u32, std.mem.trim(u8, std.mem.sliceTo(&ui.memory_buffer, 0), " "), 10) catch return error.InvalidMemory;
+            if (parsed < 256 or parsed > 1024 * 1024) return error.InvalidMemory;
+            if (value.default_memory_mb == parsed) return false;
+            value.default_memory_mb = parsed;
         },
-        .save => {
-            const settings = ui.settings() catch |err| {
-                ui.clearKey();
-                ui.failure = err;
-                return;
-            };
-            if (store.publicationUncertain()) store.reconcile() catch |err| {
-                ui.clearKey();
-                ui.failure = err;
-                return;
-            };
-            // Merge only draft-owned fields into the reconciled/latest document.
-            var document = store.snapshot().*;
-            document.settings.default_memory_mb = settings.default_memory_mb;
-            document.settings.download_connections = settings.download_connections;
-            document.settings.game_exit_behavior = settings.game_exit_behavior;
-            document.settings.microsoft_client_id = settings.microsoft_client_id;
-            if (!preserve_cf_policy) {
-                document.settings.curseforge_enabled = settings.curseforge_enabled;
-                document.settings.curseforge_terms_approved = settings.curseforge_terms_approved;
-            }
-            store.update(document) catch |err| {
-                ui.clearKey();
-                ui.failure = err;
-                return;
-            };
-            ui.failure = null;
-            ui.saved = true;
+        .connections => {
+            const parsed = std.fmt.parseInt(u16, std.mem.trim(u8, std.mem.sliceTo(&ui.connections_buffer, 0), " "), 10) catch return error.InvalidDownloadConnections;
+            if (parsed == 0 or parsed > 64) return error.InvalidDownloadConnections;
+            if (value.download_connections == parsed) return false;
+            value.download_connections = parsed;
+        },
+        .client_id => {
+            const text = ui.client_id.items;
+            if (text.len > 4096 or !std.unicode.utf8ValidateSlice(text)) return error.InvalidClientId;
+            var it = std.unicode.Utf8View.initUnchecked(text).iterator();
+            while (it.nextCodepoint()) |cp| if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return error.InvalidClientId;
+            if (std.mem.eql(u8, value.microsoft_client_id, text)) return false;
+            value.microsoft_client_id = text;
+        },
+        .game_exit => {
+            if (value.game_exit_behavior == ui.game_exit_behavior) return false;
+            value.game_exit_behavior = ui.game_exit_behavior;
+        },
+        .cf_enabled => {
+            if (value.curseforge_enabled == ui.curseforge_enabled) return false;
+            value.curseforge_enabled = ui.curseforge_enabled;
+        },
+        .cf_terms => {
+            if (value.curseforge_terms_approved == ui.curseforge_terms_approved) return false;
+            value.curseforge_terms_approved = ui.curseforge_terms_approved;
         },
     }
+    return true;
+}
+
+fn restoreField(ui: *Ui, field: Field, value: config.Settings) !void {
+    switch (field) {
+        .memory => {
+            @memset(&ui.memory_buffer, 0);
+            _ = try std.fmt.bufPrint(&ui.memory_buffer, "{d}", .{value.default_memory_mb});
+        },
+        .connections => {
+            @memset(&ui.connections_buffer, 0);
+            _ = try std.fmt.bufPrint(&ui.connections_buffer, "{d}", .{value.download_connections});
+        },
+        .client_id => if (!std.mem.eql(u8, ui.client_id.items, value.microsoft_client_id)) {
+            var text: std.ArrayList(u8) = .empty;
+            try text.appendSlice(ui.a, value.microsoft_client_id);
+            ui.client_id.deinit(ui.a);
+            ui.client_id = text;
+        },
+        .game_exit => ui.game_exit_behavior = value.game_exit_behavior,
+        .cf_enabled => ui.curseforge_enabled = value.curseforge_enabled,
+        .cf_terms => ui.curseforge_terms_approved = value.curseforge_terms_approved,
+    }
+    ui.edits[@backingInt(field)] = .{};
+}
+
+fn finishSettings(ui: *Ui, store: *config.Store, preserve_cf_policy: bool) void {
+    // Proxy failures never block unrelated ordinary settings.
+    ui.proxy.finish(ui.proxy_controller, store);
+    if (ui.restore_field) |field| {
+        ui.restore_field = null;
+        restoreField(ui, field, store.snapshot().settings) catch |err| {
+            ui.failure = err;
+            return;
+        };
+    }
+    for (0..ui.edits.len) |i| if (!ui.edits[i].dirty) {
+        restoreField(ui, @fromBackingInt(@intCast(i)), store.snapshot().settings) catch |err| {
+            ui.failure = err;
+            return;
+        };
+    };
+    if (ui.failure != null) return;
+    var accepted: [6]bool = @splat(false);
+    var candidate = store.snapshot().settings;
+    var any = false;
+    for (&ui.edits, 0..) |*state, i| {
+        if (!state.dirty or state.failure != null or state.due > now()) continue;
+        const field: Field = @fromBackingInt(@intCast(i));
+        if (preserve_cf_policy and (field == .cf_enabled or field == .cf_terms)) continue;
+        const changed = mergeField(ui, field, &candidate) catch |err| {
+            state.failure = err;
+            continue;
+        };
+        if (!changed and !store.publicationUncertain()) {
+            state.* = .{};
+            continue;
+        }
+        accepted[i] = true;
+        any = true;
+    }
+    if (!any) return;
+    if (store.publicationUncertain()) {
+        if (!ui.retry_requested) {
+            ui.failure = error.ConfigPublicationUncertain;
+            return;
+        }
+        store.reconcile() catch |err| {
+            ui.failure = err;
+            ui.retry_requested = false;
+            return;
+        };
+    }
+    ui.retry_requested = false;
+    var document = store.snapshot().*;
+    var changed = false;
+    for (accepted, 0..) |accept, i| if (accept) {
+        changed = (mergeField(ui, @fromBackingInt(@intCast(i)), &document.settings) catch unreachable) or changed;
+    };
+    if (changed) store.update(document) catch |err| {
+        ui.failure = err;
+        ui.saved = false;
+        return;
+    };
+    for (accepted, 0..) |accept, i| if (accept) {
+        ui.edits[i] = .{};
+    };
+    ui.saved = !ui.dirty();
 }
 
 fn setNumber(buffer: []u8, text: []const u8) void {
@@ -453,7 +594,7 @@ test "settings public identifier rejects controls and invalid UTF8 but permits a
     _ = try ui.settings();
 }
 
-test "settings save and cancel are deferred and preserve unrelated current records" {
+test "settings autosave independently validates fields and flushes delayed changes" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -463,77 +604,30 @@ test "settings save and cancel are deferred and preserve unrelated current recor
     defer store.deinit();
     var ui = try Ui.init(a, store.snapshot().settings);
     defer ui.deinit();
-    setNumber(&ui.memory_buffer, "4096");
-    ui.game_exit_behavior = .exit_launcher;
-    ui.curseforge_enabled = true;
-    try ui.client_id.appendSlice(a, "public-client");
-    ui.pending = .save;
-    try std.testing.expectEqual(@as(u32, 2048), store.snapshot().settings.default_memory_mb);
-    try store.update(.{ .instances = &.{.{ .id = "instance", .name = "instance", .minecraft_version = "1.21" }}, .selected_instance = "instance" });
-    finish(&ui, &store);
-    try std.testing.expect(ui.failure == null);
-    try std.testing.expect(ui.saved);
-    try std.testing.expect(ui.pending == null);
-    try std.testing.expectEqual(@as(u32, 4096), store.snapshot().settings.default_memory_mb);
-    try std.testing.expectEqual(config.GameExitBehavior.exit_launcher, store.snapshot().settings.game_exit_behavior);
-    try std.testing.expect(store.snapshot().settings.curseforge_enabled);
-    try std.testing.expectEqualStrings("public-client", store.snapshot().settings.microsoft_client_id);
-    try std.testing.expectEqualStrings("instance", store.snapshot().selected_instance.?);
-    ui.client_id.items[0] = 'X';
-    try std.testing.expectEqualStrings("public-client", store.snapshot().settings.microsoft_client_id);
     setNumber(&ui.memory_buffer, "0");
-    ui.pending = .save;
+    ui.edited(.memory, true);
+    ui.game_exit_behavior = .exit_launcher;
+    ui.edited(.game_exit, false);
+    var latest = store.snapshot().*;
+    latest.settings.download_connections = 12;
+    try store.update(latest);
     finish(&ui, &store);
-    try std.testing.expectEqual(error.InvalidMemory, ui.failure.?);
-    try std.testing.expectEqualStrings("0", std.mem.sliceTo(&ui.memory_buffer, 0));
-    try std.testing.expectEqual(@as(u32, 4096), store.snapshot().settings.default_memory_mb);
-    ui.pending = .cancel;
+    try std.testing.expectEqual(config.GameExitBehavior.exit_launcher, store.snapshot().settings.game_exit_behavior);
+    try std.testing.expect(ui.edits[0].failure == null);
+    ui.flush();
     finish(&ui, &store);
-    try std.testing.expect(ui.failure == null);
-    try std.testing.expectEqual(@as(u32, 4096), (try ui.settings()).default_memory_mb);
-    try std.testing.expectEqualStrings("public-client", ui.client_id.items);
-    try store.reconcile();
-    const reopened = &store;
-    try std.testing.expectEqual(@as(u32, 4096), reopened.snapshot().settings.default_memory_mb);
-}
-
-test "settings disk failure retains draft and old store then permits retry" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try testRoot(&tmp);
-    defer a.free(root);
-    var store = try config.Store.init(a, io, root);
-    defer store.deinit();
-    try store.update(.{});
-    var ui = try Ui.init(a, store.snapshot().settings);
-    defer ui.deinit();
-    setNumber(&ui.memory_buffer, "8192");
-    try ui.client_id.appendSlice(a, "draft-client");
-    try tmp.dir.rename(".vela/config.json", tmp.dir, ".vela/previous.json", io);
-    try tmp.dir.createDir(io, ".vela/config.json", .default_dir);
-    ui.pending = .save;
-    finish(&ui, &store);
-    try std.testing.expect(ui.failure != null);
-    try std.testing.expect(!ui.saved);
-    try std.testing.expect(ui.pending == null);
+    try std.testing.expectEqual(error.InvalidMemory, ui.edits[0].failure.?);
     try std.testing.expectEqual(@as(u32, 2048), store.snapshot().settings.default_memory_mb);
-    try std.testing.expectEqual(@as(u32, 8192), (try ui.settings()).default_memory_mb);
-    try std.testing.expectEqualStrings("draft-client", ui.client_id.items);
-    try tmp.dir.deleteDir(io, ".vela/config.json");
-    ui.pending = .save;
+    try std.testing.expectEqual(@as(u16, 12), store.snapshot().settings.download_connections);
+    setNumber(&ui.memory_buffer, "4096");
+    ui.edited(.memory, true);
     finish(&ui, &store);
-    try std.testing.expectEqual(error.FileNotFound, ui.failure.?);
-    try std.testing.expect(!ui.saved);
-    try std.testing.expect(store.publicationUncertain());
-    try std.testing.expectEqualStrings("draft-client", ui.client_id.items);
-    try tmp.dir.rename(".vela/previous.json", tmp.dir, ".vela/config.json", io);
-    ui.pending = .save;
+    try std.testing.expectEqual(@as(u32, 2048), store.snapshot().settings.default_memory_mb);
+    ui.flush();
     finish(&ui, &store);
-    try std.testing.expect(ui.failure == null);
-    try std.testing.expect(ui.saved);
-    try std.testing.expectEqual(@as(u32, 8192), store.snapshot().settings.default_memory_mb);
+    try std.testing.expect(!ui.dirty());
+    try store.reconcile();
+    try std.testing.expectEqual(@as(u32, 4096), store.snapshot().settings.default_memory_mb);
 }
 
 test "settings init rolls back allocation failure" {
@@ -550,6 +644,75 @@ test "settings public declarations are analyzed without GUI context" {
 }
 
 // Only intercept sync; all IO and userdata remain the real tempfile backend.
+test "settings autosave IO failure stops writes and no-op edits avoid disk" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    try store.update(.{});
+    var ui = try Ui.init(a, store.snapshot().settings);
+    defer ui.deinit();
+    var fault: SettingsSyncFault = .{};
+    store.io = fault.start();
+    defer fault.stop();
+    ui.edited(.memory, false);
+    finish(&ui, &store);
+    try std.testing.expectEqual(@as(usize, 0), fault.syncs);
+    fault.fail_at = 1;
+    setNumber(&ui.memory_buffer, "8192");
+    ui.edited(.memory, false);
+    finish(&ui, &store);
+    try std.testing.expectEqual(error.InputOutput, ui.failure.?);
+    const syncs = fault.syncs;
+    for (0..3) |_| {
+        ui.flush();
+        finish(&ui, &store);
+    }
+    try std.testing.expectEqual(syncs, fault.syncs);
+    try std.testing.expectEqual(@as(u32, 2048), store.snapshot().settings.default_memory_mb);
+    fault.fail_at = null;
+    ui.retry();
+    finish(&ui, &store);
+    try std.testing.expect(ui.saved and ui.failure == null);
+    try std.testing.expectEqual(@as(u32, 8192), store.snapshot().settings.default_memory_mb);
+}
+
+test "settings autosave proceeds past invalid proxy and defers leased policy" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    var ui = try Ui.init(a, store.snapshot().settings);
+    defer ui.deinit();
+    ui.proxy.mode = .manual;
+    @memset(&ui.proxy.host, 0);
+    ui.proxy.dirty = true;
+    setNumber(&ui.memory_buffer, "4096");
+    ui.edited(.memory, false);
+    ui.curseforge_enabled = true;
+    ui.edited(.cf_enabled, false);
+    finishSettings(&ui, &store, true);
+    try std.testing.expect(ui.proxy.failure != null);
+    try std.testing.expectEqual(@as(u32, 4096), store.snapshot().settings.default_memory_mb);
+    try std.testing.expect(!store.snapshot().settings.curseforge_enabled and ui.dirty());
+    finishSettings(&ui, &store, false);
+    try std.testing.expect(store.snapshot().settings.curseforge_enabled and !ui.dirty());
+    setNumber(&ui.memory_buffer, "0");
+    ui.edited(.memory, false);
+    finish(&ui, &store);
+    ui.restore_field = .memory;
+    finish(&ui, &store);
+    try std.testing.expectEqualStrings("4096", std.mem.sliceTo(&ui.memory_buffer, 0));
+    try std.testing.expect(!ui.dirty());
+}
+
 const SettingsSyncFault = struct {
     threadlocal var active: ?*SettingsSyncFault = null;
     real: std.Io = std.testing.io,
@@ -578,7 +741,7 @@ const SettingsSyncFault = struct {
     }
 };
 
-test "settings explicit Save reconciles committed disk account references and Cancel never reconciles" {
+test "settings autosave uncertain disk stops until retry and preserves new credential reference" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -595,72 +758,26 @@ test "settings explicit Save reconciles committed disk account references and Ca
     defer fault.stop();
     fault.fail_at = 3;
     const reference = "0123456789abcdef0123456789abcdef";
-    try std.testing.expectError(error.InputOutput, store.update(.{
-        .accounts = &.{.{ .id = "disk-online", .name = "DiskPlayer", .uuid = "00112233445566778899aabbccddeeff", .kind = .microsoft, .credential_ref = reference }},
-        .selected_account = "disk-online",
-        .settings = .{ .curseforge_credential_ref = reference },
-    }));
-    try std.testing.expect(store.publicationUncertain());
-    try std.testing.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
-    const authoritative = try tmp.dir.readFileAlloc(std.testing.io, ".vela/config.json", a, .limited(1024 * 1024));
-    defer a.free(authoritative);
+    var latest = store.snapshot().*;
+    latest.settings.curseforge_credential_ref = reference;
+    try std.testing.expectError(error.InputOutput, store.update(latest));
     const syncs = fault.syncs;
-    setNumber(&ui.memory_buffer, "invalid");
-    ui.pending = .save;
-    finish(&ui, &store);
-    try std.testing.expectEqual(error.InvalidMemory, ui.failure.?);
-    try std.testing.expectEqual(syncs, fault.syncs);
-    try std.testing.expect(store.publicationUncertain());
-    ui.pending = .cancel;
-    finish(&ui, &store);
-    try std.testing.expect(ui.failure == null);
-    try std.testing.expect(!ui.saved);
-    try std.testing.expectEqual(syncs, fault.syncs);
-    try std.testing.expect(store.publicationUncertain());
-    try std.testing.expectEqual(@as(u32, 2048), (try ui.settings()).default_memory_mb);
-    const after_cancel = try tmp.dir.readFileAlloc(std.testing.io, ".vela/config.json", a, .limited(1024 * 1024));
-    defer a.free(after_cancel);
-    try std.testing.expectEqualStrings(authoritative, after_cancel);
-
     setNumber(&ui.memory_buffer, "8192");
-    setNumber(&ui.connections_buffer, "9");
-    ui.game_exit_behavior = .exit_launcher;
-    ui.curseforge_enabled = true;
-    ui.curseforge_terms_approved = true;
-    try ui.client_id.appendSlice(a, "edited-public-client");
-    fault.syncs = 0;
-    fault.fail_at = 1;
-    ui.pending = .save;
+    ui.edited(.memory, false);
     finish(&ui, &store);
-    try std.testing.expectEqual(error.InputOutput, ui.failure.?);
-    try std.testing.expect(!ui.saved);
-    try std.testing.expect(store.publicationUncertain());
-    try std.testing.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
-    try std.testing.expectEqualStrings("edited-public-client", ui.client_id.items);
-    try std.testing.expectEqual(@as(u32, 8192), (try ui.settings()).default_memory_mb);
+    try std.testing.expect(ui.failure != null);
+    for (0..3) |_| {
+        ui.flush();
+        finish(&ui, &store);
+    }
+    try std.testing.expectEqual(syncs, fault.syncs);
+    try std.testing.expectEqualStrings("8192", std.mem.sliceTo(&ui.memory_buffer, 0));
     fault.fail_at = null;
-    ui.pending = .save;
+    ui.retry();
     finish(&ui, &store);
-    try std.testing.expect(ui.failure == null);
-    try std.testing.expect(ui.saved);
-    try std.testing.expect(!store.publicationUncertain());
-    const latest = store.snapshot();
-    try std.testing.expectEqual(@as(usize, 1), latest.accounts.len);
-    try std.testing.expectEqualStrings("disk-online", latest.selected_account.?);
-    try std.testing.expectEqualStrings(reference, latest.accounts[0].credential_ref.?);
-    try std.testing.expectEqual(@as(u32, 8192), latest.settings.default_memory_mb);
-    try std.testing.expectEqual(@as(u16, 9), latest.settings.download_connections);
-    try std.testing.expectEqual(config.GameExitBehavior.exit_launcher, latest.settings.game_exit_behavior);
-    try std.testing.expect(latest.settings.curseforge_enabled);
-    try std.testing.expect(latest.settings.curseforge_terms_approved);
-    try std.testing.expectEqualStrings(reference, latest.settings.curseforge_credential_ref.?);
-    try std.testing.expectEqualStrings("edited-public-client", latest.settings.microsoft_client_id);
-    try store.reconcile();
-    const reloaded = &store;
-    try std.testing.expectEqualStrings(reference, reloaded.snapshot().accounts[0].credential_ref.?);
-    try std.testing.expectEqualStrings(reference, reloaded.snapshot().settings.curseforge_credential_ref.?);
-    try std.testing.expect(reloaded.snapshot().settings.curseforge_terms_approved);
-    try std.testing.expectEqual(@as(u32, 8192), reloaded.snapshot().settings.default_memory_mb);
+    try std.testing.expect(ui.saved and ui.failure == null);
+    try std.testing.expectEqual(@as(u32, 8192), store.snapshot().settings.default_memory_mb);
+    try std.testing.expectEqualStrings(reference, store.snapshot().settings.curseforge_credential_ref.?);
 }
 
 fn keyTestSnapshot() credential_controller.Snapshot {
@@ -744,7 +861,7 @@ test "settings credential editor never preloads and queued save owns only a copi
     try std.testing.expectEqual(address, ui.key_editor.address.?);
     try std.testing.expectEqualStrings("fixture-key", ui.key_pending.?.secret.?.bytes);
     try std.testing.expect(ui.key_pending.?.policy.enabled and ui.key_pending.?.policy.terms_approved);
-    try std.testing.expect(ui.pending == null and !ui.saved);
+    try std.testing.expect(!ui.dirty() and !ui.saved);
     @memset(&ui.key_editor.bytes, 0);
     try std.testing.expectEqualStrings("fixture-key", ui.key_pending.?.secret.?.bytes);
     ui.clearKey();
@@ -809,7 +926,7 @@ test "settings credential remove requires confirmation and recovery is explicit 
     ui.confirm_remove = true;
     try ui.requestKey(.remove_key, keyTestSnapshot(), false, false);
     try std.testing.expect(!ui.key_pending.?.policy.enabled and ui.key_pending.?.policy.terms_approved);
-    try std.testing.expect(ui.key_pending.?.secret == null and ui.pending == null);
+    try std.testing.expect(ui.key_pending.?.secret == null and !ui.dirty());
     ui.clearKey();
     try std.testing.expectError(error.NoRecoveryRequired, ui.requestKey(.recover_key, keyTestSnapshot(), false, false));
     var recovery = keyTestSnapshot();
@@ -825,31 +942,6 @@ test "settings credential remove requires confirmation and recovery is explicit 
     try std.testing.expect(ui.key_pending.?.secret == null);
     ui.clearKey();
     try std.testing.expectError(error.Busy, ui.requestKey(.recover_key, recovery, true, false));
-}
-
-test "settings Cancel clears key command and replaces unpinned draft at the same address" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try testRoot(&tmp);
-    defer a.free(root);
-    var store = try config.Store.init(a, std.testing.io, root);
-    defer store.deinit();
-    var ui = try Ui.init(a, store.snapshot().settings);
-    defer ui.deinit();
-    const address = @intFromPtr(&ui.key_editor);
-    setTestKey(&ui, "fixture-key");
-    try ui.requestKey(.save_key, keyTestSnapshot(), false, false);
-    @memset(&ui.key_editor.bytes, 0xa5);
-    ui.pending = .cancel;
-    finish(&ui, &store);
-    try expectKeyCleared(&ui);
-    try std.testing.expect(ui.pending == null and ui.key_pending == null and ui.key_failure == null);
-    try std.testing.expectEqual(address, @intFromPtr(&ui.key_editor));
-    try std.testing.expect(ui.key_editor.address == null);
-    ui.key_editor.reset();
-    try std.testing.expectEqual(address, ui.key_editor.address.?);
-    try std.testing.expect(store.snapshot().settings.curseforge_credential_ref == null);
 }
 
 test "key form Cancel defers wiping and preserves unrelated settings draft" {
@@ -886,7 +978,7 @@ test "settings leased policy save preserves latest CF bits and reference while u
     ui.curseforge_enabled = false;
     ui.curseforge_terms_approved = false;
     setNumber(&ui.memory_buffer, "4096");
-    ui.pending = .save;
+    ui.edited(.memory, false);
     finishSettings(&ui, &store, true);
     try std.testing.expect(ui.saved and ui.failure == null);
     try std.testing.expectEqual(@as(u32, 4096), store.snapshot().settings.default_memory_mb);
@@ -919,7 +1011,7 @@ test "settings unavailable credentials clears secrets preserves latest policy an
     setTestKey(&ui, "fixture-key");
     try ui.requestKey(.save_key, keyTestSnapshot(), false, false);
     setNumber(&ui.memory_buffer, "4096");
-    ui.pending = .save;
+    ui.edited(.memory, false);
     finishUnavailable(&ui, &store);
     try expectKeyCleared(&ui);
     try std.testing.expect(ui.key_pending == null and ui.saved and ui.failure == null);
@@ -984,7 +1076,7 @@ test "settings public key recovery accepts joined controller publication debt an
     latest.settings.curseforge_credential_ref = "0123456789abcdef0123456789abcdef";
     try store.update(latest);
     setNumber(&ui.memory_buffer, "4096");
-    ui.pending = .save;
+    ui.edited(.memory, false);
     finishWithCredentials(&ui, &store, &controller, false);
     try std.testing.expect(ui.saved and ui.failure == null);
     try std.testing.expectEqual(@as(u32, 4096), store.snapshot().settings.default_memory_mb);
@@ -1020,4 +1112,39 @@ test "settings public credential finish rechecks fresh content busy and wipes re
     try std.testing.expect(probe.all_zero);
     try std.testing.expectEqual(@as(usize, 0), vault.calls);
     try std.testing.expect(store.snapshot().settings.curseforge_credential_ref == null);
+}
+
+test "proxy settings save preserves newer unrelated settings and cancel clears plaintext" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    var ui = try Ui.init(a, store.snapshot().settings);
+    defer ui.deinit();
+    ui.proxy.mode = .manual;
+    ui.proxy.dirty = true;
+    var latest = store.snapshot().*;
+    latest.settings.resource_list_view = true;
+    latest.settings.download_connections = 12;
+    try store.update(latest);
+    ui.proxy.command = .save;
+    finishUnavailable(&ui, &store);
+    try std.testing.expectEqual(@import("../core/proxy_config.zig").Mode.manual, store.snapshot().settings.proxy.mode);
+    try std.testing.expect(store.snapshot().settings.resource_list_view);
+    try std.testing.expectEqual(@as(u8, 12), store.snapshot().settings.download_connections);
+    // CF being unavailable must not erase independent proxy input every frame.
+    @memcpy(ui.proxy.password.bytes[0..6], "secret");
+    ui.proxy.password.len = 6;
+    finishUnavailable(&ui, &store);
+    try std.testing.expectEqualStrings("secret", (try ui.proxy.password.borrow()).?);
+    ui.clearSecrets();
+    for (ui.proxy.password.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    @memcpy(ui.proxy.password.bytes[0..6], "secret");
+    ui.proxy.password.len = 6;
+    ui.clearSecrets();
+    finish(&ui, &store);
+    try std.testing.expect((try ui.proxy.password.borrow()) == null);
 }

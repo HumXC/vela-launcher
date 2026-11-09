@@ -193,8 +193,18 @@ def main():
             before = server.counts()
             run("install")
             checked((root / "versions/fixture/fixture.jar").read_bytes() == server.responses["/client.jar"], "corrupt client was not repaired")
-            checked(server.counts()["/client.jar"] > before["/client.jar"], "repair did not fetch fresh client body")
-            print("PASS repair: corrupt installed file replaced", flush=True)
+            checked(server.counts()["/client.jar"] == before["/client.jar"], "repair retransferred a cached client body")
+            (root / "versions/fixture/fixture.jar").unlink()
+            run("install")
+            checked((root / "versions/fixture/fixture.jar").read_bytes() == server.responses["/client.jar"], "deleted client was not restored")
+            checked(server.counts()["/client.jar"] == before["/client.jar"], "deleted client retransferred")
+            cache_file = root / ".vela/cache/artifacts/sha1" / hashlib.sha1(server.responses["/client.jar"]).hexdigest()
+            cache_file.write_bytes(b"corrupt-cache")
+            (root / "versions/fixture/fixture.jar").unlink()
+            run("install")
+            checked(server.counts()["/client.jar"] == before["/client.jar"] + 1, "corrupt cache did not refetch client")
+            checked(cache_file.read_bytes() == server.responses["/client.jar"], "corrupt cache was not repaired")
+            print("PASS artifact cache: repair, deletion, corruption recovery", flush=True)
 
             capture = base / "java invocation.json"
             fake_java = base / "fake java.py"

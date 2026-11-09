@@ -42,6 +42,9 @@ pub fn panel(src: @import("std").builtin.SourceLocation, init_options: dvui.BoxW
 }
 
 fn hasBackdrop(data: *dvui.WidgetData) bool {
+    // Floating windows already composite their own surface over lower layers.
+    // Repainting the root wallpaper inside them would punch through that surface.
+    if (dvui.subwindowCurrentId() != dvui.currentWindow().data().id) return false;
     return backdrop_image != null and backdrop_settings.panel_blur > 0 and backdrop_settings.panel_opacity < 100 and backdrop_settings.background_mode == .image and data.visible() and (data.options.background orelse false);
 }
 

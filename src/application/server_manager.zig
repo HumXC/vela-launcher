@@ -12,6 +12,7 @@ pub const Snapshot = struct {
     server: ?config.Server = null,
     status: ?*const servers.OwnedStatus = null,
     failure: ?anyerror = null,
+    diagnostics: servers.Diagnostics = .{},
     /// Includes superseded work unwinding even when public state is idle.
     worker_active: bool = false,
 };
@@ -30,6 +31,7 @@ const Job = struct {
     future: ?Io.Future(void) = null,
     status: ?servers.OwnedStatus = null,
     failure: ?anyerror = null,
+    diagnostics: servers.Diagnostics = .{},
 
     fn create(a: Allocator, io: Io, server: config.Server, query: Query, options: servers.Options) !*Job {
         _ = try servers.validateAddress(server.address, server.port);
@@ -51,6 +53,7 @@ const Job = struct {
         defer self.done.store(true, .release);
         var options = self.options;
         options.cancellation = &self.cancellation;
+        options.diagnostics = &self.diagnostics;
         // Invalid picker addresses fail only this card, never its peers or the UI frame.
         _ = servers.validateAddress(self.server.address, self.server.port) catch |err| {
             self.failure = err;
@@ -59,8 +62,13 @@ const Job = struct {
         // Worker allocations never touch the UI allocator or config store.
         self.status = self.query(std.heap.page_allocator, self.io, self.server, options) catch |err| {
             self.failure = err;
+            if (err != error.Canceled) std.log.scoped(.servers).warn("query failed host={s} port={d} phase={s} error={s} elapsed_ms={d} srv={}", .{ self.server.address, self.server.port, @tagName(self.diagnostics.phase), @errorName(err), self.diagnostics.elapsed_ms, self.diagnostics.used_srv });
             return;
         };
+        if (self.status) |status| {
+            if (status.icon_issue != null or status.motd_issue != null or status.latency_issue != null)
+                std.log.scoped(.servers).info("query partial host={s} port={d} icon={s} motd={s} latency={s} elapsed_ms={d}", .{ self.server.address, self.server.port, if (status.icon_issue) |err| @errorName(err) else "ok", if (status.motd_issue) |err| @errorName(err) else "ok", if (status.latency_issue) |err| @errorName(err) else "ok", self.diagnostics.elapsed_ms });
+        }
     }
     fn destroy(self: *Job) void {
         if (self.status) |*status| status.deinit();
@@ -298,6 +306,7 @@ pub const Manager = struct {
             .server = job.server,
             .status = if (job.status) |*status| status else null,
             .failure = job.failure,
+            .diagnostics = job.diagnostics,
             .worker_active = self.active != null or self.pending != null,
         };
         if (self.pending) |job| return .{ .state = .querying, .server = job.server, .worker_active = true };

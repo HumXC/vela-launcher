@@ -4,6 +4,7 @@
 //! deinit() only after all workers have joined. Terminal tasks may be pruned.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const diagnostic_log = @import("diagnostic_log.zig");
 
 pub const Kind = enum {
     game_install,
@@ -49,10 +50,10 @@ pub const File = struct {
     pub fn init(path_value: []const u8, received: u64, total: ?u64, speed: f64, state: FileState, failure: ?anyerror) File {
         var result: File = .{ .received = received, .total = total, .bytes_per_second = validSpeed(speed), .state = state, .failure = failure };
         // URLs are labels too: avoid retaining query credentials in diagnostic text.
-        const is_url = std.mem.startsWith(u8, path_value, "https://") or std.mem.startsWith(u8, path_value, "http://");
+        const is_url = std.ascii.startsWithIgnoreCase(path_value, "https://") or std.ascii.startsWithIgnoreCase(path_value, "http://");
         const label = if (is_url) path_value[0 .. std.mem.indexOfAny(u8, path_value, "?#") orelse path_value.len] else path_value;
         result.path_len = copyText(&result.path_bytes, label);
-        result.name_len = copyText(&result.name_bytes, std.fs.path.basename(label));
+        result.name_len = if (is_url) copyUrlName(&result.name_bytes, label) else copyText(&result.name_bytes, std.fs.path.basename(label));
         if (state == .complete or state == .failed or state == .canceled) result.bytes_per_second = 0;
         return result;
     }
@@ -63,6 +64,25 @@ pub const File = struct {
         return self.path_bytes[0..self.path_len];
     }
 };
+
+/// Decode only the final URL path segment, never the request URL or local paths.
+fn copyUrlName(destination: *[160]u8, label: []const u8) usize {
+    const uri = std.Uri.parse(label) catch return copyText(destination, "下载文件");
+    const path = uri.path.percent_encoded;
+    const start = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| slash + 1 else 0;
+    const component: std.Uri.Component = .{ .percent_encoded = path[start..] };
+    // Keep enough lookahead to truncate a decoded UTF-8 codepoint safely. A fixed
+    // writer retains its prefix on overflow, so even very long URLs stay bounded.
+    var buffer: [164]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    component.formatRaw(&writer) catch {};
+    const decoded = writer.buffered();
+    var end = @min(destination.len, decoded.len);
+    if (end < decoded.len) {
+        while (end > 0 and decoded[end] & 0xc0 == 0x80) end -= 1;
+    }
+    return copyText(destination, decoded[0..end]);
+}
 
 fn validSpeed(speed: f64) f64 {
     return if (std.math.isFinite(speed) and speed > 0) speed else 0;
@@ -199,6 +219,7 @@ pub const Registry = struct {
         task.* = .{ .id = self.next_id, .title = owned_title, .kind = kind };
         try self.entries.append(self.allocator, task);
         self.next_id = if (self.next_id == std.math.maxInt(u64)) 0 else self.next_id + 1;
+        diagnostic_log.write(.info, .task, "created id={d} kind={s} title={s}", .{ task.id, @tagName(task.kind), task.title });
         return task;
     }
 
@@ -206,6 +227,7 @@ pub const Registry = struct {
         if (!self.contains(task)) return error.UnknownTask;
         if (task.state != .queued) return error.InvalidState;
         task.state = .running;
+        diagnostic_log.write(.info, .task, "started id={d} kind={s}", .{ task.id, @tagName(task.kind) });
     }
 
     /// True for an active matching task, including an existing cancel request.
@@ -219,7 +241,7 @@ pub const Registry = struct {
                 .canceling => {},
                 .canceled, .succeeded, .failed => return false,
             }
-            task.cancellation.store(true, .release);
+            if (!task.cancellation.swap(true, .release)) diagnostic_log.write(.info, .task, "cancel_requested id={d} kind={s}", .{ task.id, @tagName(task.kind) });
             return true;
         }
         return false;
@@ -247,6 +269,16 @@ pub const Registry = struct {
             }
         }
         task.progress_lock.unlock();
+        if (task.failure) |failure| {
+            diagnostic_log.write(.err, .task, "finished id={d} kind={s} state={s} stage={s} error={s}", .{ task.id, @tagName(task.kind), @tagName(task.state), @tagName(task.reported.stage), @errorName(failure) });
+            for (task.reported.files[0..task.reported.file_count]) |file| {
+                if (file.failure) |reason| if (reason != error.Canceled) {
+                    diagnostic_log.write(.err, .task, "failed_file task={d} error={s} file={s}", .{ task.id, @errorName(reason), file.path() });
+                };
+            }
+        } else {
+            diagnostic_log.write(.info, .task, "finished id={d} kind={s} state={s} stage={s}", .{ task.id, @tagName(task.kind), @tagName(task.state), @tagName(task.reported.stage) });
+        }
     }
 
     /// Borrowed list slice, invalidated by create/dismiss/prune/deinit. Surviving
@@ -623,6 +655,38 @@ test "dismiss retains a worker-owned task until join and terminal acknowledgemen
     registry.finish(task, .canceled);
     try std.testing.expect(registry.dismiss(id));
     try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
+}
+
+test "URL task names decode once without changing request labels or local filenames" {
+    const cases = .{
+        .{ "https://example.invalid/files/BattleArmory%20TACZ%2026.0.5.mrpack?token=secret#fragment", "BattleArmory TACZ 26.0.5.mrpack" },
+        .{ "HTTPS://example.invalid/%E4%B8%96%E7%95%8C+pack.mrpack", "世界+pack.mrpack" },
+        .{ "https://example.invalid/dir/a%2Fb%5Cc%2520.jar", "a/b" ++ [_]u8{92} ++ "c%20.jar" },
+        .{ "https://example.invalid/bad%Q0%2.jar%", "bad%Q0%2.jar%" },
+        .{ "https://example.invalid/a%00%0A%7F%FF.jar", "a????.jar" },
+        .{ "https://example.invalid/archive%3Fname%23part.mrpack?secret=value", "archive?name#part.mrpack" },
+        .{ "/folder/local%20name.jar", "local%20name.jar" },
+    };
+    inline for (cases) |case| {
+        const file = File.init(case[0], 0, null, 0, .queued, null);
+        try std.testing.expectEqualStrings(case[1], file.name());
+        const expected_path = case[0][0 .. std.mem.indexOfAny(u8, case[0], "?#") orelse case[0].len];
+        try std.testing.expectEqualStrings(expected_path, file.path());
+    }
+    const encoded_name = comptime blk: {
+        var bytes: [900]u8 = undefined;
+        for (0..100) |i| @memcpy(bytes[i * 9 ..][0..9], "%E4%B8%96");
+        break :blk bytes;
+    };
+    const long = File.init("https://example.invalid/" ++ encoded_name, 0, null, 0, .queued, null);
+    try std.testing.expectEqual(@as(usize, 159), long.name_len);
+    for (0..53) |i| try std.testing.expectEqualStrings("世", long.name()[i * 3 ..][0..3]);
+    const prefix: [159]u8 = @splat('a');
+    const boundary = File.init("https://example.invalid/" ++ prefix ++ "%E4%B8%96.jar", 0, null, 0, .queued, null);
+    try std.testing.expectEqualStrings(&prefix, boundary.name());
+    const large: [600]u8 = @splat('x');
+    const literal = File.init("https://example.invalid/" ++ large, 0, null, 0, .queued, null);
+    try std.testing.expectEqualStrings(large[0..160], literal.name());
 }
 
 test "bounded telemetry owns UTF8 labels and preserves failure beyond display bound" {

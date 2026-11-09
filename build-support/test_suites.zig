@@ -17,7 +17,7 @@ pub fn add(b: *std.Build) void {
         "test-mods",      "test-content-ui", "test-packs",         "test-gui-fixture",
     });
     const integration = group(b, "test-integration", "Run managed local network, archive and Minecraft module fixtures", &.{
-        "test-downloader-fixture", "test-http-fixture", "test-public-network", "test-safe-archive", "test-minecraft-fixture", "test-build-fixtures",
+        "test-downloader-fixture", "test-http-fixture", "test-proxy-fixture", "test-public-network", "test-safe-archive", "test-minecraft-fixture", "test-build-fixtures",
     });
     const tests = b.step("test", "Run local unit, workflow, UI and integration suites");
     for ([_]*std.Build.Step{ unit, workflows, ui, integration }) |suite| tests.dependOn(suite);

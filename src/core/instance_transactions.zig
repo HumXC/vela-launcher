@@ -1,6 +1,6 @@
 //! Worker-only offline instance transactions. Caller owns the stable-ID lease through
 //! config publication and confirms rename/delete before invocation. No config writes.
-//! Rename recovery manifests describe prepared intent; deletion permanently erases files.
+//! Rename journals recover against durable config; deletion permanently erases files.
 const std = @import("std");
 const builtin = @import("builtin");
 const content_fs = @import("content_fs.zig");
@@ -58,12 +58,15 @@ pub const Result = struct {
     /// Official metadata pin and actual local client hash/size, not full readiness.
     local_client_verified: bool = false,
     publication_proof: ?PublicationProof = null,
+    rename_proof: ?RenameProof = null,
     deletion_proof: ?DeletionProof = null,
     /// Direct inspection transfers ownership while its returned proof keeps files open.
     owned_ns: ?namespace.Token = null,
 
     /// Release held evidence after publication while preserving owned instance strings.
     pub fn releasePublicationProof(self: *Result) void {
+        if (self.rename_proof) |proof| proof.close();
+        self.rename_proof = null;
         if (self.publication_proof) |proof| proof.close();
         self.publication_proof = null;
         if (self.deletion_proof) |proof| proof.close();
@@ -74,6 +77,11 @@ pub const Result = struct {
 
     /// Caller holds the stable-ID lease and namespace reservation. No content rehash.
     pub fn recheckPublication(self: *const Result, root: []const u8) !void {
+        if (self.operation == .renamed) {
+            const proof = self.rename_proof orelse return error.InvalidCompletedPublication;
+            try proof.recheck(root);
+            return;
+        }
         if (self.operation == .deleted) {
             const proof = self.deletion_proof orelse return error.InvalidCompletedPublication;
             try proof.recheck(root, self.instance.name);
@@ -310,7 +318,7 @@ const Identity = struct {
 pub const max_install_receipt_bytes = 8 * 1024 * 1024;
 const receipt_limit = max_install_receipt_bytes;
 const receipt_string_limit = 4096;
-const ReceiptArtifact = struct { path: []const u8, sha256: []const u8, size: u64 };
+const ReceiptArtifact = struct { path: []const u8, sha256: []const u8, size: u64, expected_sha1: ?[]const u8 = null, producer: ?usize = null, installer_member: ?[]const u8 = null };
 const ReceiptBounds = struct { artifact_bindings: ?[]const ReceiptArtifact = null };
 
 // Bound structure before dynamic Value maps/arrays can amplify a small document.
@@ -325,7 +333,7 @@ fn receiptPreflight(a: A, bytes: []const u8) !void {
     var bindings = false;
     var binding_count: usize = 0;
     var binding_key = true;
-    var binding_fields: u3 = 0;
+    var binding_fields: u6 = 0;
     while (true) {
         const token = scanner.nextAllocMax(a, .alloc_if_needed, receipt_string_limit) catch |err| return switch (err) {
             error.OutOfMemory => err,
@@ -358,7 +366,7 @@ fn receiptPreflight(a: A, bytes: []const u8) !void {
                 }
             },
             .object_end, .array_end => {
-                if (bindings and depth == 3 and binding_fields != 7) return error.InvalidInstallReceipt;
+                if (bindings and depth == 3 and binding_fields & 7 != 7) return error.InvalidInstallReceipt;
                 if (depth == 0) return error.InvalidInstallReceipt;
                 depth -= 1;
                 if (depth == 1) {
@@ -378,7 +386,7 @@ fn receiptPreflight(a: A, bytes: []const u8) !void {
                     }
                 } else if (bindings and depth == 3) {
                     if (binding_key) {
-                        const bit: u3 = if (std.mem.eql(u8, text, "path")) 1 else if (std.mem.eql(u8, text, "sha256")) 2 else if (std.mem.eql(u8, text, "size")) 4 else return error.InvalidInstallReceipt;
+                        const bit: u6 = if (std.mem.eql(u8, text, "path")) 1 else if (std.mem.eql(u8, text, "sha256")) 2 else if (std.mem.eql(u8, text, "size")) 4 else if (std.mem.eql(u8, text, "expected_sha1")) 8 else if (std.mem.eql(u8, text, "producer")) 16 else if (std.mem.eql(u8, text, "installer_member")) 32 else return error.InvalidInstallReceipt;
                         if (binding_fields & bit != 0) return error.InvalidInstallReceipt;
                         binding_fields |= bit;
                     }
@@ -408,6 +416,13 @@ fn receiptPreflight(a: A, bytes: []const u8) !void {
     }
     if (typed.value.artifact_bindings) |entries| for (entries) |entry| {
         if (!std.mem.startsWith(u8, entry.path, "libraries/") or !lowerHex(entry.sha256, 64)) return error.InvalidInstallReceipt;
+        if (entry.expected_sha1) |sha1| if (!lowerHex(sha1, 40)) return error.InvalidInstallReceipt;
+        // Installer profile parser caps the processor pipeline at 256 entries.
+        if (entry.producer) |producer| if (producer >= 256) return error.InvalidInstallReceipt;
+        if (entry.installer_member) |member| {
+            var parts = std.mem.splitScalar(u8, member, '/');
+            while (parts.next()) |part| safe.component(part) catch return error.InvalidInstallReceipt;
+        }
         var components = std.mem.splitScalar(u8, entry.path, '/');
         while (components.next()) |part| safe.component(part) catch return error.InvalidInstallReceipt;
         const key = try std.ascii.allocLowerString(a, entry.path);
@@ -744,52 +759,13 @@ fn privateDir(io: std.Io, parent: Dir, name: []const u8) !Dir {
     try parent.createDir(io, name, content_fs.privatePermissions(true));
     return tree.child(io, parent, name, false);
 }
-const Manifest = struct {
-    schema_version: u32 = 1,
-    transaction_id: []const u8,
-    operation: Operation,
-    instance_id: []const u8,
-    old_name: []const u8,
-    new_name: ?[]const u8,
-    instance: config.Instance,
-    snapshot_bytes: u64,
-    entries: []const tree.Entry,
-    backup: []const u8 = "backup",
-    original: []const u8 = "original",
-    phase: []const u8 = "prepared",
-};
-fn writeManifest(a: A, io: std.Io, dir: Dir, manifest: Manifest, options: Options) ![]const u8 {
-    const json = try std.json.Stringify.valueAlloc(a, manifest, .{});
-    if (json.len > options.limits.max_manifest_bytes) return error.ResourceLimit;
-    const file = try dir.createFile(io, "manifest.json", .{ .read = true, .exclusive = true, .permissions = content_fs.privatePermissions(false) });
-    defer file.close(io);
-    try file.writePositionalAll(io, json, 0);
-    try file.setPermissions(io, if (builtin.os.tag == .windows)
-        windowsReadOnlyPermissions((try file.stat(io)).permissions)
-    else
-        .fromMode(0o400));
-    try file.sync(io);
-    try tree.syncDir(io, dir);
-    try verifyManifest(a, io, dir, json, options);
-    return json;
-}
-fn verifyManifest(a: A, io: std.Io, dir: Dir, expected: []const u8, options: Options) !void {
-    const before = try dir.statFile(io, "manifest.json", .{ .follow_symlinks = false });
-    if (before.kind != .file or before.nlink != 1) return error.UnsafeFileType;
-    const actual = try tree.readBounded(a, io, dir, "manifest.json", options.limits.max_manifest_bytes);
-    defer a.free(actual);
-    if (!std.mem.eql(u8, actual, expected)) return error.IntegrityMismatch;
-    const after = try dir.statFile(io, "manifest.json", .{ .follow_symlinks = false });
-    try sameInode(before, after);
-    if (after.nlink != 1) return error.HardLinkAlias;
-}
 
 pub fn rename(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_name: []const u8, options: Options) !Result {
     _ = try requireScope(options);
     if (!config.validId(new_name)) return error.UnsafeInstance;
     try safe.component(new_name);
     if (std.ascii.eqlIgnoreCase(instance.name, new_name)) return error.SameInstanceName;
-    return transact(a, io, root, instance, new_name, .renamed, options);
+    return renameInPlace(a, io, root, instance, new_name, options);
 }
 pub fn remove(a: A, io: std.Io, root: []const u8, instance: config.Instance, options: Options) !Result {
     return eraseInstance(a, io, root, instance, options);
@@ -889,6 +865,15 @@ fn eraseInstance(a: A, io: std.Io, root: []const u8, instance: config.Instance, 
     var release_handles = true;
     defer if (release_handles) handles.close(io);
     try check(io, instance, options);
+    const pending_name = try rename_journal.name(ar, instance.id);
+    const pending_parent: ?Dir = tree.child(io, handles.root, ".vela", false) catch |err| blk: {
+        if (err == error.FileNotFound) break :blk null;
+        return err;
+    };
+    if (pending_parent) |parent| {
+        defer parent.close(io);
+        if (try rename_journal.stat(io, parent, pending_name) != null) return error.RecoveryRequired;
+    }
     const source = try tree.child(io, handles.versions, instance.name, false);
     defer source.close(io);
     const source_stat = try directoryStat(io, source);
@@ -953,146 +938,199 @@ fn eraseInstance(a: A, io: std.Io, root: []const u8, instance: config.Instance, 
     };
     return result;
 }
-fn transact(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_name: ?[]const u8, operation: Operation, options: Options) !Result {
+const rename_journal = @import("instance_rename.zig");
+
+const RenameProof = struct {
+    io: std.Io,
+    root: Root,
+    plan: rename_journal.Plan,
+    fn close(self: RenameProof) void {
+        self.root.close(self.io);
+    }
+    fn recheck(self: RenameProof, root: []const u8) !void {
+        try self.root.verify(self.io, root);
+        try rename_journal.verifyCompleted(std.heap.page_allocator, self.io, self.root.versions, self.plan, true);
+    }
+};
+
+fn renameInPlace(a: A, io: std.Io, root: []const u8, instance: config.Instance, new_name: []const u8, options: Options) !Result {
     const lease = try requireScope(options);
     try validate(instance, options);
     try lease.recheck(lease.context, instance.id);
     const token = try reserveNamespace(io, options);
     defer if (options.namespace_token == null) token.release();
     try recheckNamespace(token, options);
-    var result: Result = .{
-        .arena = .init(a),
-        .operation = operation,
-        .instance = undefined,
-        .durability_uncertain = !tree.directory_sync_supported,
-    };
-    errdefer result.deinit();
-    var scratch: std.heap.ArenaAllocator = .init(a);
-    defer scratch.deinit();
-    const ar = scratch.allocator();
-    const output = result.arena.allocator();
-    result.instance = try owned(output, instance);
-    result.original_name = try output.dupe(u8, instance.name);
-    if (new_name) |name| result.instance.name = try output.dupe(u8, name);
-    const handles = try Root.open(io, root);
-    defer handles.close(io);
     try check(io, instance, options);
-    if (new_name) |name| try collision(io, handles.versions, name);
+    var result: Result = .{ .arena = .init(a), .operation = .renamed, .instance = undefined, .durability_uncertain = !tree.directory_sync_supported };
+    errdefer result.deinit();
+    const ar = result.arena.allocator();
+    result.instance = try owned(ar, instance);
+    result.original_name = try ar.dupe(u8, instance.name);
+    result.instance.name = try ar.dupe(u8, new_name);
+    const handles = try Root.open(io, root);
+    errdefer handles.close(io);
+    try collision(io, handles.versions, new_name);
     const source = try tree.child(io, handles.versions, instance.name, false);
     defer source.close(io);
     const source_stat = try directoryStat(io, source);
     const identity = try inspect(ar, io, root, handles, instance, options);
     if (identity.ambiguous_flattened) return error.MissingInstallReceipt;
     try requireUnreferencedInstance(ar, io, handles.versions, instance, options);
-
-    try auditTree(io, source, options, false);
+    const old_json = try std.fmt.allocPrint(ar, "{s}.json", .{instance.name});
+    const new_json = try std.fmt.allocPrint(ar, "{s}.json", .{new_name});
+    const old_jar = try std.fmt.allocPrint(ar, "{s}.jar", .{instance.name});
+    const new_jar = try std.fmt.allocPrint(ar, "{s}.jar", .{new_name});
+    try collision(io, source, new_json);
+    try collision(io, source, new_jar);
+    const original = try readMetadata(ar, io, source, old_json);
+    const jar_stat = try rename_journal.stat(io, source, old_jar);
+    if (jar_stat) |s| {
+        if (s.kind != .file) return error.UnsafeFileType;
+        if (s.nlink != 1) return error.HardLinkAlias;
+    } else if (identity.receipt != null) return error.MissingClientJar;
+    // Only managed flattened descriptors change their embedded identity. Inherited
+    // aliases preserve their canonical reference, just as the existing loader expects.
+    var next_document: []const u8 = original;
+    var next_receipt: ?[]const u8 = null;
+    if (identity.receipt) |receipt| {
+        var document = try std.json.parseFromSlice(std.json.Value, ar, original, .{ .allocate = .alloc_always });
+        defer document.deinit();
+        try document.value.object.put(document.arena.allocator(), "id", .{ .string = result.instance.name });
+        next_document = try std.json.Stringify.valueAlloc(ar, document.value, .{});
+        var parsed = try parseReceipt(ar, receipt.bytes);
+        defer parsed.deinit();
+        const pa = parsed.arena.allocator();
+        try parsed.value.object.put(pa, "instance_name", .{ .string = result.instance.name });
+        if (parsed.value.object.contains("client_jar")) try parsed.value.object.put(pa, "client_jar", .{ .string = new_jar });
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(next_document, &hash, .{});
+        const hex = try ar.dupe(u8, &std.fmt.bytesToHex(&hash, .lower));
+        try parsed.value.object.put(pa, "metadata_sha256", .{ .string = hex });
+        next_receipt = try std.json.Stringify.valueAlloc(ar, parsed.value, .{});
+    }
     const vela = try tree.child(io, handles.root, ".vela", true);
     defer vela.close(io);
-    var random: [16]u8 = undefined;
-    try std.Io.randomSecure(io, &random);
-    const transaction_id = try std.fmt.allocPrint(ar, "instance-{s}", .{std.fmt.bytesToHex(random, .lower)});
-    const recovery = try privateDir(io, vela, transaction_id);
-    defer recovery.close(io);
-    // Failed preparation deliberately retains only private recoverable artifacts.
-    result.recovery_directory = try std.fs.path.join(output, &.{ root, ".vela", transaction_id });
-    const backup = try privateDir(io, recovery, "backup");
-    defer backup.close(io);
-    var snapshot = try tree.snapshot(ar, io, source, backup, options.limits, hooks(options));
-    defer snapshot.deinit();
-    try verified(ar, io, backup, snapshot, options);
-    try auditTree(io, backup, options, true);
-    try verified(ar, io, backup, snapshot, options);
-
-    var expected_stage: ?tree.Snapshot = null;
-    defer if (expected_stage) |*snapshot_value| snapshot_value.deinit();
-    if (new_name) |name| {
-        const staged = try privateDir(io, recovery, "staged");
-        defer staged.close(io);
-        var stage_snapshot = try tree.snapshot(ar, io, backup, staged, options.limits, hooks(options));
-        defer stage_snapshot.deinit();
-        if (!tree.equal(snapshot, stage_snapshot)) return error.IntegrityMismatch;
-        try verified(ar, io, staged, snapshot, options);
-        const old_json = try std.fmt.allocPrint(ar, "{s}.json", .{instance.name});
-        const new_json = try std.fmt.allocPrint(ar, "{s}.json", .{name});
-        try collision(io, staged, new_json);
-        const rewritten = if (identity.receipt) |receipt| try rewriteFlattened(ar, io, staged, instance, name, receipt) else null;
-        try staged.renamePreserve(old_json, staged, new_json, io);
-        try tree.syncDir(io, staged);
-        const entries = try ar.dupe(tree.Entry, snapshot.entries);
-        var expected_bytes = snapshot.bytes;
-        const old_jar = try std.fmt.allocPrint(ar, "{s}.jar", .{instance.name});
-        const new_jar = try std.fmt.allocPrint(ar, "{s}.jar", .{name});
-        for (entries) |*entry| {
-            if (std.mem.eql(u8, entry.path, old_json)) {
-                entry.path = try ar.dupe(u8, new_json);
-                if (rewritten) |data| updateExpected(entry, data.document, &expected_bytes);
-            } else if (rewritten != null and std.mem.eql(u8, entry.path, old_jar)) {
-                entry.path = try ar.dupe(u8, new_jar);
-            } else {
-                if (rewritten) |data| if (std.mem.eql(u8, entry.path, identity.receipt.?.name)) updateExpected(entry, data.receipt, &expected_bytes);
-                entry.path = try ar.dupe(u8, entry.path);
-            }
-        }
-        std.mem.sort(tree.Entry, entries, {}, struct {
-            fn less(_: void, x: tree.Entry, y: tree.Entry) bool {
-                return std.mem.lessThan(u8, x.path, y.path);
-            }
-        }.less);
-        expected_stage = .{ .allocator = ar, .entries = entries, .bytes = expected_bytes };
-        try verified(ar, io, staged, expected_stage.?, options);
+    const journal_name = try rename_journal.name(ar, instance.id);
+    if (try rename_journal.stat(io, vela, journal_name) != null) return error.RecoveryRequired;
+    const journal = try privateDir(io, vela, journal_name);
+    defer journal.close(io);
+    result.recovery_directory = try std.fs.path.join(ar, &.{ root, ".vela", journal_name });
+    try rename_journal.write(io, journal, "new-document", next_document);
+    var plan: rename_journal.Plan = .{
+        .id = result.instance.id,
+        .old_name = result.original_name.?,
+        .new_name = result.instance.name,
+        .directory_inode = source_stat.inode,
+        .jar_inode = if (jar_stat) |s| s.inode else null,
+        .old_jar = old_jar,
+        .new_jar = new_jar,
+        .document = .{ .old_name = old_json, .new_name = new_json, .before = try rename_journal.identity(io, source, old_json, original), .after = try rename_journal.identity(io, journal, "new-document", next_document) },
+        .receipt = null,
+    };
+    if (identity.receipt) |receipt| {
+        try rename_journal.write(io, journal, "new-receipt", next_receipt.?);
+        plan.receipt = .{ .old_name = receipt.name, .new_name = receipt.name, .before = try rename_journal.identity(io, source, receipt.name, receipt.bytes), .after = try rename_journal.identity(io, journal, "new-receipt", next_receipt.?) };
     }
-    const manifest_json = try writeManifest(ar, io, recovery, .{ .transaction_id = transaction_id, .operation = operation, .instance_id = instance.id, .old_name = instance.name, .new_name = new_name, .instance = instance, .snapshot_bytes = snapshot.bytes, .entries = snapshot.entries }, options);
+    try rename_journal.save(ar, io, journal, plan);
     try tree.syncDir(io, vela);
-
+    try tree.syncDir(io, handles.root);
     try lease.recheck(lease.context, instance.id);
     try recheckNamespace(token, options);
     try check(io, instance, options);
     try handles.verify(io, root);
-    try sameInode(try directoryStat(io, vela), try handles.root.statFile(io, ".vela", .{ .follow_symlinks = false }));
-    try sameInode(try directoryStat(io, recovery), try vela.statFile(io, transaction_id, .{ .follow_symlinks = false }));
     try sameInode(source_stat, try handles.versions.statFile(io, instance.name, .{ .follow_symlinks = false }));
+    try sameInode(try directoryStat(io, vela), try handles.root.statFile(io, ".vela", .{ .follow_symlinks = false }));
+    try sameInode(try directoryStat(io, journal), try vela.statFile(io, journal_name, .{ .follow_symlinks = false }));
     try requireUnreferencedInstance(ar, io, handles.versions, instance, options);
-    if (new_name) |name| try collision(io, handles.versions, name);
-    try verified(ar, io, source, snapshot, options);
-    try verified(ar, io, backup, snapshot, options);
-    var stage_stat: ?Stat = null;
-    if (expected_stage) |expected| {
-        const staged = try tree.child(io, recovery, "staged", false);
-        stage_stat = try directoryStat(io, staged);
-        defer staged.close(io);
-        try verified(ar, io, staged, expected, options);
-    }
-    try verifyManifest(ar, io, recovery, manifest_json, options);
+    try collision(io, handles.versions, new_name);
     try lease.recheck(lease.context, instance.id);
     try recheckNamespace(token, options);
     try check(io, instance, options);
-    // No cancellation after the first namespace mutation: report committed success.
-    const protection = io.swapCancelProtection(.blocked);
-    defer _ = io.swapCancelProtection(protection);
-    handles.versions.renamePreserve(instance.name, recovery, "original", io) catch |err| {
-        if (!namedMatches(io, handles.versions, instance.name, source_stat) or !namedAbsent(io, recovery, "original")) return error.RecoveryRequired;
+    // Once apply starts, failures retain durable intent for restart recovery.
+    rename_journal.apply(ar, io, handles.versions, journal, plan, true) catch |err| {
+        if (err == error.OutOfMemory) return err; // validation allocates before mutation
+        return error.RecoveryRequired;
+    };
+    result.rename_proof = .{ .io = io, .root = handles, .plan = plan };
+    return result;
+}
+
+/// Recover using the *durably loaded* configuration. Old name rolls back; new name
+/// rolls forward. Caller holds the stable-ID lease through config publication.
+/// Returns false when no journal exists. Conflicts retain evidence and block launch.
+pub fn recoverRename(a: A, io: std.Io, root: []const u8, configured: config.Instance, options: Options) !bool {
+    return reconcileRename(a, io, root, configured, options, false);
+}
+/// Call only after configuration publication is durable. Revalidates the completed
+/// target before tombstoning and cleaning up the small metadata journal.
+pub fn finishRename(a: A, io: std.Io, root: []const u8, configured: config.Instance, options: Options) !void {
+    _ = try reconcileRename(a, io, root, configured, options, true);
+}
+fn reconcileRename(a: A, io: std.Io, root: []const u8, configured: config.Instance, options: Options, finish_only: bool) !bool {
+    const lease = try requireScope(options);
+    try validate(configured, options);
+    try lease.recheck(lease.context, configured.id);
+    const token = try reserveNamespace(io, options);
+    defer if (options.namespace_token == null) token.release();
+    try check(io, configured, options);
+    const root_dir = tree.openAbsolute(io, root) catch |err| {
+        if (err == error.FileNotFound) return false;
         return err;
     };
-    if (!namedMatches(io, recovery, "original", source_stat) or !namedAbsent(io, handles.versions, instance.name)) return error.RecoveryRequired;
-    if (new_name) |name| {
-        recovery.renamePreserve("staged", handles.versions, name, io) catch |err| {
-            // A failed syscall is not enough evidence that publication did not occur.
-            if (!namedMatches(io, recovery, "staged", stage_stat.?) or !namedDifferent(io, handles.versions, name, stage_stat.?)) return error.RecoveryRequired;
-            recovery.renamePreserve("original", handles.versions, instance.name, io) catch return error.RecoveryRequired;
-            if (!namedMatches(io, handles.versions, instance.name, source_stat) or !namedAbsent(io, recovery, "original")) return error.RecoveryRequired;
-            return err;
-        };
-        if (!namedMatches(io, handles.versions, name, stage_stat.?) or !namedAbsent(io, recovery, "staged")) return error.RecoveryRequired;
+    defer root_dir.close(io);
+    const vela = tree.child(io, root_dir, ".vela", false) catch |err| {
+        if (err == error.FileNotFound) return false;
+        return err;
+    };
+    defer vela.close(io);
+    const journal_name = try rename_journal.name(a, configured.id);
+    defer a.free(journal_name);
+    const journal = tree.child(io, vela, journal_name, false) catch |err| {
+        if (err == error.FileNotFound) return false;
+        return err;
+    };
+    defer journal.close(io);
+    // A pending journal with missing version roots is a conflict, not "no work".
+    const handles = Root.open(io, root) catch return error.RecoveryConflict;
+    defer handles.close(io);
+    try sameInode(try directoryStat(io, root_dir), try directoryStat(io, handles.root));
+    try lease.recheck(lease.context, configured.id);
+    try recheckNamespace(token, options);
+    try check(io, configured, options);
+    try handles.verify(io, root);
+    try sameInode(try directoryStat(io, vela), try handles.root.statFile(io, ".vela", .{ .follow_symlinks = false }));
+    try sameInode(try directoryStat(io, journal), try vela.statFile(io, journal_name, .{ .follow_symlinks = false }));
+    // Incomplete preparation has never touched instance data. Finished journals
+    // have already committed to the durable config and can only be cleaned up.
+    if (try rename_journal.stat(io, journal, "manifest.json") == null) {
+        if ((try rename_journal.stat(io, journal, "old-document") != null or try rename_journal.stat(io, journal, "old-receipt") != null) and try rename_journal.stat(io, journal, "finished.json") == null) return error.RecoveryConflict;
+        try rename_journal.finish(io, vela, journal, journal_name);
+        return true;
     }
-    // Namespace commit already happened. Durability failures must not masquerade as
-    // an uncommitted failure; the verified immutable backup remains available.
-    tree.syncDir(io, handles.versions) catch {
-        result.durability_uncertain = true;
-    };
-    tree.syncDir(io, recovery) catch {
-        result.durability_uncertain = true;
-    };
-    return result;
+    var parsed = try rename_journal.load(a, io, journal, configured.id);
+    defer parsed.deinit();
+    const plan = parsed.value;
+    const forward = std.mem.eql(u8, configured.name, plan.new_name);
+    if (!forward and !std.mem.eql(u8, configured.name, plan.old_name)) return error.RecoveryConflict;
+    if (finish_only and !forward) return error.RecoveryConflict;
+    try lease.recheck(lease.context, configured.id);
+    try recheckNamespace(token, options);
+    try check(io, configured, options);
+    try handles.verify(io, root);
+    if (finish_only) {
+        try rename_journal.verifyCompleted(a, io, handles.versions, plan, true);
+        // Validate the retained originals too; never erase changed recovery evidence.
+        try rename_journal.apply(a, io, handles.versions, journal, plan, true);
+    } else {
+        var previous = configured;
+        previous.name = if (try rename_journal.stat(io, handles.versions, plan.old_name) != null) plan.old_name else plan.new_name;
+        var scratch: std.heap.ArenaAllocator = .init(a);
+        defer scratch.deinit();
+        try requireUnreferencedInstance(scratch.allocator(), io, handles.versions, previous, options);
+        try rename_journal.apply(a, io, handles.versions, journal, plan, forward);
+    }
+    try rename_journal.finish(io, vela, journal, journal_name);
+    return true;
 }
 fn namedMatches(io: std.Io, dir: Dir, name: []const u8, expected: Stat) bool {
     const actual = dir.statFile(io, name, .{ .follow_symlinks = false }) catch return false;
@@ -1169,61 +1207,6 @@ fn verifyClient(io: std.Io, handles: Root, client: ClientProof, options: Options
     const held: HeldFile = .{ .file = file, .stat = opened };
     try held.recheck(io, dir, name);
     return .{ .dir = dir, .file = held };
-}
-const Rewritten = struct { document: []const u8, receipt: []const u8 };
-fn rewriteFlattened(a: A, io: std.Io, staged: Dir, instance: config.Instance, new_name: []const u8, receipt: Receipt) !Rewritten {
-    const old_json = try std.fmt.allocPrint(a, "{s}.json", .{instance.name});
-    const old_jar = try std.fmt.allocPrint(a, "{s}.jar", .{instance.name});
-    const new_jar = try std.fmt.allocPrint(a, "{s}.jar", .{new_name});
-    const original = try readMetadata(a, io, staged, old_json);
-    var version = try metadata.parseSlice(a, original);
-    defer version.deinit();
-    const staged_identity = (try receiptIdentity(a, io, staged, instance, version.value, original)) orelse return error.InvalidInstallReceipt;
-    if (!std.mem.eql(u8, staged_identity.receipt.?.bytes, receipt.bytes)) return error.TreeChanged;
-    var document = try std.json.parseFromSlice(std.json.Value, a, original, .{ .allocate = .alloc_always });
-    defer document.deinit();
-    const ja = document.arena.allocator();
-    try document.value.object.put(ja, "id", .{ .string = new_name });
-    _ = document.value.object.swapRemove("jar");
-    _ = document.value.object.swapRemove("inheritsFrom");
-    const bytes = try std.json.Stringify.valueAlloc(a, document.value, .{});
-    var next_receipt = try parseReceipt(a, receipt.bytes);
-    defer next_receipt.deinit();
-    const ra = next_receipt.arena.allocator();
-    try next_receipt.value.object.put(ra, "instance_name", .{ .string = new_name });
-    if (next_receipt.value.object.contains("client_jar")) try next_receipt.value.object.put(ra, "client_jar", .{ .string = new_jar });
-    var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
-    const hex = try a.dupe(u8, &std.fmt.bytesToHex(&hash, .lower));
-    try next_receipt.value.object.put(ra, "metadata_sha256", .{ .string = hex });
-    const receipt_bytes = try std.json.Stringify.valueAlloc(a, next_receipt.value, .{});
-    if (receipt_bytes.len > receipt_limit or bytes.len > metadata.max_document_bytes) return error.MetadataTooLarge;
-    const jar_stat = try staged.statFile(io, old_jar, .{ .follow_symlinks = false });
-    if (jar_stat.kind != .file) return error.UnsafeFileType;
-    if (jar_stat.nlink != 1) return error.HardLinkAlias;
-    try collision(io, staged, new_jar);
-    try staged.renamePreserve(old_jar, staged, new_jar, io);
-    try rewritePrivate(io, staged, old_json, bytes);
-    try rewritePrivate(io, staged, receipt.name, receipt_bytes);
-    return .{ .document = bytes, .receipt = receipt_bytes };
-}
-fn rewritePrivate(io: std.Io, dir: Dir, name: []const u8, bytes: []const u8) !void {
-    const before = try dir.statFile(io, name, .{ .follow_symlinks = false });
-    if (before.kind != .file or before.nlink != 1) return error.UnsafeFileType;
-    const file = try dir.openFile(io, name, .{ .mode = .read_write, .follow_symlinks = false });
-    defer file.close(io);
-    const opened = try file.stat(io);
-    try sameInode(before, opened);
-    if (opened.nlink != 1) return error.HardLinkAlias;
-    try file.writePositionalAll(io, bytes, 0);
-    try file.setLength(io, bytes.len);
-    try file.sync(io);
-    try sameInode(before, try dir.statFile(io, name, .{ .follow_symlinks = false }));
-}
-fn updateExpected(entry: *tree.Entry, bytes: []const u8, total: *u64) void {
-    total.* = total.* - entry.size + bytes.len;
-    entry.size = bytes.len;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &entry.sha256, .{});
 }
 
 const TestCall = enum { inspect_installed, rename_instance, remove_instance };
@@ -1302,11 +1285,10 @@ fn fixtureWritable(io: std.Io, dir: Dir) void {
     }
 }
 
-test "instance mutations preserve committed success when final directory sync fails" {
+test "instance deletion preserves committed success when final directory sync fails" {
     if (!tree.directory_sync_supported) return error.SkipZigTest;
     const SyncFailure = struct {
         root: Dir,
-        rename_it: bool,
         failures: usize = 0,
         var active: ?*@This() = null;
 
@@ -1314,8 +1296,7 @@ test "instance mutations preserve committed success when final directory sync fa
             const self = active.?;
             const real_io = std.testing.io;
             const removed = if (self.root.statFile(real_io, ".minecraft/versions/Play", .{ .follow_symlinks = false })) |_| false else |err| err == error.FileNotFound;
-            const published = !self.rename_it or if (self.root.statFile(real_io, ".minecraft/versions/Renamed", .{ .follow_symlinks = false })) |_| true else |_| false;
-            if (removed and published) {
+            if (removed) {
                 self.failures += 1;
                 return error.Unexpected;
             }
@@ -1324,33 +1305,26 @@ test "instance mutations preserve committed success when final directory sync fa
     };
     const a = std.testing.allocator;
     const real_io = std.testing.io;
-    for ([_]bool{ false, true }) |rename_it| {
-        var tmp = std.testing.tmpDir(.{ .iterate = true });
-        defer tmp.cleanup();
-        defer fixtureWritable(real_io, tmp.dir);
-        try fixture(real_io, tmp.dir);
-        const root = try tmp.dir.realPathFileAlloc(real_io, ".", a);
-        defer a.free(root);
-        var probe: SyncFailure = .{ .root = tmp.dir, .rename_it = rename_it };
-        SyncFailure.active = &probe;
-        defer SyncFailure.active = null;
-        var vtable = real_io.vtable.*;
-        vtable.fileSync = SyncFailure.sync;
-        const io: std.Io = .{ .userdata = real_io.userdata, .vtable = &vtable };
-        const options: Options = .{};
-        var result = if (rename_it)
-            try testRename(a, io, root, fixture_instance, "Renamed", options)
-        else
-            try testRemove(a, io, root, fixture_instance, options);
-        defer result.deinit();
-        try std.testing.expect(probe.failures > 0);
-        try std.testing.expect(result.durability_uncertain);
-        try std.testing.expectEqual(if (rename_it) Operation.renamed else Operation.deleted, result.operation);
-        try std.testing.expectError(error.FileNotFound, tmp.dir.access(real_io, ".minecraft/versions/Play", .{}));
-        if (rename_it) try expectBytes(real_io, tmp.dir, ".minecraft/versions/Renamed/Renamed.json", fixture_alias);
-        try expectBytes(real_io, tmp.dir, ".minecraft/assets/shared", "asset");
-        try result.recheckPublication(root);
-    }
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    defer fixtureWritable(real_io, tmp.dir);
+    try fixture(real_io, tmp.dir);
+    const root = try tmp.dir.realPathFileAlloc(real_io, ".", a);
+    defer a.free(root);
+    var probe: SyncFailure = .{ .root = tmp.dir };
+    SyncFailure.active = &probe;
+    defer SyncFailure.active = null;
+    var vtable = real_io.vtable.*;
+    vtable.fileSync = SyncFailure.sync;
+    const io: std.Io = .{ .userdata = real_io.userdata, .vtable = &vtable };
+    var result = try testRemove(a, io, root, fixture_instance, .{});
+    defer result.deinit();
+    try std.testing.expect(probe.failures > 0);
+    try std.testing.expect(result.durability_uncertain);
+    try std.testing.expectEqual(Operation.deleted, result.operation);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(real_io, ".minecraft/versions/Play", .{}));
+    try expectBytes(real_io, tmp.dir, ".minecraft/assets/shared", "asset");
+    try result.recheckPublication(root);
 }
 
 test "instance transaction rename preserves metadata payload shared data and recovery" {
@@ -1379,20 +1353,13 @@ test "instance transaction rename preserves metadata payload shared data and rec
     try expectBytes(io, tmp.dir, ".minecraft/libraries/shared", "library");
     const recovery = try tree.openAbsolute(io, result.recovery_directory.?);
     defer recovery.close(io);
-    try expectBytes(io, recovery, "backup/Play.json", fixture_alias);
-    try expectBytes(io, recovery, "original/Play.json", fixture_alias);
-    const backup_stat = try recovery.statFile(io, "backup", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o500), backup_stat.permissions.toMode() & 0o777);
-    const file_stat = try recovery.statFile(io, "backup/Play.json", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o400), file_stat.permissions.toMode() & 0o777);
-    const manifest_bytes = try recovery.readFileAlloc(io, "manifest.json", a, .limited(1024 * 1024));
-    defer a.free(manifest_bytes);
-    const manifest = try std.json.parseFromSlice(Manifest, a, manifest_bytes, .{});
+    try expectBytes(io, recovery, "old-document", fixture_alias);
+    try std.testing.expectError(error.FileNotFound, recovery.access(io, "backup", .{}));
+    var manifest = try rename_journal.load(a, io, recovery, fixture_instance.id);
     defer manifest.deinit();
-    try std.testing.expectEqualStrings("stable-id", manifest.value.instance_id);
+    try std.testing.expectEqualStrings("stable-id", manifest.value.id);
     try std.testing.expectEqualStrings("Play", manifest.value.old_name);
-    try std.testing.expectEqualStrings("New Play", manifest.value.new_name.?);
-    try std.testing.expectEqual(.renamed, manifest.value.operation);
+    try std.testing.expectEqualStrings("New Play", manifest.value.new_name);
     var renamed_inspection = try testInspectInstalled(a, io, root, result.instance, .{});
     defer renamed_inspection.deinit();
     try std.testing.expectEqualStrings("1.21", renamed_inspection.instance.minecraft_version);
@@ -1781,7 +1748,6 @@ test "instance transaction rejects symlinks hardlinks and linked root components
     try tmp.dir.deleteFile(io, ".minecraft/versions/Play/link");
     try tmp.dir.hardLink(".minecraft/assets/shared", tmp.dir, ".minecraft/versions/Play/alias", io, .{});
     try std.testing.expectError(error.HardLinkAlias, testInspectInstalled(a, io, root, fixture_instance, .{}));
-    try std.testing.expectError(error.HardLinkAlias, testRename(a, io, root, fixture_instance, "New", .{}));
     try std.testing.expectError(error.HardLinkAlias, testRemove(a, io, root, fixture_instance, .{}));
     try tmp.dir.symLink(io, ".minecraft", "linked", .{ .is_directory = true });
     const linked = try std.fs.path.join(a, &.{ root, "linked" });
@@ -1853,20 +1819,19 @@ const CommitFixture = struct {
         }
     }
 };
-test "instance transaction detects changed source during backup before commit" {
+test "instance rename does not traverse or hash changed payload" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    defer fixtureWritable(io, tmp.dir);
     try fixture(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     var mutation: CommitFixture = .{ .dir = tmp.dir, .at = 2, .action = .change_source };
-    try std.testing.expectError(error.IntegrityMismatch, testRename(a, io, root, fixture_instance, "New", .{ .lease = .{ .context = &mutation, .recheck = CommitFixture.recheck } }));
+    var renamed = try testRename(a, io, root, fixture_instance, "New", .{ .lease = .{ .context = &mutation, .recheck = CommitFixture.recheck } });
+    defer renamed.deinit();
     try std.testing.expect(mutation.failure == null);
-    try expectBytes(io, tmp.dir, ".minecraft/versions/Play/config/options.txt", "changed");
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".minecraft/versions/New", .{}));
+    try expectBytes(io, tmp.dir, ".minecraft/versions/New/config/options.txt", "changed");
 }
 test "instance transaction exclusive publish rolls original back on late collision" {
     const a = std.testing.allocator;
@@ -1877,8 +1842,8 @@ test "instance transaction exclusive publish rolls original back on late collisi
     try fixture(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    var mutation: CommitFixture = .{ .dir = tmp.dir, .at = 3, .action = .collide };
-    try std.testing.expectError(error.PathAlreadyExists, testRename(a, io, root, fixture_instance, "New", .{ .lease = .{ .context = &mutation, .recheck = CommitFixture.recheck } }));
+    var mutation: CommitFixture = .{ .dir = tmp.dir, .at = 2, .action = .collide };
+    try std.testing.expectError(error.NameCollision, testRename(a, io, root, fixture_instance, "New", .{ .lease = .{ .context = &mutation, .recheck = CommitFixture.recheck } }));
     try std.testing.expect(mutation.failure == null);
     try expectBytes(io, tmp.dir, ".minecraft/versions/Play/Play.json", fixture_alias);
     try tmp.dir.access(io, ".minecraft/versions/New", .{});
@@ -1921,52 +1886,105 @@ test "instance transaction allocation failures leave source and release owned me
     try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{Operation.renamed});
     try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{Operation.deleted});
 }
-const RenameFault = enum { first_before, first_after, publish_after, rollback_before };
-var rename_fault: ?RenameFault = null;
+var rename_fault_step: usize = 0;
+var rename_fault_seen: usize = 0;
 fn faultRename(userdata: ?*anyopaque, old_dir: Dir, old_name: []const u8, new_dir: Dir, new_name: []const u8) Dir.RenamePreserveError!void {
-    const fault = rename_fault.?;
-    if (std.mem.eql(u8, new_name, "original") and fault == .first_before) return error.OperationUnsupported;
-    if (std.mem.eql(u8, old_name, "staged") and fault == .rollback_before) return error.PathAlreadyExists;
-    if (std.mem.eql(u8, old_name, "original") and fault == .rollback_before) return error.Unexpected;
     try std.testing.io.vtable.dirRenamePreserve(userdata, old_dir, old_name, new_dir, new_name);
-    if ((std.mem.eql(u8, new_name, "original") and fault == .first_after) or
-        (std.mem.eql(u8, old_name, "staged") and fault == .publish_after)) return error.Unexpected;
+    if (std.mem.eql(u8, old_name, "prepared.json")) return;
+    rename_fault_seen += 1;
+    if (rename_fault_seen == rename_fault_step) return error.Unexpected;
 }
-test "instance transaction uncertain syscall outcomes and failed rollback require recovery" {
+fn testRecovery(a: A, io: std.Io, root: []const u8, instance: config.Instance, finish_only: bool) !bool {
+    const leases = @import("instance_leases.zig");
+    var coordinator = leases.Coordinator.init(io);
+    const mutation = coordinator.mutation(0);
+    try mutation.acquire(instance.id);
+    defer {
+        mutation.release(instance.id);
+        coordinator.tick();
+    }
+    var chain: TestCheckChain = .{ .mutation = mutation, .injected = null };
+    const options: Options = .{ .lease = .{ .context = &chain, .recheck = TestCheckChain.recheck } };
+    if (finish_only) {
+        try finishRename(a, io, root, instance, options);
+        return true;
+    }
+    return recoverRename(a, io, root, instance, options);
+}
+test "instance rename restarts after every successful syscall with an uncertain outcome" {
     const a = std.testing.allocator;
     const real_io = std.testing.io;
-    for ([_]RenameFault{ .first_before, .first_after, .publish_after, .rollback_before }) |fault| {
+    for ([_]bool{ false, true }) |forward| for (1..7) |step| {
         var tmp = std.testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
-        defer fixtureWritable(real_io, tmp.dir);
-        try fixture(real_io, tmp.dir);
+        try flattenedFixture(real_io, tmp.dir, .forge);
         const root = try tmp.dir.realPathFileAlloc(real_io, ".", a);
         defer a.free(root);
+        const inode = (try tmp.dir.statFile(real_io, ".minecraft/versions/Play/Play.jar", .{})).inode;
         var vtable = real_io.vtable.*;
         vtable.dirRenamePreserve = faultRename;
         const io: std.Io = .{ .userdata = real_io.userdata, .vtable = &vtable };
-        rename_fault = fault;
-        defer rename_fault = null;
-        if (fault == .first_before) {
-            try std.testing.expectError(error.OperationUnsupported, testRename(a, io, root, fixture_instance, "New", .{}));
-            try expectBytes(real_io, tmp.dir, ".minecraft/versions/Play/Play.json", fixture_alias);
-            continue;
-        }
+        rename_fault_step = step;
+        rename_fault_seen = 0;
         try std.testing.expectError(error.RecoveryRequired, testRename(a, io, root, fixture_instance, "New", .{}));
-        try std.testing.expectError(error.FileNotFound, tmp.dir.access(real_io, ".minecraft/versions/Play", .{}));
-        const vela = try tmp.dir.openDir(real_io, ".vela", .{ .iterate = true });
-        defer vela.close(real_io);
-        var entries = vela.iterate();
-        const entry = (try entries.next(real_io)).?;
-        const recovery = try vela.openDir(real_io, entry.name, .{ .iterate = true });
-        defer recovery.close(real_io);
-        try expectBytes(real_io, recovery, "original/Play.json", fixture_alias);
-        try expectBytes(real_io, recovery, "backup/Play.json", fixture_alias);
-        if (fault == .publish_after) {
-            try expectBytes(real_io, tmp.dir, ".minecraft/versions/New/New.json", fixture_alias);
+        var configured = fixture_instance;
+        if (forward) configured.name = "New";
+        try std.testing.expect(try testRecovery(a, real_io, root, configured, false));
+        try std.testing.expect(!try testRecovery(a, real_io, root, configured, false));
+        const jar = if (forward) ".minecraft/versions/New/New.jar" else ".minecraft/versions/Play/Play.jar";
+        try std.testing.expectEqual(inode, (try tmp.dir.statFile(real_io, jar, .{})).inode);
+        var checked = try testInspectInstalled(a, real_io, root, configured, .{});
+        checked.deinit();
+    };
+}
+test "instance rename retains payload inodes and confirms durable publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try flattenedFixture(io, tmp.dir, .forge);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const paths = [_][]const u8{ "Play.jar", "saves/World/level.dat", "extraMods/mod.jar", "config/options.txt" };
+    var inodes: [4]u64 = undefined;
+    for (paths, 0..) |path, index| {
+        const full = try std.fmt.allocPrint(a, ".minecraft/versions/Play/{s}", .{path});
+        defer a.free(full);
+        inodes[index] = (try tmp.dir.statFile(io, full, .{})).inode;
+    }
+    const dir_inode = (try tmp.dir.statFile(io, ".minecraft/versions/Play", .{})).inode;
+    var renamed = try testRename(a, io, root, fixture_instance, "New", .{});
+    defer renamed.deinit();
+    try renamed.recheckPublication(root);
+    try std.testing.expectEqual(dir_inode, (try tmp.dir.statFile(io, ".minecraft/versions/New", .{})).inode);
+    for (paths, 0..) |path, index| {
+        const full = try std.fmt.allocPrint(a, ".minecraft/versions/New/{s}", .{if (index == 0) "New.jar" else path});
+        defer a.free(full);
+        try std.testing.expectEqual(inodes[index], (try tmp.dir.statFile(io, full, .{})).inode);
+    }
+    _ = try testRecovery(a, io, root, renamed.instance, true);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".vela/rename-stable-id", .{}));
+    try renamed.recheckPublication(root);
+}
+test "instance rename recovery refuses collisions and modified metadata without overwriting" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |metadata_conflict| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try fixture(io, tmp.dir);
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var renamed = try testRename(a, io, root, fixture_instance, "New", .{});
+        defer renamed.deinit();
+        if (metadata_conflict) {
+            try tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/New/New.json", .data = "external edit" });
         } else {
-            try std.testing.expectError(error.FileNotFound, tmp.dir.access(real_io, ".minecraft/versions/New", .{}));
+            try tmp.dir.createDir(io, ".minecraft/versions/Play", .default_dir);
         }
+        try std.testing.expectError(error.RecoveryConflict, testRecovery(a, io, root, fixture_instance, false));
+        try tmp.dir.access(io, ".vela/rename-stable-id/manifest.json", .{});
+        try expectBytes(io, tmp.dir, ".minecraft/versions/New/New.json", if (metadata_conflict) "external edit" else fixture_alias);
     }
 }
 const fixture_private_jar = "processed-client";
@@ -2046,9 +2064,8 @@ fn expectFlattenedRename(kind: config.Loader) !void {
     try std.testing.expectEqualStrings("1.21", renamed.instance.minecraft_version);
     const recovery = try tree.openAbsolute(io, renamed.recovery_directory.?);
     defer recovery.close(io);
-    try expectBytes(io, recovery, "backup/Play.json", original);
-    try expectBytes(io, recovery, "original/Play.json", original);
-    try expectBytes(io, recovery, "backup/Play.jar", fixture_private_jar);
+    try expectBytes(io, recovery, "old-document", original);
+    try std.testing.expectError(error.FileNotFound, recovery.access(io, "backup", .{}));
     try expectBytes(io, tmp.dir, ".minecraft/versions/New/New.jar", fixture_private_jar);
     try expectBytes(io, tmp.dir, ".minecraft/versions/New/saves/World/level.dat", "world");
     try expectBytes(io, tmp.dir, ".minecraft/versions/New/config/options.txt", "config");
@@ -2084,6 +2101,7 @@ fn expectFlattenedRename(kind: config.Loader) !void {
     var loaded = try loader.loadInstalled(a, io, .{ .root = minecraft, .version_id = "New" });
     defer loaded.deinit();
     try std.testing.expectEqualStrings("New", loaded.version.value.jar orelse loaded.version.value.id);
+    _ = try testRecovery(a, io, root, renamed.instance, true);
     var deleted = try testRemove(a, io, root, renamed.instance, .{});
     defer deleted.deinit();
     try std.testing.expect(deleted.recovery_directory == null);
@@ -2438,6 +2456,9 @@ fn artifactReceiptFixture(a: A, io: std.Io, dir: Dir, count: usize) !void {
         .path = try std.fmt.allocPrint(ar, "libraries/org/example/item-{d}/item-{d}.jar", .{ index, index }),
         .sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
         .size = index,
+        .expected_sha1 = "0123456789012345678901234567890123456789",
+        .producer = index % 128,
+        .installer_member = "maven/org/example/runtime.jar",
     };
     const bindings = try std.json.Stringify.valueAlloc(ar, entries, .{});
     var parsed_bindings = try std.json.parseFromSlice(std.json.Value, ar, bindings, .{});
@@ -2477,7 +2498,10 @@ test "instance transaction accepts producer 4096 artifact receipt and preserves 
     const artifacts = parsed.value.object.get("artifact_bindings").?.array.items;
     try std.testing.expectEqual(@as(usize, 4096), artifacts.len);
     try std.testing.expectEqualStrings("libraries/org/example/item-4095/item-4095.jar", try fieldText(artifacts[4095].object, "path"));
-    const original_path = try std.fmt.allocPrint(a, "{s}/backup/.vela-loader.json", .{moved.recovery_directory.?});
+    try std.testing.expectEqualStrings("0123456789012345678901234567890123456789", try fieldText(artifacts[0].object, "expected_sha1"));
+    try std.testing.expectEqual(@as(i64, 127), artifacts[4095].object.get("producer").?.integer);
+    try std.testing.expectEqualStrings("maven/org/example/runtime.jar", try fieldText(artifacts[0].object, "installer_member"));
+    const original_path = try std.fmt.allocPrint(a, "{s}/old-receipt", .{moved.recovery_directory.?});
     defer a.free(original_path);
     const recovered = try Dir.cwd().readFileAlloc(io, original_path, a, .limited(receipt_limit));
     defer a.free(recovered);
@@ -2540,7 +2564,7 @@ test "instance transaction receipt artifacts reject aliases nonflat shapes unsaf
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     const path = ".minecraft/versions/Play/.vela-loader.json";
-    for (0..8) |mode| {
+    for (0..12) |mode| {
         try artifactReceiptFixture(a, io, tmp.dir, 2);
         const bytes = try tmp.dir.readFileAlloc(io, path, a, .limited(receipt_limit));
         defer a.free(bytes);
@@ -2557,6 +2581,10 @@ test "instance transaction receipt artifacts reject aliases nonflat shapes unsaf
             5 => try entries[0].object.put(ar, "extra", .null),
             6 => try entries[0].object.put(ar, "path", .{ .array = std.json.Array.init(ar) }),
             7 => try parsed.value.object.put(ar, "client_jar", .{ .string = "Other.jar" }),
+            8 => try entries[0].object.put(ar, "expected_sha1", .{ .string = "invalid" }),
+            9 => try entries[0].object.put(ar, "producer", .{ .integer = -1 }),
+            10 => try entries[0].object.put(ar, "producer", .{ .integer = 256 }),
+            11 => try entries[0].object.put(ar, "installer_member", .{ .string = "../outside.jar" }),
             else => unreachable,
         }
         const changed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});

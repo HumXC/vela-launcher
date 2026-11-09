@@ -115,7 +115,7 @@ test "status JSON owns UTF8 text structured MOTD and counts" {
 }
 
 test "structured JSON rejects malformed fields counts duplicate keys UTF8" {
-    for ([_][]const u8{ "{", "{}", "[]", "{\"version\":1}", "{\"version\":{\"name\":1,\"protocol\":1}}", "{\"version\":{\"name\":\"x\",\"protocol\":2147483648}}", "{\"version\":{\"name\":\"x\",\"protocol\":1},\"players\":{\"online\":-1}}", "{\"version\":{\"name\":\"x\",\"protocol\":1},\"description\":false}", "{\"version\":{\"name\":\"x\",\"protocol\":1},\"description\":{\"extra\":1}}", "{\"version\":{\"name\":\"x\",\"protocol\":1},\"version\":{}}", "\xff" }) |json| {
+    for ([_][]const u8{ "{", "{}", "[]", "{\"version\":1}", "{\"version\":{\"name\":1,\"protocol\":1}}", "{\"version\":{\"name\":\"x\",\"protocol\":2147483648}}", "{\"version\":{\"name\":\"x\",\"protocol\":1},\"players\":{\"online\":-1}}", "{\"version\":{\"name\":\"x\",\"protocol\":1},\"version\":{}}" }) |json| {
         if (servers.parseStatus(a, json)) |s| {
             var status = s;
             status.deinit();
@@ -152,6 +152,13 @@ fn pngFixture(buffer: []u8, width: u32) ![]const u8 {
     try pngChunk(&w, "IEND", "");
     return w.buffered();
 }
+fn expectBadIcon(json: []const u8) !void {
+    var status = try servers.parseStatus(a, json);
+    defer status.deinit();
+    try std.testing.expect(status.icon == null);
+    try std.testing.expect(status.icon_issue != null);
+    try std.testing.expectEqualStrings("x", status.version);
+}
 fn iconJson(allocator: std.mem.Allocator, png: []const u8) ![]u8 {
     const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
     defer allocator.free(encoded);
@@ -166,26 +173,26 @@ test "base64 PNG icon enforces dimensions checksums and size" {
     defer a.free(json);
     var status = try servers.parseStatus(a, json);
     defer status.deinit();
-    try std.testing.expectEqualSlices(u8, png, status.icon_png.?);
+    try std.testing.expectEqualSlices(u8, png, status.icon.?.png);
     const wrong = try iconJson(a, try pngFixture(&buffer, 128));
     defer a.free(wrong);
-    try std.testing.expectError(error.InvalidIcon, servers.parseStatus(a, wrong));
+    try expectBadIcon(wrong);
     _ = try pngFixture(&buffer, 64);
     buffer[50] ^= 1;
     const corrupt = try iconJson(a, buffer[0..png.len]);
     defer a.free(corrupt);
-    try std.testing.expectError(error.InvalidIcon, servers.parseStatus(a, corrupt));
+    try expectBadIcon(corrupt);
     for ([_][]const u8{ "%%%%", "AAAA", "A===", "AAAA=" }) |encoded| {
         const malformed = try std.fmt.allocPrint(a, "{{\"version\":{{\"name\":\"x\",\"protocol\":1}},\"favicon\":\"data:image/png;base64,{s}\"}}", .{encoded});
         defer a.free(malformed);
-        try std.testing.expectError(error.InvalidIcon, servers.parseStatus(a, malformed));
+        try expectBadIcon(malformed);
     }
     const huge = try a.alloc(u8, servers.max_icon_bytes + 1);
     defer a.free(huge);
     @memset(huge, 0);
     const oversized = try iconJson(a, huge);
     defer a.free(oversized);
-    try std.testing.expectError(error.InvalidIcon, servers.parseStatus(a, oversized));
+    try expectBadIcon(oversized);
 }
 
 test "fragmented protocol exchanges configured host handshake ping and owned result" {
@@ -194,7 +201,7 @@ test "fragmented protocol exchanges configured host handshake ping and owned res
     var status = try servers.queryStream(a, endpoint, -1, fixture.adapter());
     defer status.deinit();
     try std.testing.expectEqual(@as(?u32, 3), status.players_online);
-    try std.testing.expectEqual(@as(u64, 0), status.latency_ms);
+    try std.testing.expectEqual(@as(?u64, 0), status.latency_ms);
     try std.testing.expect(std.mem.indexOf(u8, fixture.output[0..fixture.output_len], "virtual.example") != null);
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0x0f }, fixture.output[2..7]);
     try std.testing.expectEqualSlices(u8, &.{ 9, 1, 0, 0, 0, 0, 0, 0, 0, 0 }, fixture.output[fixture.output_len - 10 .. fixture.output_len]);
@@ -215,7 +222,29 @@ test "malformed oversized truncated and invalid pong frames" {
     const bytes = try fixtureBytes(valid_json, &buffer);
     buffer[bytes.len - 1] = 99;
     var fixture: Fixture = .{ .input = bytes };
-    try std.testing.expectError(error.InvalidPacket, servers.queryStream(a, endpoint, -1, fixture.adapter()));
+    var partial = try servers.queryStream(a, endpoint, -1, fixture.adapter());
+    defer partial.deinit();
+    try std.testing.expectEqual(@as(?u64, null), partial.latency_ms);
+    try std.testing.expectEqual(error.InvalidPacket, partial.latency_issue.?);
+    try std.testing.expectEqualStrings("1.21", partial.version);
+}
+
+test "valid status survives EOF and deadline during pong but not user cancellation" {
+    var buffer: [4096]u8 = undefined;
+    const bytes = try fixtureBytes(valid_json, &buffer);
+    const status_bytes = bytes[0 .. bytes.len - 10];
+    var disconnected: Fixture = .{ .input = status_bytes };
+    var status = try servers.queryStream(a, endpoint, -1, disconnected.adapter());
+    defer status.deinit();
+    try std.testing.expectEqual(error.EndOfStream, status.latency_issue.?);
+    try std.testing.expectEqual(@as(?u64, null), status.latency_ms);
+    try std.testing.expectEqual(@as(?u32, 3), status.players_online);
+    var timed: Fixture = .{ .input = status_bytes, .timeout_at = disconnected.reads };
+    var partial = try servers.queryStream(a, endpoint, -1, timed.adapter());
+    defer partial.deinit();
+    try std.testing.expectEqual(error.Timeout, partial.latency_issue.?);
+    var canceled: Fixture = .{ .input = status_bytes, .cancel_at = disconnected.reads };
+    try std.testing.expectError(error.Canceled, servers.queryStream(a, endpoint, -1, canceled.adapter()));
 }
 
 test "stream cancellation deadline and offline errors propagate" {
@@ -249,9 +278,41 @@ test "all allocation failures free JSON icon and protocol ownership" {
     try @import("test_allocations").checkAllAllocationFailures(a, oomStream, .{});
 }
 
+test "resolved dial endpoint preserves configured handshake identity and owned target" {
+    const Redirect = struct {
+        var target_port: u16 = 0;
+        fn resolve(allocator: std.mem.Allocator, _: std.Io, host: []const u8, port: u16) !@import("server_dns.zig").Result {
+            try std.testing.expectEqualStrings("virtual.example", host);
+            try std.testing.expectEqual(@as(u16, 25565), port);
+            return .{ .allocator = allocator, .target_host = try allocator.dupe(u8, "127.0.0.1"), .target_port = target_port, .used_srv = true };
+        }
+    };
+    const ip = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try ip.listen(io, .{});
+    defer listener.deinit(io);
+    Redirect.target_port = listener.socket.address.getPort();
+    var fixture: Loopback = .{ .listener = &listener, .mode = .normal, .expected_host = "virtual.example", .expected_port = 25565 };
+    var worker = try io.concurrent(Loopback.run, .{&fixture});
+    defer worker.cancel(io) catch {};
+    var diagnostics: servers.Diagnostics = .{};
+    const record: config.Server = .{ .id = "fixture", .name = "Fixture", .address = "virtual.example", .port = 25565 };
+    var status = try servers.query(a, io, record, .{ .timeout_ms = 2000, .resolve_endpoint = Redirect.resolve, .diagnostics = &diagnostics });
+    defer status.deinit();
+    try worker.await(io);
+    try std.testing.expectEqualStrings("127.0.0.1", status.connection.?.host);
+    try std.testing.expectEqual(Redirect.target_port, status.connection.?.port);
+    try std.testing.expect(status.connection.?.used_srv);
+    try std.testing.expectEqual(servers.Phase.complete, diagnostics.phase);
+    try std.testing.expect(diagnostics.used_srv);
+    try std.testing.expectEqualStrings("virtual.example", record.address);
+    try std.testing.expectEqual(@as(u16, 25565), record.port);
+}
+
 const Loopback = struct {
     listener: *std.Io.net.Server,
-    mode: enum { normal, stall, cancel },
+    mode: enum { normal, stall, cancel, no_pong, cancel_pong },
+    expected_host: []const u8 = "127.0.0.1",
+    expected_port: ?u16 = null,
     cancellation: ?*std.atomic.Value(bool) = null,
     fn run(self: *Loopback) anyerror!void {
         const connection = try self.listener.accept(io);
@@ -263,11 +324,12 @@ const Loopback = struct {
         if (prefix[0] >= 128) return error.InvalidFixture;
         var handshake: [128]u8 = undefined;
         try reader.interface.readSliceAll(handshake[0..prefix[0]]);
-        if (std.mem.indexOf(u8, handshake[0..prefix[0]], "127.0.0.1") == null) return error.InvalidFixture;
+        if (std.mem.indexOf(u8, handshake[0..prefix[0]], self.expected_host) == null) return error.InvalidFixture;
+        if (self.expected_port) |port| if (std.mem.readInt(u16, handshake[prefix[0] - 3 ..][0..2], .big) != port) return error.InvalidFixture;
         var request: [12]u8 = undefined;
         try reader.interface.readSliceAll(&request);
         if (!std.mem.eql(u8, request[0..4], &.{ 1, 0, 9, 1 })) return error.InvalidFixture;
-        if (self.mode != .normal) {
+        if (self.mode == .stall or self.mode == .cancel) {
             if (self.cancellation) |token| token.store(true, .release);
             try io.sleep(.fromSeconds(10), .awake);
             return;
@@ -277,8 +339,12 @@ const Loopback = struct {
         @memcpy(output[bytes.len - 8 .. bytes.len], request[4..12]);
         var write_buffer: [512]u8 = undefined;
         var writer = connection.writer(io, &write_buffer);
-        try writer.interface.writeAll(bytes);
+        try writer.interface.writeAll(if (self.mode == .no_pong or self.mode == .cancel_pong) bytes[0 .. bytes.len - 10] else bytes);
         try writer.interface.flush();
+        if (self.mode == .no_pong or self.mode == .cancel_pong) {
+            if (self.mode == .cancel_pong) if (self.cancellation) |token| token.store(true, .release);
+            try io.sleep(.fromSeconds(10), .awake);
+        }
     }
 };
 fn loopbackCase(mode: @FieldType(Loopback, "mode")) !void {
@@ -286,7 +352,7 @@ fn loopbackCase(mode: @FieldType(Loopback, "mode")) !void {
     var listener = try ip.listen(io, .{});
     defer listener.deinit(io);
     var token = std.atomic.Value(bool).init(false);
-    var fixture: Loopback = .{ .listener = &listener, .mode = mode, .cancellation = if (mode == .cancel) &token else null };
+    var fixture: Loopback = .{ .listener = &listener, .mode = mode, .cancellation = if (mode == .cancel or mode == .cancel_pong) &token else null };
     var worker = try io.concurrent(Loopback.run, .{&fixture});
     defer worker.cancel(io) catch |err| {
         if (err != error.Canceled) std.debug.panic("loopback fixture failed: {s}", .{@errorName(err)});
@@ -301,13 +367,22 @@ fn loopbackCase(mode: @FieldType(Loopback, "mode")) !void {
             try worker.await(io);
         },
         .stall => try std.testing.expectError(error.Timeout, servers.query(a, io, record, options)),
-        .cancel => try std.testing.expectError(error.Canceled, servers.query(a, io, record, options)),
+        .cancel, .cancel_pong => try std.testing.expectError(error.Canceled, servers.query(a, io, record, options)),
+        .no_pong => {
+            var status = try servers.query(a, io, record, options);
+            defer status.deinit();
+            try std.testing.expectEqualStrings("1.21", status.version);
+            try std.testing.expectEqual(@as(?u64, null), status.latency_ms);
+            try std.testing.expectEqual(error.Timeout, status.latency_issue.?);
+        },
     }
 }
 test "production std.Io.net only loopback normal timeout and atomic cancellation" {
     try loopbackCase(.normal);
     try loopbackCase(.stall);
     try loopbackCase(.cancel);
+    try loopbackCase(.no_pong);
+    try loopbackCase(.cancel_pong);
 }
 test "production options and pre-cancellation do not connect" {
     const record: config.Server = .{ .id = "fixture", .name = "Fixture", .address = "127.0.0.1", .instance_id = "test" };
@@ -326,7 +401,9 @@ test "bounded JSON MOTD and component nesting" {
     @memset(long, 'a');
     const json = try std.fmt.allocPrint(a, "{{\"version\":{{\"name\":\"x\",\"protocol\":1}},\"description\":\"{s}\"}}", .{long});
     defer a.free(json);
-    try std.testing.expectError(error.MotdTooLarge, servers.parseStatus(a, json));
+    var oversized = try servers.parseStatus(a, json);
+    defer oversized.deinit();
+    try std.testing.expectEqual(error.MotdTooLarge, oversized.motd_issue.?);
     var buffer: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buffer);
     try w.writeAll("{\"version\":{\"name\":\"x\",\"protocol\":1},\"description\":");
@@ -334,7 +411,9 @@ test "bounded JSON MOTD and component nesting" {
     try w.writeAll("\"text\"");
     for (0..35) |_| try w.writeByte(']');
     try w.writeByte('}');
-    try std.testing.expectError(error.InvalidStatus, servers.parseStatus(a, w.buffered()));
+    var nested = try servers.parseStatus(a, w.buffered());
+    defer nested.deinit();
+    try std.testing.expectEqual(error.InvalidStatus, nested.motd_issue.?);
 }
 
 test "production future cancellation interrupts blocked loopback read and joins" {

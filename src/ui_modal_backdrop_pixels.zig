@@ -5,6 +5,10 @@ const theme = @import("ui/theme.zig");
 const components = @import("ui/components.zig");
 const surface = @import("ui/surface.zig");
 const appearance = @import("core/appearance.zig");
+const background = @import("ui/background_image.zig");
+var wallpaper_pixel: [1]dvui.Color.PMA = .{.{ .r = 255, .g = 0, .b = 0, .a = 255 }};
+var empty: [0]u8 = .{};
+var wallpaper: background.Image = .{ .bytes = &empty, .path = &empty, .width = 1, .height = 1, .pixels = @splat(&wallpaper_pixel), .digest = @splat(0), .extension = "png" };
 pub const dvui_app: dvui.App = .{ .config = .{ .startFn = start }, .initFn = @import("ui/fonts.zig").install, .frameFn = frame };
 pub const main = dvui.App.main;
 pub const panic = dvui.App.panic;
@@ -27,6 +31,7 @@ fn stripes(rect: dvui.Rect.Physical, blue: bool, changed: bool) void {
 fn frame() !dvui.App.Result {
     const win = dvui.currentWindow();
     theme.install(win);
+    if (tick >= 36) return materialFrame();
     const scenario = tick / 3;
     // Whole-app scale exercises the same physical/logical mapping as 2x DPI;
     // begin() picks this up next frame. Keep the native pixel target unchanged.
@@ -113,7 +118,80 @@ fn frame() !dvui.App.Result {
         std.debug.print("modal backdrop scenario {}: contrast={d:.1}, mean blue={d:.1}, read={} blur={} tex-create={}\n", .{ scenario, contrast, mean_blue, stats.read_pixels, stats.blur_pixels, stats.texture_creates });
     }
     tick += 1;
-    if (tick == 36) return .close;
     dvui.refresh(null, @src(), null);
     return .ok;
+}
+
+/// Compare real shared controls with plain tint over the same modal surface.
+/// A contrasting wallpaper detects any accidental bypass of the parent surface.
+fn materialFrame() !dvui.App.Result {
+    const win = dvui.currentWindow();
+    const scenario = (tick - 36) / 3;
+    win.content_scale = if (scenario < 2) 1 else 2;
+    const settings: appearance.Settings = .{ .background_mode = .image, .panel_opacity = 60, .panel_blur = 16, .image_dimming = 0 };
+    theme.applyAppearance(settings);
+    theme.setPanelBackdrop(&wallpaper, settings, dvui.windowRectScale());
+    defer theme.setPanelBackdrop(null, .{}, dvui.windowRectScale());
+    background.draw(&wallpaper, settings, dvui.windowRectScale());
+    // Represents opaque page content between the wallpaper and the modal.
+    surface.fill(dvui.windowRectScale(), .{}, .{ .color = .{ .r = 0, .g = 0, .b = 180 } });
+    // Keep the main-page probe outside even two nested modals at 2x scale.
+    const root = components.bentoPanel(@src(), .{ .expand = .none, .rect = .{ .x = 1, .y = 1, .w = 12, .h = 12 }, .corners = .all(2), .padding = .all(0), .margin = .all(0) });
+    const root_region = root.data().backgroundRectScale().r;
+    root.deinit();
+    var lower: ?*dvui.FloatingWindowWidget = null;
+    if (scenario % 2 == 1) lower = components.modalPanel(@src(), "Lower material", 400, null);
+    const modal = components.modalPanel(@src(), "Modal material", 280, null);
+    var samples: [3][2]dvui.Rect.Physical = undefined;
+    for (0..3) |kind| {
+        var options: dvui.Options = .{ .id_extra = kind, .expand = .none, .rect = .{ .x = 8, .y = 8 + @as(f32, @floatFromInt(kind)) * 60, .w = 100, .h = 40 }, .padding = .all(0), .margin = .all(0), .border = .all(0), .corners = .all(8), .background = true, .color_fill = .{ .color = theme.colors.inset } };
+        if (kind == 0) {
+            const card = components.bentoPanel(@src(), options);
+            samples[kind][0] = card.data().backgroundRectScale().r;
+            card.deinit();
+        } else {
+            var button: dvui.ButtonWidget = undefined;
+            button.init(@src(), .{ .draw_focus = false }, options);
+            samples[kind][0] = button.data().backgroundRectScale().r;
+            if (kind == 1) theme.panelFill(button.data(), options) else theme.buttonBackground(&button, .{ .material = true });
+            button.deinit();
+        }
+        options.rect.?.x += 140;
+        const reference = dvui.box(@src(), .{}, options);
+        samples[kind][1] = reference.data().backgroundRectScale().r;
+        reference.deinit();
+    }
+    modal.deinit();
+    if (lower) |parent| parent.deinit();
+    win.endRendering(.{ .show_toasts = false });
+    const width: usize = @intFromFloat(dvui.windowRectPixels().w);
+    const height: usize = @intFromFloat(dvui.windowRectPixels().h);
+    const bytes = try win.gpa.alloc(u8, width * height * 4);
+    defer win.gpa.free(bytes);
+    try win.backend.readPixels(dvui.windowRectPixels(), bytes.ptr);
+    if (tick % 3 == 2) {
+        const root_at = pixelIndex(root_region, width);
+        if (bytes[root_at] <= @as(u16, bytes[root_at + 2]) + 20) return error.RootPanelLostWallpaper;
+        for (samples, 0..) |pair, kind| {
+            const actual = pixelIndex(pair[0], width);
+            const expected = pixelIndex(pair[1], width);
+            for (0..3) |channel| {
+                if (@abs(@as(i16, bytes[actual + channel]) - @as(i16, bytes[expected + channel])) > 3) {
+                    std.log.err("modal material scenario {} kind {} actual={any} expected={any}", .{ scenario, kind, bytes[actual..][0..4], bytes[expected..][0..4] });
+                    return error.ModalControlRepaintedWallpaper;
+                }
+            }
+        }
+        std.debug.print("modal material scenario {}: root wallpaper retained, three controls match parent surface\n", .{scenario});
+    }
+    tick += 1;
+    if (tick == 48) return .close;
+    dvui.refresh(null, @src(), null);
+    return .ok;
+}
+
+fn pixelIndex(rect: dvui.Rect.Physical, width: usize) usize {
+    const x: usize = @intFromFloat(rect.x + rect.w / 2);
+    const y: usize = @intFromFloat(rect.y + rect.h / 2);
+    return (y * width + x) * 4;
 }

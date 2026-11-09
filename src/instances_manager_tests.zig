@@ -1,7 +1,7 @@
 const std = @import("std");
-const module = @import("ui/instances_manager.zig");
+const module = @import("application/instances_manager.zig");
 test {
-    _ = @import("ui/metadata_http_cache.zig");
+    _ = @import("application/metadata_http_cache.zig");
 }
 const config = @import("core/config.zig");
 const instances = @import("core/instances.zig");
@@ -553,6 +553,47 @@ fn writableFixture(dir: std.Io.Dir) void {
 }
 
 const editable: config.Instance = .{ .id = "stable-editable", .name = "Play", .minecraft_version = "1.21", .java_path = "/old/java", .max_memory_mb = 2048, .origin = .{ .kind = .modrinth, .project_id = "project", .version_id = "release" } };
+
+test "shutdown publishes a joined rename and terminates failed publication without replay" {
+    try requireSyncFaults();
+    for ([_]bool{ false, true }) |fail_publication| {
+        var env = try Environment.init();
+        defer env.deinit();
+        defer writableFixture(env.tmp.dir);
+        try editableFixture(env.tmp.dir);
+        try env.store.update(.{ .instances = &.{editable} });
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var fixture: Fixture = .{};
+        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+        defer manager.deinit();
+        var updated = editable;
+        updated.name = "New Play";
+        updated.max_memory_mb = 8192;
+        try manager.startRenameWithOptions(editable, updated);
+        try settle(&manager);
+        try std.testing.expect(manager.isBusy());
+        var fault: PublicationFaultIo = .{ .require_namespace = true };
+        env.store.io = fault.start();
+        defer fault.stop();
+        if (fail_publication) fault.fail_sync = 1;
+        manager.finishShutdown(&env.store);
+        try std.testing.expect(!manager.isBusy() and !registry.hasActive());
+        const writes = fault.writes;
+        manager.finishShutdown(&env.store);
+        try std.testing.expectEqual(writes, fault.writes);
+        if (fail_publication) {
+            try std.testing.expect(manager.pending != null);
+            try std.testing.expectEqual(error.InputOutput, manager.snapshot().failure.?);
+            try std.testing.expect(fixture.held.load(.acquire));
+            try std.testing.expect(module.sameInstance(editable, env.store.snapshot().instances[0]));
+        } else {
+            try std.testing.expect(manager.pending == null);
+            try std.testing.expect(module.sameInstance(updated, env.store.snapshot().instances[0]));
+            try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+        }
+    }
+}
 
 test "combined rename options publishes one complete config update after JOIN and retries as one result" {
     try requireSyncFaults();
@@ -2610,4 +2651,82 @@ test "instance manager production stage rolls back cancellation open and sync ac
         while (try iterator.next(io)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".vela-instance-"));
         try std.testing.expectError(error.FileNotFound, versions.statFile(io, example.name, .{ .follow_symlinks = false }));
     }
+}
+
+test "rename restart recovery follows durable configuration and removes only its journal" {
+    for ([_]bool{ false, true }) |committed| {
+        var env = try Environment.init();
+        defer env.deinit();
+        try editableFixture(env.tmp.dir);
+        try env.tmp.dir.writeFile(io, .{ .sub_path = ".minecraft/versions/Play/Play.jar", .data = "game" });
+        try env.store.update(.{ .instances = &.{editable}, .selected_instance = editable.id });
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var fixture: Fixture = .{};
+        var updated = editable;
+        updated.name = "New Play";
+        {
+            var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+            defer manager.deinit();
+            try manager.startRenameWithOptions(editable, updated);
+            try settle(&manager);
+            try std.testing.expectEqual(module.Phase.awaiting_publication, manager.snapshot().phase);
+            try std.testing.expect(!manager.snapshot().local_client_verified);
+            if (committed) try env.store.update(.{ .instances = &.{updated}, .selected_instance = editable.id });
+            // Simulate shutdown before publication acknowledgement/journal cleanup.
+        }
+        try env.reloadStore();
+        var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+        defer manager.deinit();
+        try manager.recoverRenames(&env.store);
+        try manager.recoverRenames(&env.store); // Restart recovery is idempotent.
+        try std.testing.expect(!fixture.held.load(.acquire));
+        const expected = if (committed) "New Play" else "Play";
+        try std.testing.expectEqualStrings(expected, env.store.snapshot().instances[0].name);
+        const json = try std.fmt.allocPrint(a, ".minecraft/versions/{s}/{s}.json", .{ expected, expected });
+        defer a.free(json);
+        try env.tmp.dir.access(io, json, .{});
+        const jar = try std.fmt.allocPrint(a, ".minecraft/versions/{s}/{s}.jar", .{ expected, expected });
+        defer a.free(jar);
+        try env.tmp.dir.access(io, jar, .{});
+        try std.testing.expectError(error.FileNotFound, env.tmp.dir.access(io, ".vela/rename-stable-editable", .{}));
+    }
+}
+
+test "rename retry acknowledges a reconciled committed configuration without rewriting it" {
+    try requireSyncFaults();
+    var env = try Environment.init();
+    defer env.deinit();
+    try editableFixture(env.tmp.dir);
+    try env.store.update(.{ .instances = &.{editable} });
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var fixture: Fixture = .{};
+    var manager = try module.Manager.init(a, io, &env.paths, &registry, .{}, fixture.lease());
+    defer manager.deinit();
+    var updated = editable;
+    updated.name = "New Play";
+    try manager.startRenameWithOptions(editable, updated);
+    try settle(&manager);
+    var fault: PublicationFaultIo = .{ .require_namespace = true };
+    env.store.io = fault.start();
+    defer fault.stop();
+    fault.fail_sync = 3;
+    try std.testing.expectError(error.InputOutput, manager.publish(&env.store));
+    try std.testing.expect(env.store.publicationUncertain());
+    try expectRetained(&manager, &fixture, &registry);
+    fault.reset();
+    try env.store.reconcile();
+    try std.testing.expect(module.sameInstance(updated, env.store.snapshot().instances[0]));
+    var latest = env.store.snapshot().*;
+    latest.settings.default_memory_mb = 8192;
+    try env.store.update(latest);
+    fault.reset();
+    try manager.publish(&env.store);
+    try std.testing.expectEqual(module.Phase.complete, manager.snapshot().phase);
+    try std.testing.expectEqual(@as(u32, 8192), env.store.snapshot().settings.default_memory_mb);
+    try std.testing.expectEqual(@as(usize, 0), fault.writes);
+    try std.testing.expectEqual(@as(usize, 0), fault.renames);
+    try std.testing.expect(manager.snapshot().recovery_directory == null);
+    try std.testing.expectError(error.FileNotFound, env.tmp.dir.access(io, ".vela/rename-stable-editable", .{}));
 }

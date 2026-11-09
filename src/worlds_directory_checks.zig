@@ -1,3 +1,3 @@
 test {
-    _ = @import("ui/worlds_manager.zig");
+    _ = @import("application/worlds_manager.zig");
 }

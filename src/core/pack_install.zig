@@ -12,6 +12,7 @@ const authorization = @import("pack_source_authorization.zig");
 const download_session = @import("pack_download_session.zig");
 const fs = @import("content_fs.zig");
 const tasks = @import("tasks.zig");
+const diagnostic_log = @import("diagnostic_log.zig");
 const A = std.mem.Allocator;
 const Io = std.Io;
 pub const CancelToken = std.atomic.Value(bool);
@@ -22,6 +23,7 @@ pub const Options = struct {
     download_connections: u16 = 8,
     /// Borrowed sink; its owner must join inspection/creation before destroying it.
     telemetry: ?*tasks.Task = null,
+    diagnostics: ?*packs.Diagnostics = null,
     source_policy: authorization.Policy = .{},
     fixture_credential_store: ?@import("credentials.zig").Store = null,
     fn sourceOptions(self: Options) authorization.Options {
@@ -56,9 +58,13 @@ pub fn clone(comptime T: type, a: A, value: T) anyerror!T {
 }
 
 pub fn inspect(a: A, io: Io, paths: *const instances.Paths, source: Source, options: Options, cancel: *const CancelToken) !packs.Inspection {
-    defer stopTelemetry(options.telemetry);
-    return inspectImpl(a, io, paths, source, options, cancel) catch |err| {
-        failTelemetry(options.telemetry, err);
+    var diagnostic: packs.Diagnostics = .{};
+    var effective = options;
+    if (effective.diagnostics == null) effective.diagnostics = &diagnostic;
+    effective.diagnostics.?.len = 0;
+    defer stopTelemetry(effective.telemetry);
+    return inspectImpl(a, io, paths, source, effective, cancel) catch |err| {
+        failTelemetry(effective.telemetry, effective.diagnostics, err);
         return err;
     };
 }
@@ -67,7 +73,7 @@ fn inspectImpl(a: A, io: Io, paths: *const instances.Paths, source: Source, opti
     reportStage(options.telemetry, .metadata);
     if (source == .local) {
         reportStage(options.telemetry, .extracting);
-        var local = try packs.inspect(a, io, paths, source.local, cancel);
+        var local = try packs.inspect(a, io, paths, source.local, cancel, options.diagnostics);
         errdefer {
             local.cleanup(io) catch {};
             local.deinit();
@@ -108,12 +114,15 @@ fn inspectImpl(a: A, io: Io, paths: *const instances.Paths, source: Source, opti
     const fetcher = adapter.fetcher();
     const limit = packs.archive_limit;
     if (file.size) |size| if (size > limit) return error.ArchiveTooLarge;
-    try fetcher.fetchToFile(fetcher.context, io, .{ .url = file.download.remote, .directory = downloads, .name = name, .absolute_path = absolute, .max_bytes = limit, .expected_size = file.size, .expected_sha1 = null, .deadline_ns = null, .cancel = cancel });
+    const fetch_started = Io.Clock.awake.now(io).nanoseconds;
+    try fetcher.fetchToFile(fetcher.context, io, .{ .url = file.download.remote, .directory = downloads, .name = name, .absolute_path = absolute, .max_bytes = limit, .expected_size = file.size, .expected_sha1 = try @import("artifact_cache.zig").parseHex(20, file.hashes.sha1), .expected_sha256 = try @import("artifact_cache.zig").parseHex(32, file.hashes.sha256), .expected_sha512 = try @import("artifact_cache.zig").parseHex(64, file.hashes.sha512), .deadline_ns = null, .cancel = cancel });
+    diagnostic_log.write(.info, .pack, "archive_ready elapsed_ms={d} file={s}", .{ @divTrunc(Io.Clock.awake.now(io).nanoseconds - fetch_started, std.time.ns_per_ms), absolute });
     reportStage(options.telemetry, .verifying);
-    const actual = (try fs.fingerprint(downloads, io, name, cancel, null)) orelse return error.MissingArchive;
-    try actual.verify(file.hashes, file.size);
+    // The private staging copy verifies callback output before extraction, avoiding
+    // a separate full-archive fingerprint pass (including on cache hits).
+    if (try fs.inspectEntry(downloads, io, name) == null) return error.MissingArchive;
     reportStage(options.telemetry, .extracting);
-    var result = try packs.inspect(a, io, paths, absolute, cancel);
+    var result = try packs.inspectVerified(a, io, paths, absolute, file.hashes, file.size, cancel, options.diagnostics);
     errdefer {
         result.cleanup(io) catch {};
         result.deinit();
@@ -160,15 +169,21 @@ fn stopTelemetry(sink: ?*tasks.Task) void {
     }
 }
 
-fn failTelemetry(sink: ?*tasks.Task, err: anyerror) void {
+fn failTelemetry(sink: ?*tasks.Task, diagnostic: ?*const packs.Diagnostics, err: anyerror) void {
     if (sink) |task| {
         var details = task.details();
         var has_failure = false;
         for (details.files[0..details.file_count]) |file| {
             if (file.failure != null) has_failure = true;
         }
-        // Transport errors already identify their file. Later hash/extraction
-        // errors retain the just-downloaded file and measured bytes.
+        // Copy the offending path before failed preparation arenas are released.
+        if (!has_failure and err != error.Canceled) {
+            if (diagnostic) |value| if (value.len != 0) {
+                details.addFile(tasks.File.init(value.pathSlice(), 0, null, 0, .failed, err));
+                has_failure = true;
+            };
+        }
+        // Otherwise retain the downloaded archive and its measured bytes.
         if (!has_failure and details.file_count != 0) {
             const file = &details.files[details.file_count - 1];
             file.state = if (err == error.Canceled) .canceled else .failed;
@@ -180,10 +195,14 @@ fn failTelemetry(sink: ?*tasks.Task, err: anyerror) void {
 }
 
 pub fn precommit(raw: ?*anyopaque, a: A, io: Io, stage_path: []const u8, cancel: *const CancelToken) !void {
-    const request: *const Request = @ptrCast(@alignCast(raw orelse return error.MissingContext));
+    const source: *const Request = @ptrCast(@alignCast(raw orelse return error.MissingContext));
+    var request = source.*;
+    var diagnostic: packs.Diagnostics = .{};
+    if (request.options.diagnostics == null) request.options.diagnostics = &diagnostic;
+    request.options.diagnostics.?.len = 0;
     defer stopTelemetry(request.options.telemetry);
-    return precommitImpl(request, a, io, stage_path, cancel) catch |err| {
-        failTelemetry(request.options.telemetry, err);
+    return precommitImpl(&request, a, io, stage_path, cancel) catch |err| {
+        failTelemetry(request.options.telemetry, request.options.diagnostics, err);
         return err;
     };
 }
@@ -191,7 +210,7 @@ pub fn precommit(raw: ?*anyopaque, a: A, io: Io, stage_path: []const u8, cancel:
 fn precommitImpl(request: *const Request, a: A, io: Io, stage_path: []const u8, cancel: *const CancelToken) !void {
     reportStage(request.options.telemetry, .extracting);
     try fs.cancelled(io, cancel, null);
-    var prepared = try packs.prepareInspected(a, io, request.paths, request.instance, request.inspection, cancel);
+    var prepared = try packs.prepareNewInstance(a, io, request.paths, request.instance, request.inspection, cancel, request.options.diagnostics);
     defer prepared.deinit();
     defer prepared.cleanup(io) catch {};
     var arena: std.heap.ArenaAllocator = .init(a);
@@ -208,8 +227,10 @@ fn precommitImpl(request: *const Request, a: A, io: Io, stage_path: []const u8, 
     var pack = try clone(manifest.PackPlan, aa, fresh.pack);
     if (pack.unresolved.len != 0) return error.UnresolvedPackReferences;
     const files = try clone([]const manifest.InstallFile, aa, pack.files);
-    for (@constCast(files)) |*file| {
-        try manifest.checkedPathForInstance(file.record.path, request.instance.name);
+    const worlds = try clone([]const manifest.InstallFile, aa, pack.initial_world_files);
+    for (0..files.len + worlds.len) |index| {
+        const file = if (index < files.len) &@constCast(files)[index] else &@constCast(worlds)[index - files.len];
+        if (index < files.len) try manifest.checkedPathForInstance(file.record.path, request.instance.name) else try manifest.checkedInitialWorldPath(file.record.path);
         if (std.mem.startsWith(u8, file.record.path, ".vela-pack-work")) return error.ProtectedPath;
         file.record.standalone = false;
         if (file.record.identity_provenance == .pack_archive or file.record.identity_provenance == .pack_override) {
@@ -232,6 +253,8 @@ fn precommitImpl(request: *const Request, a: A, io: Io, stage_path: []const u8, 
         if (!file.required and file.selected == null) return error.OptionalDecisionRequired;
     }
     pack.files = files;
+    // The generic content transaction receives managed content only.
+    pack.initial_world_files = &.{};
     var records: std.ArrayList(manifest.ManagedFile) = .empty;
     for (files) |file| if (file.required or file.selected == true) try records.append(aa, file.record);
     var membership = try manifest.membershipForPack(aa, pack);
@@ -243,7 +266,7 @@ fn precommitImpl(request: *const Request, a: A, io: Io, stage_path: []const u8, 
     try manual.appendSlice(aa, prepared.manual_files);
     for (request.manual_files) |mapping| {
         for (prepared.manual_files) |owned| if (std.mem.eql(u8, owned.path, mapping.path)) return error.OverrideSourceReplacement;
-        try manual.append(aa, mapping);
+        if (!manifest.initialWorldPath(mapping.path)) try manual.append(aa, mapping);
     }
     const stage = try fs.openAbsolute(io, stage_path);
     defer stage.close(io);
@@ -261,6 +284,18 @@ fn precommitImpl(request: *const Request, a: A, io: Io, stage_path: []const u8, 
         adapter.telemetry = request.options.telemetry;
         reportStage(request.options.telemetry, .installing);
         var fetcher: PackFetcher = .{ .inner = adapter.fetcher(), .telemetry = request.options.telemetry };
+        var initial: std.ArrayList(packs.InitialWorldFile) = .empty;
+        try initial.appendSlice(aa, prepared.initial_world_files);
+        for (worlds, 0..) |file, index| {
+            if (!file.required and file.selected == false) continue;
+            if (request.options.diagnostics) |d| d.setPath(file.record.path);
+            const name = try std.fmt.allocPrint(aa, "initial-world-{d}", .{index});
+            const absolute = try std.fs.path.join(aa, &.{ stage_path, ".vela-pack-work", name });
+            const hash = try stageInitialWorld(io, work, name, absolute, file, request.manual_files, .{ .context = &fetcher, .fetchToFile = PackFetcher.fetch }, cancel);
+            try initial.append(aa, .{ .path = file.record.path, .source_absolute_path = absolute, .fingerprint = hash });
+        }
+        prepared.initial_world_files = initial.items;
+        if (request.options.diagnostics) |d| d.len = 0;
         var report = try install.execute(a, io, .{ .paths = &private_paths, .instance_id = request.instance.id, .instance_name = request.instance.name, .plan = plan.value, .files = files, .pack = pack, .prerequisites = .{ .overrides_processed = true, .dependencies_resolved = true, .loader_ready = true }, .manual_files = manual.items, .lease = .{ .context = null, .acquire = leaseCheck, .recheck = leaseCheck, .release = leaseRelease }, .cancel = cancel, .fetcher = .{ .context = &fetcher, .fetchToFile = PackFetcher.fetch }, .allow_curseforge_remote = request.options.transport_options.allow_curseforge, .approved_download_hosts = request.options.transport_options.approved_download_hosts });
         defer report.deinit();
         if (!report.complete or !report.committed or !report.fully_applied) return error.IncompletePack;
@@ -278,6 +313,7 @@ fn precommitImpl(request: *const Request, a: A, io: Io, stage_path: []const u8, 
             try fs.syncDir(to.dir, io);
         }
     }
+    try packs.copyInitialWorlds(&prepared, io, stage, cancel, request.options.diagnostics);
     reportStage(request.options.telemetry, .finalizing);
     try stage.deleteTree(io, ".vela-pack-work");
     try fs.syncDir(stage, io);
@@ -286,6 +322,46 @@ fn precommitImpl(request: *const Request, a: A, io: Io, stage_path: []const u8, 
     defer receipt_dir.close(io);
     try fs.write(receipt_dir, io, sidecar, bytes);
     try fs.cancelled(io, cancel, null);
+}
+
+/// Downloads only into the private new-instance work directory. Authorization is
+/// checked by resolveInspection; every delivered byte is verified again here.
+fn stageInitialWorld(io: Io, work: Io.Dir, name: []const u8, absolute: []const u8, file: manifest.InstallFile, manual: []const install.ManualFile, fetcher: install.Fetcher, cancel: *const CancelToken) !fs.Fingerprint {
+    try manifest.checkedInitialWorldPath(file.record.path);
+    try fs.cancelled(io, cancel, null);
+    if (try fs.inspectEntry(work, io, name) != null) return error.PathAlreadyExists;
+    const limit = file.record.size orelse return error.MissingFileSize;
+    switch (file.download) {
+        .remote => |url| {
+            var sha1: [20]u8 = undefined;
+            const digest: ?[20]u8 = if (file.record.hashes.sha1) |hash| blk: {
+                _ = try std.fmt.hexToBytes(&sha1, hash);
+                break :blk sha1;
+            } else null;
+            try fetcher.fetchToFile(fetcher.context, io, .{ .url = url, .directory = work, .name = name, .absolute_path = absolute, .max_bytes = limit, .expected_size = limit, .expected_sha1 = digest, .expected_sha256 = try @import("artifact_cache.zig").parseHex(32, file.record.hashes.sha256), .expected_sha512 = try @import("artifact_cache.zig").parseHex(64, file.record.hashes.sha512), .deadline_ns = null, .cancel = cancel });
+        },
+        .manual_required => {
+            var source_path: ?[]const u8 = null;
+            for (manual) |mapping| if (std.mem.eql(u8, mapping.path, file.record.path)) {
+                if (source_path != null) return error.DuplicateManualFile;
+                source_path = mapping.source_absolute_path;
+            };
+            const path = source_path orelse return error.ManualFileRequired;
+            const parent = try fs.openAbsolute(io, std.fs.path.dirname(path) orelse return error.UnsafePath);
+            defer parent.close(io);
+            const source = try fs.openRegular(parent, io, std.fs.path.basename(path));
+            defer source.close(io);
+            _ = try fs.copy(source, work, io, name, limit, cancel, null);
+        },
+    }
+    const staged = try fs.openRegularForSeal(work, io, name);
+    defer staged.close(io);
+    const hash = try fs.stream(staged, null, io, limit, cancel, null);
+    try hash.verify(file.record.hashes, file.record.size);
+    try staged.setPermissions(io, fs.privatePermissions(false));
+    try staged.sync(io);
+    try fs.syncDir(work, io);
+    return hash;
 }
 
 /// Small, idempotent publication of the complete content receipt, before config

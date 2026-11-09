@@ -1,8 +1,8 @@
 //! Owns the pack page, independent discovery and transactional creation lifecycle.
 const std = @import("std");
 const dvui = @import("dvui");
-const catalog = @import("pack_catalog.zig");
-const install = @import("pack_install_controller.zig");
+const catalog = @import("../application/pack_catalog.zig");
+const install = @import("../application/pack_install_controller.zig");
 const view = @import("pack_view.zig");
 const instances_ui = @import("instances_view.zig");
 const config = @import("../core/config.zig");
@@ -33,9 +33,9 @@ pub const Page = struct {
     download_connections: u16 = 8,
     download_budget: *@import("../core/downloader.zig").Budget,
     pub fn init(a: A, io: std.Io, paths: *const paths_mod.Paths, registry: *tasks.Registry, download_budget: *@import("../core/downloader.zig").Budget) !Page {
-        var browser = try catalog.Controller.init(a, io, .{ .transport_options = .{ .allow_curseforge = true, .download_budget = download_budget } });
+        var browser = try catalog.Controller.init(a, io, .{ .transport_options = .{ .allow_curseforge = true, .download_budget = download_budget, .cache_root = paths.cache } });
         errdefer browser.deinit();
-        const installer = try install.Controller.init(a, io, paths, .{ .creation_options = .{ .task_registry = registry }, .backend_options = .{ .transport_options = .{ .download_budget = download_budget } } });
+        const installer = try install.Controller.init(a, io, paths, .{ .creation_options = .{ .task_registry = registry }, .backend_options = .{ .transport_options = .{ .download_budget = download_budget, .cache_root = paths.cache } } });
         var ui = view.Ui.init(a);
         ui.icon_cache = @import("resource_icons.zig").Manager.init(a, io);
         return .{ .allocator = a, .io = io, .ui = ui, .browser = browser, .installer = installer, .download_budget = download_budget };
@@ -48,8 +48,8 @@ pub const Page = struct {
     pub fn pinned(self: *const Page) bool {
         return self.installer.ownership().pinned;
     }
-    pub fn busy(self: *const Page) bool {
-        return self.installer.isBusy() or self.browser.current != null or self.browser.retired != null or (if (self.ui.icon_cache) |*icons| icons.busy() else false);
+    pub fn presentationBusy(self: *const Page) bool {
+        return if (self.ui.icon_cache) |*icons| icons.busy() else false;
     }
     pub fn configure(self: *Page, policy: catalog.CurseForgePolicy, connections: u16) !void {
         self.download_connections = connections;
@@ -60,7 +60,7 @@ pub const Page = struct {
             self.lookup = .none;
             return; // Retry after tick retires canceled workers without blocking the UI.
         }
-        var replacement = try catalog.Controller.init(self.allocator, self.io, .{ .transport_options = .{ .allow_curseforge = true, .download_budget = self.download_budget }, .curseforge = policy });
+        var replacement = try catalog.Controller.init(self.allocator, self.io, .{ .transport_options = .{ .allow_curseforge = true, .download_budget = self.download_budget, .cache_root = self.browser.options.transport_options.cache_root }, .curseforge = policy });
         errdefer replacement.deinit();
         self.browser.deinit();
         self.browser = replacement;
@@ -92,20 +92,18 @@ pub const Page = struct {
         try view.setText(&self.inspected_archive, path);
     }
     fn cancelIcons(self: *Page) void {
-        if (self.ui.icon_cache) |*icons| {
-            for (icons.entries.items) |*entry| entry.pending = false;
-            if (icons.active) |job| job.cancel.store(true, .release);
-        }
+        if (self.ui.icon_cache) |*icons| icons.cancelAll();
     }
-    pub fn cancel(self: *Page, services: install.Services) void {
+    pub fn cancelPresentation(self: *Page) void {
         self.cancelIcons();
-        self.browser.cancel();
         self.lookup = .none;
         self.opening = false;
         self.ui.discardPicker();
-        self.installer.cancel(services);
     }
     pub fn syncActive(self: *Page, active: bool, services: install.Services) void {
+        if (active and !self.ui.active) {
+            if (self.ui.icon_cache) |*icons| icons.resetRequests();
+        }
         if (self.ui.active and !active) {
             self.browser.cancel();
             self.lookup = .none;
@@ -121,12 +119,11 @@ pub const Page = struct {
         if (!active) self.cancelIcons();
         self.ui.active = active;
     }
-    pub fn tick(self: *Page, services: install.Services, allowed: bool) void {
+    /// Presentation work only; the application runtime advances catalog and installer.
+    pub fn tickPresentation(self: *Page, services: install.Services, allowed: bool) void {
         if (!allowed) self.cancelIcons();
-        if (self.ui.icon_cache) |*icons| icons.poll(.{});
-        self.browser.tick();
-        self.installer.tickWithMutations(services, allowed);
-        self.tickResults(services) catch |err| {
+        if (self.ui.icon_cache) |*icons| icons.poll(self.browser.options.transport_options);
+        if (allowed) self.tickResults(services) catch |err| {
             self.ui.failure = err;
         };
     }
@@ -142,6 +139,7 @@ pub const Page = struct {
                     switch (kind) {
                         .search => {
                             try self.ui.acceptCatalog(result.catalog, result.total);
+                            if (self.ui.icon_cache) |*icons| icons.resetRequests();
                             self.ui.submitted_query = self.pending_query;
                             self.ui.submitted_minecraft = self.pending_minecraft;
                             self.ui.submitted_loader = self.pending_loader;
@@ -187,7 +185,10 @@ pub const Page = struct {
         const pack = state.pack_plan orelse return error.MissingInspection;
         var choices: std.ArrayList(install.OptionalChoice) = .empty;
         defer choices.deinit(self.allocator);
-        for (pack.files) |file| if (!file.required) try choices.append(self.allocator, .{ .path = file.record.path, .include = file.selected orelse false });
+        for (0..pack.sourceFileCount()) |index| {
+            const file = pack.sourceFile(index);
+            if (!file.required) try choices.append(self.allocator, .{ .path = file.record.path, .include = file.selected orelse false });
+        }
         try self.installer.setDecisions(state.manual_files, choices.items);
         try view.setText(&self.ui.name, "整合包实例");
         if (pack.name.len < self.ui.name.len and config.validId(pack.name)) try view.setText(&self.ui.name, pack.name);
@@ -238,8 +239,8 @@ pub const Page = struct {
     fn selectManual(self: *Page, index: usize, absolute: []const u8) !void {
         const state = self.installer.snapshot();
         const pack = state.pack_plan orelse return error.MissingInspection;
-        if (index >= pack.files.len or pack.files[index].download != .manual_required) return error.UnknownPackFile;
-        const path = pack.files[index].record.path;
+        if (index >= pack.sourceFileCount() or pack.sourceFile(index).download != .manual_required) return error.UnknownPackFile;
+        const path = pack.sourceFile(index).record.path;
         var mappings: std.ArrayList(content.ManualFile) = .empty;
         defer mappings.deinit(self.allocator);
         for (state.manual_files) |file| if (!std.mem.eql(u8, file.path, path)) try mappings.append(self.allocator, file);
@@ -268,10 +269,14 @@ pub const Page = struct {
         switch (intent) {
             .search => try self.search(0, true),
             .page => |offset| try self.search(offset, false),
-            .refresh => if (self.ui.route == .detail) {
-                try self.browser.loadVersions(self.ui.project orelse return error.NoProject, self.filter());
-                self.lookup = .versions;
-            } else try self.search(self.ui.offset, false),
+            .refresh => {
+                self.browser.options.transport_options.cache_mode = .revalidate;
+                defer self.browser.options.transport_options.cache_mode = .prefer_cache;
+                if (self.ui.route == .detail) {
+                    try self.browser.loadVersions(self.ui.project orelse return error.NoProject, self.filter());
+                    self.lookup = .versions;
+                } else try self.search(self.ui.offset, false);
+            },
             .project => |index| {
                 try self.resetInstaller(services);
                 try self.ui.openProject(index);
@@ -320,8 +325,8 @@ pub const Page = struct {
             .optional => |decision| {
                 const snapshot = self.installer.snapshot();
                 const pack = snapshot.pack_plan orelse return error.MissingInspection;
-                if (decision.index >= pack.files.len) return error.UnknownPackFile;
-                const path = pack.files[decision.index].record.path;
+                if (decision.index >= pack.sourceFileCount()) return error.UnknownPackFile;
+                const path = pack.sourceFile(decision.index).record.path;
                 var choices: std.ArrayList(install.OptionalChoice) = .empty;
                 defer choices.deinit(self.allocator);
                 for (snapshot.optional) |choice| if (!std.mem.eql(u8, choice.path, path)) try choices.append(self.allocator, choice);
@@ -365,8 +370,11 @@ pub const Page = struct {
         var manual: std.ArrayList(view.Manual) = .empty;
         if (pack) |*p| {
             const files = try a.dupe(manifest.InstallFile, p.files);
+            const worlds = try a.dupe(manifest.InstallFile, p.initial_world_files);
             p.files = files;
-            for (files, 0..) |*file, index| {
+            p.initial_world_files = worlds;
+            for (0..p.sourceFileCount()) |index| {
+                const file = if (index < files.len) &files[index] else &worlds[index - files.len];
                 for (state.optional) |choice| if (std.mem.eql(u8, choice.path, file.record.path)) {
                     file.selected = choice.include;
                 };

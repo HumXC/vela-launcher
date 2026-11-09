@@ -5,7 +5,6 @@ const java_runtime = @import("../core/java_runtime.zig");
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const max_entries = 256;
-const max_choices = 4096;
 const max_path = 4096;
 const max_json = 1024 * 1024;
 const max_candidates = 64;
@@ -312,12 +311,10 @@ pub fn probe(a: Allocator, io: std.Io, path: []const u8, canceled: ?*const std.a
     return .{ .path = try a.dupe(u8, canonical), .major = major, .vendor = vendor, .architecture = architecture };
 }
 
-const Choice = struct { game: []const u8, path: []const u8 };
-const Document = struct { version: u32, runtimes: []const Runtime, choices: []const Choice, hidden: []const Runtime };
+const Document = struct { version: u32, runtimes: []const Runtime, hidden: []const Runtime };
 const State = struct {
     arena: std.heap.ArenaAllocator,
     runtimes: std.ArrayList(Runtime) = .empty,
-    choices: std.ArrayList(Choice) = .empty,
     hidden: std.ArrayList(Runtime) = .empty,
     visible: std.ArrayList(Runtime) = .empty,
     search_visible: std.ArrayList(Runtime) = .empty,
@@ -340,7 +337,6 @@ const State = struct {
         errdefer next.destroy(a);
         for (self.runtimes.items) |r| try next.copy(r);
         const na = next.arena.allocator();
-        for (self.choices.items) |c| try next.choices.append(na, .{ .game = try na.dupe(u8, c.game), .path = try na.dupe(u8, c.path) });
         for (self.hidden.items) |r| try next.copyHidden(r);
         for (self.forgotten.items) |path| try next.forgotten.append(na, try na.dupe(u8, path));
         return next;
@@ -363,14 +359,6 @@ const State = struct {
         self.search_visible = .empty;
         for (self.runtimes.items) |r| if (self.hiddenIndex(r.path) == null) try self.visible.append(a, r);
         for (results) |r| if (self.hiddenIndex(r.path) == null and !self.isForgotten(r.path)) try self.search_visible.append(a, r);
-    }
-    fn clearReferences(self: *State, path: []const u8) void {
-        var i: usize = 0;
-        while (i < self.choices.items.len) {
-            if (std.mem.eql(u8, self.choices.items[i].path, path)) {
-                _ = self.choices.orderedRemove(i);
-            } else i += 1;
-        }
     }
     fn find(self: *const State, path: []const u8) ?usize {
         for (self.runtimes.items, 0..) |r, i| if (std.mem.eql(u8, r.path, path)) return i;
@@ -556,7 +544,6 @@ pub const Manager = struct {
         const next = try self.state.clone(self.a);
         errdefer next.destroy(self.a);
         try next.copyHidden(r);
-        next.clearReferences(path);
         try self.commit(next);
     }
     pub fn unhide(self: *Manager, path: []const u8) !void {
@@ -587,7 +574,6 @@ pub const Manager = struct {
         const next = try self.state.clone(self.a);
         errdefer next.destroy(self.a);
         if (!next.isForgotten(path)) try next.forgotten.append(next.arena.allocator(), try next.arena.allocator().dupe(u8, path));
-        next.clearReferences(path);
         try self.commit(next);
     }
     pub fn entries(self: *const Manager) []const Runtime {
@@ -673,43 +659,11 @@ pub const Manager = struct {
         const next = try self.state.clone(self.a);
         errdefer next.destroy(self.a);
         const removed = next.runtimes.orderedRemove(index);
-        next.clearReferences(removed.path);
         if (!next.isForgotten(removed.path)) try next.forgotten.append(next.arena.allocator(), try next.arena.allocator().dupe(u8, removed.path));
         try self.commit(next);
     }
-    pub fn choose(self: *Manager, game: []const u8, path: []const u8, required: u32) !void {
-        if (!validText(game, 512)) return error.InvalidGameId;
-        const index = try self.lookup(path) orelse return error.JavaNotRegistered;
-        const r = self.state.runtimes.items[index];
-        if (self.isHidden(path)) return error.JavaHidden;
-        if (!compatible(r.major, required)) return error.IncompatibleJava;
-        const next = try self.state.clone(self.a);
-        errdefer next.destroy(self.a);
-        const a = next.arena.allocator();
-        var found = false;
-        for (next.choices.items) |*c| {
-            if (std.mem.eql(u8, c.game, game)) {
-                c.path = next.runtimes.items[index].path;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            if (next.choices.items.len >= max_choices) return error.TooManyChoices;
-            try next.choices.append(a, .{ .game = try a.dupe(u8, game), .path = next.runtimes.items[index].path });
-        }
-        try self.commit(next);
-    }
-    pub fn selectedPath(self: *const Manager, game: []const u8) ?[]const u8 {
-        for (self.state.choices.items) |c| if (std.mem.eql(u8, c.game, game) and !self.isHidden(c.path)) return c.path;
-        return null;
-    }
-    pub fn resolve(self: *const Manager, game: []const u8, required: u32) ?Runtime {
-        if (self.selectedPath(game)) |path| {
-            const index = self.state.find(path) orelse return null;
-            const r = self.state.runtimes.items[index];
-            return if (compatible(r.major, required)) r else null;
-        }
+    /// Automatically selects a visible runtime with the required major and host architecture.
+    pub fn resolve(self: *const Manager, required: u32) ?Runtime {
         for (self.entries()) |r| if (compatible(r.major, required) and r.architecture == java_runtime.host()) return r;
         return null;
     }
@@ -719,7 +673,7 @@ pub const Manager = struct {
     }
     fn commit(self: *Manager, next: *State) !void {
         try next.refresh(if (self.published) |job| job.results else &.{});
-        const json = try std.json.Stringify.valueAlloc(self.a, Document{ .version = 2, .runtimes = next.runtimes.items, .choices = next.choices.items, .hidden = next.hidden.items }, .{ .whitespace = .indent_2 });
+        const json = try std.json.Stringify.valueAlloc(self.a, Document{ .version = 3, .runtimes = next.runtimes.items, .hidden = next.hidden.items }, .{ .whitespace = .indent_2 });
         defer self.a.free(json);
         if (json.len > max_json) return error.RegistryTooLarge;
         var atomic = try Dir.cwd().createFileAtomic(self.io, self.file, .{ .make_path = true, .replace = true });
@@ -742,14 +696,20 @@ pub const Manager = struct {
             else => return err,
         };
         defer self.a.free(bytes);
+        // Check the format before decoding its payload; historical fields are never loaded.
+        const header = std.json.parseFromSlice(struct { version: u32 }, self.a, bytes, .{ .ignore_unknown_fields = true, .max_value_len = max_path }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidJavaRegistry,
+        };
+        defer header.deinit();
+        if (header.value.version != 3) return error.UnsupportedJavaRegistryVersion;
         const parsed = std.json.parseFromSlice(Document, self.a, bytes, .{ .allocate = .alloc_always, .max_value_len = max_path }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidJavaRegistry,
         };
         defer parsed.deinit();
         const doc = parsed.value;
-        if (doc.version != 2 or doc.runtimes.len > max_entries or doc.choices.len > max_choices or doc.hidden.len > max_entries) return error.InvalidJavaRegistry;
-        const a = self.state.arena.allocator();
+        if (doc.runtimes.len > max_entries or doc.hidden.len > max_entries) return error.InvalidJavaRegistry;
         for (doc.runtimes) |r| {
             if (!validText(r.path, max_path) or !std.fs.path.isAbsolute(r.path) or !validText(r.vendor, 256) or r.major == 0 or r.major > 1000) return error.InvalidJavaRegistry;
             if (self.state.find(r.path) == null) try self.state.copy(r);
@@ -758,13 +718,6 @@ pub const Manager = struct {
             if (!validText(r.path, max_path) or !std.fs.path.isAbsolute(r.path) or !validText(r.vendor, 256) or r.major == 0 or r.major > 1000) return error.InvalidJavaRegistry;
             if (self.state.hiddenIndex(r.path) != null) return error.InvalidJavaRegistry;
             try self.state.copyHidden(r);
-        }
-        for (doc.choices) |c| {
-            if (!validText(c.game, 512) or !validText(c.path, max_path)) return error.InvalidJavaRegistry;
-            const index = self.state.find(c.path) orelse continue;
-            if (self.isHidden(c.path)) continue;
-            for (self.state.choices.items) |old| if (std.mem.eql(u8, old.game, c.game)) return error.InvalidJavaRegistry;
-            try self.state.choices.append(a, .{ .game = try a.dupe(u8, c.game), .path = self.state.runtimes.items[index].path });
         }
     }
 };
@@ -861,7 +814,7 @@ test "explicit directory search stable publication no autoadd and canonical dedu
         try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
     }
 }
-test "add choose persistence remove references and never delete executables" {
+test "batch add persists runtimes and removal never deletes executables" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -890,27 +843,21 @@ test "add choose persistence remove references and never delete executables" {
     try std.testing.expectError(error.JavaNotInSearchResults, manager.add(&.{alias}));
     try manager.add(&.{ p1, p2, p3, p1 });
     try std.testing.expectEqual(@as(usize, 3), manager.entries().len);
-    try std.testing.expectEqualStrings(p1, manager.resolve("unselected", 25).?.path);
-    try manager.choose("game", p2, 25);
-    try std.testing.expectEqualStrings(p2, manager.selectedPath("game").?);
-    try std.testing.expect(manager.resolve("game", 21) == null);
-    try std.testing.expectError(error.IncompatibleJava, manager.choose("game", p3, 25));
-    try std.testing.expectEqualStrings(p2, manager.resolve("game", 25).?.path);
+    try std.testing.expectEqualStrings(p1, manager.entries()[0].path);
+    try std.testing.expectEqualStrings(p3, manager.entries()[2].path);
     {
         var loaded = try Manager.init(a, io, root);
         defer loaded.deinit();
         try std.testing.expectEqual(@as(usize, 3), loaded.entries().len);
-        try std.testing.expectEqualStrings(p2, loaded.selectedPath("game").?);
+        try std.testing.expectEqualStrings(p2, loaded.entries()[1].path);
         try std.testing.expect(!loaded.isSearching());
     }
     try manager.remove(p2);
-    try std.testing.expect(manager.selectedPath("game") == null);
-    try std.testing.expectEqualStrings(p1, manager.resolve("game", 25).?.path);
+    try std.testing.expectEqualStrings(p1, manager.entries()[0].path);
     _ = try tmp.dir.statFile(io, "Zulu JDK/bin/java", .{});
     var loaded = try Manager.init(a, io, root);
     defer loaded.deinit();
     try std.testing.expectEqual(@as(usize, 2), loaded.entries().len);
-    try std.testing.expect(loaded.selectedPath("game") == null);
     try std.testing.expectError(error.JavaNotRegistered, manager.remove(p2));
 }
 test "invalid probes reject version-only fallback timeout cancellation and shutdown" {
@@ -977,21 +924,18 @@ test "failed search bounded malformed load and transactional save rollback" {
     try manager.search(root);
     try waitSearch(&manager);
     try manager.add(&.{java});
-    try manager.choose("game", java, 21);
     const stable = manager.entries()[0].path;
     // A directory at the registry destination forces atomic replacement to fail.
     try tmp.dir.deleteFile(io, ".vela/java.json");
     try tmp.dir.createDir(io, ".vela/java.json", .default_dir);
     if (manager.remove(java)) |_| return error.ExpectedSaveFailure else |_| {}
     try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
-    try std.testing.expectEqualStrings(stable, manager.selectedPath("game").?);
-    if (manager.choose("other", java, 21)) |_| return error.ExpectedSaveFailure else |_| {}
-    try std.testing.expect(manager.selectedPath("other") == null);
+    try std.testing.expectEqualStrings(stable, manager.entries()[0].path);
     if (manager.add(&.{java})) |_| return error.ExpectedSaveFailure else |_| {}
     try std.testing.expectEqualStrings(stable, manager.entries()[0].path);
     try tmp.dir.deleteDir(io, ".vela/java.json");
     try tmp.dir.writeFile(io, .{ .sub_path = ".vela/java.json", .data = "{\"version\":99}" });
-    try std.testing.expectError(error.InvalidJavaRegistry, Manager.init(a, io, root));
+    try std.testing.expectError(error.UnsupportedJavaRegistryVersion, Manager.init(a, io, root));
     try tmp.dir.writeFile(io, .{ .sub_path = ".vela/java.json", .data = "not json" });
     if (Manager.init(a, io, root)) |value| {
         var unexpected = value;
@@ -1211,7 +1155,7 @@ test "search cancelAndJoin consumes late results without rewriting successful di
     try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
 }
 
-test "hidden metadata persists filters choices and survives forgetting until explicit restore" {
+test "hidden metadata persists and survives forgetting until explicit restore" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1228,14 +1172,11 @@ test "hidden metadata persists filters choices and survives forgetting until exp
     defer manager.deinit();
     try manager.addDownloaded(first);
     try manager.addDownloaded(second);
-    try manager.choose("game", first_path, 21);
     try manager.hide(first_path);
     try std.testing.expect(manager.isHidden(first_path));
     try std.testing.expectEqual(@as(usize, 2), manager.allEntries().len);
     try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
-    try std.testing.expect(manager.selectedPath("game") == null);
-    try std.testing.expectEqualStrings(second_path, manager.resolve("game", 21).?.path);
-    try std.testing.expectError(error.JavaHidden, manager.choose("game", first_path, 21));
+    try std.testing.expectEqualStrings(second_path, manager.resolve(21).?.path);
     try std.testing.expectError(error.JavaHidden, manager.add(&.{first_path}));
     try std.testing.expectError(error.JavaHidden, manager.addDownloaded(first));
     {
@@ -1245,8 +1186,7 @@ test "hidden metadata persists filters choices and survives forgetting until exp
         try std.testing.expectEqual(java_runtime.Architecture.x86, loaded.hiddenEntries()[0].architecture);
         try std.testing.expectEqual(@as(usize, 1), loaded.entries().len);
         try std.testing.expectEqual(java_runtime.host(), loaded.entries()[0].architecture);
-        try std.testing.expect(loaded.selectedPath("game") == null);
-        try std.testing.expectEqualStrings(second_path, loaded.resolve("game", 21).?.path);
+        try std.testing.expectEqualStrings(second_path, loaded.resolve(21).?.path);
     }
     try manager.forget(first_path);
     try std.testing.expect(manager.isHidden(first_path));
@@ -1261,7 +1201,6 @@ test "hidden metadata persists filters choices and survives forgetting until exp
     try std.testing.expect(!manager.isHidden(first_path));
     try std.testing.expectEqual(@as(usize, 0), manager.hiddenEntries().len);
     try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
-    try std.testing.expectError(error.JavaNotRegistered, manager.choose("game", first_path, 21));
 }
 
 test "scanned hidden paths stay suppressed on fresh publication without auto registration" {
@@ -1285,7 +1224,7 @@ test "scanned hidden paths stay suppressed on fresh publication without auto reg
     try std.testing.expectEqual(@as(usize, 1), manager.searchResults().len);
     try manager.hide(path);
     try std.testing.expectEqual(@as(usize, 0), manager.searchResults().len);
-    try std.testing.expect(manager.resolve("unselected", 25) == null);
+    try std.testing.expect(manager.resolve(25) == null);
     try manager.forget(path);
     const next = try std.heap.page_allocator.create(Job);
     next.* = .{ .io = io, .path = "", .results = &results };
@@ -1301,7 +1240,7 @@ test "scanned hidden paths stay suppressed on fresh publication without auto reg
     try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
 }
 
-test "failed hidden save leaves registry choices and visible snapshots intact" {
+test "failed hidden save leaves registry and visible snapshots intact" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1313,7 +1252,6 @@ test "failed hidden save leaves registry choices and visible snapshots intact" {
     var manager = try Manager.init(a, io, root);
     defer manager.deinit();
     try manager.addDownloaded(.{ .path = path, .major = 21, .vendor = "OpenJDK", .architecture = .x86_64 });
-    try manager.choose("game", path, 21);
     try tmp.dir.createDir(io, "blocked", .default_dir);
     const original_file = manager.file;
     manager.file = try std.fs.path.join(a, &.{ root, "blocked" });
@@ -1326,7 +1264,7 @@ test "failed hidden save leaves registry choices and visible snapshots intact" {
     try std.testing.expectEqual(original_state, manager.state);
     try std.testing.expect(!manager.isHidden(path));
     try std.testing.expectEqual(@as(usize, 1), manager.entries().len);
-    try std.testing.expectEqualStrings(path, manager.selectedPath("game").?);
+    try std.testing.expectEqualStrings(path, manager.entries()[0].path);
 }
 
 test "probe rejects missing unknown and contradictory architecture properties" {
@@ -1356,7 +1294,7 @@ test "probe rejects missing unknown and contradictory architecture properties" {
     try std.testing.expectEqual(java_runtime.Architecture.aarch64, runtime.architecture);
 }
 
-test "registry v2 rejects old schemas and missing or unknown architecture" {
+test "registry v3 rejects unsupported versions without modifying the file" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1365,8 +1303,30 @@ test "registry v2 rejects old schemas and missing or unknown architecture" {
     const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
     try tmp.dir.createDirPath(io, ".vela");
     for ([_][]const u8{
-        "{\"version\":1,\"runtimes\":[],\"choices\":[],\"hidden\":[]}",
-        "{\"runtimes\":[],\"choices\":[],\"hidden\":[]}",
+        "{\"version\":1,\"runtimes\":[],\"hidden\":[]}",
+        "{\"version\":2,\"runtimes\":[],\"hidden\":[],\"choices\":[]}",
+        "{\"version\":2,\"runtimes\":[],\"hidden\":[]}",
+        "{\"version\":4,\"runtimes\":[],\"hidden\":[]}",
+    }) |json| {
+        try tmp.dir.writeFile(io, .{ .sub_path = ".vela/java.json", .data = json });
+        try std.testing.expectError(error.UnsupportedJavaRegistryVersion, Manager.init(a, io, root));
+        const unchanged = try tmp.dir.readFileAlloc(io, ".vela/java.json", a, .limited(max_json));
+        defer a.free(unchanged);
+        try std.testing.expectEqualStrings(json, unchanged);
+    }
+}
+
+test "registry v3 rejects missing version historical fields and invalid architecture" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try tmp.dir.createDirPath(io, ".vela");
+    for ([_][]const u8{
+        "{\"runtimes\":[],\"hidden\":[]}",
+        "{\"version\":3,\"runtimes\":[],\"hidden\":[],\"choices\":[]}",
     }) |json| {
         try tmp.dir.writeFile(io, .{ .sub_path = ".vela/java.json", .data = json });
         try std.testing.expectError(error.InvalidJavaRegistry, Manager.init(a, io, root));
@@ -1376,7 +1336,7 @@ test "registry v2 rejects old schemas and missing or unknown architecture" {
     const json_path = try std.json.Stringify.valueAlloc(a, path, .{});
     defer a.free(json_path);
     for ([_][]const u8{ "", ",\"architecture\":\"amd64\"", ",\"architecture\":\"riscv64\"" }) |field| {
-        const json = try std.fmt.allocPrint(a, "{{\"version\":2,\"runtimes\":[{{\"path\":{s},\"major\":21,\"vendor\":\"Test JVM\"{s}}}],\"choices\":[],\"hidden\":[]}}", .{ json_path, field });
+        const json = try std.fmt.allocPrint(a, "{{\"version\":3,\"runtimes\":[{{\"path\":{s},\"major\":21,\"vendor\":\"Test JVM\"{s}}}],\"hidden\":[]}}", .{ json_path, field });
         defer a.free(json);
         try tmp.dir.writeFile(io, .{ .sub_path = ".vela/java.json", .data = json });
         try std.testing.expectError(error.InvalidJavaRegistry, Manager.init(a, io, root));
@@ -1396,15 +1356,14 @@ test "architecture-only registration updates survive cloning hiding and reload" 
     var manager = try Manager.init(a, io, root);
     defer manager.deinit();
     try manager.addDownloaded(runtime);
-    try manager.choose("game", path, 21);
-    try std.testing.expectEqual(java_runtime.Architecture.x86, manager.resolve("game", 21).?.architecture);
+    try std.testing.expectEqual(java_runtime.Architecture.x86, manager.entries()[0].architecture);
     runtime.architecture = .aarch64;
     try manager.addDownloaded(runtime);
-    try std.testing.expectEqual(java_runtime.Architecture.aarch64, manager.resolve("game", 21).?.architecture);
+    try std.testing.expectEqual(java_runtime.Architecture.aarch64, manager.entries()[0].architecture);
     {
         var loaded = try Manager.init(a, io, root);
         defer loaded.deinit();
-        try std.testing.expectEqual(java_runtime.Architecture.aarch64, loaded.resolve("game", 21).?.architecture);
+        try std.testing.expectEqual(java_runtime.Architecture.aarch64, loaded.entries()[0].architecture);
     }
     try manager.hide(path);
     var loaded = try Manager.init(a, io, root);

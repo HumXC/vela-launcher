@@ -11,7 +11,7 @@ const providers = @import("core/content_providers.zig");
 const manifest = @import("core/content_manifest.zig");
 const http = @import("core/http_transport.zig");
 const credentials = @import("core/credentials.zig");
-const manager = @import("ui/content_manager.zig");
+const manager = @import("application/content_manager.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 const selected: config.Instance = .{ .id = "stable-id", .name = "Display Name", .minecraft_version = "1.20.1" };
@@ -209,7 +209,8 @@ const HttpFixture = struct {
             while (!request.cancel.?.load(.acquire)) try worker_io.sleep(.fromMilliseconds(1), .awake);
             return error.Canceled;
         }
-        return .{ .allocator = allocator, .status = self.status, .body = try allocator.dupe(u8, self.body) };
+        const body = try allocator.dupe(u8, self.body);
+        return .{ .allocator = allocator, .status = self.status, .body = body, .allocation = body };
     }
 };
 const catalog_fixture =
@@ -992,7 +993,8 @@ const CfHttp = struct {
             try std.testing.expectEqual(@as(usize, 0), keys);
             try std.testing.expectEqual(@as(usize, 0), request.headers.len);
             self.cdn_calls += 1;
-            return .{ .allocator = allocator, .status = 200, .body = try allocator.dupe(u8, self.payload) };
+            const payload = try allocator.dupe(u8, self.payload);
+            return .{ .allocator = allocator, .status = 200, .body = payload, .allocation = payload };
         }
         try std.testing.expectEqual(@as(usize, 1), keys);
         const api_prefix = "https://api.curseforge.com/v1/mods/";
@@ -1027,7 +1029,10 @@ const CfHttp = struct {
             while (!request.cancel.?.load(.acquire)) try worker_io.sleep(.fromMilliseconds(1), .awake);
             return error.Canceled;
         }
-        if (self.fail_all or (second and self.fail_second)) return .{ .allocator = allocator, .status = 500, .body = try allocator.dupe(u8, "{}") };
+        if (self.fail_all or (second and self.fail_second)) {
+            const failure_body = try allocator.dupe(u8, "{}");
+            return .{ .allocator = allocator, .status = 500, .body = failure_body, .allocation = failure_body };
+        }
         const body = if (project) try std.json.Stringify.valueAlloc(allocator, .{ .data = .{
             .id = if (self.mode == .wrong_project) @as(u32, 99) else project_id,
             .gameId = @as(u32, 432),
@@ -1074,7 +1079,7 @@ const CfHttp = struct {
             }
             break :blk try std.json.Stringify.valueAlloc(allocator, .{ .data = file_value }, .{});
         };
-        return .{ .allocator = allocator, .status = 200, .body = body };
+        return .{ .allocator = allocator, .status = 200, .body = body, .allocation = body };
     }
 };
 fn writeCfGame(dir: std.Io.Dir) !void {
@@ -1427,7 +1432,7 @@ fn inspectionRollbackAllocations(allocator: std.mem.Allocator) !void {
     try writeCfPack(tmp.dir, false, "overrides/config/pack.cfg");
     const archive = try tmp.dir.realPathFileAlloc(io, "fixture.zip", a);
     defer a.free(archive);
-    var inspected = try packs.inspect(a, io, &paths, archive, null);
+    var inspected = try packs.inspect(a, io, &paths, archive, null, null);
     defer inspected.deinit();
     defer inspected.cleanup(io) catch {};
     const original_hash = inspected.source_sha256;
@@ -1470,7 +1475,7 @@ test "content inspected adoption uses private bytes and removes owned stages on 
     try writeCfPack(tmp.dir, false, "overrides/config/pack.cfg");
     const archive = try tmp.dir.realPathFileAlloc(io, "fixture.zip", a);
     defer a.free(archive);
-    var inspected = try packs.inspect(a, io, &paths, archive, null);
+    var inspected = try packs.inspect(a, io, &paths, archive, null, null);
     var caller_owns = true;
     defer if (caller_owns) {
         inspected.cleanup(io) catch {};

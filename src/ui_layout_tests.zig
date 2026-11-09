@@ -7,24 +7,24 @@ const appearance_view = @import("ui/appearance_view.zig");
 const view = @import("ui/view.zig");
 const model = @import("ui/model.zig");
 const config = @import("core/config.zig");
-const java = @import("ui/java_manager.zig");
+const java = @import("application/java_manager.zig");
 const servers_view = @import("ui/servers_view.zig");
 const instances_view = @import("ui/instances_view.zig");
 const java_view = @import("ui/java_view.zig");
 const java_download_view = @import("ui/java_download_view.zig");
-const java_download_controller = @import("ui/java_download_controller.zig");
-const instances_manager = @import("ui/instances_manager.zig");
-const server_manager = @import("ui/server_manager.zig");
+const java_download_controller = @import("application/java_download_controller.zig");
+const instances_manager = @import("application/instances_manager.zig");
+const server_manager = @import("application/server_manager.zig");
 const instances = @import("core/instances.zig");
 const worlds = @import("core/worlds.zig");
 const instance_leases = @import("core/instance_leases.zig");
-const worlds_manager = @import("ui/worlds_manager.zig");
+const worlds_manager = @import("application/worlds_manager.zig");
 const worlds_view = @import("ui/worlds_view.zig");
 const servers = @import("core/servers.zig");
 const components = @import("ui/components.zig");
 const vela_theme = @import("ui/theme.zig");
-const games = @import("ui/game_library.zig");
-const launch = @import("ui/game_launch.zig");
+const games = @import("application/game_library.zig");
+const launch = @import("application/game_launch.zig");
 const logs_view = @import("ui/logs_view.zig");
 const shutdown_view = @import("ui/shutdown_view.zig");
 const lifecycle = @import("core/lifecycle.zig");
@@ -33,7 +33,7 @@ comptime {
     _ = @import("ui/avatar_manager.zig");
     _ = @import("ui/avatar_image.zig");
     _ = @import("ui/avatar_layout_tests.zig");
-    _ = @import("ui/game_library.zig");
+    _ = @import("application/game_library.zig");
     _ = @import("ui/instances_view.zig");
     _ = @import("ui/instance_wizard_layout_tests.zig");
     _ = @import("ui/instance_settings_layout_tests.zig");
@@ -43,7 +43,7 @@ comptime {
     _ = @import("ui/pack_layout_tests.zig");
 }
 const accounts_view = @import("ui/accounts_view.zig");
-const accounts_manager = @import("ui/accounts_manager.zig");
+const accounts_manager = @import("application/accounts_manager.zig");
 
 test {
     _ = @import("ui/curseforge_key_editor.zig");
@@ -196,18 +196,18 @@ test "UI layout Home Choose Game and Choose Account reserve Start and preserve n
     defer store.deinit();
     var appearance = try appearance_view.Ui.init(a, std.testing.io, store.snapshot().appearance);
     defer appearance.deinit();
-    try store.update(.{ .instances = &.{.{ .id = "fixture-game", .name = "fixture-game", .minecraft_version = "1.21" }}, .servers = &.{.{ .id = "fixture-server", .name = "Fixture Survival", .address = "survival.fixture.invalid", .instance_id = "fixture-game", .show_on_home = true }}, .selected_instance = "fixture-game", .selected_server = "fixture-server" });
+    try store.update(.{ .instances = &.{.{ .id = "fixture-game", .name = "fixture-game", .minecraft_version = "1.21" }}, .servers = &.{.{ .id = "fixture-server", .name = "Fixture Survival", .address = "survival.fixture.invalid", .instance_id = "fixture-game" }}, .selected_instance = "fixture-game", .selected_server = "fixture-server" });
     var manager = try java.Manager.init(a, std.testing.io, root);
     defer manager.deinit();
     var server_ui = servers_view.Ui.init(a);
     defer server_ui.deinit();
-    var account_service = try @import("ui/accounts_manager.zig").Manager.init(a, std.testing.io, root);
+    var account_service = try @import("application/accounts_manager.zig").Manager.init(a, std.testing.io, root);
     defer account_service.deinit();
     var account_ui = try @import("ui/accounts_view.zig").Ui.init(a);
     defer account_ui.deinit();
     var server_service = server_manager.Manager.initWithQuery(a, std.testing.io, EditorsFrame.rejectQuery);
     defer server_service.deinit();
-    var ordinary_creation = try @import("ui/instance_creation_controller.zig").Controller.init(a, std.testing.io, root, .{});
+    var ordinary_creation = try @import("application/instance_creation_controller.zig").Controller.init(a, std.testing.io, root, .{});
     defer ordinary_creation.deinit(undefined);
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
@@ -414,7 +414,7 @@ test "UI layout Home Choose Game and Choose Account reserve Start and preserve n
             try std.testing.expectEqualStrings("Player_A", store.snapshot().accounts[0].name);
             try std.testing.expectEqual(start.rect, (try dvui.testing.tagGet(start_tag)).rect);
         }
-        for ([_]struct { process: launch.Phase, allow_mutations: bool = true, creation_phase: @import("ui/instance_creation_controller.zig").Phase = .idle }{
+        for ([_]struct { process: launch.Phase, allow_mutations: bool = true, creation_phase: @import("application/instance_creation_controller.zig").Phase = .idle }{
             .{ .process = .preparing },
             .{ .process = .running },
             .{ .process = .idle, .allow_mutations = false },
@@ -853,7 +853,7 @@ test "UI layout real Home root native sidebar drag clamps and survives panel cha
         try std.testing.expectEqual(maximum, RootHomeFrame.layout.?);
         try expectInside(maximum.right, (try dvui.testing.tagGet("home-layout")).rect);
         try std.testing.expectEqual(original_draft, server_ui.draft);
-        try std.testing.expect(server_ui.pending == null and settings.pending == null and download_ui.pending == null);
+        try std.testing.expect(server_ui.pending == null and !settings.dirty() and download_ui.pending == null);
         try std.testing.expectEqual(@as(usize, 0), java_ui.commands.items.len);
         try std.testing.expect(library.active == null and launcher.job == null);
         try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
@@ -1026,7 +1026,7 @@ test "UI layout settings numeric entries contain complete font metrics and accep
     try dvui.testing.writeText("1");
     try dvui.testing.settle(SettingsTextFrame.draw);
     try std.testing.expectEqualStrings("14096", std.mem.sliceTo(&ui.memory_buffer, 0));
-    try std.testing.expect(ui.pending == null);
+    try std.testing.expect(ui.dirty());
 }
 
 const EditorsFrame = struct {
@@ -1425,7 +1425,7 @@ test "UI layout Servers cards keep legacy targets available and shared sidebar a
     defer paths.deinit();
     var store = try config.Store.init(a, std.testing.io, root);
     defer store.deinit();
-    try store.update(.{ .instances = &.{.{ .id = "fixture-instance", .name = "Fixture", .minecraft_version = "1.21" }}, .servers = &.{.{ .id = "legacy", .name = "Legacy", .address = "localhost:25565", .instance_id = "fixture-instance", .show_on_home = false }}, .selected_instance = "fixture-instance" });
+    try store.update(.{ .instances = &.{.{ .id = "fixture-instance", .name = "Fixture", .minecraft_version = "1.21" }}, .servers = &.{.{ .id = "legacy", .name = "Legacy", .address = "localhost:25565", .instance_id = "fixture-instance" }}, .selected_instance = "fixture-instance" });
     var registry = tasks.Registry.init(a);
     defer registry.deinit();
     var server_service = server_manager.Manager.initWithQuery(a, std.testing.io, EditorsFrame.rejectQuery);
@@ -1482,7 +1482,7 @@ test "UI layout Servers cards keep legacy targets available and shared sidebar a
             try ServerLayoutFrame.scrollPage(-100000);
             try expectInside((try dvui.testing.tagGet("server-layout-page")).rect, (try ServerLayoutFrame.visible(5)).rect);
             try dvui.testing.settle(ServerLayoutFrame.draw);
-            try std.testing.expect(server_ui.editor_open and !server_ui.draft.show_on_home);
+            try std.testing.expect(server_ui.editor_open);
             try std.testing.expectEqualStrings("localhost:25565", std.mem.sliceTo(&server_ui.draft.address, 0));
             const original_draft = server_ui.draft;
             // A queued sidebar target can disappear while this editor is open.
@@ -1547,7 +1547,6 @@ test "UI layout Servers cards keep legacy targets available and shared sidebar a
             try std.testing.expectEqual(@as(usize, 0), EditorsFrame.service_calls);
             try std.testing.expectEqual(@as(usize, 0), registry.tasks().len);
             try std.testing.expectEqual(@as(usize, 1), store.snapshot().servers.len);
-            try std.testing.expect(!store.snapshot().servers[0].show_on_home);
             try std.testing.expectEqualStrings("legacy", store.snapshot().selected_server.?);
         }
     }
@@ -1999,7 +1998,7 @@ test "UI layout Java left-top acquisition and registered hidden paths share whol
     const hidden_path = "/fixture/hidden-runtime-with-a-long-directory-name/another-long-directory/bin/java";
     const visible: java.Runtime = .{ .path = visible_path, .major = 21, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Visible" };
     const hidden: java.Runtime = .{ .path = hidden_path, .major = 17, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Hidden" };
-    const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .runtimes = &[_]java.Runtime{ visible, hidden }, .choices = &[_]struct { game: []const u8, path: []const u8 }{}, .hidden = &[_]java.Runtime{hidden} }, .{});
+    const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 3), .runtimes = &[_]java.Runtime{ visible, hidden }, .hidden = &[_]java.Runtime{hidden} }, .{});
     defer a.free(fixture);
     try tmp.dir.createDirPath(std.testing.io, ".vela");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/java.json", .data = fixture });
@@ -2151,7 +2150,7 @@ test "UI layout real Java acquisition empty and hidden sidebar keep independent 
     defer a.free(hidden_path);
     const visible: java.Runtime = .{ .path = visible_path, .major = 21, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Visible" };
     const hidden: java.Runtime = .{ .path = hidden_path, .major = 17, .architecture = @import("core/java_runtime.zig").host(), .vendor = "Fixture Hidden" };
-    const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .runtimes = &[_]java.Runtime{ visible, hidden }, .choices = &[_]struct { game: []const u8, path: []const u8 }{}, .hidden = &[_]java.Runtime{hidden} }, .{});
+    const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 3), .runtimes = &[_]java.Runtime{ visible, hidden }, .hidden = &[_]java.Runtime{hidden} }, .{});
     defer a.free(fixture);
     try tmp.dir.createDirPath(std.testing.io, ".vela");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/java.json", .data = fixture });
@@ -2535,11 +2534,12 @@ test "UI layout Java folder browse queues after draft edits and blocks stale com
 }
 
 const ShutdownFrame = struct {
-    const labels = [_][]const u8{ "等待完成", "取消任务并退出", "保持打开" };
-    const choices = [_]lifecycle.CloseChoice{ .wait, .cancel_and_quit, .keep_open };
+    const shutdown = @import("core/shutdown.zig");
+    var labels = [_][]const u8{ "不退出", "取消安装并退出" };
+    const choices = [_]lifecycle.CloseChoice{ .keep_open, .cancel_and_quit };
     const Control = struct { id: dvui.Id, window_id: dvui.Id, rect: dvui.Rect.Physical, primary: bool };
     const Observation = struct { text: dvui.Rect.Physical, clip: dvui.Rect.Physical, control: Control };
-    var active_background: usize = 1;
+    var summary: shutdown.Summary = .{};
     var background_clips: [labels.len]?dvui.Rect.Physical = @splat(null);
     var selected: ?lifecycle.CloseChoice = null;
     var layout: shutdown_view.Layout = .{};
@@ -2566,7 +2566,7 @@ const ShutdownFrame = struct {
         const parent_id = dvui.parentGet().data().id;
         const subwindow_id = dvui.subwindowCurrentId();
         background_clips = @splat(null);
-        const result = shutdown_view.drawWithLayout(active_background, &layout);
+        const result = shutdown_view.drawWithLayout(summary, &layout);
         // The caller can apply policy only after every modal widget has deinitialized.
         try std.testing.expectEqual(parent_id, dvui.parentGet().data().id);
         try std.testing.expectEqual(subwindow_id, dvui.subwindowCurrentId());
@@ -2630,7 +2630,6 @@ const ShutdownFrame = struct {
         const sample = observations[index] orelse return error.ShutdownLabelNotRendered;
         const control = sample.control;
         const reported = switch (choices[index]) {
-            .wait => layout.wait,
             .cancel_and_quit => layout.cancel_and_quit,
             .keep_open => layout.keep_open,
         } orelse return error.ShutdownRectangleNotReported;
@@ -2638,7 +2637,7 @@ const ShutdownFrame = struct {
         try std.testing.expect(sample.text.w > 0 and sample.text.h > 0);
         try std.testing.expect(control.rect.w > 0 and control.rect.h > 0);
         try std.testing.expectEqual(control.rect, reported);
-        try std.testing.expectEqual(index == 2, control.primary);
+        try std.testing.expectEqual(index == 0, control.primary);
         try expectInside(native_viewport, control.rect);
         try expectInside(dvui.windowRectPixels(), control.rect);
         try expectInside(layout.viewport orelse return error.ShutdownViewportMissing, control.rect);
@@ -2677,7 +2676,7 @@ test "UI layout real shutdown modal keeps every choice fully visible and reachab
         .{ .native = .{ .w = 1280, .h = 720 }, .ui = .{ .w = 1280, .h = 683 } },
     };
     for (viewports) |viewport| {
-        for ([_]usize{ 1, std.math.maxInt(usize) }) |count| {
+        for ([_]usize{ 1, 2, 10 }) |count| {
             for (ShutdownFrame.choices, 0..) |choice, index| {
                 for ([_]bool{ false, true }) |keyboard| {
                     var window = try dvui.testing.init(.{ .window_size = viewport.ui });
@@ -2687,7 +2686,9 @@ test "UI layout real shutdown modal keeps every choice fully visible and reachab
                     theme.font_body = theme.font_body.withSize(16);
                     theme.font_heading = theme.font_body.withSize(18);
                     window.window.themeSet(theme);
-                    ShutdownFrame.active_background = count;
+                    ShutdownFrame.summary = .{};
+                    for (0..count) |operation| ShutdownFrame.summary.add(@fromBackingInt(@intCast(operation)));
+                    ShutdownFrame.labels[1] = ShutdownFrame.summary.cancelLabel();
                     ShutdownFrame.selected = null;
                     ShutdownFrame.native_viewport = .{ .w = viewport.native.w, .h = viewport.native.h };
                     try dvui.testing.settle(ShutdownFrame.draw);
@@ -2700,6 +2701,7 @@ test "UI layout real shutdown modal keeps every choice fully visible and reachab
                         if (slot > 0) try std.testing.expect(controls[slot - 1].rect.y + controls[slot - 1].rect.h <= control.rect.y);
                     }
                     try ShutdownFrame.expectStable(controls);
+                    try std.testing.expectEqual(controls[0].id, dvui.focusedWidgetId().?);
                     const information = (try dvui.testing.tagGet("shutdown-information")).rect;
                     try std.testing.expect(information.y + information.h <= controls[0].rect.y + 0.1);
                     // Scrolling overflowing text must never move or clip an action.
@@ -2740,6 +2742,26 @@ test "UI layout real shutdown modal keeps every choice fully visible and reachab
                 }
             }
         }
+    }
+}
+
+test "UI shutdown defaults Enter and Escape to keeping the launcher open" {
+    if (dvui.Backend.kind != .testing) return error.SkipZigTest;
+    for ([_]dvui.enums.Key{ .enter, .escape }) |key| {
+        var window = try dvui.testing.init(.{ .window_size = .{ .w = 640, .h = 363 } });
+        defer window.deinit();
+        ShutdownFrame.summary = .{};
+        ShutdownFrame.summary.add(.save_restore);
+        ShutdownFrame.labels[1] = ShutdownFrame.summary.cancelLabel();
+        ShutdownFrame.selected = null;
+        ShutdownFrame.native_viewport = .{ .w = 640, .h = 400 };
+        try dvui.testing.settle(ShutdownFrame.draw);
+        const keep_open = try ShutdownFrame.visibleControl(0);
+        _ = try ShutdownFrame.visibleControl(1);
+        try std.testing.expectEqual(keep_open.id, dvui.focusedWidgetId().?);
+        try dvui.testing.pressKey(key, .none);
+        try dvui.testing.settle(ShutdownFrame.draw);
+        try std.testing.expectEqual(lifecycle.CloseChoice.keep_open, ShutdownFrame.selected.?);
     }
 }
 

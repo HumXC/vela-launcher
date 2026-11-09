@@ -20,8 +20,8 @@ pub const EndReason = union(enum) {
         };
     }
 };
-pub const CloseChoice = enum { wait, cancel_and_quit, keep_open };
-pub const Shutdown = enum { none, prompt, wait, canceling };
+pub const CloseChoice = enum { cancel_and_quit, keep_open };
+pub const Shutdown = enum { none, prompt, canceling };
 pub const Actions = struct {
     hide: bool = false,
     restore: bool = false,
@@ -39,6 +39,8 @@ pub const Policy = struct {
     options: Options = .{},
     shutdown: Shutdown = .none,
     hidden_by_close: bool = false,
+    /// Updated from operation owners, never from the generic busy count.
+    confirm_operations: bool = false,
 
     pub fn canLaunch(self: *const Policy) bool {
         return self.game == .idle and self.shutdown == .none;
@@ -98,39 +100,30 @@ pub const Policy = struct {
     fn requestShutdown(self: *Policy, active_background: usize) Actions {
         if (self.shutdown != .none) return .{};
         if (active_background == 0) return .{ .quit = true };
-        self.shutdown = .prompt;
-        return .{ .restore = true, .prompt_background = true };
+        if (self.confirm_operations) {
+            self.shutdown = .prompt;
+            // The caller shows a hidden window only when necessary.
+            return .{ .prompt_background = true };
+        }
+        self.shutdown = .canceling;
+        return .{ .hide = true, .cancel_background = true };
     }
 
-    pub fn chooseClose(self: *Policy, choice: CloseChoice, active_background: usize) Actions {
+    pub fn chooseClose(self: *Policy, choice: CloseChoice, _: usize) Actions {
         if (self.shutdown != .prompt or self.game != .idle) return .{};
         switch (choice) {
             .keep_open => {
                 self.shutdown = .none;
                 return .{};
             },
-            .wait => {
-                self.shutdown = .wait;
-                return self.backgroundChanged(active_background);
-            },
             .cancel_and_quit => {
                 self.shutdown = .canceling;
-                // Even zero active tasks requires an explicit join acknowledgement.
-                return .{ .cancel_background = true };
+                return .{ .hide = true, .cancel_background = true };
             },
         }
     }
 
-    /// Registry terminal states must only be published after worker joins.
-    pub fn backgroundChanged(self: *Policy, active_background: usize) Actions {
-        if (self.game == .idle and self.shutdown == .wait and active_background == 0) {
-            self.shutdown = .none;
-            return .{ .quit = true };
-        }
-        return .{};
-    }
-
-    /// Call only after joining ALL background tasks, not just sending cancel tokens.
+    /// Call after all workers and required publications have settled.
     pub fn backgroundJoined(self: *Policy) Actions {
         if (self.game == .idle and self.shutdown == .canceling) {
             self.shutdown = .none;
@@ -167,7 +160,7 @@ test "all abnormal outcomes override exit and restore logs in every phase" {
             if (running) _ = policy.gameRunning();
             try std.testing.expectEqual(Actions{ .restore = true, .show_logs = true }, policy.gameEnded(reason, 5));
             try std.testing.expectEqual(Shutdown.none, policy.shutdown);
-            try std.testing.expectEqual(Actions{}, policy.backgroundChanged(0));
+            try std.testing.expectEqual(Actions{}, policy.backgroundJoined());
         }
     }
 }
@@ -226,7 +219,7 @@ test "dismissed debug logs restore Home for every end reason and reset per launc
                 try std.testing.expectEqual(Shutdown.none, policy.shutdown);
                 try std.testing.expect(!policy.hidden_by_close);
                 try std.testing.expect(policy.canLaunch());
-                try std.testing.expectEqual(Actions{}, policy.backgroundChanged(0));
+                try std.testing.expectEqual(Actions{}, policy.backgroundJoined());
                 try std.testing.expectEqual(Actions{ .restore = true, .show_logs = true }, policy.launchStarted(.{ .debug_launch = true }));
                 try std.testing.expectEqual(Actions{ .restore = true, .show_logs = true }, policy.gameEnded(.{ .exited = 0 }, 0));
             }
@@ -234,48 +227,38 @@ test "dismissed debug logs restore Home for every end reason and reset per launc
     }
 }
 
-test "idle close exits directly only without active background tasks" {
+test "shutdown auxiliary work hides without prompting and waits for drain" {
     var policy: Policy = .{};
     try std.testing.expectEqual(Actions{ .quit = true }, policy.closeRequested(0));
-    try std.testing.expectEqual(Actions{ .restore = true, .prompt_background = true }, policy.closeRequested(2));
+    try std.testing.expectEqual(Actions{ .hide = true, .cancel_background = true }, policy.closeRequested(2));
     try std.testing.expect(!policy.canLaunch());
     try std.testing.expectEqual(Actions{}, policy.closeRequested(2));
-    try std.testing.expectEqual(Actions{}, policy.chooseClose(.keep_open, 2));
-    try std.testing.expect(policy.canLaunch());
-    try std.testing.expectEqual(Actions{}, policy.backgroundChanged(0));
-}
-
-test "wait keeps tasks active and exits only after all joined tasks finish" {
-    var policy: Policy = .{};
-    _ = policy.closeRequested(2);
-    try std.testing.expectEqual(Actions{}, policy.chooseClose(.wait, 2));
-    try std.testing.expectEqual(Shutdown.wait, policy.shutdown);
-    try std.testing.expectEqual(Actions{}, policy.backgroundChanged(1));
-    try std.testing.expectEqual(Actions{}, policy.backgroundJoined());
-    try std.testing.expectEqual(Actions{ .quit = true }, policy.backgroundChanged(0));
-    try std.testing.expectEqual(Actions{}, policy.backgroundChanged(0));
-}
-
-test "cancel requests cancellation but zero count alone cannot authorize quit" {
-    var policy: Policy = .{};
-    _ = policy.closeRequested(1);
-    try std.testing.expectEqual(Actions{ .cancel_background = true }, policy.chooseClose(.cancel_and_quit, 1));
-    try std.testing.expectEqual(Actions{}, policy.backgroundChanged(0));
-    try std.testing.expectEqual(Actions{}, policy.closeRequested(0));
+    try std.testing.expectEqual(Shutdown.canceling, policy.shutdown);
     try std.testing.expectEqual(Actions{ .quit = true }, policy.backgroundJoined());
     try std.testing.expectEqual(Actions{}, policy.backgroundJoined());
 }
 
-test "autoexit with background tasks prompts and accepts wait or cancel" {
-    for ([_]CloseChoice{ .wait, .cancel_and_quit, .keep_open }) |choice| {
-        var policy: Policy = .{};
+test "shutdown important operations prompt without restoring visible window" {
+    var policy: Policy = .{ .confirm_operations = true };
+    try std.testing.expectEqual(Actions{ .prompt_background = true }, policy.closeRequested(2));
+    try std.testing.expectEqual(Actions{}, policy.chooseClose(.keep_open, 2));
+    try std.testing.expect(policy.canLaunch());
+    _ = policy.closeRequested(2);
+    // Completion while the dialog is open still requires the drain path.
+    try std.testing.expectEqual(Actions{ .hide = true, .cancel_background = true }, policy.chooseClose(.cancel_and_quit, 0));
+    try std.testing.expectEqual(Shutdown.canceling, policy.shutdown);
+    try std.testing.expectEqual(Actions{ .quit = true }, policy.backgroundJoined());
+}
+
+test "shutdown game autoexit uses the same classified confirmation" {
+    for ([_]CloseChoice{ .cancel_and_quit, .keep_open }) |choice| {
+        var policy: Policy = .{ .confirm_operations = true };
         _ = policy.launchStarted(.{ .after_game = .exit_launcher });
-        try std.testing.expectEqual(Actions{ .restore = true, .prompt_background = true }, policy.gameEnded(.{ .exited = 0 }, 1));
+        try std.testing.expectEqual(Actions{ .prompt_background = true }, policy.gameEnded(.{ .exited = 0 }, 1));
         const action = policy.chooseClose(choice, 0);
         switch (choice) {
-            .wait => try std.testing.expectEqual(Actions{ .quit = true }, action),
             .cancel_and_quit => {
-                try std.testing.expectEqual(Actions{ .cancel_background = true }, action);
+                try std.testing.expectEqual(Actions{ .hide = true, .cancel_background = true }, action);
                 try std.testing.expectEqual(Actions{ .quit = true }, policy.backgroundJoined());
             },
             .keep_open => try std.testing.expectEqual(Actions{}, action),
@@ -284,13 +267,12 @@ test "autoexit with background tasks prompts and accepts wait or cancel" {
 }
 
 test "late failure cancels pending exit regardless of close choice" {
-    for ([_]Shutdown{ .prompt, .wait, .canceling }) |pending| {
+    for ([_]Shutdown{ .prompt, .canceling }) |pending| {
         var policy: Policy = .{};
         _ = policy.launchStarted(.{ .after_game = .exit_launcher });
         _ = policy.gameEnded(.{ .exited = 0 }, 1);
         policy.shutdown = pending;
         try std.testing.expectEqual(Actions{ .restore = true, .show_logs = true }, policy.gameEnded(.failed, 0));
-        try std.testing.expectEqual(Actions{}, policy.backgroundChanged(0));
         try std.testing.expectEqual(Actions{}, policy.backgroundJoined());
     }
 }

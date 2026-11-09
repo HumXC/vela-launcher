@@ -1,14 +1,13 @@
 const std = @import("std");
 const dvui = @import("dvui");
-const java = @import("java_manager.zig");
-const download = @import("java_download_controller.zig");
+const java = @import("../application/java_manager.zig");
+const download = @import("../application/java_download_controller.zig");
 const theme = @import("theme.zig");
 const components = @import("components.zig");
 const download_view = @import("java_download_view.zig");
 const file_picker = @import("file_picker.zig");
 const R = dvui.Rect;
 
-const Choice = struct { game: []const u8, path: []const u8, required: u32 };
 const Command = union(enum) {
     search: []const u8,
     browse_folder,
@@ -20,7 +19,6 @@ const Command = union(enum) {
     unhide: []const u8,
     delete_files: []const u8,
     add: []const []const u8,
-    choose: Choice,
 
     fn deinit(self: Command, a: std.mem.Allocator) void {
         switch (self) {
@@ -29,10 +27,6 @@ const Command = union(enum) {
             .add => |paths| {
                 for (paths) |path| a.free(path);
                 a.free(paths);
-            },
-            .choose => |choice| {
-                a.free(choice.game);
-                a.free(choice.path);
             },
         }
     }
@@ -45,8 +39,6 @@ pub const Ui = struct {
     selection_fingerprint: ?u64 = null,
     failure: ?anyerror = null,
     add_failure: ?anyerror = null,
-    choice_failure: ?anyerror = null,
-    choice_context: ?u64 = null,
     acquisition_open: bool = true,
     acquisition_mode: enum { download, local } = .download,
     search_started: bool = false,
@@ -83,12 +75,6 @@ pub const Ui = struct {
         self.add_failure = null;
     }
 
-    fn syncChoiceContext(self: *Ui, game: []const u8, required: u32) void {
-        const context = std.hash.Wyhash.hash(required, game);
-        if (self.choice_context != context) self.choice_failure = null;
-        self.choice_context = context;
-    }
-
     fn enqueue(self: *Ui, command: Command) !void {
         errdefer command.deinit(self.allocator);
         try self.commands.append(self.allocator, command);
@@ -113,15 +99,6 @@ pub const Ui = struct {
             .delete_files => .{ .delete_files = owned },
         });
     }
-    fn queueChoice(self: *Ui, game: []const u8, path: []const u8, required: u32) !void {
-        const owned_game = try self.allocator.dupe(u8, game);
-        const owned_path = self.allocator.dupe(u8, path) catch |err| {
-            self.allocator.free(owned_game);
-            return err;
-        };
-        try self.enqueue(.{ .choose = .{ .game = owned_game, .path = owned_path, .required = required } });
-    }
-
     fn clearSelection(self: *Ui) void {
         self.allocator.free(self.search_selection);
         self.search_selection = &.{};
@@ -602,88 +579,6 @@ fn drawSearch(ui: *Ui, manager: *java.Manager, enabled: bool) void {
     if (ui.add_failure) |err| components.text(@src(), frameFmt("添加失败：{s}", .{@errorName(err)}), theme.colors.danger);
 }
 
-pub fn versionChoice(ui: *Ui, manager: *java.Manager, game: []const u8, required: u32) void {
-    ui.syncChoiceContext(game, required);
-    if (components.action(@src(), "获取 Java", ui.interactive and !hasModal(ui))) {
-        ui.acquisition_mode = .download;
-        ui.requested_major = required;
-        ui.download_requested = true;
-    }
-    const heading = frameFmt("Java {d}", .{required});
-    clippedLabel(@src(), heading, true);
-    gap(@src(), theme.spacing.row_gap);
-    if (ui.choice_failure) |err| {
-        components.text(@src(), frameFmt("选择失败：{s}", .{@errorName(err)}), theme.colors.danger);
-        gap(@src(), theme.spacing.row_gap);
-    }
-    const entries = manager.entries();
-    const selected = manager.resolve(game, required);
-    var selected_index: ?usize = null;
-    var compatible_count: usize = 0;
-    for (entries) |runtime| {
-        if (!java.compatible(runtime.major, required)) continue;
-        if (selected) |current| {
-            if (std.mem.eql(u8, current.path, runtime.path)) selected_index = compatible_count;
-        }
-        compatible_count += 1;
-    }
-    if (compatible_count == 0) {
-        clippedLabel(@src(), "未选择", true);
-        return;
-    }
-    const current_label = if (selected) |runtime| frameFmt("{s} · Java {d} · {s}", .{ runtime.vendor, runtime.major, runtime.path }) else "未选择";
-    var dropdown: dvui.DropdownWidget = undefined;
-    dropdown.init(@src(), .{
-        .selected_index = selected_index,
-        .label = null,
-        .placeholder = null,
-    }, components.entryOptions(heading, .{ .gap_after = 0 }));
-    defer dropdown.deinit();
-    {
-        const control = dvui.box(@src(), .{ .dir = .horizontal }, .{
-            .expand = .both,
-            .padding = R.all(0),
-            .margin = R.all(0),
-        });
-        clippedLabel(@src(), current_label, false);
-        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = theme.spacing.row_gap } });
-        dvui.icon(@src(), "展开 Java 选项", dvui.entypo.chevron_small_down, .{}, .{
-            .min_size_content = .{ .w = theme.style.sizing.compact_icon, .h = theme.style.sizing.compact_icon },
-            .max_size_content = .{ .w = theme.style.sizing.compact_icon, .h = theme.style.sizing.compact_icon },
-            .gravity_y = 0.5,
-            .padding = R.all(0),
-            .margin = R.all(0),
-            .role = .none,
-        });
-        control.deinit();
-    }
-    if (dropdown.dropped()) {
-        for (entries) |runtime| {
-            if (!java.compatible(runtime.major, required)) continue;
-            const item = dropdown.addChoice();
-            {
-                const content = dvui.box(@src(), .{}, .{
-                    .expand = .horizontal,
-                    .min_size_content = .{ .h = rowHeight() - 2 * theme.spacing.list_row_padding },
-                    .padding = .{ .y = theme.spacing.control_padding_y, .h = theme.spacing.control_padding_y },
-                    .margin = R.all(0),
-                    .label = .{ .text = frameFmt("{s} Java {d} {s}", .{ runtime.vendor, runtime.major, runtime.path }) },
-                });
-                runtimeDetails(runtime);
-                content.deinit();
-            }
-            const chosen = item.activeRect() != null;
-            item.deinit();
-            if (chosen) {
-                dropdown.close();
-                ui.queueChoice(game, runtime.path, required) catch |err| {
-                    ui.choice_failure = err;
-                };
-            }
-        }
-    }
-}
-
 // Call only after the parent's entire draw, including floating widgets, is closed.
 pub fn finish(ui: *Ui, manager: *java.Manager) void {
     for (ui.commands.items) |command| {
@@ -765,34 +660,21 @@ pub fn finish(ui: *Ui, manager: *java.Manager) void {
                 };
                 ui.clearSelection();
             },
-            .choose => |choice| {
-                ui.syncChoiceContext(choice.game, choice.required);
-                ui.choice_failure = null;
-                manager.choose(choice.game, choice.path, choice.required) catch |err| {
-                    ui.choice_failure = err;
-                };
-            },
         }
     }
     for (ui.commands.items) |command| command.deinit(ui.allocator);
     ui.commands.clearRetainingCapacity();
 }
 
-test "deferred paths and choices own their input bytes" {
+test "deferred paths own their input bytes" {
     var ui = Ui.init(std.testing.allocator);
     defer ui.deinit();
     var path = [_]u8{ '/', 'j', 'd', 'k' };
-    var game = [_]u8{ '1', '.', '2', '1' };
     try ui.queuePath(&path, true);
     try ui.queuePath(&path, false);
-    try ui.queueChoice(&game, &path, 21);
     @memset(&path, 'x');
-    @memset(&game, 'y');
     try std.testing.expectEqualStrings("/jdk", ui.commands.items[0].search);
     try std.testing.expectEqualStrings("/jdk", ui.commands.items[1].remove);
-    try std.testing.expectEqualStrings("/jdk", ui.commands.items[2].choose.path);
-    try std.testing.expectEqualStrings("1.21", ui.commands.items[2].choose.game);
-    try std.testing.expectEqual(@as(u32, 21), ui.commands.items[2].choose.required);
 }
 
 test "search selection follows result identity and adds only checked owned paths" {
@@ -822,7 +704,6 @@ fn exerciseQueueAllocations(a: std.mem.Allocator) !void {
     defer ui.deinit();
     try ui.queuePath("/search", true);
     try ui.queuePath("/remove", false);
-    try ui.queueChoice("1.21", "/chosen", 21);
     const results = [_]java.Runtime{
         .{ .path = "/a", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor A" },
         .{ .path = "/b", .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "Vendor B" },
@@ -845,49 +726,6 @@ test "a new search clears selection even when results are identical" {
     ui.clearSelection();
     try ui.syncSelection(&results);
     try std.testing.expectEqual(@as(usize, 0), ui.selectedCount());
-}
-
-test "choice persistence failure is visible scoped and reset on successful retry" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(io, ".vela", .default_dir);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".vela/java.json",
-        .data = comptime std.fmt.comptimePrint("{{\"version\":2,\"runtimes\":[{{\"path\":\"/java-test\",\"major\":21,\"vendor\":\"Test Vendor\",\"architecture\":\"{s}\"}}],\"choices\":[],\"hidden\":[]}}", .{@tagName(@import("../core/java_runtime.zig").host())}),
-    });
-    var root_buffer: [4096]u8 = undefined;
-    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
-    var manager = try java.Manager.init(a, io, root);
-    defer manager.deinit();
-    var ui = Ui.init(a);
-    defer ui.deinit();
-    try tmp.dir.deleteFile(io, ".vela/java.json");
-    try tmp.dir.createDir(io, ".vela/java.json", .default_dir);
-    try ui.queueChoice("game", "/java-test", 21);
-    finish(&ui, &manager);
-    try std.testing.expect(ui.choice_failure != null);
-    try std.testing.expect(ui.failure == null);
-    const failure = ui.choice_failure;
-    ui.syncChoiceContext("game", 21);
-    try std.testing.expectEqual(failure, ui.choice_failure);
-    ui.syncChoiceContext("other-game", 21);
-    try std.testing.expect(ui.choice_failure == null);
-    try ui.queueChoice("game", "/java-test", 21);
-    finish(&ui, &manager);
-    try std.testing.expect(ui.choice_failure != null);
-    ui.syncChoiceContext("game", 17);
-    try std.testing.expect(ui.choice_failure == null);
-    try ui.queueChoice("game", "/java-test", 21);
-    finish(&ui, &manager);
-    try std.testing.expect(ui.choice_failure != null);
-    try tmp.dir.deleteDir(io, ".vela/java.json");
-    try ui.queueChoice("game", "/java-test", 21);
-    finish(&ui, &manager);
-    try std.testing.expect(ui.choice_failure == null);
-    try std.testing.expectEqualStrings("/java-test", manager.selectedPath("game").?);
 }
 
 test "failed add keeps selection and allows a smaller retry without fatal search error" {
@@ -946,7 +784,7 @@ test "management commands and selected paths own bytes and discard releases them
     try std.testing.expect(!ui.search_queued);
 }
 
-test "deferred management filters choices and obeys use lease barrier" {
+test "deferred management filters automatic runtimes and obeys use lease barrier" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -957,14 +795,13 @@ test "deferred management filters choices and obeys use lease barrier" {
     var manager = try java.Manager.init(a, std.testing.io, root);
     defer manager.deinit();
     try manager.addDownloaded(.{ .path = path, .major = 21, .architecture = @import("../core/java_runtime.zig").host(), .vendor = "OpenJDK" });
-    try manager.choose("game", path, 21);
     var ui = Ui.init(a);
     defer ui.deinit();
     try ui.queueManagement(path, .hide);
     finish(&ui, &manager);
     try std.testing.expect(ui.failure == null);
     try std.testing.expect(manager.isHidden(path));
-    try std.testing.expect(manager.resolve("game", 21) == null);
+    try std.testing.expect(manager.resolve(21) == null);
     try ui.queueManagement(path, .unhide);
     finish(&ui, &manager);
     try std.testing.expect(!manager.isHidden(path));
@@ -1008,7 +845,7 @@ test "restoring a forgotten hidden Java clears suppression without registering i
     try std.testing.expect(!manager.isHidden(path));
     try std.testing.expect(!registered(&manager, path));
     try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
-    try std.testing.expect(manager.resolve("game", 21) == null);
+    try std.testing.expect(manager.resolve(21) == null);
 }
 
 test "UI layout Java search-only runtime cannot resolve management after all registered runtimes are removed" {

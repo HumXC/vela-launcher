@@ -3,7 +3,7 @@ const dvui = @import("dvui");
 const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
 const components = @import("components.zig");
-const server_manager = @import("server_manager.zig");
+const server_manager = @import("../application/server_manager.zig");
 const style = @import("style.zig");
 
 pub const Options = struct {
@@ -33,8 +33,12 @@ pub fn draw(src: std.builtin.SourceLocation, server: config.Server, document: *c
                 signal = .offline;
             },
             .online => if (query.status) |value| {
-                signal = if (value.latency_ms <= 100) .good else if (value.latency_ms <= 250) .fair else .poor;
-                status = if (value.players_online) |online| if (value.players_max) |maximum| fmt("{d}/{d} · {d} ms", .{ online, maximum, value.latency_ms }) else fmt("{d} · {d} ms", .{ online, value.latency_ms }) else fmt("在线 · {d} ms", .{value.latency_ms});
+                if (value.latency_ms) |latency| {
+                    signal = if (latency <= 100) .good else if (latency <= 250) .fair else .poor;
+                    status = if (value.players_online) |online| if (value.players_max) |maximum| fmt("{d}/{d} · {d} ms", .{ online, maximum, latency }) else fmt("{d} · {d} ms", .{ online, latency }) else fmt("在线 · {d} ms", .{latency});
+                } else {
+                    status = if (value.players_online) |online| if (value.players_max) |maximum| fmt("{d}/{d} · 延迟未知", .{ online, maximum }) else fmt("{d} · 延迟未知", .{online}) else "在线 · 延迟未知";
+                }
             },
         };
     }

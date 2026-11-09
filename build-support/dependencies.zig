@@ -22,6 +22,8 @@ pub const Core = struct {
     nbt_dep: *std.Build.Dependency,
     compression: *std.Build.Module,
     linux: ?*std.Build.Module,
+    cache_hash: *std.Build.Module,
+    server_icon_native: *std.Build.Step.Compile,
 
     pub fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
         return .{
@@ -32,6 +34,8 @@ pub const Core = struct {
             .nbt_dep = b.dependency("nbt", .{ .target = target, .optimize = optimize }),
             .compression = b.createModule(.{ .root_source_file = b.path("src/core/worlds_gzip.zig"), .target = target, .optimize = optimize }),
             .linux = if (target.result.os.tag == .linux) linux_c.create(b, target, optimize) else null,
+            .cache_hash = createCacheHash(b, target),
+            .server_icon_native = createServerIcon(b, target, optimize),
         };
     }
 
@@ -44,23 +48,57 @@ pub const Core = struct {
                 .{ .name = "curl", .module = self.curl_dep.module("curl") },
                 .{ .name = "nbt", .module = self.nbt_dep.module("nbt") },
                 .{ .name = "nbt_compression", .module = self.compression },
+                .{ .name = "cache_hash", .module = self.cache_hash },
             },
         });
         if (self.linux) |bindings| module.addImport("linux_c", bindings);
+        linkNetworkPlatform(module, self.target);
+        module.linkLibrary(self.server_icon_native);
         return module;
     }
 };
 
+fn createServerIcon(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const vendor = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3, .@"tree-sitter" = false });
+    const module = b.createModule(.{ .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+    module.addIncludePath(vendor.path("vendor/stb"));
+    module.addCSourceFile(.{ .file = b.path("src/core/server_icon_stb.c"), .flags = &.{"-std=c11"} });
+    return b.addLibrary(.{ .name = "vela-server-icon", .linkage = .static, .root_module = module });
+}
+
+fn createCacheHash(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Module {
+    const kernels = b.addLibrary(.{ .name = "vela-cache-hash", .linkage = .static, .root_module = b.createModule(.{ .root_source_file = b.path("src/core/cache_hash_backend.zig"), .target = target, .optimize = .ReleaseSafe }) });
+    const api = b.createModule(.{ .root_source_file = b.path("src/core/cache_hash.zig"), .target = target });
+    api.linkLibrary(kernels);
+    return api;
+}
+
+/// Native proxy discovery and credential storage are shared by every transport.
+pub fn linkNetworkPlatform(module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    switch (target.result.os.tag) {
+        .windows => {
+            module.linkSystemLibrary("winhttp", .{});
+            module.linkSystemLibrary("advapi32", .{});
+            module.linkSystemLibrary("kernel32", .{});
+            module.linkSystemLibrary("iphlpapi", .{});
+        },
+        .macos => {
+            module.linkFramework("Security", .{});
+            module.linkFramework("CoreFoundation", .{});
+            module.linkFramework("CFNetwork", .{});
+        },
+        else => {},
+    }
+}
+
 pub const App = struct {
     core: Core,
     dvui: *std.Build.Module,
-    clap: *std.Build.Module,
     sdk: ?[]const u8,
 
     pub fn createModule(self: App, source: std.Build.LazyPath) *std.Build.Module {
         const module = self.core.createModule(source);
         module.addImport("dvui", self.dvui);
-        module.addImport("clap", self.clap);
         if (self.core.target.result.os.tag == .macos) {
             module.linkFramework("Security", .{});
             module.linkFramework("CoreFoundation", .{});

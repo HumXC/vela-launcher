@@ -27,7 +27,7 @@ pub const Snapshot = struct {
     attempt_id: u64,
 };
 pub const Request = struct { version: []const u8, java_path: []const u8, java_major: u32, username: []const u8, min_memory_mb: ?u32 = null, max_memory_mb: u32 = 2048 };
-pub const ServerEndpoint = struct { address: []const u8, port: u16 = 25565 };
+pub const ServerEndpoint = struct { address: []const u8, port: u16 = 25565, name: ?[]const u8 = null };
 pub const LaunchOptions = struct {
     /// Stable configuration ID and explicit launcher base opt into guarded recovery checks.
     instance_id: ?[]const u8 = null,
@@ -329,7 +329,7 @@ fn cloneOptions(a: std.mem.Allocator, options: LaunchOptions) !LaunchOptions {
     if (options.launcher_root) |root| result.launcher_root = try a.dupe(u8, root);
     if (options.instance_directory) |path| result.instance_directory = try a.dupe(u8, path);
     if (options.metadata_path) |path| result.metadata_path = try a.dupe(u8, path);
-    if (options.server) |server| result.server = .{ .address = try a.dupe(u8, server.address), .port = server.port };
+    if (options.server) |server| result.server = .{ .address = try a.dupe(u8, server.address), .port = server.port, .name = if (server.name) |name| try a.dupe(u8, name) else null };
     if (options.identity) |identity| result.identity = .{
         .name = try a.dupe(u8, identity.name),
         .uuid = try a.dupe(u8, identity.uuid),
@@ -430,6 +430,17 @@ fn perform(job: *Job) !EndReason {
     defer command.deinit();
     // Command arguments contain credentials; never send argv to diagnostics.
     defer for (command.value.argv) |arg| std.crypto.secureZero(u8, @constCast(arg));
+    try job.checkCancel();
+    if (job.options.server) |server| {
+        @import("../core/server_list.zig").ensure(a, job.io, command.value.cwd, .{
+            .name = server.name orelse server.address,
+            .host = try serverHost(server),
+            .port = server.port,
+        }, &job.canceled) catch |err| {
+            if (err == error.Canceled) return err;
+            @import("../core/diagnostic_log.zig").write(.warn, .launch, "server_list_update_failed error={s} directory={s}", .{ @errorName(err), command.value.cwd });
+        };
+    }
     try job.checkCancel();
     var disk: [2]?std.Io.File = .{ null, null };
     defer for (disk) |file| if (file) |value| value.close(job.io);
@@ -1456,11 +1467,13 @@ test "quick exit preserves code and sanitizes owned options before UI and both d
     var token = "fake-token-123".*;
     var name = "Alice".*;
     var host = "localhost".*;
+    var server_name = "My server".*;
     const request: Request = .{ .version = "fixture", .java_path = java_path, .java_major = 21, .username = "Player" };
-    try controller.startWithOptions(request, .{ .debug = true, .instance_directory = game_path, .identity = .{ .name = &name, .uuid = "11111111111111111111111111111111", .access_token = &token }, .server = .{ .address = &host, .port = 24444 }, .extra_jvm = &.{"-Dfake=test"}, .extra_game = &.{"--fixture"}, .resolution_width = 960, .resolution_height = 540 });
+    try controller.startWithOptions(request, .{ .debug = true, .instance_directory = game_path, .identity = .{ .name = &name, .uuid = "11111111111111111111111111111111", .access_token = &token }, .server = .{ .address = &host, .port = 24444, .name = &server_name }, .extra_jvm = &.{"-Dfake=test"}, .extra_game = &.{"--fixture"}, .resolution_width = 960, .resolution_height = 540 });
     token[0] = 'X';
     name[0] = 'X';
     host[0] = 'X';
+    server_name[0] = 'X';
     try std.testing.expectError(error.Busy, controller.start(request));
     try std.testing.expectEqual(@as(u64, 1), controller.snapshot().attempt_id);
     try std.testing.expect(controller.takeEndEvent() == null);
@@ -1495,6 +1508,22 @@ test "quick exit preserves code and sanitizes owned options before UI and both d
     const after_clear = try readTestLog(&controller, "stdout");
     defer std.testing.allocator.free(after_clear);
     try std.testing.expectEqualStrings(out, after_clear);
+    const nbt = @import("nbt");
+    const saved = try tmp.dir.readFileAlloc(std.testing.io, "instances/custom/servers.dat", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(saved);
+    var saved_doc = try nbt.parse(std.testing.allocator, saved, .java);
+    defer saved_doc.deinit(std.testing.allocator);
+    const saved_servers = saved_doc.root.compound.get("servers").?.list.items;
+    try std.testing.expectEqual(@as(usize, 1), saved_servers.len);
+    try std.testing.expectEqualStrings("My server", saved_servers[0].compound.get("name").?.string);
+    try std.testing.expectEqualStrings("localhost:24444", saved_servers[0].compound.get("ip").?.string);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "instances/custom/servers.dat", .data = "broken-list" });
+    try controller.startWithOptions(request, .{ .instance_directory = game_path, .server = .{ .address = "localhost", .port = 24444 } });
+    try waitForTest(&controller);
+    try std.testing.expectEqual(@as(?u8, 7), controller.snapshot().exit_code);
+    const unchanged = try tmp.dir.readFileAlloc(std.testing.io, "instances/custom/servers.dat", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(unchanged);
+    try std.testing.expectEqualStrings("broken-list", unchanged);
 }
 
 test "disk failure and bounded handoff never block a high-volume game" {

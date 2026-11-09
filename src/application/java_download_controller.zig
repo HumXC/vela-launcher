@@ -47,6 +47,7 @@ pub const OwnedDeleteAdmission = struct {
 };
 pub const Options = struct {
     root: []const u8,
+    cache_root: ?[]const u8 = null,
     download_budget: *downloader.Budget,
     task_registry: ?*tasks.Registry = null,
     download_connections: u16 = 8,
@@ -244,6 +245,7 @@ pub const Controller = struct {
     allocator: Allocator,
     io: Io,
     root: []const u8,
+    cache_root: ?[]const u8 = null,
     service: *downloader.Service,
     download_connections: u16,
     registry: *tasks.Registry,
@@ -271,6 +273,8 @@ pub const Controller = struct {
         defer a.free(cwd);
         const root = try std.fs.path.resolve(a, &.{ cwd, options.root, ".vela", "jdks" });
         errdefer a.free(root);
+        const cache_root = if (options.cache_root) |path| try a.dupe(u8, path) else null;
+        errdefer if (cache_root) |path| a.free(path);
         const registry = options.task_registry orelse try a.create(tasks.Registry);
         errdefer if (options.task_registry == null) a.destroy(registry);
         if (options.task_registry == null) registry.* = tasks.Registry.init(a);
@@ -281,6 +285,7 @@ pub const Controller = struct {
             .allocator = a,
             .io = io,
             .root = root,
+            .cache_root = cache_root,
             .service = service,
             .download_connections = options.download_connections,
             .registry = registry,
@@ -315,6 +320,7 @@ pub const Controller = struct {
             self.allocator.destroy(self.registry);
         }
         self.allocator.free(self.root);
+        if (self.cache_root) |path| self.allocator.free(path);
         self.* = undefined;
     }
     pub fn hostPlatform(self: *const Controller) !backend.Platform {
@@ -417,6 +423,8 @@ pub const Controller = struct {
         };
         errdefer job.destroy();
         job.root = try job.arena.allocator().dupe(u8, self.root);
+        job.service_adapter.io = self.io;
+        job.service_adapter.cache_root = if (self.cache_root) |path| try job.arena.allocator().dupe(u8, path) else null;
         job.transport = self.fixture_transport orelse job.service_adapter.transport();
         const title = try std.fmt.allocPrint(self.allocator, "Java {d} · {s}", .{ request.major, if (request.vendor == .azul) "Azul Zulu CA" else "Microsoft OpenJDK" });
         defer self.allocator.free(title);

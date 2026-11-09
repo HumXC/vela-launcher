@@ -500,6 +500,7 @@ test "resource menu focus routes click and keyboard events in one frame" {
     Fixture.foreign_tab = false;
     var test_ui = try dvui.testing.init(.{});
     defer test_ui.deinit();
+    try @import("fonts.zig").installForTesting(test_ui.window);
     try dvui.testing.settle(Fixture.frame);
     try dvui.testing.moveTo("resource-type-button");
     try dvui.testing.click(.left);
@@ -641,6 +642,7 @@ test "UI layout resource menu surfaces follow live radius including square corne
     for ([_]f32{ 1, 2 }) |scale| {
         var window = try dvui.testing.init(.{ .window_size = .{ .w = 800, .h = 600 } });
         defer window.deinit();
+        try @import("fonts.zig").installForTesting(window.window);
         window.backend.size_pixels = .{ .w = 800 * scale, .h = 600 * scale };
         Fixture.state = .{ .mode = .pinned };
         for ([_]u8{ 0, 20, 0 }) |radius| {

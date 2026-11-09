@@ -1,5 +1,5 @@
 const std = @import("std");
-const catalog = @import("ui/pack_catalog.zig");
+const catalog = @import("application/pack_catalog.zig");
 const http = @import("core/http_transport.zig");
 const credentials = @import("core/credentials.zig");
 const a = std.testing.allocator;
@@ -34,16 +34,19 @@ const Fixture = struct {
                 authorized = std.mem.eql(u8, h.value, "fixture-only-key");
             };
             try std.testing.expect(authorized);
-            return .{ .allocator = alloc, .status = 200, .body = try alloc.dupe(u8, "{\"data\":[],\"pagination\":{\"index\":0,\"pageSize\":40,\"resultCount\":0,\"totalCount\":0}}") };
+            const cf_body = try alloc.dupe(u8, "{\"data\":[],\"pagination\":{\"index\":0,\"pageSize\":40,\"resultCount\":0,\"totalCount\":0}}");
+            return .{ .allocator = alloc, .status = 200, .body = cf_body, .allocation = cf_body };
         }
         for (req.headers) |h| try std.testing.expect(!std.mem.eql(u8, h.name, "x-api-key"));
         if (std.mem.indexOf(u8, req.url, "/version?") != null) {
-            return .{ .allocator = alloc, .status = 200, .body = try alloc.dupe(u8, "[{\"id\":\"v1\",\"project_id\":\"pack1\",\"name\":\"Release\",\"date_published\":\"2025-01-01T00:00:00Z\",\"game_versions\":[\"1.20.1\"],\"loaders\":[\"fabric\"],\"dependencies\":[],\"files\":[{\"filename\":\"test.mrpack\",\"url\":\"https://cdn.modrinth.com/test.mrpack\",\"primary\":true,\"size\":1,\"hashes\":{\"sha1\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}]}]") };
+            const version_body = try alloc.dupe(u8, "[{\"id\":\"v1\",\"project_id\":\"pack1\",\"name\":\"Release\",\"date_published\":\"2025-01-01T00:00:00Z\",\"game_versions\":[\"1.20.1\"],\"loaders\":[\"fabric\"],\"dependencies\":[],\"files\":[{\"filename\":\"test.mrpack\",\"url\":\"https://cdn.modrinth.com/test.mrpack\",\"primary\":true,\"size\":1,\"hashes\":{\"sha1\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}]}]");
+            return .{ .allocator = alloc, .status = 200, .body = version_body, .allocation = version_body };
         }
         try std.testing.expect(std.mem.indexOf(u8, req.url, "project_type%3Amodpack") != null);
         try std.testing.expectEqual(self.filtered, std.mem.indexOf(u8, req.url, "versions%3A1.20.1") != null);
         try std.testing.expectEqual(self.filtered, std.mem.indexOf(u8, req.url, "categories%3Afabric") != null);
-        return .{ .allocator = alloc, .status = 200, .body = try alloc.dupe(u8, "{\"hits\":[{\"project_id\":\"pack1\",\"project_type\":\"modpack\",\"title\":\"Fixture pack\",\"description\":\"Owned metadata\"}],\"total_hits\":1}") };
+        const search_body = try alloc.dupe(u8, "{\"hits\":[{\"project_id\":\"pack1\",\"project_type\":\"modpack\",\"title\":\"Fixture pack\",\"description\":\"Owned metadata\"}],\"total_hits\":1}");
+        return .{ .allocator = alloc, .status = 200, .body = search_body, .allocation = search_body };
     }
     fn options(self: *Fixture) catalog.Options {
         return .{ .transport_options = .{ .fixture_http = execute, .fixture_context = self } };
@@ -139,7 +142,8 @@ const CfVersions = struct {
             "{\"data\":[{\"id\":34,\"modId\":12,\"gameId\":432,\"displayName\":\"Release\",\"fileName\":\"pack.zip\",\"fileDate\":\"2025-01-01T00:00:00Z\",\"gameVersions\":[\"1.20.1\",\"Fabric\"],\"hashes\":[{\"algo\":1,\"value\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"dependencies\":[],\"isAvailable\":true,\"fileLength\":1,\"downloadUrl\":\"https://evil.example/pack.zip\"}],\"pagination\":{\"index\":0,\"pageSize\":50,\"resultCount\":1,\"totalCount\":1}}"
         else
             return error.UnexpectedRequest;
-        return .{ .allocator = alloc, .status = 200, .body = try alloc.dupe(u8, body) };
+        const owned_body = try alloc.dupe(u8, body);
+        return .{ .allocator = alloc, .status = 200, .body = owned_body, .allocation = owned_body };
     }
 };
 test "pack catalog CurseForge versions remain manual and do not trust download host" {

@@ -1,4 +1,8 @@
 const std = @import("std");
+test {
+    _ = @import("downloader_artifact_tests.zig");
+    _ = @import("downloader_retry_tests.zig");
+}
 const curl = @import("curl");
 const dl = @import("downloader.zig");
 const a = std.testing.allocator;
@@ -208,6 +212,77 @@ test "JSON parsing, malformed JSON, limits, HTTP errors and explicit proxy" {
     const proxy = try s.submit(.{ .url = "http://downloader-fixture.invalid/bytes", .proxy = base });
     try std.testing.expectEqualStrings("hello minecraft\n", (try success(proxy)).result.?.bytes);
 }
+test "obsolete cache formats miss without sending validators and are replaced" {
+    const base = try baseUrl();
+    defer a.free(base);
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    var budget = try dl.Budget.init(io, 1);
+    defer budget.deinit();
+    const service = try dl.Service.init(a, io, &budget, 1);
+    defer service.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try pathIn(&tmp, "obsolete.json");
+    defer a.free(path);
+    const meta_path = try std.fmt.allocPrint(a, "{s}.meta.json", .{path});
+    defer a.free(meta_path);
+    const endpoint = try url(base, "/fresh");
+    defer a.free(endpoint);
+    const encoded_url = try std.json.Stringify.valueAlloc(a, endpoint, .{});
+    defer a.free(encoded_url);
+    const old_body = "{\"name\":\"obsolete\"}";
+    var digest: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(old_body, &digest, .{});
+    const encoded_digest = try std.json.Stringify.valueAlloc(a, digest, .{});
+    defer a.free(encoded_digest);
+    const now = @divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s);
+    // Exercise actual old shapes as well as version checks independently of
+    // unknown-field rejection. Even a current version cannot carry old aliases.
+    const formats = [_]struct { version: []const u8, aliases: bool }{
+        .{ .version = "", .aliases = true },
+        .{ .version = "\"version\":0,", .aliases = true },
+        .{ .version = "\"version\":1,", .aliases = true },
+        .{ .version = "", .aliases = false },
+        .{ .version = "\"version\":0,", .aliases = false },
+        .{ .version = "\"version\":1,", .aliases = false },
+        .{ .version = "\"version\":3,", .aliases = false },
+        .{ .version = "\"version\":2,", .aliases = true },
+    };
+    for (formats) |format| {
+        const encoded = try std.fmt.allocPrint(
+            a,
+            "{{{s}{s}\"url\":{s},\"sha1\":{s}," ++
+                "\"headers\":{{\"etag\":\"\\\"fixture-v1\\\"\",\"cache_control\":\"max-age=3600\"}}," ++
+                "\"request_time\":{d},\"response_time\":{d},\"user_agent\":\"Vela/1\",\"accept_encoding\":\"identity\"}}",
+            .{ format.version, if (format.aliases) "\"etag\":\"\\\"fixture-v1\\\"\",\"modified\":\"\"," else "", encoded_url, encoded_digest, now, now },
+        );
+        defer a.free(encoded);
+        try put(path, old_body);
+        try put(meta_path, encoded);
+        const task = try service.submit(.{ .url = endpoint, .output = .json, .cache_path = path });
+        const state = try success(task);
+        try eq(dl.Source.network, state.source);
+        try eq(@as(u16, 200), state.http_status);
+        try std.testing.expectEqualStrings("minecraft", state.result.?.json.object.get("name").?.string);
+        try task.release();
+
+        const saved = try std.Io.Dir.cwd().readFileAlloc(io, meta_path, a, .limited(64 * 1024));
+        defer a.free(saved);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, saved, .{});
+        defer parsed.deinit();
+        try eq(@as(i64, 2), parsed.value.object.get("version").?.integer);
+        try expect(parsed.value.object.get("etag") == null);
+        try expect(parsed.value.object.get("modified") == null);
+        try std.testing.expectEqualStrings("\"fixture-v1\"", parsed.value.object.get("headers").?.object.get("etag").?.string);
+        const current = try service.submit(.{ .url = endpoint, .output = .json, .cache_path = path, .cache_mode = .revalidate });
+        const validated = try success(current);
+        try eq(dl.Source.revalidated, validated.source);
+        try eq(@as(u16, 304), validated.http_status);
+        try current.release();
+    }
+}
+
 test "persistent ETag cache, 304 missing and corrupt recovery, modified validator" {
     const base = try baseUrl();
     defer a.free(base);
@@ -251,6 +326,128 @@ test "persistent ETag cache, 304 missing and corrupt recovery, modified validato
     const m2 = try s.submit(.{ .url = modified, .output = .json, .cache_path = path });
     try eq(dl.Source.revalidated, (try success(m2)).source);
 }
+test "SHA256 and SHA512 cached mismatch recover once for fresh and 304 bodies" {
+    const base = try baseUrl();
+    defer a.free(base);
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    var budget = try dl.Budget.init(io, 1);
+    defer budget.deinit();
+    const service = try dl.Service.init(a, io, &budget, 1);
+    defer service.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try pathIn(&tmp, "strong-hash.json");
+    defer a.free(path);
+    const meta_path = try std.fmt.allocPrint(a, "{s}.meta.json", .{path});
+    defer a.free(meta_path);
+    const endpoint = try url(base, "/fresh");
+    defer a.free(endpoint);
+    const stats_url = try url(base, "/stats");
+    defer a.free(stats_url);
+    const before_task = try service.submit(.{ .url = stats_url, .output = .json });
+    defer before_task.release() catch unreachable;
+    const before_value = (try success(before_task)).result.?.json.object.get("/fresh");
+    const before = if (before_value) |value| value.integer else 0;
+    const old_body = "obsolete representation";
+    const current_body = "{\"name\":\"minecraft\",\"version\":1}";
+    var old_sha1: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(old_body, &old_sha1, .{});
+    var sha256: [32]u8 = undefined;
+    var sha512: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(current_body, &sha256, .{});
+    std.crypto.hash.sha2.Sha512.hash(current_body, &sha512, .{});
+    const now = @divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s);
+    // A valid SHA1 for the obsolete body ensures only the expected strong hash
+    // rejects it. Keep the fixture validator so revalidate really receives 304.
+    const metadata = try std.json.Stringify.valueAlloc(a, .{
+        .version = @as(u32, 2),
+        .url = endpoint,
+        .sha1 = old_sha1,
+        .headers = .{ .etag = "\"fixture-v1\"", .cache_control = "max-age=3600" },
+        .request_time = now,
+        .response_time = now,
+        .user_agent = "Vela/1",
+        .accept_encoding = "identity",
+    }, .{});
+    defer a.free(metadata);
+    for ([_]bool{ false, true }) |use_sha512| {
+        for ([_]dl.CacheMode{ .prefer_cache, .revalidate }) |mode| {
+            try put(path, old_body);
+            try put(meta_path, metadata);
+            const task = try service.submit(.{
+                .url = endpoint,
+                .cache_path = path,
+                .cache_mode = mode,
+                .expected_sha256 = if (use_sha512) null else sha256,
+                .expected_sha512 = if (use_sha512) sha512 else null,
+            });
+            defer task.release() catch unreachable;
+            const state = try success(task);
+            try eq(dl.Source.network, state.source);
+            try eq(@as(u16, 200), state.http_status);
+            try std.testing.expectEqualStrings(current_body, state.result.?.bytes);
+            try expect(task.retry_unconditional);
+            try eq(@as(u8, 0), task.network_retries);
+        }
+        // A network mismatch is terminal, even after recovering a cached mismatch.
+        const task = try service.submit(.{
+            .url = endpoint,
+            .cache_path = path,
+            .expected_sha256 = if (use_sha512) null else @as([32]u8, @splat(0)),
+            .expected_sha512 = if (use_sha512) @as([64]u8, @splat(0)) else null,
+        });
+        defer task.release() catch unreachable;
+        const state = try wait(task);
+        try eq(dl.Phase.failed, state.progress.phase);
+        try eq(if (use_sha512) error.Sha512Mismatch else error.Sha256Mismatch, state.failure.?);
+        try expect(task.retry_unconditional);
+        try eq(@as(u8, 0), task.network_retries);
+    }
+    const after_task = try service.submit(.{ .url = stats_url, .output = .json });
+    defer after_task.release() catch unreachable;
+    const after = (try success(after_task)).result.?.json.object.get("/fresh").?.integer;
+    // Per algorithm: fresh recovery (1), 304 recovery (2), terminal mismatch (1).
+    try eq(@as(i64, 8), after - before);
+}
+
+test "HTTP freshness, forced validation, no-cache and Age govern disk reuse" {
+    const base = try baseUrl();
+    defer a.free(base);
+    try curl.globalInit();
+    defer curl.globalDeinit();
+    var budget = try dl.Budget.init(io, 2);
+    defer budget.deinit();
+    const service = try dl.Service.init(a, io, &budget, 2);
+    defer service.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try pathIn(&tmp, "fresh.json");
+    defer a.free(path);
+    for ([_][]const u8{ "/fresh", "/no-cache", "/aged" }) |suffix| {
+        const endpoint = try url(base, suffix);
+        defer a.free(endpoint);
+        const first = try service.submit(.{ .url = endpoint, .output = .json, .cache_path = path });
+        try eq(dl.Source.network, (try success(first)).source);
+        const second = try service.submit(.{ .url = endpoint, .output = .json, .cache_path = path });
+        const cached = try success(second);
+        const fresh = std.mem.eql(u8, suffix, "/fresh");
+        try eq(if (fresh) dl.Source.fresh else dl.Source.revalidated, cached.source);
+        try eq(@as(u16, if (fresh) 0 else 304), cached.http_status);
+        const forced = try service.submit(.{ .url = endpoint, .output = .json, .cache_path = path, .cache_mode = .revalidate });
+        try eq(dl.Source.revalidated, (try success(forced)).source);
+        const bypass = try service.submit(.{ .url = endpoint, .output = .json, .cache_path = path, .cache_mode = .bypass });
+        try eq(dl.Source.network, (try success(bypass)).source);
+    }
+    // Optional persistence failures must not discard successfully verified bytes.
+    const missing = try std.fmt.allocPrint(a, "{s}/missing/body", .{path});
+    defer a.free(missing);
+    const endpoint = try url(base, "/fresh");
+    defer a.free(endpoint);
+    const uncached = try service.submit(.{ .url = endpoint, .cache_path = missing });
+    try eq(dl.Source.network, (try success(uncached)).source);
+}
+
 test "no-store and Vary are not cached; unexpected 304 and truncated transfers fail" {
     const base = try baseUrl();
     defer a.free(base);
@@ -479,6 +676,38 @@ test "client installation stays in its stage across source and instance name col
             .environment = .{ .os_name = "linux", .arch = "x86_64" },
         });
         defer installed.deinit();
+        const repeat_config: installer.Config = .{
+            .root = root,
+            .version_id = "1.20.1",
+            .target = .{ .directory_name = ".vela-repeat-cache-fixture", .name = "Second" },
+            .metadata_path = source_path,
+            .environment = .{ .os_name = "linux", .arch = "x86_64" },
+        };
+        var repeat = try installer.run(a, io, service, repeat_config);
+        defer repeat.deinit();
+        try eq(@as(usize, 0), repeat.downloaded);
+        try expect(repeat.reused > 0);
+        const repeated_jar = "versions/.vela-repeat-cache-fixture/Second.jar";
+        try expectInstallFixtureFile(&tmp, repeated_jar, client_bytes);
+        try tmp.dir.writeFile(io, .{ .sub_path = repeated_jar, .data = "corrupt installed client" });
+        var repaired = try installer.run(a, io, service, repeat_config);
+        defer repaired.deinit();
+        try eq(@as(usize, 0), repaired.downloaded);
+        try expectInstallFixtureFile(&tmp, repeated_jar, client_bytes);
+        try tmp.dir.deleteFile(io, repeated_jar);
+        var restored = try installer.run(a, io, service, repeat_config);
+        defer restored.deinit();
+        try eq(@as(usize, 0), restored.downloaded);
+        try expectInstallFixtureFile(&tmp, repeated_jar, client_bytes);
+        const cached_client = try std.fmt.allocPrint(a, ".vela/cache/artifacts/sha1/{s}", .{client_hex});
+        defer a.free(cached_client);
+        try tmp.dir.writeFile(io, .{ .sub_path = cached_client, .data = "corrupt cached client" });
+        try tmp.dir.deleteFile(io, repeated_jar);
+        var refetched = try installer.run(a, io, service, repeat_config);
+        defer refetched.deinit();
+        try eq(@as(usize, 1), refetched.downloaded);
+        try expectInstallFixtureFile(&tmp, repeated_jar, client_bytes);
+        try expectInstallFixtureFile(&tmp, cached_client, client_bytes);
         const expected_client = try std.fmt.allocPrint(a, "{s}/{s}.jar", .{ stage, name });
         defer a.free(expected_client);
         const expected_target = try std.fs.path.resolve(a, &.{expected_client});
@@ -517,8 +746,9 @@ test "client installation stays in its stage across source and instance name col
     const task = try service.submit(.{ .url = stats_url, .output = .json });
     defer task.release() catch unreachable;
     const counts = (try success(task)).result.?.json.object;
-    try eq(@as(i64, 2), counts.get("/instance-client/jar").?.integer);
-    try eq(@as(i64, 2), counts.get("/instance-client/index").?.integer);
+    // Each root downloads the client once, then once more only after cache corruption.
+    try eq(@as(i64, 4), counts.get("/instance-client/jar").?.integer);
+    try eq(@as(i64, 10), counts.get("/instance-client/index").?.integer);
 }
 
 test "streamed transfers without a total deadline complete but stalled connections time out" {

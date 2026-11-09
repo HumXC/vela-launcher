@@ -2,7 +2,7 @@
 const std = @import("std");
 const config = @import("core/config.zig");
 const servers = @import("core/servers.zig");
-const server_manager = @import("ui/server_manager.zig");
+const server_manager = @import("application/server_manager.zig");
 const testing = std.testing;
 const Manager = server_manager.Manager;
 const AtomicCount = std.atomic.Value(u32);
@@ -75,8 +75,8 @@ const Fixture = struct {
     }
 };
 
-fn fixtureServer(id: []const u8, legacy_show_on_home: bool) config.Server {
-    return .{ .id = id, .name = "Original", .address = "127.0.0.1", .instance_id = "instance", .show_on_home = legacy_show_on_home };
+fn fixtureServer(id: []const u8) config.Server {
+    return .{ .id = id, .name = "Original", .address = "127.0.0.1", .instance_id = "instance" };
 }
 
 fn expired(start: std.Io.Timestamp) bool {
@@ -134,7 +134,7 @@ fn expectTarget(snapshot: server_manager.Snapshot, id: []const u8, name: []const
     try testing.expectEqualStrings(instance, status.description.string);
 }
 
-test "picker entry immediately queries every configured card regardless of legacy visibility without a main selection" {
+test "picker entry immediately queries every configured card without a main selection" {
     Fixture.reset();
     Fixture.block("alpha", true);
     Fixture.block("beta", true);
@@ -143,10 +143,10 @@ test "picker entry immediately queries every configured card regardless of legac
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
     const configured = [_]config.Server{
-        fixtureServer("alpha", true),
-        fixtureServer("hidden", false),
-        fixtureServer("offline", true),
-        fixtureServer("beta", true),
+        fixtureServer("alpha"),
+        fixtureServer("hidden"),
+        fixtureServer("offline"),
+        fixtureServer("beta"),
     };
     try manager.updatePicker(&configured, true);
     try awaitCalls(&manager, "alpha", 1);
@@ -184,14 +184,14 @@ test "picker statuses and main refresh and clear remain independent" {
     Fixture.reset();
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
-    try manager.refreshConfigured(fixtureServer("selected", false));
+    try manager.refreshConfigured(fixtureServer("selected"));
     try awaitSettled(&manager);
-    const configured = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("offline", true) };
+    const configured = [_]config.Server{ fixtureServer("alpha"), fixtureServer("offline") };
     try manager.updatePicker(&configured, true);
     try awaitSettled(&manager);
     try expectTarget(manager.snapshot(), "selected", "Original", "127.0.0.1", 25565, "instance");
     try testing.expectEqual(@as(u32, 1), Fixture.count("selected"));
-    var selected = fixtureServer("selected", false);
+    var selected = fixtureServer("selected");
     selected.name = "Selected again";
     selected.address = "127.0.0.2";
     selected.port = 25570;
@@ -211,7 +211,7 @@ test "picker unchanged page polls again only when due after the previous round s
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
     manager.picker_poll_interval_ms = std.math.maxInt(u32);
-    const configured = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("beta", true) };
+    const configured = [_]config.Server{ fixtureServer("alpha"), fixtureServer("beta") };
     try manager.updatePicker(&configured, true);
     try awaitSettled(&manager);
     for (0..3) |_| {
@@ -239,7 +239,7 @@ test "picker busy card is not superseded and leaving cancels before fresh reentr
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
     manager.picker_poll_interval_ms = 0;
-    const configured = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("beta", true) };
+    const configured = [_]config.Server{ fixtureServer("alpha"), fixtureServer("beta") };
     try manager.updatePicker(&configured, true);
     try awaitCalls(&manager, "alpha", 1);
     // A slow card must not prevent a different card from completing.
@@ -269,27 +269,26 @@ test "picker busy card is not superseded and leaving cancels before fresh reentr
     try expectMainIdle(&manager);
 }
 
-test "picker config edits refresh endpoints and membership while ignoring legacy visibility by stable server ID" {
+test "picker config edits refresh endpoints and membership by stable server ID" {
     Fixture.reset();
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
     manager.picker_poll_interval_ms = std.math.maxInt(u32);
-    const initial = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("beta", true), fixtureServer("hidden", false) };
+    const initial = [_]config.Server{ fixtureServer("alpha"), fixtureServer("beta"), fixtureServer("hidden") };
     try manager.updatePicker(&initial, true);
     try awaitSettled(&manager);
-    const legacy_flags_changed = [_]config.Server{ fixtureServer("alpha", false), fixtureServer("beta", false), fixtureServer("hidden", true) };
-    try manager.updatePicker(&legacy_flags_changed, true);
+    try manager.updatePicker(&initial, true);
     try awaitSettled(&manager);
     for ([_][]const u8{ "alpha", "beta", "hidden" }) |id| {
         try testing.expectEqual(@as(u32, 1), Fixture.count(id));
         try expectTarget(manager.pickerSnapshot(id), id, "Original", "127.0.0.1", 25565, "instance");
     }
-    var alpha = fixtureServer("alpha", false);
+    var alpha = fixtureServer("alpha");
     alpha.name = "Edited";
     alpha.address = "127.0.0.2";
     alpha.port = 25570;
     alpha.instance_id = "other-instance";
-    const edited = [_]config.Server{ fixtureServer("hidden", true), fixtureServer("selected", false), alpha };
+    const edited = [_]config.Server{ fixtureServer("hidden"), fixtureServer("selected"), alpha };
     try manager.updatePicker(&edited, true);
     try awaitSettled(&manager);
     try testing.expectEqual(@as(u32, 2), Fixture.count("alpha"));
@@ -314,7 +313,7 @@ test "picker jobs own mutable config strings on entry and after target edits" {
     var name = "Original".*;
     var address = "127.0.0.1".*;
     var instance = "instance".*;
-    var configured = [_]config.Server{.{ .id = &id, .name = &name, .address = &address, .port = 25566, .instance_id = &instance, .show_on_home = true }};
+    var configured = [_]config.Server{.{ .id = &id, .name = &name, .address = &address, .port = 25566, .instance_id = &instance }};
     try manager.updatePicker(&configured, true);
     try awaitCalls(&manager, "alpha", 1);
     @memset(&id, 'x');
@@ -348,9 +347,9 @@ test "picker tick progresses while main query is busy and main clear preserves a
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
     manager.picker_poll_interval_ms = 0;
-    try manager.refreshConfigured(fixtureServer("selected", false));
+    try manager.refreshConfigured(fixtureServer("selected"));
     try awaitCalls(&manager, "selected", 1);
-    const configured = [_]config.Server{fixtureServer("alpha", true)};
+    const configured = [_]config.Server{fixtureServer("alpha")};
     try manager.updatePicker(&configured, true);
     try awaitCardState(&manager, "alpha", .online);
     try testing.expectEqual(servers.State.querying, manager.snapshot().state);
@@ -376,10 +375,10 @@ test "picker invalid configured address fails only its own card without calling 
         var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
         defer manager.deinit();
         manager.picker_poll_interval_ms = 0;
-        var invalid = fixtureServer("beta", false);
+        var invalid = fixtureServer("beta");
         invalid.address = invalid_address;
         const expected_failure = error.InvalidAddress;
-        const configured = [_]config.Server{ invalid, fixtureServer("alpha", true) };
+        const configured = [_]config.Server{ invalid, fixtureServer("alpha") };
         for ([_]u32{ 1, 2 }) |round| {
             try manager.updatePicker(&configured, true);
             try awaitSettled(&manager);
@@ -401,7 +400,7 @@ test "selected server polling is independent of navigation and repeated frames k
     Fixture.reset();
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
-    const configured = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("hidden", false) };
+    const configured = [_]config.Server{ fixtureServer("alpha"), fixtureServer("hidden") };
     const document: config.Document = .{ .servers = &configured, .selected_server = "hidden" };
     Fixture.block("hidden", true);
     try manager.updateSelected(&document, true);
@@ -458,7 +457,7 @@ test "selected worker activity excludes busy and canceled retired picker cards" 
     // Always release the real worker before shutdown, including on assertion failure.
     defer GatedQuery.other_release.set(testing.io);
     manager.picker_poll_interval_ms = std.math.maxInt(u32);
-    const configured = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("beta", false) };
+    const configured = [_]config.Server{ fixtureServer("alpha"), fixtureServer("beta") };
     const document: config.Document = .{ .servers = &configured, .selected_server = "alpha" };
     try manager.updateSelected(&document, true);
     try GatedQuery.finishSelected(&manager);
@@ -533,7 +532,7 @@ test "selected server status is shared with the picker and polls automatically o
     Fixture.reset();
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
-    const configured = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("beta", true) };
+    const configured = [_]config.Server{ fixtureServer("alpha"), fixtureServer("beta") };
     const document: config.Document = .{ .servers = &configured, .selected_server = "alpha" };
     try manager.updateSelected(&document, false);
     try expectMainIdle(&manager);
@@ -577,7 +576,7 @@ test "selected polling handles target changes and configuration edits without a 
     Fixture.reset();
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
-    var configured = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("beta", true) };
+    var configured = [_]config.Server{ fixtureServer("alpha"), fixtureServer("beta") };
     var document: config.Document = .{ .servers = &configured, .selected_server = "alpha" };
     try manager.updateSelected(&document, true);
     try awaitSettled(&manager);
@@ -609,7 +608,7 @@ test "an instance alone does not query and malformed selections fail inside thei
     Fixture.reset();
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
-    var invalid = fixtureServer("alpha", true);
+    var invalid = fixtureServer("alpha");
     invalid.address = "999.999.999.999";
     const configured = [_]config.Server{invalid};
     var document: config.Document = .{ .servers = &configured };
@@ -641,7 +640,7 @@ test "refresh keeps the last result until completion and publishes success or fa
     Fixture.reset();
     var manager = Manager.initWithQuery(testing.allocator, testing.io, ChangingQuery.query);
     defer manager.deinit();
-    const configured = [_]config.Server{fixtureServer("alpha", true)};
+    const configured = [_]config.Server{fixtureServer("alpha")};
     const document: config.Document = .{ .servers = &configured, .selected_server = "alpha" };
     Fixture.block("alpha", true);
     try manager.updateSelected(&document, true);
@@ -683,7 +682,7 @@ test "selection promotes cached cards without querying or changing their polling
     Fixture.reset();
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
-    const configured = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("beta", true), fixtureServer("offline", true), fixtureServer("hidden", false) };
+    const configured = [_]config.Server{ fixtureServer("alpha"), fixtureServer("beta"), fixtureServer("offline"), fixtureServer("hidden") };
     try manager.updatePicker(&configured, true);
     try awaitSettled(&manager);
     const picker = manager.picker.?;
@@ -734,7 +733,7 @@ test "selection transfers an in-flight card across owners without cancellation a
     Fixture.block("alpha", true);
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
-    const configured = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("beta", true) };
+    const configured = [_]config.Server{ fixtureServer("alpha"), fixtureServer("beta") };
     try manager.updatePicker(&configured, true);
     try awaitCalls(&manager, "alpha", 1);
     try awaitCardState(&manager, "beta", .online);
@@ -769,7 +768,7 @@ test "switching selected cards preserves published status and its in-flight refr
     Fixture.reset();
     var manager = Manager.initWithQuery(testing.allocator, testing.io, Fixture.query);
     defer manager.deinit();
-    const configured = [_]config.Server{ fixtureServer("alpha", true), fixtureServer("beta", true) };
+    const configured = [_]config.Server{ fixtureServer("alpha"), fixtureServer("beta") };
     try manager.updateSelected(&.{ .servers = &configured, .selected_server = "alpha" }, true);
     try manager.updatePicker(&configured, true);
     try awaitSettled(&manager);

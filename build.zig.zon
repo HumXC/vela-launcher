@@ -24,10 +24,6 @@
             .url = "https://github.com/jiacai2050/zig-curl/archive/9c0f1d211ad22dd0f4c20aa54060c1d9f163595a.tar.gz",
             .hash = "curl-0.6.0-dev-P4tT4W7_AAAEPibcTLuVEkwsmt61vws3n0pBs0DpAmv9",
         },
-        .clap = .{
-            .url = "https://github.com/Hejsil/zig-clap/archive/05faf3905e8548f5cc269a8836e154065e70128d.tar.gz",
-            .hash = "clap-0.12.0-oBajB4XpAQCF1WRKnD5KOKPsnwwT_NNdAJ7Ww3irYJac",
-        },
         .nbt = .{
             .url = "https://github.com/Bedrock-Phanatics/nbt-zig/archive/e162b97a76099f53d630124a2c6f3e3ff6f6a794.tar.gz",
             .hash = "nbt-1.1.5-iJUBvvdJBAB2nW0FSVjwF8EPjsEgwIHj1JsVjOzlQ5HS",

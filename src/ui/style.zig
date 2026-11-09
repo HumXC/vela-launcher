@@ -56,11 +56,11 @@ pub const Material = enum { panel, control, selected };
 
 pub fn materialColor(base: dvui.Color, percent: u8, material: Material) dvui.Color {
     const opacity = @as(f32, @floatFromInt(@min(percent, 100))) / 100;
-    const selected = opacity * opacity;
+    const control = opacity * opacity;
     const alpha = switch (material) {
         .panel => opacity,
-        .selected => selected,
-        .control => selected * selected,
+        .selected => (control + opacity) / 2,
+        .control => control,
     };
     var result = base;
     result.a = @intFromFloat(@round(@as(f32, @floatFromInt(base.a)) * alpha));
@@ -88,7 +88,7 @@ test "panel opacity keeps foregrounds solid and nested surfaces light" {
                 try std.testing.expect(actual.selected_surface.a < actual.pressed_surface.a);
                 const panel = @as(f32, @floatFromInt(percent)) / 100;
                 const nested = @as(f32, @floatFromInt(actual.surface.a)) / 255;
-                try std.testing.expect(panel + (1 - panel) * nested < panel + 0.1);
+                try std.testing.expect(nested < panel);
             }
             try std.testing.expectEqual(actual.selected_surface.a, actual.log_match.a);
             try std.testing.expectEqual(@as(u8, 0), actual.transparent.a);
@@ -153,7 +153,7 @@ pub const dialogs = struct {
     pub const action_width: f32 = 160;
     pub const three_action_width: f32 = 180;
     pub const task_action_width: f32 = 176;
-    pub const account_height: f32 = 288;
+    pub const account_height: f32 = 256;
     pub const microsoft_account_height: f32 = 424;
     pub const error_height: f32 = 48;
     pub const account_confirm_height: f32 = 248;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const accounts = @import("accounts_manager.zig");
+const accounts = @import("../application/accounts_manager.zig");
 const config = @import("../core/config.zig");
 const auth = @import("../core/auth.zig");
 const credentials = @import("../core/credentials.zig");
@@ -1094,6 +1094,174 @@ test "accounts uncertain config blocks new work and cleanup recovers latest prot
     try t.expectEqual(@as(usize, 0), fake.puts);
     try t.expectEqual(@as(usize, 0), fake.gets);
     try t.expectEqual(@as(usize, 0), fake.requests);
+    try expectWorkerOnly(&fake);
+    try expectNoPlaintext(&tmp);
+}
+
+fn settleShutdown(manager: *accounts.Manager, store: *config.Store) !void {
+    const end = clockMs() + 8_000;
+    manager.beginShutdown();
+    while (clockMs() < end) {
+        manager.finishShutdown(store);
+        if (!manager.shutdownBusy()) return;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.FixtureWaitTimedOut;
+}
+
+test "accounts shutdown retries transient publication and acknowledges only after commit" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try rootPath(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, io, root);
+    defer store.deinit();
+    try configure(&store);
+    var fake: Fake = .{};
+    var manager = try accounts.Manager.initWithOptions(a, io, .{ .root = root, .fixture = fake.fixture() });
+    defer manager.deinit();
+    try tmp.dir.rename(".vela/config.json", tmp.dir, ".vela/previous.json", io);
+    try tmp.dir.createDir(io, ".vela/config.json", .default_dir);
+    try manager.startDeviceRemember(&store, true);
+    try settle(&manager, &store);
+    try t.expect(manager.snapshot().publication_pending);
+    try t.expect(!manager.snapshot().busy);
+    try t.expect(manager.shutdownBusy());
+    try t.expectEqual(@as(usize, 1), fake.refs_len);
+    try tmp.dir.deleteDir(io, ".vela/config.json");
+    try tmp.dir.rename(".vela/previous.json", tmp.dir, ".vela/config.json", io);
+    try settleShutdown(&manager, &store);
+    try t.expect(!manager.snapshot().publication_pending);
+    try t.expect(!store.publicationUncertain());
+    try t.expectEqual(@as(usize, 1), store.snapshot().accounts.len);
+    try t.expect(store.snapshot().accounts[0].credential_ref != null);
+    try t.expectEqual(@as(usize, 0), fake.refs_len);
+    try t.expectEqual(@as(usize, 1), fake.puts);
+    try t.expectEqual(@as(usize, 0), fake.deletes);
+    const removes = fake.removes;
+    manager.finishShutdown(&store);
+    try t.expectEqual(removes, fake.removes);
+    try t.expectError(error.LoginRequired, manager.launchIdentity(clockMs()));
+    try expectWorkerOnly(&fake);
+    try expectNoPlaintext(&tmp);
+}
+
+test "accounts shutdown permanent publication failure preserves journal and reaches terminal state" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try rootPath(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, io, root);
+    defer store.deinit();
+    try configure(&store);
+    var fake: Fake = .{};
+    var manager = try accounts.Manager.initWithOptions(a, io, .{ .root = root, .fixture = fake.fixture() });
+    defer manager.deinit();
+    try tmp.dir.rename(".vela/config.json", tmp.dir, ".vela/previous.json", io);
+    try tmp.dir.createDir(io, ".vela/config.json", .default_dir);
+    try manager.startDeviceRemember(&store, true);
+    try settle(&manager, &store);
+    try t.expect(manager.shutdownBusy());
+    try settleShutdown(&manager, &store);
+    try t.expect(!manager.snapshot().publication_pending);
+    try t.expectEqual(accounts.Phase.failed, manager.snapshot().phase);
+    try t.expect(manager.snapshot().failure != null);
+    try t.expect(store.publicationUncertain());
+    try t.expectEqual(@as(usize, 1), fake.refs_len);
+    try t.expectEqual(@as(usize, 1), manager.snapshot().cleanup_count);
+    try t.expectEqual(@as(usize, 0), fake.removes + fake.deletes);
+    // Restoring the config after terminal failure must not trigger another retry.
+    try tmp.dir.deleteDir(io, ".vela/config.json");
+    try tmp.dir.rename(".vela/previous.json", tmp.dir, ".vela/config.json", io);
+    manager.beginShutdown();
+    manager.finishShutdown(&store);
+    manager.tick(&store);
+    try t.expect(!manager.shutdownBusy());
+    try t.expectEqual(@as(usize, 0), store.snapshot().accounts.len);
+    try t.expectEqual(@as(usize, 1), fake.refs_len);
+    try t.expectEqual(@as(usize, 1), fake.puts);
+    try expectWorkerOnly(&fake);
+    try expectNoPlaintext(&tmp);
+}
+
+test "accounts shutdown reset and acknowledgement spawn failures are terminal and retain journal" {
+    for ([_]bool{ false, true }) |ack| {
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try rootPath(&tmp);
+        defer a.free(root);
+        var store = try config.Store.init(a, io, root);
+        defer store.deinit();
+        try configure(&store);
+        var fake: Fake = .{};
+        var fixture = fake.fixture();
+        fixture.fail_reset_spawn = true;
+        var manager = try accounts.Manager.initWithOptions(a, io, .{ .root = root, .fixture = fixture });
+        defer manager.deinit();
+        if (ack) {
+            try manager.startDeviceRemember(&store, true);
+            const end = clockMs() + 8_000;
+            while (manager.pending_ack == null and clockMs() < end) {
+                manager.tick(&store);
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try t.expect(manager.pending_ack != null);
+            try t.expectEqual(@as(usize, 1), fake.refs_len);
+        } else {
+            manager.cancel();
+            try t.expect(manager.reset_needed);
+        }
+        try settleShutdown(&manager, &store);
+        try t.expect(!manager.snapshot().busy);
+        try t.expectEqual(@as(anyerror, error.SystemResources), manager.snapshot().failure.?);
+        try t.expectEqual(accounts.Phase.failed, manager.snapshot().phase);
+        if (ack) {
+            try t.expectEqual(@as(usize, 1), fake.refs_len);
+            try t.expectEqual(@as(usize, 0), fake.removes);
+            try t.expect(store.snapshot().accounts[0].credential_ref != null);
+        }
+        manager.finishShutdown(&store);
+        try t.expect(!manager.shutdownBusy());
+        try expectWorkerOnly(&fake);
+        try expectNoPlaintext(&tmp);
+    }
+}
+
+test "accounts shutdown failed signout publication retains config evidence for idempotent recovery" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try rootPath(&tmp);
+    defer a.free(root);
+    var store = try config.Store.init(a, io, root);
+    defer store.deinit();
+    try savedAccount(&store);
+    var fake: Fake = .{};
+    fake.preload();
+    {
+        var manager = try accounts.Manager.initWithOptions(a, io, .{ .root = root, .fixture = fake.fixture() });
+        defer manager.deinit();
+        try tmp.dir.rename(".vela/config.json", tmp.dir, ".vela/previous.json", io);
+        try tmp.dir.createDir(io, ".vela/config.json", .default_dir);
+        try manager.signOut(&store, "saved-online");
+        try settle(&manager, &store);
+        try t.expect(manager.snapshot().publication_pending);
+        try t.expectEqual(@as(usize, 0), fake.secret_len);
+        try settleShutdown(&manager, &store);
+        try t.expectEqual(accounts.Phase.failed, manager.snapshot().phase);
+        try t.expectEqualStrings(&saved_ref, store.snapshot().accounts[0].credential_ref.?);
+        try t.expectEqual(@as(usize, 1), fake.deletes);
+    }
+    try tmp.dir.deleteDir(io, ".vela/config.json");
+    try tmp.dir.rename(".vela/previous.json", tmp.dir, ".vela/config.json", io);
+    try store.reconcile();
+    var recovery = try accounts.Manager.initWithOptions(a, io, .{ .root = root, .fixture = fake.fixture() });
+    defer recovery.deinit();
+    try recovery.signOut(&store, "saved-online");
+    // An active signout must settle normally rather than being cancelled on exit.
+    try settleShutdown(&recovery, &store);
+    try t.expect(store.snapshot().accounts[0].credential_ref == null);
+    try t.expectEqual(@as(usize, 2), fake.deletes);
+    try t.expectEqual(@as(usize, 0), fake.puts + fake.requests);
     try expectWorkerOnly(&fake);
     try expectNoPlaintext(&tmp);
 }

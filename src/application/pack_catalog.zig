@@ -104,6 +104,7 @@ pub const Controller = struct {
     io: Io,
     arena: std.heap.ArenaAllocator,
     options: Options,
+    owned_connections: ?*@import("../core/http_transport.zig").ConnectionPool = null,
     current: ?*Job = null,
     retired: ?*Job = null,
     catalog: ?*Job = null,
@@ -114,8 +115,10 @@ pub const Controller = struct {
     pub fn init(a: A, io: Io, options: Options) !Controller {
         var arena: std.heap.ArenaAllocator = .init(a);
         errdefer arena.deinit();
-        const owned_options = try copy(Options, arena.allocator(), options);
-        return .{ .allocator = a, .io = io, .arena = arena, .options = owned_options };
+        var owned_options = try copy(Options, arena.allocator(), options);
+        const pool = if (owned_options.transport_options.http.connections == null) try @import("../core/http_transport.zig").ConnectionPool.create(a) else null;
+        if (pool) |value| owned_options.transport_options.http.connections = value;
+        return .{ .allocator = a, .io = io, .arena = arena, .options = owned_options, .owned_connections = pool };
     }
     pub fn deinit(self: *Controller) void {
         self.cancel();
@@ -126,6 +129,7 @@ pub const Controller = struct {
         }
         if (self.catalog) |job| job.destroy(self.allocator);
         if (self.versions) |job| job.destroy(self.allocator);
+        if (self.owned_connections) |pool| pool.destroy(self.allocator);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -243,7 +247,7 @@ const Job = struct {
     }
     fn execute(self: *Job) !void {
         try self.check();
-        var adapter = try transport.Adapter.initWithOptions(std.heap.page_allocator, self.io, &self.cancel, 1, self.options.transport_options);
+        var adapter = try transport.Adapter.init(std.heap.page_allocator, self.io, &self.cancel, 1, self.options.transport_options);
         defer adapter.deinit();
         const provider = switch (self.request) {
             .search => |s| s.provider,

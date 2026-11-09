@@ -1,7 +1,7 @@
 const std = @import("std");
 const fixtures = @import("pack_install_fixture.zig");
 const page_mod = @import("ui/pack_page.zig");
-const install = @import("ui/pack_install_controller.zig");
+const install = @import("application/pack_install_controller.zig");
 const config = @import("core/config.zig");
 const http = @import("core/http_transport.zig");
 const a = std.testing.allocator;
@@ -17,15 +17,19 @@ const Download = struct {
         self.entered.store(true, .release);
         while (!self.release.load(.acquire)) try request_io.sleep(.fromMilliseconds(1), .awake);
         if (self.fail) return error.ConnectionRefused;
-        return .{ .allocator = allocator, .status = 200, .body = try allocator.dupe(u8, self.bytes) };
+        const body = try allocator.dupe(u8, self.bytes);
+        return .{ .allocator = allocator, .status = 200, .body = body, .allocation = body };
     }
 };
 
 test "pack online prepare shows a task then confirms or reports failure and cancellation" {
-    for (0..4) |scenario| {
+    for (0..5) |scenario| {
         var fixture = try fixtures.Fixture.init();
         defer fixture.deinit();
-        try fixtures.zip(fixture.tmp.dir, "source.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = fixtures.index }});
+        try fixtures.zip(fixture.tmp.dir, "source.mrpack", &.{
+            .{ .path = "modrinth.index.json", .bytes = fixtures.index },
+            .{ .path = if (scenario == 4) "overrides/assets/forbidden.txt" else "overrides/saves/枪战地图/level.dat", .bytes = "initial world" },
+        });
         const bytes = try fixture.tmp.dir.readFileAlloc(io, "source.mrpack", a, .limited(1024 * 1024));
         defer a.free(bytes);
         var digest: [20]u8 = undefined;
@@ -42,6 +46,7 @@ test "pack online prepare shows a task then confirms or reports failure and canc
         defer budget.deinit();
         var page = try page_mod.Page.init(a, io, &fixture.paths, &registry, &budget);
         defer page.deinit(services);
+        try std.testing.expectEqualStrings(fixture.paths.cache, page.installer.core.options.backend_options.transport_options.cache_root.?);
         // Always release the fixture before Page joins its worker, including on assertion failure.
         defer download.release.store(true, .release);
         page.installer.core.options.backend_options.transport_options.fixture_http = Download.request;
@@ -56,6 +61,7 @@ test "pack online prepare shows a task then confirms or reports failure and canc
         page.ui.queue(.prepare);
         page.finish(&model, &navigation, services, true);
         try std.testing.expect(page.ui.failure == null);
+        try std.testing.expectEqualStrings(fixture.paths.cache, page.installer.core.options.backend_options.transport_options.cache_root.?);
         try std.testing.expect(page.ui.task_visible and page.opening);
         var arena: std.heap.ArenaAllocator = .init(a);
         defer arena.deinit();
@@ -80,7 +86,8 @@ test "pack online prepare shows a task then confirms or reports failure and canc
         download.release.store(true, .release);
         page.installer.core.job.?.thread.?.join();
         page.installer.core.job.?.thread = null;
-        page.tick(services, true);
+        page.installer.tickWithMutations(services, true);
+        page.tickPresentation(services, true);
         try std.testing.expect(!page.opening);
         const result = try page.presentation(arena.allocator());
         if (scenario == 0) {
@@ -91,16 +98,26 @@ test "pack online prepare shows a task then confirms or reports failure and canc
             try std.testing.expectEqual(if (scenario == 2) @as(@import("ui/pack_view.zig").Task, .canceled) else .failed, result.task);
             try std.testing.expectEqual(.detail, page.ui.route);
             try std.testing.expectEqual(@as(f64, 0), result.details.files[0].bytes_per_second);
-            try std.testing.expectEqual(@as(usize, 1), result.details.file_count);
+            try std.testing.expectEqual(@as(usize, if (scenario == 4) 2 else 1), result.details.file_count);
             try std.testing.expectEqualStrings("fixture.mrpack", result.details.files[0].name());
             try std.testing.expectEqual(@as(f64, 0), result.details.bytes_per_second);
             if (scenario == 1 or scenario == 3) {
-                try std.testing.expectEqual(if (scenario == 1) @as(anyerror, error.ConnectionRefused) else error.HashMismatch, result.details.files[0].failure.?);
+                try std.testing.expectEqual(if (scenario == 1) @as(anyerror, error.ConnectionRefused) else error.Sha1Mismatch, result.details.files[0].failure.?);
                 if (scenario == 3) {
                     try std.testing.expectEqual(.verifying, result.details.stage);
                     try std.testing.expectEqual(@as(u64, bytes.len), result.details.received);
                 }
                 try std.testing.expectEqual(.failed, result.details.files[0].state);
+                try std.testing.expect(page.installer.core.job == null);
+                try std.testing.expectEqualDeep(result.details, page.installer.details());
+            }
+            if (scenario == 4) {
+                try std.testing.expectEqual(error.ProtectedPath, result.failure.?);
+                try std.testing.expectEqual(.extracting, result.details.stage);
+                try std.testing.expectEqual(.complete, result.details.files[0].state);
+                try std.testing.expectEqualStrings("assets", result.details.files[1].path());
+                try std.testing.expectEqual(error.ProtectedPath, result.details.files[1].failure.?);
+                try std.testing.expectEqualStrings("解压或检查整合包失败", @import("ui/pack_view.zig").failureStage(result.details.stage));
                 try std.testing.expect(page.installer.core.job == null);
                 try std.testing.expectEqualDeep(result.details, page.installer.details());
             }
@@ -147,7 +164,8 @@ test "local pack inspection shows failure and cancellation in the task modal and
         }
         page.installer.core.job.?.thread.?.join();
         page.installer.core.job.?.thread = null;
-        page.tick(services, true);
+        page.installer.tickWithMutations(services, true);
+        page.tickPresentation(services, true);
         const result = try page.presentation(arena.allocator());
         try std.testing.expectEqual(.local, page.ui.route);
         try std.testing.expect(page.ui.failure == null);

@@ -18,10 +18,13 @@ pub const HttpFunction = *const fn (?*anyopaque, Allocator, std.Io, http.Request
 pub const Adapter = struct {
     pub const Options = struct {
         http: http.Options = .{},
+        /// Public metadata and verified files. Copied by init; null disables caching.
+        cache_root: ?[]const u8 = null,
+        cache_mode: @import("http_cache_client.zig").Mode = .prefer_cache,
         /// Required for production downloads; fixture-only transports need no network budget.
         download_budget: ?*downloader.Budget = null,
         allow_curseforge: bool = false,
-        /// Worker-only secret, borrowed only until initWithOptions returns.
+        /// Worker-only secret, borrowed only until init returns.
         /// The adapter owns a private copy and securely erases it at deinit.
         curseforge_download_key: ?[]const u8 = null,
         /// Explicit test transport for metadata and downloads; never falls back to real HTTP.
@@ -40,6 +43,8 @@ pub const Adapter = struct {
     allow_curseforge: bool,
     curseforge_download_key: ?[]u8,
     client: http.Client,
+    cache_root: ?[]u8,
+    cache_mode: @import("http_cache_client.zig").Mode,
     fixture_http: ?HttpFunction,
     fixture_context: ?*anyopaque,
     approved_download_hosts: [][]const u8,
@@ -50,13 +55,8 @@ pub const Adapter = struct {
     transfer_base_received: u64 = 0,
     transfer_index: usize = 0,
 
-    pub fn init(a: Allocator, io: std.Io, cancel: ?*const CancelToken, connections: u16) !Adapter {
-        return initWithOptions(a, io, cancel, connections, .{});
-    }
-
-    pub fn initWithOptions(a: Allocator, io: std.Io, cancel: ?*const CancelToken, connections: u16, options: Options) !Adapter {
+    pub fn init(a: Allocator, io: std.Io, cancel: ?*const CancelToken, connections: u16, options: Options) !Adapter {
         if (connections == 0 or connections > 64) return error.InvalidConcurrency;
-        if (options.http.proxy) |proxy| if (proxy.len != 0) return error.UnsupportedProxyWithPublicAddressGuard;
         if (options.approved_download_hosts.len > 64) return error.TooManyHosts;
         const hosts = try a.alloc([]const u8, options.approved_download_hosts.len);
         errdefer a.free(hosts);
@@ -80,6 +80,8 @@ pub const Adapter = struct {
             std.crypto.secureZero(u8, owned);
             a.free(owned);
         };
+        const cache_root = if (options.cache_root) |root| try a.dupe(u8, root) else null;
+        errdefer if (cache_root) |root| a.free(root);
         return .{
             .allocator = a,
             .io = io,
@@ -89,6 +91,8 @@ pub const Adapter = struct {
             .allow_curseforge = options.allow_curseforge,
             .curseforge_download_key = key,
             .client = try http.Client.init(a, io, options.http),
+            .cache_root = cache_root,
+            .cache_mode = options.cache_mode,
             .fixture_http = options.fixture_http,
             .fixture_context = options.fixture_context,
             .approved_download_hosts = hosts,
@@ -99,6 +103,7 @@ pub const Adapter = struct {
         // Client's libcurl global reference outlives the streaming service.
         if (self.service) |service| service.deinit();
         self.client.deinit();
+        if (self.cache_root) |root| self.allocator.free(root);
         if (self.curseforge_download_key) |key| {
             std.crypto.secureZero(u8, key);
             self.allocator.free(key);
@@ -141,12 +146,29 @@ pub const Adapter = struct {
         var response = if (self.fixture_http) |execute|
             try execute(self.fixture_context, a, self.io, bounded)
         else
-            try self.client.execute(bounded);
+            try self.executeMetadata(bounded);
         defer response.deinit();
         try fs.cancelled(self.io, self.cancel, null);
         if (response.body.len > request.max_body_bytes) return error.ResponseTooLarge;
         if (response.status < 100 or response.status > 599) return error.InvalidHttpStatus;
         return .{ .status = response.status, .body = try a.dupe(u8, response.body) };
+    }
+
+    fn executeNetwork(context: ?*anyopaque, request: http.Request) !http.Response {
+        const self: *Adapter = @ptrCast(@alignCast(context.?));
+        return self.client.execute(request);
+    }
+    fn executeMetadata(self: *Adapter, request: http.Request) !http.Response {
+        const root = self.cache_root orelse return self.client.execute(request);
+        const cache: @import("http_cache_client.zig").Client = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .root = root,
+            .backend = .{ .context = self, .execute = executeNetwork },
+        };
+        // Authorization has already succeeded in get; credential header bytes
+        // enter only the cache key digest and never persistent metadata.
+        return cache.execute(request, self.cache_mode, "public-content");
     }
 
     /// Serial callback use on the owning worker. The downloader itself manages
@@ -182,9 +204,12 @@ pub const Adapter = struct {
             .output = .{ .file = request.absolute_path },
             .curseforge_download_key = self.downloadKey(request.url),
             .expected_sha1 = request.expected_sha1,
+            .expected_sha256 = request.expected_sha256,
+            .expected_sha512 = request.expected_sha512,
+            .artifact_cache_root = self.cache_root,
             .expected_size = request.expected_size,
             .max_bytes = std.math.cast(usize, request.max_bytes) orelse return error.BodyTooLarge,
-            .proxy = self.client.proxy,
+            .proxy_policy = &self.client.policy,
             .ca_bundle = self.client.ca_path,
             // Progress and cancellation remain user-controlled for large pack files.
             .timeout_ms = 0,
@@ -209,7 +234,7 @@ pub const Adapter = struct {
                 if (cancellation) |err| return err;
                 try self.checkFetch(io, request);
                 if (snapshot.failure) |err| return err;
-                if (snapshot.http_status < 200 or snapshot.http_status >= 300) return error.HttpStatus;
+                if (snapshot.source != .artifact and (snapshot.http_status < 200 or snapshot.http_status >= 300)) return error.HttpStatus;
                 return;
             }
             self.checkFetch(io, request) catch |err| {
@@ -270,6 +295,16 @@ pub const Adapter = struct {
             hash.final(&digest);
             if (!std.mem.eql(u8, &digest, &expected)) return error.Sha1Mismatch;
         }
+        if (request.expected_sha256) |expected| {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(response.body, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &expected)) return error.Sha256Mismatch;
+        }
+        if (request.expected_sha512) |expected| {
+            var digest: [64]u8 = undefined;
+            std.crypto.hash.sha2.Sha512.hash(response.body, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &expected)) return error.Sha512Mismatch;
+        }
         try file.sync(io);
         try fs.syncDir(request.directory, io);
         try self.checkFetch(io, request);
@@ -295,7 +330,11 @@ pub const Adapter = struct {
         row.bytes_per_second = speed;
         row.state = file_state;
         row.failure = failure;
-        self.transfer_details.stage = .downloading;
+        const integrity_failure = if (failure) |err| switch (err) {
+            error.Sha1Mismatch, error.Sha256Mismatch, error.Sha512Mismatch, error.SizeMismatch => true,
+            else => false,
+        } else false;
+        self.transfer_details.stage = if (integrity_failure or file_state == .verifying) .verifying else .downloading;
         self.transfer_details.received = self.transfer_base_received +| received;
         self.transfer_details.total_bytes = if (total) |limit| self.transfer_base_received +| limit else null;
         self.transfer_details.completed = self.transfer_details.received;
@@ -430,7 +469,8 @@ const ScopedFixture = struct {
         } else {
             try std.testing.expectEqual(@as(usize, 2), request.headers.len);
         }
-        return .{ .status = 200, .body = try a.dupe(u8, "{}"), .allocator = a };
+        const body = try a.dupe(u8, "{}");
+        return .{ .status = 200, .body = body, .allocator = a, .allocation = body };
     }
 };
 
@@ -445,7 +485,7 @@ fn scopedFixtureRequest() providers.Request {
 test "CF transport default admission denies an enabled client before HTTP" {
     const a = std.testing.allocator;
     var fixture: ScopedFixture = .{};
-    var adapter = try Adapter.initWithOptions(a, std.testing.io, null, 1, .{ .fixture_http = ScopedFixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, std.testing.io, null, 1, .{ .fixture_http = ScopedFixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     const transport = adapter.providerTransport();
     try std.testing.expectError(error.ProviderDisabled, transport.get(transport.context, a, scopedFixtureRequest()));
@@ -462,7 +502,7 @@ test "CF transport default admission denies an enabled client before HTTP" {
 test "CF transport explicit admission scopes headers to four bounded GET routes" {
     const a = std.testing.allocator;
     var fixture: ScopedFixture = .{ .max_bytes = 512, .timeout_ms = 1000 };
-    var adapter = try Adapter.initWithOptions(a, std.testing.io, null, 1, .{ .allow_curseforge = true, .fixture_http = ScopedFixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, std.testing.io, null, 1, .{ .allow_curseforge = true, .fixture_http = ScopedFixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     const transport = adapter.providerTransport();
     var request = scopedFixtureRequest();
@@ -488,7 +528,7 @@ test "CF transport explicit admission scopes headers to four bounded GET routes"
 test "CF transport rejects missing malformed and oversized credentials before HTTP" {
     const a = std.testing.allocator;
     var fixture: ScopedFixture = .{};
-    var adapter = try Adapter.initWithOptions(a, std.testing.io, null, 1, .{ .allow_curseforge = true, .fixture_http = ScopedFixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, std.testing.io, null, 1, .{ .allow_curseforge = true, .fixture_http = ScopedFixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     const transport = adapter.providerTransport();
     var request = scopedFixtureRequest();
@@ -509,7 +549,7 @@ test "CF transport rejects missing malformed and oversized credentials before HT
 test "CF transport rejects credential origin leaks and ambiguous numeric routes before HTTP" {
     const a = std.testing.allocator;
     var fixture: ScopedFixture = .{};
-    var adapter = try Adapter.initWithOptions(a, std.testing.io, null, 1, .{ .allow_curseforge = true, .fixture_http = ScopedFixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, std.testing.io, null, 1, .{ .allow_curseforge = true, .fixture_http = ScopedFixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     const transport = adapter.providerTransport();
     var request = scopedFixtureRequest();
@@ -548,7 +588,7 @@ test "CF transport enforces redirects bounds and cancellation before HTTP buffer
     const a = std.testing.allocator;
     var cancel: CancelToken = .init(false);
     var fixture: ScopedFixture = .{};
-    var adapter = try Adapter.initWithOptions(a, std.testing.io, &cancel, 1, .{ .allow_curseforge = true, .fixture_http = ScopedFixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, std.testing.io, &cancel, 1, .{ .allow_curseforge = true, .fixture_http = ScopedFixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     const transport = adapter.providerTransport();
     var request = scopedFixtureRequest();
@@ -629,7 +669,7 @@ const Fixture = struct {
         const owner = self.response_allocator orelse a;
         const body = try owner.dupe(u8, self.body);
         if (self.cancel_after) |cancel| cancel.store(true, .release);
-        return .{ .allocator = owner, .status = self.status, .body = body };
+        return .{ .allocator = owner, .status = self.status, .body = body, .allocation = body };
     }
 };
 
@@ -637,7 +677,7 @@ test "fixture metadata retains ownership cancellation status and bounds" {
     const a = std.testing.allocator;
     var fixture: Fixture = .{};
     var cancel: CancelToken = .init(false);
-    var adapter = try Adapter.initWithOptions(a, std.testing.io, &cancel, 4, .{ .fixture_http = Fixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, std.testing.io, &cancel, 4, .{ .fixture_http = Fixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     const transport = adapter.providerTransport();
     const request: providers.Request = .{ .url = "https://api.modrinth.com/v2/search", .user_agent = "untrusted caller value" };
@@ -660,12 +700,13 @@ test "fixture metadata retains ownership cancellation status and bounds" {
 
 test "initialization rejects unsafe concurrency and unapproved download targets" {
     const a = std.testing.allocator;
-    try std.testing.expectError(error.InvalidConcurrency, Adapter.init(a, std.testing.io, null, 0));
-    try std.testing.expectError(error.InvalidConcurrency, Adapter.init(a, std.testing.io, null, 65));
-    try std.testing.expectError(error.UnsupportedProxyWithPublicAddressGuard, Adapter.initWithOptions(a, std.testing.io, null, 1, .{ .http = .{ .proxy = "https://proxy.example" } }));
-    try std.testing.expectError(error.InvalidDownloadHost, Adapter.initWithOptions(a, std.testing.io, null, 1, .{ .approved_download_hosts = &.{"127.0.0.1"} }));
-    try std.testing.expectError(error.InvalidDownloadHost, Adapter.initWithOptions(a, std.testing.io, null, 1, .{ .approved_download_hosts = &.{"cdn.modrinth.com/path"} }));
-    var adapter = try Adapter.init(a, std.testing.io, null, 64);
+    try std.testing.expectError(error.InvalidConcurrency, Adapter.init(a, std.testing.io, null, 0, .{}));
+    try std.testing.expectError(error.InvalidConcurrency, Adapter.init(a, std.testing.io, null, 65, .{}));
+    var proxied = try Adapter.init(a, std.testing.io, null, 1, .{ .http = .{ .proxy = "https://proxy.example" } });
+    defer proxied.deinit();
+    try std.testing.expectError(error.InvalidDownloadHost, Adapter.init(a, std.testing.io, null, 1, .{ .approved_download_hosts = &.{"127.0.0.1"} }));
+    try std.testing.expectError(error.InvalidDownloadHost, Adapter.init(a, std.testing.io, null, 1, .{ .approved_download_hosts = &.{"cdn.modrinth.com/path"} }));
+    var adapter = try Adapter.init(a, std.testing.io, null, 64, .{});
     defer adapter.deinit();
     try std.testing.expect(adapter.approvedUrl("https://cdn.modrinth.com/data/file.jar"));
     for ([_][]const u8{
@@ -683,7 +724,7 @@ test "fetcher rejects unsafe targets and cancellation before staging or HTTP" {
     const a = std.testing.allocator;
     var fixture: Fixture = .{};
     var cancel: CancelToken = .init(false);
-    var adapter = try Adapter.initWithOptions(a, std.testing.io, &cancel, 1, .{ .fixture_http = Fixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, std.testing.io, &cancel, 1, .{ .fixture_http = Fixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -725,7 +766,7 @@ test "fixture response allocator and cancellation after HTTP are independent" {
     const a = std.testing.allocator;
     var cancel: CancelToken = .init(false);
     var fixture: Fixture = .{ .response_allocator = a };
-    var adapter = try Adapter.initWithOptions(a, std.testing.io, &cancel, 1, .{ .fixture_http = Fixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, std.testing.io, &cancel, 1, .{ .fixture_http = Fixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -768,7 +809,7 @@ const DownloadFixture = struct {
         const owner = self.response_allocator orelse a;
         const body = try owner.dupe(u8, self.body);
         if (self.cancel_after) |cancel| cancel.store(true, .release);
-        return .{ .allocator = owner, .status = self.status, .body = body };
+        return .{ .allocator = owner, .status = self.status, .body = body, .allocation = body };
     }
 };
 
@@ -789,7 +830,7 @@ test "explicit fixture CDN fetch is unkeyed bounded verified and never creates a
     defer a.free(payload);
     @memset(payload, 0x7b);
     var fixture: DownloadFixture = .{ .body = payload, .expected_limit = payload.len, .response_allocator = std.heap.page_allocator };
-    var adapter = try Adapter.initWithOptions(a, io, null, 4, .{ .allow_curseforge = true, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = DownloadFixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, io, null, 4, .{ .allow_curseforge = true, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = DownloadFixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     const fetch = adapter.fetcher();
     var request = fixtureDownloadRequest(tmp.dir, absolute);
@@ -822,7 +863,7 @@ test "fixture CDN status size hash and callback failures cannot fall through or 
     const absolute = try std.fs.path.join(a, &.{ root, "download.bin" });
     defer a.free(absolute);
     var fixture: DownloadFixture = .{};
-    var adapter = try Adapter.initWithOptions(a, io, null, 1, .{ .allow_curseforge = true, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = DownloadFixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, io, null, 1, .{ .allow_curseforge = true, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = DownloadFixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     const fetch = adapter.fetcher();
     const Case = struct { status: u16 = 200, max: usize = 64, size: ?u64 = null, sha1: ?[20]u8 = null, failure: ?anyerror = null, expected: anyerror };
@@ -867,7 +908,7 @@ test "fixture CDN policy bounds deadline and cancellation checks run before and 
     var cancel: CancelToken = .init(false);
     var request_cancel: CancelToken = .init(false);
     var fixture: DownloadFixture = .{ .expected_cancel = &request_cancel };
-    var adapter = try Adapter.initWithOptions(a, io, &cancel, 1, .{ .allow_curseforge = true, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = DownloadFixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, io, &cancel, 1, .{ .allow_curseforge = true, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = DownloadFixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     const fetch = adapter.fetcher();
     var request = fixtureDownloadRequest(tmp.dir, absolute);
@@ -912,10 +953,49 @@ test "fixture CDN policy bounds deadline and cancellation checks run before and 
     try std.testing.expect((try fs.inspectEntry(tmp.dir, io, "download.bin")) == null);
 }
 
+test "production content adapter reuses verified archives without network or fixture transport" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const cache = @import("artifact_cache.zig");
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const source = try std.fs.path.join(a, &.{ root, "source" });
+    defer a.free(source);
+    const target = try std.fs.path.join(a, &.{ root, "download.bin" });
+    defer a.free(target);
+    const payload = "verified pack archive fixture";
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = payload });
+    var digest: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(payload, &digest, .{});
+    const hashes: cache.Hashes = .{ .sha512 = digest };
+    const cached = (try hashes.path(a, root)).?;
+    defer a.free(cached);
+    try cache.publish(a, io, source, cached, hashes, payload.len, 4096);
+    try tmp.dir.deleteFile(io, "source");
+    var budget = try downloader.Budget.init(io, 1);
+    defer budget.deinit();
+    // Any accidental network fallback fails at a local closed proxy.
+    var adapter = try Adapter.init(a, io, null, 1, .{ .cache_root = root, .download_budget = &budget, .http = .{ .proxy = "http://127.0.0.1:1" } });
+    defer adapter.deinit();
+    const fetch = adapter.fetcher();
+    const request: install.FetchRequest = .{ .url = "https://cdn.modrinth.com/cache-fixture.mrpack", .directory = tmp.dir, .name = "download.bin", .absolute_path = target, .expected_sha1 = null, .expected_sha512 = digest, .expected_size = payload.len, .max_bytes = 4096, .deadline_ns = null, .cancel = null };
+    for (0..2) |_| {
+        try fetch.fetchToFile(fetch.context, io, request);
+        const bytes = try tmp.dir.readFileAlloc(io, "download.bin", a, .limited(4096));
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(payload, bytes);
+        try tmp.dir.deleteFile(io, "download.bin");
+    }
+    try std.testing.expect(adapter.fixture_http == null);
+    try std.testing.expect(adapter.service != null);
+}
+
 test "fixture CDN injection cannot authorize disabled keyed CF metadata" {
     const a = std.testing.allocator;
     var fixture: DownloadFixture = .{};
-    var adapter = try Adapter.initWithOptions(a, std.testing.io, null, 1, .{ .allow_curseforge = false, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = DownloadFixture.execute, .fixture_context = &fixture });
+    var adapter = try Adapter.init(a, std.testing.io, null, 1, .{ .allow_curseforge = false, .approved_download_hosts = &.{"edge.forgecdn.net"}, .fixture_http = DownloadFixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     const metadata = adapter.providerTransport();
     const request: providers.Request = .{ .url = "https://api.curseforge.com/v1/mods/12/files/34", .user_agent = user_agent, .credential_header = .{ .name = "x-api-key", .value = "fixture-key" } };

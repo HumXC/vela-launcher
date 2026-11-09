@@ -70,6 +70,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with self.server.count_lock:
                 body = json.dumps(dict(self.server.counts)).encode()
             self.reply(200, body, {"Content-Type": "application/json"})
+        elif path.startswith("/retry/"):
+            with self.server.count_lock:
+                attempt = self.server.counts[path]
+            if path == "/retry/not-found":
+                self.reply(404)
+            elif path == "/retry/exhaust" or path == "/retry/cancel":
+                self.reply(503, headers={"Retry-After": "1"})
+            elif path == "/retry/deadline":
+                self.reply(429, headers={"Retry-After": "30"})
+            elif path == "/retry/partial" and attempt == 1:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(BODY)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(BODY[:4])
+                self.wfile.flush()
+                self.close_connection = True
+            elif path == "/retry/recover" and attempt <= 2:
+                self.reply(503)
+            else:
+                self.reply(200, BODY)
         elif path in ("/bytes", "/instance-client/jar"):
             self.reply(200, BODY)
         elif path == "/instance-client/index":
@@ -98,6 +119,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             time.sleep(4)
             self.wfile.write(b"x")
             self.close_connection = True
+        elif path in ("/fresh", "/no-cache", "/aged"):
+            headers = {"ETag": ETAG, "Vary": "Accept-Encoding", "Cache-Control": "max-age=3600"}
+            if path == "/no-cache":
+                headers["Cache-Control"] = "no-cache, max-age=3600"
+            if path == "/aged":
+                headers["Age"] = "3600"
+            if self.headers.get("If-None-Match") == ETAG:
+                self.reply(304, headers=headers)
+            else:
+                self.reply(200, JSON_BODY, headers)
         elif path == "/etag":
             if self.headers.get("If-None-Match") == ETAG:
                 self.reply(304, headers={"ETag": ETAG})

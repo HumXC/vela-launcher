@@ -3,35 +3,35 @@ const dvui = @import("dvui");
 const state = @import("model.zig");
 const theme = @import("theme.zig");
 const components = @import("components.zig");
-const games = @import("game_library.zig");
+const games = @import("../application/game_library.zig");
 const game_selection_view = @import("game_selection_view.zig");
 const tools = @import("tools_view.zig");
-const java = @import("java_manager.zig");
+const java = @import("../application/java_manager.zig");
 const java_view = @import("java_view.zig");
-const launch = @import("game_launch.zig");
+const launch = @import("../application/game_launch.zig");
 const launch_instance = @import("../application/launch_instance.zig");
 const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
 const task_registry = @import("../core/tasks.zig");
 const settings_view = @import("settings_view.zig");
 const appearance_view = @import("appearance_view.zig");
-const cf_credentials_controller = @import("curseforge_credentials_controller.zig");
-const java_download_controller = @import("java_download_controller.zig");
+const cf_credentials_controller = @import("../application/curseforge_credentials_controller.zig");
+const java_download_controller = @import("../application/java_download_controller.zig");
 const java_download_view = @import("java_download_view.zig");
 const avatar_manager = @import("avatar_manager.zig");
 const avatar_image = @import("avatar_image.zig");
-const server_manager = @import("server_manager.zig");
+const server_manager = @import("../application/server_manager.zig");
 const servers_view = @import("servers_view.zig");
 const logs_view = @import("logs_view.zig");
-const worlds_manager = @import("worlds_manager.zig");
+const worlds_manager = @import("../application/worlds_manager.zig");
 const worlds_view = @import("worlds_view.zig");
-const accounts_manager = @import("accounts_manager.zig");
+const accounts_manager = @import("../application/accounts_manager.zig");
 const accounts_view = @import("accounts_view.zig");
-const instances_manager = @import("instances_manager.zig");
+const instances_manager = @import("../application/instances_manager.zig");
 const instances_view = @import("instances_view.zig");
-const content_manager = @import("content_manager.zig");
-const instance_creation_controller = @import("instance_creation_controller.zig");
-const mods_controller = @import("mods_controller.zig");
+const content_manager = @import("../application/content_manager.zig");
+const instance_creation_controller = @import("../application/instance_creation_controller.zig");
+const mods_controller = @import("../application/mods_controller.zig");
 const mods_view = @import("mods_view.zig");
 const mods_page = @import("mods_page.zig");
 
@@ -249,7 +249,6 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
     theme.applyTypography();
     const canvas_bounds = dvui.parentGet().data().contentRect();
     appearance_view.drawBackground(services.appearance, services.configuration, canvas_bounds);
-    if (services.mods) |controller| if (services.content) |backend| controller.tick(backend);
     discardInactivePickers(model, java_ui, services);
     if (services.allow_mutations) services.worlds_ui.setPageActive(model.panel == .worlds);
     const snapshot = library.snapshot();
@@ -423,7 +422,7 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
         if (command) |cmd| {
             model.library_error = null;
             switch (cmd) {
-                .load => library.loadCatalogue() catch |err| {
+                .load => library.refreshCatalogue() catch |err| {
                     model.library_error = err;
                     if (services.instances_ui) |ui| ui.failure = err;
                 },
@@ -438,17 +437,18 @@ pub fn draw(model: *state.Model, library: *games.Controller, manager: *java.Mana
     // A start intent above can acquire the launch lease in this same frame.
     const java_blocked = gates.java or launchPinsJava(launcher.snapshot().phase) or if (services.instances) |instance_manager| instance_manager.isBusy() else false;
     if (!java_blocked) java_view.finish(java_ui, manager) else discardJavaIntents(java_ui, services.java_download_ui);
-    if (model.panel != .more or model.category != .settings) services.settings.clearKey();
+    const leaving_settings = model.panel != .more or model.category != .settings;
+    if (leaving_settings) services.settings.flush();
     if (services.allow_mutations) {
         if (services.cf_credentials) |controller| {
             settings_view.finishWithCredentials(services.settings, services.configuration, controller, gates.content or if (services.content) |content_service| content_service.isBusy() else false);
         } else if (services.cf_credentials_failure != null) {
             settings_view.finishUnavailable(services.settings, services.configuration);
-        } else if (!gates.content) settings_view.finish(services.settings, services.configuration) else {
-            services.settings.pending = null;
-            services.settings.clearKey();
-        }
+        } else if (gates.content) {
+            settings_view.finishUnavailable(services.settings, services.configuration);
+        } else settings_view.finish(services.settings, services.configuration);
     }
+    if (leaving_settings) services.settings.clearSecrets();
     if (!gates.content) {
         if (services.content) |content_service| {
             const credential_lease = if (services.cf_credentials) |controller| controller.lease() else services.cf_credentials_failure != null;

@@ -1,8 +1,9 @@
 //! Controlled native process, not a JVM. Only exact Java probe forms or the
 //! fixture main class are admitted; game Ready cannot be emitted by a probe.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
-const Case = enum { restore, close_preparing, close_running, debug, abnormal, exit_together, idle_keep, idle_wait, idle_cancel, ordinary_destroy };
+const Case = enum { restore, close_preparing, close_running, debug, abnormal, exit_together, idle_keep, idle_auxiliary, idle_cancel, ordinary_destroy };
 
 fn required(env: *const std.process.Environ.Map, key: []const u8) ![]const u8 {
     const value = env.get(key) orelse return error.MissingOwnedEnvironment;

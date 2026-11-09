@@ -34,6 +34,16 @@ pub fn build(b: *std.Build) void {
     @import("build-support/sdl_software.zig").apply(b, dvui);
     @import("build-support/webp.zig").link(b, target, optimize, dvui);
     const core = dependencies.Core.init(b, target, optimize);
+    const server_probe = b.addExecutable(.{ .name = "vela-server-probe", .root_module = core.createModule(b.path("src/server_probe.zig")) });
+    const server_probe_run = b.addRunArtifact(server_probe);
+    server_probe_run.addPassthruArgs();
+    b.step("probe-server", "Query explicit Java server host/port pairs without reading configuration").dependOn(&server_probe_run.step);
+    const cache_hash_tests = b.addTest(.{ .root_module = core.cache_hash });
+    b.step("test-cache-hash", "Test optimized digest kernels against standard SHA").dependOn(&b.addRunArtifact(cache_hash_tests).step);
+    const cache_benchmark = b.addExecutable(.{ .name = "vela-cache-benchmark", .root_module = core.createModule(b.path("src/cache_benchmark.zig")) });
+    const cache_benchmark_run = b.addRunArtifact(cache_benchmark);
+    cache_benchmark_run.addArg(b.option([]const u8, "cache-bench-dir", "Fresh temporary directory for cache benchmark") orelse "/tmp/vela-cache-benchmark");
+    b.step("bench-cache", "Benchmark local cache hashing and verified copying").dependOn(&cache_benchmark_run.step);
     const curl_dep = core.curl_dep;
     const nbt_dep = core.nbt_dep;
     const nbt_module = nbt_dep.module("nbt");
@@ -43,7 +53,7 @@ pub fn build(b: *std.Build) void {
         dependencies.disableWindowsTranslationFortify(dvui_dep.module("sdl3").import_table.get("sdl3-c").?);
         dependencies.disableWindowsTranslationFortify(dvui.import_table.get("dvui-c").?);
     }
-    const app_modules: dependencies.App = .{ .core = core, .dvui = dvui, .clap = b.dependency("clap", .{}).module("clap"), .sdk = sdk };
+    const app_modules: dependencies.App = .{ .core = core, .dvui = dvui, .sdk = sdk };
     const app_mod = app_modules.createModule(b.path("src/app.zig"));
     if (sdk) |root| macos_sdk.apply(b, app_mod, root);
     const exe = b.addExecutable(.{ .name = "vela", .root_module = app_mod });
@@ -165,6 +175,9 @@ pub fn build(b: *std.Build) void {
     mods_tests.root_module.addImport("test_allocations", test_allocations);
     const mods_run = runTestWithFixture(b, java_process_fixture_install, mods_tests);
     b.step("test-mods", "Test local inventory and mod view/controller").dependOn(&mods_run.step);
+    const webp_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/core/webp_decode.zig"), .target = target, .optimize = optimize, .link_libc = true }) });
+    @import("build-support/webp.zig").link(b, target, optimize, webp_tests.root_module);
+    b.step("test-webp", "Test concurrent cold-start WebP decoding").dependOn(&b.addRunArtifact(webp_tests).step);
     const app_test_filter = b.option([]const u8, "test-filter", "Run a focused application test group");
     const app_tests = b.addTest(.{ .root_module = app_modules.createModule(b.path("src/app.zig")), .name = "test-app", .filters = if (app_test_filter) |filter| &.{filter} else &.{} });
     const app_test_run = runTestWithFixture(b, java_process_fixture_install, app_tests);
@@ -235,6 +248,13 @@ pub fn build(b: *std.Build) void {
         .root_module = app_modules.createModule(b.path("src/instances_manager_tests.zig")),
     });
     b.step("test-instances-manager", "Test instance manager with production adapters").dependOn(&runTestWithFixture(b, java_process_fixture_install, instances_manager_tests).step);
+    const diagnostic_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/core/diagnostic_log.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    b.step("test-diagnostic-log", "Test persistent launcher diagnostics and redaction").dependOn(&b.addRunArtifact(diagnostic_tests).step);
     const safe_archive_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/core/safe_archive_test.zig"),
         .target = target,
@@ -320,6 +340,7 @@ pub fn build(b: *std.Build) void {
     const http_run = runTestWithFixture(b, java_process_fixture_install, http_tests);
     http_run.has_side_effects = true;
     b.step("test-http-transport", "Test secure HTTP transport against local fixtures").dependOn(&http_run.step);
+    const proxy_tests = b.addTest(.{ .root_module = core.createModule(b.path("src/proxy_tests.zig")), .filters = &.{"proxy"} });
     const content_install_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/core/content_install_test.zig"),
         .target = target,
@@ -434,6 +455,7 @@ pub fn build(b: *std.Build) void {
         worlds_directory_tests,
         downloader_tests,
         http_tests,
+        proxy_tests,
         content_install_tests,
         pack_inspection_tests,
         cf_credentials_tests,
@@ -447,12 +469,20 @@ pub fn build(b: *std.Build) void {
         pack_source_tests,
         pack_download_auth_tests,
         gui_fixture_tests,
-    }) |test_compile| test_compile.root_module.addImport("test_allocations", test_allocations);
+        diagnostic_tests,
+    }) |test_compile| {
+        test_compile.root_module.addImport("test_allocations", test_allocations);
+        test_compile.root_module.addImport("cache_hash", core.cache_hash);
+        test_compile.root_module.linkLibrary(core.server_icon_native);
+        dependencies.linkNetworkPlatform(test_compile.root_module, target);
+    }
     const suites = @import("build-support/test_suites.zig");
     const download_fixture = suites.pythonFixture(b, python, "scripts/test-downloader.py", downloader_tests, java_process_fixture_install);
     b.step("test-downloader-fixture", "Run downloader tests with local HTTP fixtures").dependOn(&download_fixture.step);
     const http_fixture = suites.pythonFixture(b, python, "scripts/test-http-transport.py", http_tests, java_process_fixture_install);
     b.step("test-http-fixture", "Run HTTP tests with local fixtures").dependOn(&http_fixture.step);
+    const proxy_fixture = suites.pythonFixture(b, python, "scripts/test-proxy.py", proxy_tests, java_process_fixture_install);
+    b.step("test-proxy-fixture", "Verify authenticated HTTP and SOCKS5 HTTPS proxy transfers").dependOn(&proxy_fixture.step);
     const guard_fixture = suites.pythonFixture(b, python, "scripts/test-public-network.py", http_tests, java_process_fixture_install);
     guard_fixture.step.dependOn(&http_fixture.step);
     b.step("test-public-network", "Verify forbidden IPv4/IPv6 connections and connection reuse").dependOn(&guard_fixture.step);

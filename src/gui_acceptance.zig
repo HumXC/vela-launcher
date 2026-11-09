@@ -15,28 +15,28 @@ const servers_core = @import("core/servers.zig");
 const java_backend = @import("core/java_download.zig");
 const nbt = @import("nbt");
 const compression = @import("nbt_compression");
-const games = @import("ui/game_library.zig");
+const games = @import("application/game_library.zig");
 const logs = @import("core/logs.zig");
-const java = @import("ui/java_manager.zig");
+const java = @import("application/java_manager.zig");
 const java_view = @import("ui/java_view.zig");
-const game_launch = @import("ui/game_launch.zig");
+const game_launch = @import("application/game_launch.zig");
 const settings_view = @import("ui/settings_view.zig");
 const appearance_view = @import("ui/appearance_view.zig");
-const java_download = @import("ui/java_download_controller.zig");
+const java_download = @import("application/java_download_controller.zig");
 const java_download_view = @import("ui/java_download_view.zig");
-const server_manager = @import("ui/server_manager.zig");
+const server_manager = @import("application/server_manager.zig");
 const servers_view = @import("ui/servers_view.zig");
 const logs_view = @import("ui/logs_view.zig");
-const worlds_manager = @import("ui/worlds_manager.zig");
+const worlds_manager = @import("application/worlds_manager.zig");
 const worlds_view = @import("ui/worlds_view.zig");
-const instances_manager = @import("ui/instances_manager.zig");
+const instances_manager = @import("application/instances_manager.zig");
 const instances_view = @import("ui/instances_view.zig");
-const content_manager = @import("ui/content_manager.zig");
-const mods_controller = @import("ui/mods_controller.zig");
+const content_manager = @import("application/content_manager.zig");
+const mods_controller = @import("application/mods_controller.zig");
 const mods_view = @import("ui/mods_view.zig");
 const resource_fixture = @import("ui/resource_download_fixture.zig");
 const resource_navigation = @import("ui/resource_navigation_fixture.zig");
-const accounts_manager = @import("ui/accounts_manager.zig");
+const accounts_manager = @import("application/accounts_manager.zig");
 const accounts_view = @import("ui/accounts_view.zig");
 const instance_leases = @import("core/instance_leases.zig");
 const instance_tx = @import("core/instance_transactions.zig");
@@ -45,7 +45,7 @@ const http = @import("core/http_transport.zig");
 const auth = @import("core/auth.zig");
 const credentials = @import("core/credentials.zig");
 const shutdown_view = @import("ui/shutdown_view.zig");
-const creation_controller = @import("ui/instance_creation_controller.zig");
+const creation_controller = @import("application/instance_creation_controller.zig");
 const instance_fixture = @import("gui_instance_fixture.zig");
 fn javaProgressDetails(stage: tasks.Stage, known_total: bool) tasks.Details {
     const received = 10 * 1024 * 1024;
@@ -225,11 +225,8 @@ pub fn frame() !dvui.App.Result {
     try f.writeLogsReceipt();
     try f.writeResourceReceipt();
     if (f.shutdown_prompt) {
-        if (shutdown_view.draw(activeFixtureTasks(&f.registry))) |choice| switch (choice) {
+        if (shutdown_view.draw(fixtureShutdownSummary(&f.registry))) |choice| switch (choice) {
             .keep_open => f.shutdown_prompt = false,
-            .wait => {
-                if (!f.registry.hasActive()) f.shutdown_prompt = false;
-            },
             .cancel_and_quit => {
                 for (f.registry.tasks()) |task| if (task.id <= f.fixture_task_last_id) {
                     _ = f.registry.cancel(task.id);
@@ -245,7 +242,7 @@ pub fn frame() !dvui.App.Result {
     return .ok;
 }
 
-const cf_credentials_controller = @import("ui/curseforge_credentials_controller.zig");
+const cf_credentials_controller = @import("application/curseforge_credentials_controller.zig");
 
 const FixtureVault = struct {
     const Slot = struct {
@@ -599,6 +596,7 @@ const Fixture = struct {
         f.creation_core.tick(f.creationServices());
         f.ticks.creation_core += 1;
         f.content.tick();
+        f.mods.tick(&f.content);
         f.ticks.content += 1;
         f.cf_credentials.tick(&f.configuration);
         try f.download_budget.setLimit(f.configuration.snapshot().settings.download_connections);
@@ -974,7 +972,7 @@ fn seedConfiguration(store: *config.Store) !void {
             .{ .id = "fixture-copy", .name = "fixture-copy", .minecraft_version = "1.21.4" },
         },
         .servers = &.{
-            .{ .id = "fixture-server-one", .name = "Fixture Survival", .address = "survival.fixture.invalid", .instance_id = "fixture-primary", .show_on_home = true },
+            .{ .id = "fixture-server-one", .name = "Fixture Survival", .address = "survival.fixture.invalid", .instance_id = "fixture-primary" },
             .{ .id = "fixture-server-two", .name = "Fixture Creative", .address = "creative.fixture.invalid", .instance_id = "fixture-primary" },
             .{ .id = "fixture-server-three", .name = "Fixture Minigames", .address = "minigames.fixture.invalid", .port = 25566, .instance_id = "fixture-copy" },
         },
@@ -1090,13 +1088,26 @@ fn instanceFingerprint(doc: *const config.Document) u64 {
     return hash.final();
 }
 
-fn activeFixtureTasks(registry: *const tasks.Registry) usize {
-    var count: usize = 0;
-    for (registry.tasks()) |task| switch (task.state) {
-        .queued, .running, .canceling => count += 1,
-        .canceled, .succeeded, .failed => {},
-    };
-    return count;
+fn fixtureShutdownSummary(registry: *const tasks.Registry) @import("core/shutdown.zig").Summary {
+    var summary: @import("core/shutdown.zig").Summary = .{};
+    for (registry.tasks()) |task| {
+        switch (task.state) {
+            .queued, .running, .canceling => {},
+            .canceled, .succeeded, .failed => continue,
+        }
+        switch (task.kind) {
+            .game_install => summary.add(.instance_install),
+            .java_download => summary.add(.java_install),
+            .mod_install => summary.add(.mod_install),
+            .modpack_install => summary.add(.pack_install),
+            .modpack_update => summary.add(.pack_update),
+            .save_backup => summary.add(.save_backup),
+            .save_copy => summary.add(.save_copy),
+            .save_restore => summary.add(.save_restore),
+            .java_scan, .credential_update => {},
+        }
+    }
+    return summary;
 }
 
 fn seedTasks(a: std.mem.Allocator, registry: *tasks.Registry) !void {
@@ -1240,7 +1251,7 @@ test "fixture Alt-F4 requests ordinary close only on modified key down" {
 }
 
 test "synthetic owned Java passes actual storage gate and is never reseeded after hide forget or delete" {
-    const owned_storage = @import("ui/java_owned_storage.zig");
+    const owned_storage = @import("application/java_owned_storage.zig");
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2337,10 +2348,8 @@ test "prepared genuine owner rejects root id name generation loader environment 
     checkpoint = .missing_probes;
     try std.testing.expectError(error.FixtureMissingJavaProbe, instance_fixture.validateRequest(&f.instance_data, a, io, request, .{ .cancel = &cancel }));
     const runner = f.instance_data.runner();
-    const selected_runtime = f.java_manager.resolve(target.instance_name, 17) orelse return error.FixtureMissingRuntime;
-    const installer_key = try std.fmt.allocPrint(a, "{s}:installer", .{target.instance_id});
-    defer a.free(installer_key);
-    const selected_installer = f.java_manager.resolve(installer_key, 8) orelse return error.FixtureMissingInstaller;
+    const selected_runtime = f.java_manager.resolve(17) orelse return error.FixtureMissingRuntime;
+    const selected_installer = f.java_manager.resolve(8) orelse return error.FixtureMissingInstaller;
     try std.testing.expectEqualStrings(data.java17_path, selected_runtime.path);
     try std.testing.expectEqualStrings(data.java8_path, selected_installer.path);
     checkpoint = .runtime_probe;

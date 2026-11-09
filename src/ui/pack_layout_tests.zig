@@ -151,3 +151,32 @@ test "pack detail retains its icon and version selector during archive preparati
     try std.testing.expect(dvui.tagGet("pack-import") == null);
     try std.testing.expect(dvui.tagGet("pack-project-link") != null);
 }
+
+test "pack catalog only queues icons intersecting the viewport" {
+    var ui = view.Ui.init(std.testing.allocator);
+    defer ui.deinit();
+    ui.icon_cache = @import("resource_icons.zig").Manager.init(std.testing.allocator, std.testing.io);
+    var owner = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer owner.deinit();
+    var projects: [40]providers.Project = undefined;
+    for (&projects, 0..) |*project, i| project.* = .{
+        .provider = .modrinth,
+        .id = try std.fmt.allocPrint(owner.allocator(), "pack-{d}", .{i}),
+        .name = "Visible catalog fixture",
+        .summary = "An ordinary pack description that reserves enough card height to scroll.",
+        .official_page = "https://modrinth.com/modpack/example",
+        .icon_url = try std.fmt.allocPrint(owner.allocator(), "https://cdn.modrinth.com/{d}.png", .{i}),
+    };
+    try ui.acceptCatalog(&projects, projects.len);
+    Frame.ui = &ui;
+    Frame.state = .{};
+    Frame.allowed = true;
+    var window = try dvui.testing.init(.{ .window_size = .{ .w = 800, .h = 640 } });
+    defer window.deinit();
+    window.backend.size_pixels = .{ .w = 800, .h = 640 };
+    theme.install(dvui.currentWindow());
+    theme.applyTypography();
+    try dvui.testing.settle(Frame.draw);
+    try std.testing.expect(ui.icon_cache.?.entries.items.len > 0);
+    try std.testing.expect(ui.icon_cache.?.entries.items.len < projects.len);
+}

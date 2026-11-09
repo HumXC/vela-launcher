@@ -1,6 +1,6 @@
 //! Owned task presentation state; no frame-local manager strings survive synchronization.
 const std = @import("std");
-const manager = @import("instances_manager.zig");
+const manager = @import("../application/instances_manager.zig");
 const tasks = @import("../core/tasks.zig");
 
 pub const State = struct {

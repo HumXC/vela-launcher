@@ -7,13 +7,13 @@ const config = @import("core/config.zig");
 const instances = @import("core/instances.zig");
 const tree = @import("core/worlds_tree.zig");
 const worlds = @import("core/worlds.zig");
-const world_manager = @import("ui/worlds_manager.zig");
-const accounts = @import("ui/accounts_manager.zig");
+const world_manager = @import("application/worlds_manager.zig");
+const accounts = @import("application/accounts_manager.zig");
 const auth = @import("core/auth.zig");
 const credentials = @import("core/credentials.zig");
 const http = @import("core/http_transport.zig");
-const content = @import("ui/content_manager.zig");
-const java_download = @import("ui/java_download_controller.zig");
+const content = @import("application/content_manager.zig");
+const java_download = @import("application/java_download_controller.zig");
 const java_backend = @import("core/java_download.zig");
 const servers = @import("core/servers.zig");
 const lifecycle = @import("core/lifecycle.zig");
@@ -25,7 +25,7 @@ pub const dvui_app = app.dvui_app;
 pub const panic = app.panic;
 pub const std_options = app.std_options;
 pub const vela_lifecycle_acceptance = @This();
-pub const Case = enum { restore, close_preparing, close_running, debug, abnormal, exit_together, idle_keep, idle_wait, idle_cancel, ordinary_destroy };
+pub const Case = enum { restore, close_preparing, close_running, debug, abnormal, exit_together, idle_keep, idle_auxiliary, idle_cancel, ordinary_destroy };
 
 const State = struct {
     allocator: A,
@@ -223,7 +223,8 @@ fn released(s: *State, io: Io, name: []const u8) !bool {
 /// Real borrowed-scope local listing. The owned fixture has no icons or mutations.
 /// The hold owns its output until cleanup returns; Manager owns JOIN/publication.
 pub fn worldWorker(a: A, io: Io, paths: *const instances.Paths, instance: config.Instance, request: ?world_manager.Request, options: worlds.Options) !world_manager.Result {
-    if (request != null) return error.LifecycleMutationDenied;
+    if (request) |operation| if (operation != .backup or !std.mem.eql(u8, operation.backup, "Lifecycle")) return error.LifecycleMutationDenied;
+    // The important-operation fixture holds a backup request without writing files.
     const held = options.held_scope orelse return error.MissingWorldScope;
     try held.recheck();
     var result: world_manager.Result = .{};
@@ -264,7 +265,9 @@ pub fn beforeFrame(launcher: anytype, manager: *world_manager.Manager, configura
         .none => return error.InvalidLifecycleCommand,
         .arm_world => {
             if (s.armed.swap(true, .acq_rel)) return error.LifecycleAlreadyArmed;
-            if (manager.snapshot().instance == null) {
+            if (s.case == .idle_keep or s.case == .idle_cancel or s.case == .exit_together) {
+                try manager.perform(.{ .backup = "Lifecycle" });
+            } else if (manager.snapshot().instance == null) {
                 const selected_id = configuration.snapshot().selected_instance orelse return error.InvalidLifecycleProfile;
                 const selected = instances.findById(configuration.snapshot(), selected_id) orelse return error.InvalidLifecycleProfile;
                 try manager.select(selected.*);

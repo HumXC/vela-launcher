@@ -4,9 +4,9 @@ const dvui = @import("dvui");
 const config = @import("../core/config.zig");
 const theme = @import("theme.zig");
 const components = @import("components.zig");
-const manager_module = @import("instances_manager.zig");
-const library = @import("game_library.zig");
-const java_module = @import("java_manager.zig");
+const manager_module = @import("../application/instances_manager.zig");
+const library = @import("../application/game_library.zig");
+const java_module = @import("../application/java_manager.zig");
 const task_view = @import("instance_task_view.zig");
 const Allocator = std.mem.Allocator;
 const R = dvui.Rect;
@@ -31,10 +31,10 @@ pub const metrics = struct {
     pub const check_icon = theme.sizing.selection_icon;
 };
 
-pub const Mode = enum { none, create, packs, options, rename, delete_confirm };
+pub const Mode = enum { none, create, packs, options, delete_confirm };
 pub const CreateStep = enum { version, loader, confirm };
 pub const VersionFilter = enum { release, snapshot, old };
-pub const Action = enum { create, packs, edit, ask_rename, ask_delete, select, submit, confirm, close, cancel, close_task, retry_publication, choose_base, choose_loader_kind, choose_loader, load_loaders, next_step, previous_step, save_navigation, discard_navigation, cancel_navigation, leave };
+pub const Action = enum { create, packs, edit, ask_delete, select, submit, confirm, close, cancel, close_task, retry_publication, choose_base, choose_loader_kind, choose_loader, load_loaders, next_step, previous_step, save_navigation, discard_navigation, cancel_navigation, leave };
 const Pending = struct { action: Action, text: ?[]u8 = null, kind: config.Loader = .vanilla, force_refresh: bool = false };
 pub const Draft = struct {
     id: ?[]u8 = null,
@@ -103,7 +103,7 @@ pub const Draft = struct {
 
     pub fn value(self: *const Draft, mode: Mode, doc: *const config.Document) !config.Instance {
         const name = text(&self.name);
-        try validateName(doc, name, if (mode == .options or mode == .rename) self.id else null);
+        try validateName(doc, name, if (mode == .options) self.id else null);
         const java = text(&self.java_path);
         if (!validText(java, true)) return error.InvalidJavaPath;
         const min_memory = try parseMemory(text(&self.min_memory));
@@ -135,7 +135,6 @@ pub const Ui = struct {
     allocator: Allocator,
     draft: Draft = .{},
     mode: Mode = .none,
-    rename_confirmed: bool = false,
     pending: ?Pending = null,
     navigation: ?Pending = null,
     navigation_prompt: bool = false,
@@ -172,7 +171,7 @@ pub const Ui = struct {
     name_focus_layout_seen: bool = false,
     name_focus_requested: bool = false,
     /// Reassigned by page integration before drawing; never dereference between frames.
-    java_preview: @import("version_preview_types.zig").Snapshot = .{},
+    java_preview: @import("../application/version_preview_types.zig").Snapshot = .{},
 
     pub fn init(a: Allocator) Ui {
         return .{ .allocator = a };
@@ -206,7 +205,6 @@ pub const Ui = struct {
     fn reset(self: *Ui) void {
         self.draft.deinit(self.allocator);
         self.mode = .none;
-        self.rename_confirmed = false;
         self.submitted = false;
         self.settings_failure_scroll_pending = false;
         self.create_step = .version;
@@ -263,7 +261,7 @@ fn replaceOwned(a: Allocator, target: *?[]u8, borrowed: []const u8) !void {
 
 fn isNavigation(action: Action) bool {
     return switch (action) {
-        .select, .create, .packs, .edit, .ask_rename, .leave => true,
+        .select, .create, .packs, .edit, .leave => true,
         else => false,
     };
 }
@@ -288,10 +286,7 @@ fn saveInstalled(ui: *Ui, store: *config.Store, manager: anytype) !void {
     if (!manager_module.sameInstance(original, try find(store.snapshot(), original.id))) return error.InstanceChanged;
     const updated = try ui.draft.value(.options, store.snapshot());
     if (!std.mem.eql(u8, original.name, updated.name)) {
-        manager.startRenameWithOptions(original, updated) catch |err| {
-            ui.task.failAdmission(ui.allocator, .renaming, updated.name, err);
-            return err;
-        };
+        try manager.startRenameWithOptions(original, updated);
         ui.submitted = true;
         ui.publication_failed = false;
         return;
@@ -354,7 +349,7 @@ fn performDirect(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !v
             ui.mode = .create;
             ui.catalogue_requested = true;
         },
-        .edit, .ask_rename, .ask_delete => {
+        .edit, .ask_delete => {
             if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
             if (p.action == .ask_delete and (ui.submitted or ui.navigation != null)) return error.Busy;
             if (p.action == .ask_delete and ui.mode == .options) {
@@ -366,11 +361,7 @@ fn performDirect(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !v
             const draft = try Draft.fromInstance(ui.allocator, try find(doc, p.text orelse return error.InvalidId));
             ui.reset();
             ui.draft = draft;
-            ui.mode = switch (p.action) {
-                .edit => .options,
-                .ask_rename => .rename,
-                else => .delete_confirm,
-            };
+            ui.mode = if (p.action == .edit) .options else .delete_confirm;
         },
         .select => {
             if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
@@ -424,6 +415,7 @@ fn performDirect(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !v
             if (current.phase != .awaiting_publication) return error.NoPendingPublication;
             if (ui.task.task_id == null or ui.task.task_id != current.task_id) return error.NoPendingPublication;
             ui.publication_failed = true;
+            if (ui.task.operation == .renaming and store.publicationUncertain()) try store.reconcile();
             try manager.publish(store);
             ui.publication_failed = false;
             if (ui.submitted) ui.reset();
@@ -469,11 +461,6 @@ fn performDirect(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !v
         .submit => {
             if (manager.isBusy() or manager.snapshot().phase == .awaiting_publication) return error.Busy;
             if (ui.mode == .create and ui.create_step != .confirm) return error.WizardStepRequired;
-            if (ui.mode == .rename) {
-                try validateName(doc, text(&ui.draft.name), ui.draft.id);
-                ui.rename_confirmed = true;
-                return;
-            }
             if (store.publicationUncertain()) return error.ConfigPublicationUncertain;
             if (ui.mode != .create and ui.mode != .options) return error.InvalidAction;
             try ui.draft.ensureId(ui.allocator, store.io);
@@ -500,14 +487,6 @@ fn performDirect(ui: *Ui, store: *config.Store, manager: anytype, p: Pending) !v
             const original = try find(doc, ui.draft.id orelse return error.InvalidId);
             if (!manager_module.sameInstance(original, try ui.draft.original())) return error.InstanceChanged;
             switch (ui.mode) {
-                .rename => {
-                    if (!ui.rename_confirmed) return error.ConfirmationRequired;
-                    try validateName(doc, text(&ui.draft.name), ui.draft.id);
-                    manager.startRename(original, text(&ui.draft.name)) catch |err| {
-                        ui.task.failAdmission(ui.allocator, .renaming, original.name, err);
-                        return err;
-                    };
-                },
                 .delete_confirm => {
                     manager.startDelete(original) catch |err| {
                         ui.task.failAdmission(ui.allocator, .deleting, original.name, err);
@@ -1278,7 +1257,9 @@ fn drawSettingsFooter(ui: *Ui, enabled: bool) void {
     const labels: components.FormOptions = .{};
     const width = theme.footerButtonWidth(footer.data().contentRect().w);
     if (wizardFooterButton(@src(), labels.cancel_label, "instance-settings-cancel", enabled, false, width)) ui.queue(.close, null);
-    if (wizardFooterButton(@src(), labels.save_label, "instance-settings-save", enabled, true, width)) ui.queue(.submit, null);
+    const retry = ui.task.operation == .renaming and ui.task_can_retry;
+    const save_label = if (retry) "重试保存" else if (ui.submitted) "正在保存" else labels.save_label;
+    if (wizardFooterButton(@src(), save_label, "instance-settings-save", if (retry) ui.pending == null else enabled, true, width)) ui.queue(if (retry) .retry_publication else .submit, null);
 }
 
 fn settingsMode(mode: Mode) bool {
@@ -1408,10 +1389,12 @@ pub fn syncTaskSnapshot(ui: *Ui, snapshot: manager_module.Snapshot) void {
     ui.task_can_cancel = current and snapshot.phase == .working;
     ui.task_can_retry = current and snapshot.phase == .awaiting_publication and ui.publication_failed;
     if (current and snapshot.phase == .awaiting_publication and ui.publication_failed) ui.task.failure = ui.failure;
+    // Renaming stays in its form; task identity still guards publication retries.
+    if (ui.task.operation == .renaming) ui.task.visible = false;
 }
 
 fn taskFailureOwned(ui: *const Ui) bool {
-    return ui.failure != null and ui.task.available() and ui.failure == ui.task.failure;
+    return ui.task.operation != .renaming and ui.failure != null and ui.task.available() and ui.failure == ui.task.failure;
 }
 
 fn taskOperation(operation: manager_module.Operation) []const u8 {
@@ -1502,7 +1485,7 @@ fn taskText(src: std.builtin.SourceLocation, tag: []const u8, value: []const u8)
 }
 
 fn taskError(err: anyerror) []const u8 {
-    return fmt("原因：{s}\n错误代码：{s}", .{ if (std.mem.eql(u8, failureMessage(err), @errorName(err))) "任务未完成，请检查网络连接、磁盘空间与实例目录。" else failureMessage(err), @errorName(err) });
+    return fmt("原因：{s}\n错误代码：{s}", .{ if (std.mem.eql(u8, failureMessage(err), @errorName(err))) "任务未完成。" else failureMessage(err), @errorName(err) });
 }
 
 fn drawTaskPopup(ui: *Ui, _: bool) void {
@@ -1562,7 +1545,9 @@ fn drawTaskPopup(ui: *Ui, _: bool) void {
     {
         const summary = components.modalSection(@src(), .{ .min_height = 132, .tag = "instance-task-summary" });
         defer summary.deinit();
-        taskLabel(@src(), "instance-task-status", fmt("{s} · {s}", .{ taskStatus(ui), taskStage(ui.task.details.stage) }), true);
+        const status = taskStatus(ui);
+        const heading = if (std.mem.endsWith(u8, status, "。")) status[0 .. status.len - "。".len] else status;
+        taskLabel(@src(), "instance-task-status", fmt("{s} · {s}", .{ heading, taskStage(ui.task.details.stage) }), true);
         if (task_view.percent(details.completed, details.total)) |p| {
             taskLabel(@src(), "instance-task-progress", fmt("总体进度：{d}/{d} · {d:.1}%", .{ details.completed, details.total.?, p }), false);
         } else taskLabel(@src(), "instance-task-progress", fmt("总体进度：{d} · 总量未知", .{details.completed}), false);
@@ -1726,24 +1711,6 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, manager: *manager_module.Man
         }
         return;
     }
-    if (ui.mode == .rename and ui.rename_confirmed) {
-        components.text(@src(), fmt("确认将「{s}」重命名为「{s}」？", .{ text(&ui.draft.original_name), text(&ui.draft.name) }), theme.colors.accent);
-        const actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .padding = R.all(0) });
-        if (!locked and components.iconButton(@src(), "确认重命名", dvui.entypo.check, .{})) ui.queue(.confirm, null);
-        if (!locked and components.iconButton(@src(), "取消重命名", dvui.entypo.cross, .{})) ui.queue(.close, null);
-        actions.deinit();
-        return;
-    }
-    if (locked) {
-        components.text(@src(), fmt("{s}", .{text(&ui.draft.name)}), theme.colors.muted);
-        return;
-    }
-    if (ui.mode == .rename) {
-        _ = components.field(@src(), "实例名称", &ui.draft.name, .{});
-        drawFormFailure(ui, "instance-rename-validation");
-        if (components.action(@src(), "继续重命名", !locked)) ui.queue(.submit, null);
-        if (components.action(@src(), "取消", !locked)) ui.queue(.close, null);
-    }
 }
 
 fn selectedInstance(doc: *const config.Document) ?config.Instance {
@@ -1837,15 +1804,29 @@ pub fn draw(ui: *Ui, store: *config.Store, manager: *manager_module.Manager, cat
 
 fn failureMessage(err: anyerror) []const u8 {
     return switch (err) {
+        error.NetworkConnectionFailed, error.ConnectionFailed => "网络连接失败，部分资源未能下载。",
+        error.NameResolutionFailed => "无法解析下载服务器地址。",
+        error.TimedOut, error.Timeout => "下载连接超时。",
+        error.TlsCertificateInvalid => "下载服务器证书校验失败。",
+        error.TransferFailed, error.TransportFailed => "资源传输失败。",
+        error.TlsFailure => "无法建立安全下载连接。",
+        error.OutOfMemory => "内存不足，任务未完成。",
+        error.HttpStatus => "下载服务器返回错误。",
         error.InstanceAlreadyExists, error.DuplicateInstanceName => "同名实例或目录已存在，请使用其他名称。",
         error.InvalidInstanceName => "实例名称无效，请勿使用路径分隔符或保留名称。",
         error.InvalidMemory => "内存必须为 256–1048576 MiB，且最小内存不能大于最大内存（留空时使用默认值）。",
         error.InstanceNameUnchanged => "暂不支持仅修改名称大小写，请使用不同名称。",
         error.InstanceReferenced => "此实例正被其他版本继承或引用，暂时无法删除或重命名。请先处理依赖它的版本。",
         error.MissingInstallReceipt => "缺少实例安装信息，无法安全核对版本身份。请修复或重新安装实例后重试。",
+        error.InvalidInstallReceipt, error.InstallReceiptMismatch => "实例安装记录与版本信息不一致，无法完成操作。",
+        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => "没有写入权限，请检查实例目录和启动器配置目录的权限。",
+        error.FileBusy => "实例文件正在被其他程序使用，请关闭相关程序后重试。",
+        error.InstanceRunning => "实例正在运行，请退出游戏后再修改。",
+        error.RecoveryRequired => "上次文件操作尚未恢复，请重新启动启动器以恢复后再试。",
+        error.NoSpaceLeft, error.DiskQuota => "无法保存更改，磁盘可用空间或配额不足。",
         error.PermanentDeletionIncomplete => "删除未完成，部分文件可能已经删除。请检查实例目录。",
         error.SizeMismatch => "下载文件大小与预期不符，文件可能不完整。",
-        error.ChecksumMismatch => "文件内容与预期校验值不一致，请重新获取后重试。",
+        error.ChecksumMismatch, error.Sha1Mismatch, error.Sha256Mismatch, error.Sha512Mismatch => "文件内容与预期校验值不一致，请重新获取后重试。",
         error.UnsupportedDirectoryLink => "压缩包包含不受支持的目录链接。若正在安装 Java，可改用其他发行版，或在 Java 管理中添加本机 Java 后重试。",
         error.JavaAmbiguous => "下载包中存在多个独立的 Java 运行时，无法自动确定入口。请在 Java 管理中添加所需版本后重试。",
         else => @errorName(err),
@@ -1967,7 +1948,20 @@ test "deletion confirmation admission guards busy submitted pending and navigati
     ui.mode = .options;
     try std.testing.expect(!deleteConfirmationAllowed(&ui, true));
     try std.testing.expect(settingsMode(ui.mode));
-    try std.testing.expect(!settingsMode(.rename));
+}
+
+test "installation failure messages name the known cause without unrelated troubleshooting" {
+    for ([_]anyerror{ error.NetworkConnectionFailed, error.ConnectionFailed, error.NameResolutionFailed, error.TimedOut, error.TlsCertificateInvalid, error.TransferFailed, error.HttpStatus }) |err| {
+        const message = failureMessage(err);
+        try std.testing.expect(!std.mem.eql(u8, message, @errorName(err)));
+        try std.testing.expect(std.mem.indexOf(u8, message, "磁盘") == null);
+        try std.testing.expect(std.mem.indexOf(u8, message, "权限") == null);
+    }
+    for ([_]anyerror{ error.NoSpaceLeft, error.DiskQuota, error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem }) |err| {
+        const message = failureMessage(err);
+        try std.testing.expect(!std.mem.eql(u8, message, @errorName(err)));
+        try std.testing.expect(std.mem.indexOf(u8, message, "网络") == null);
+    }
 }
 
 test "instance reference protection explains the actual blocker" {

@@ -4,7 +4,7 @@ const local = @import("../core/local_content.zig");
 const config = @import("../core/config.zig");
 const paths_module = @import("../core/instances.zig");
 const content = @import("content_manager.zig");
-const presentation = @import("mods_view.zig");
+const presentation = @import("mods_snapshot.zig");
 const logicalPath = @import("mods_logical_path.zig").logicalPath;
 const A = std.mem.Allocator;
 const Io = std.Io;
@@ -172,6 +172,12 @@ pub const Controller = struct {
             entry.physical_path = pending.physical_path;
             self.inventory_revision +%= 1;
         };
+    }
+    /// Stop scans without blocking; tick retains ownership until the worker joins.
+    pub fn cancel(self: *Controller) void {
+        self.needs_scan = false;
+        self.generation +%= 1;
+        if (self.active) |job| job.canceled.store(true, .release);
     }
     pub fn busy(self: *const Controller) bool {
         return self.active != null or self.needs_scan or self.mutation != .idle;

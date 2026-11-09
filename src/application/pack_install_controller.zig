@@ -1,5 +1,5 @@
-//! UI owner for pack inspection/decisions and the shared creation coordinator.
-//! tick owns creation's instances/Java work; App must honor the owns* queries.
+//! Application service for pack inspection/decisions and shared creation.
+//! tick owns creation workers; runtime scheduling honors ownership() until joined.
 //! Services and fixture contexts outlive deinit, which cancels and joins workers.
 const std = @import("std");
 const config = @import("../core/config.zig");
@@ -142,19 +142,22 @@ pub const Controller = struct {
         for (optional, 0..) |choice, i| {
             for (optional[0..i]) |other| if (std.mem.eql(u8, choice.path, other.path)) return error.DuplicateDecision;
             var found = false;
-            for (pack.files) |file| if (std.mem.eql(u8, choice.path, file.record.path)) {
-                if (file.required and !choice.include) return error.RequiredFileExcluded;
-                found = true;
-            };
+            for (0..pack.sourceFileCount()) |index| {
+                const file = pack.sourceFile(index);
+                if (std.mem.eql(u8, choice.path, file.record.path)) {
+                    if (file.required and !choice.include) return error.RequiredFileExcluded;
+                    found = true;
+                }
+            }
             if (!found) return error.UnknownPackFile;
         }
         for (manual, 0..) |mapping, i| {
             if (!std.fs.path.isAbsolute(mapping.source_absolute_path)) return error.ManualPathNotAbsolute;
             for (manual[0..i]) |other| if (std.mem.eql(u8, mapping.path, other.path)) return error.DuplicateManualFile;
             var found = false;
-            for (pack.files) |file| if (std.mem.eql(u8, mapping.path, file.record.path)) {
-                found = true;
-            };
+            for (0..pack.sourceFileCount()) |index| {
+                if (std.mem.eql(u8, mapping.path, pack.sourceFile(index).record.path)) found = true;
+            }
             if (!found) return error.UnknownPackFile;
         }
         var next: std.heap.ArenaAllocator = .init(core.a);
@@ -175,7 +178,8 @@ pub const Controller = struct {
         const job = core.job orelse return error.MissingInspection;
         const inspection = job.inspection orelse return error.MissingInspection;
         if (inspection.pack.unresolved.len != 0) return error.UnresolvedPackReferences;
-        for (inspection.pack.files) |file| {
+        for (0..inspection.pack.sourceFileCount()) |index| {
+            const file = inspection.pack.sourceFile(index);
             var selected = file.selected;
             for (core.optional) |choice| if (std.mem.eql(u8, choice.path, file.record.path)) {
                 selected = choice.include;
@@ -295,7 +299,7 @@ pub const Controller = struct {
             return core.creation.creationSnapshot().details;
         return pack;
     }
-    pub fn ownership(self: *const Controller) @import("../application/creation_runtime.zig").Ownership {
+    pub fn ownership(self: *const Controller) @import("creation_runtime.zig").Ownership {
         var result = self.core.creation.ownership();
         result.pinned = self.core.phase == .creating or result.instances_publication or result.java_discovery or result.java_download;
         return result;

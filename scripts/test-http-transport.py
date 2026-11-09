@@ -44,6 +44,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/get":
             self.reply(200, b'{"ok":true}')
+        elif self.path == "/connection":
+            self.reply(200, str(self.client_address[1]).encode("ascii"),
+                       {"Cache-Control": "max-age=60", "ETag": '"fixture-v1"', "Vary": "Accept-Encoding"})
         elif self.path == "/empty":
             self.reply(204)
         elif self.path == "/auth":

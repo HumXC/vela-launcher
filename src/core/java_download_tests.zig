@@ -266,7 +266,7 @@ test "Zulu Java 16 resolves official metadata with exact target and Microsoft re
 }
 
 test "registered Java 16 resolves exactly and retains its explicit registry choice" {
-    const registry = @import("../ui/java_manager.zig");
+    const registry = @import("../application/java_manager.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try rootPath(&tmp);
@@ -280,14 +280,12 @@ test "registered Java 16 resolves exactly and retains its explicit registry choi
     // Already-probed fixture records exercise registry publication, never execution.
     try manager.addDownloaded(.{ .path = java17_path, .major = 17, .architecture = @import("java_runtime.zig").host(), .vendor = "Azul Systems, Inc." });
     try manager.addDownloaded(.{ .path = java16_path, .major = 16, .architecture = @import("java_runtime.zig").host(), .vendor = "Azul Systems, Inc." });
-    try std.testing.expectEqualStrings(java16_path, manager.resolve("minecraft-1.17", 16).?.path);
-    try std.testing.expectError(error.IncompatibleJava, manager.choose("minecraft-1.17", java17_path, 16));
-    try manager.choose("minecraft-1.17", java16_path, 16);
-    try std.testing.expect(manager.resolve("minecraft-1.17", 17) == null);
+    try std.testing.expectEqualStrings(java16_path, manager.resolve(16).?.path);
+    try std.testing.expectEqualStrings(java17_path, manager.resolve(17).?.path);
     var reloaded = try registry.Manager.init(a, io, root);
     defer reloaded.deinit();
-    try std.testing.expectEqualStrings(java16_path, reloaded.resolve("minecraft-1.17", 16).?.path);
-    try std.testing.expectEqual(@as(u32, 16), reloaded.resolve("minecraft-1.17", 16).?.major);
+    try std.testing.expectEqualStrings(java16_path, reloaded.resolve(16).?.path);
+    try std.testing.expectEqual(@as(u32, 16), reloaded.resolve(16).?.major);
 }
 
 test "staged install publishes manifest and Java together without probing" {

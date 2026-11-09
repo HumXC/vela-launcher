@@ -3,9 +3,9 @@ const dvui = @import("dvui");
 const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
 const tasks = @import("../core/tasks.zig");
-const manager_module = @import("instances_manager.zig");
+const manager_module = @import("../application/instances_manager.zig");
 const wizard = @import("instances_view.zig");
-const library = @import("game_library.zig");
+const library = @import("../application/game_library.zig");
 const components = @import("components.zig");
 const bento_theme = @import("theme.zig");
 

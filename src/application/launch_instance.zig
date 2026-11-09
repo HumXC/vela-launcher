@@ -3,9 +3,9 @@
 const std = @import("std");
 const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
-const java = @import("../ui/java_manager.zig");
-const accounts = @import("../ui/accounts_manager.zig");
-const launch = @import("../ui/game_launch.zig");
+const java = @import("java_manager.zig");
+const accounts = @import("accounts_manager.zig");
+const launch = @import("game_launch.zig");
 
 pub const Selection = struct {
     document: *const config.Document,
@@ -30,7 +30,7 @@ pub const Selection = struct {
 
 pub fn prepare(document: *const config.Document, java_manager: *const java.Manager, account_manager: ?*const accounts.Manager) !Selection {
     const instance = try selectedInstance(document);
-    const java_path = instance.java_path orelse java_manager.selectedPath(instance.name) orelse "";
+    const java_path = instance.java_path orelse "";
     const selected_accounts = account_manager orelse return error.NoAccountSelected;
     return .{
         .document = document,
@@ -50,7 +50,7 @@ fn serverEndpoint(document: *const config.Document, instance_id: []const u8) !?l
     if (document.selected_server) |id| {
         for (document.servers) |server| if (std.mem.eql(u8, server.id, id)) {
             if (server.instance_id == null or !std.mem.eql(u8, server.instance_id.?, instance_id)) return error.ServerInstanceMismatch;
-            return .{ .address = server.address, .port = server.port };
+            return .{ .address = server.address, .port = server.port, .name = server.name };
         };
     }
     // Preserve the existing behavior for a stale selected server ID.
@@ -145,4 +145,26 @@ test "launch instance arguments preserve memory defaults identity and worker Jav
     try std.testing.expectEqualStrings("test-only-token", online.options.identity.?.access_token);
     try std.testing.expectEqualStrings("localhost", online.options.server.?.address);
     try std.testing.expectEqual(@as(u16, 25566), online.options.server.?.port);
+}
+
+test "launch preparation preserves external bindings and leaves automatic selection to metadata" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var manager = try java.Manager.init(a, std.testing.io, root);
+    defer manager.deinit();
+    var account_manager = try accounts.Manager.init(a, std.testing.io, root);
+    defer account_manager.deinit();
+    const external = try std.fs.path.join(a, &.{ root, "external", "bin", "java" });
+    defer a.free(external);
+    var rows = [_]config.Instance{.{ .id = "stable-id", .name = "Before rename", .minecraft_version = "1.21", .java_path = external }};
+    const document: config.Document = .{ .selected_instance = "stable-id", .instances = &rows };
+    try std.testing.expectEqual(@as(usize, 0), manager.entries().len);
+    try std.testing.expectEqualStrings(external, (try prepare(&document, &manager, &account_manager)).java_path);
+    rows[0].name = "After rename";
+    try std.testing.expectEqualStrings(external, (try prepare(&document, &manager, &account_manager)).java_path);
+    rows[0].java_path = null;
+    try std.testing.expectEqualStrings("", (try prepare(&document, &manager, &account_manager)).java_path);
 }

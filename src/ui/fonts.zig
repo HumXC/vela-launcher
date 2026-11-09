@@ -32,6 +32,23 @@ pub fn install(win: *dvui.Window) !void {
     std.log.info("Loaded CJK UI font {s}", .{loaded.path});
 }
 
+/// Production-module tests create DVUI windows without App.main_init.
+/// Testing-renderer builds already provide their deterministic embedded face.
+pub fn installForTesting(win: *dvui.Window) !void {
+    if (!builtin.is_test) @compileError("test font setup is test-only");
+    if (win.fonts.database.items.len != 0) return;
+    const a = std.testing.allocator;
+    var environ = try std.testing.environ.createMap(a);
+    defer environ.deinit();
+    const loaded = if (environ.get("VELA_FONT_PATH")) |path|
+        try load(a, std.testing.io, path)
+    else
+        try discover(a, std.testing.io, &environ);
+    defer a.free(loaded.path);
+    errdefer a.free(loaded.bytes);
+    try win.addFont(family, loaded.bytes, a);
+}
+
 const Loaded = struct { path: []u8, bytes: []u8 };
 fn load(a: std.mem.Allocator, io: std.Io, path: []const u8) !Loaded {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_font_bytes));

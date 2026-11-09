@@ -12,21 +12,9 @@ const resource_menu = @import("resource_type_menu.zig");
 const A = std.mem.Allocator;
 const R = dvui.Rect;
 
-pub const Row = struct { entry: *const local.Entry, managed: bool = false };
-pub const Snapshot = struct {
-    rows: []const Row = &.{},
-    /// Changes whenever entry membership, order or searchable/sortable data changes.
-    /// Unversioned transient snapshots are rebuilt on every use.
-    inventory: ?InventoryVersion = null,
-    busy: bool = false,
-    failure: ?anyerror = null,
-    can_mutate: bool = false,
-    recovery_required: bool = false,
-    truncated: bool = false,
-    /// Optional actual instance/loader context, owned by the caller.
-    title: ?[]const u8 = null,
-    subtitle: ?[]const u8 = null,
-};
+const inventory = @import("../application/mods_snapshot.zig");
+const Row = inventory.Row;
+const Snapshot = inventory.Snapshot;
 pub const Intent = union(enum) {
     refresh,
     list_view: bool,
@@ -36,7 +24,7 @@ pub const Intent = union(enum) {
 pub const Filter = enum { all, enabled, disabled };
 pub const Sort = enum { name_ascending, name_descending, newest, oldest };
 
-pub const InventoryVersion = struct { source: usize, revision: u64 };
+const InventoryVersion = inventory.InventoryVersion;
 
 const DerivedRows = struct {
     indices: []usize = &.{},

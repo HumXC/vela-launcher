@@ -191,10 +191,10 @@ pub const Context = struct {
     }
 
     // Mock auth metadata exists only in this independent, service-free gallery.
-    fn accountSnapshot(self: *const Context) @import("accounts_manager.zig").Snapshot {
-        var snapshot: @import("accounts_manager.zig").Snapshot = .{ .phase = .idle, .busy = self.variant == .loading or self.variant == .disabled, .failure = null, .device = null, .cleanup_count = 0, .publication_pending = false, .remember_available = false };
+    fn accountSnapshot(self: *const Context) @import("../application/accounts_manager.zig").Snapshot {
+        var snapshot: @import("../application/accounts_manager.zig").Snapshot = .{ .phase = .idle, .busy = self.variant == .loading or self.variant == .disabled, .failure = null, .device = null, .cleanup_count = 0, .publication_pending = false, .remember_available = false };
         if (self.scene == .@"account-code" or self.scene == .@"account-wait") {
-            var device: @import("accounts_manager.zig").DeviceSnapshot = .{ .expires_at_ms = 900_000, .next_poll_ms = 5_000 };
+            var device: @import("../application/accounts_manager.zig").DeviceSnapshot = .{ .expires_at_ms = 900_000, .next_poll_ms = 5_000 };
             const code = "ABCD-EFGH";
             const uri = "https://www.microsoft.com/link";
             @memcpy(device.code[0..code.len], code);

@@ -36,7 +36,7 @@ import time
 import types
 
 CASES = ('restore', 'close_preparing', 'close_running', 'debug', 'abnormal',
-         'exit_together', 'idle_keep', 'idle_wait', 'idle_cancel', 'ordinary_destroy')
+         'exit_together', 'idle_keep', 'idle_auxiliary', 'idle_cancel', 'ordinary_destroy')
 LIBRARIES = (
  '/nix/store/gvgz0nm1mwj50k0xd2pr78bx9m5mjxvj-alsa-lib-1.2.16.1/lib',
  '/nix/store/c7z4kv21nh2y5mvfyhj1ixkgxwc420z4-libdecor-0.2.5/lib',
@@ -406,9 +406,10 @@ class Run:
             t.create('.minecraft/versions/' + name + '/' + name + '.jar', jar)
         t.create('.minecraft/assets/indexes/lifecycle-local.json', b'{"objects":{}}')
         t.create('.vela/config.json', json.dumps(config).encode())
-        t.create('.vela/java.json', json.dumps({'version': 1,
-            'runtimes': [{'path': helper, 'major': 21, 'vendor': 'Vela Lifecycle Fixture'}],
-            'choices': [{'game': row['name'], 'path': helper} for row in config['instances']]}).encode())
+        architecture = {'x86_64': 'x86_64', 'amd64': 'x86_64', 'i386': 'x86', 'i686': 'x86', 'aarch64': 'aarch64', 'arm64': 'aarch64'}[os.uname().machine.lower()]
+        t.create('.vela/java.json', json.dumps({'version': 3,
+            'runtimes': [{'path': helper, 'major': 21, 'vendor': 'Vela Lifecycle Fixture', 'architecture': architecture}],
+            'hidden': []}).encode())
         t.create('ipc/command.json', json.dumps({'nonce': self.nonce, 'sequence': 0, 'kind': 'none'}).encode(), mutable=True)
         t.create('ipc/status.json', b' ' * (64 * 1024), mutable=True)
         for name in ('probe.json', 'game.json'):
@@ -873,19 +874,16 @@ class Run:
     def exercise(self):
         self.start()
         case = self.case
-        if case in ('idle_keep', 'idle_wait', 'idle_cancel', 'ordinary_destroy', 'exit_together'):
+        if case in ('idle_keep', 'idle_auxiliary', 'idle_cancel', 'ordinary_destroy', 'exit_together'):
             self.held_world()
         if case.startswith('idle_'):
             self.close_input()
-            choice = {'idle_keep': 'keep_open', 'idle_wait': 'wait', 'idle_cancel': 'cancel_and_quit'}[case]
-            self.choose(choice)
-            if case == 'idle_cancel':
-                self.continued(lambda v: v.get('shutdown') == 'canceling' and v['world']['worker_active'] and
+            if case != 'idle_auxiliary':
+                self.choose({'idle_keep': 'keep_open', 'idle_cancel': 'cancel_and_quit'}[case])
+            if case in ('idle_cancel', 'idle_auxiliary'):
+                self.continued(lambda v: v.get('shutdown') == 'canceling' and v['hidden'] and v['world']['worker_active'] and
                                v.get('cleanup_entered') and not v.get('cleanup_returned') and not v.get('destroy_entered'),
-                               'cleanup-held-after-real-cancel')
-            elif case == 'idle_wait':
-                self.continued(lambda v: v.get('shutdown') == 'wait' and v['world']['worker_active'] and
-                               not v.get('cleanup_returned') and not v.get('destroy_entered'), 'wait-retains-owned-worker')
+                               'hidden-cleanup-held-after-real-cancel')
             else:
                 self.continued(lambda v: v.get('shutdown') == 'none' and not v['hidden'] and v['world']['worker_active'],
                                'keep-open-retains-window-worker')

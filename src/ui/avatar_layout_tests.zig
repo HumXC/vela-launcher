@@ -1,7 +1,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("../core/config.zig");
-const accounts = @import("accounts_manager.zig");
+const accounts = @import("../application/accounts_manager.zig");
 const chooser = @import("accounts_view.zig");
 const avatar = @import("avatar_manager.zig");
 

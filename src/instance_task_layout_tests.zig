@@ -4,7 +4,7 @@ const dvui = @import("dvui");
 const tasks = @import("core/tasks.zig");
 const config = @import("core/config.zig");
 const instances = @import("core/instances.zig");
-const manager_module = @import("ui/instances_manager.zig");
+const manager_module = @import("application/instances_manager.zig");
 const view = @import("ui/instances_view.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
@@ -402,6 +402,21 @@ fn atBothSizes(comptime scenario: fn (*Installer, *tasks.Registry) anyerror!void
     }
 }
 
+test "instance task modal failure heading paints status and actual stage without sentence punctuation" {
+    const Scenario = struct {
+        fn run(installer: *Installer, registry: *tasks.Registry) !void {
+            installer.finish.store(true, .release);
+            try join(Frame.manager);
+            try dvui.testing.settle(Frame.draw);
+            _ = try Frame.paintedText("任务失败 · 校验文件");
+            registry.pruneFinished(0);
+            try dvui.testing.settle(Frame.draw);
+            _ = try Frame.paintedText("任务失败 · 校验文件");
+        }
+    };
+    try atBothSizes(Scenario.run, false);
+}
+
 const Removal = enum { dismiss, prune };
 
 fn assertRetainedFailure() !void {
@@ -415,6 +430,7 @@ fn assertRetainedFailure() !void {
     try std.testing.expectEqual(@as(u64, 3072), retained.details.files[0].received);
     try std.testing.expectEqual(@as(f64, 0), retained.details.bytes_per_second);
     _ = try Frame.footer(false);
+    _ = try Frame.paintedText("任务失败 · 校验文件");
     _ = try Frame.paintedText("原因");
     _ = try Frame.paintedText("SizeMismatch");
     _ = try Frame.paintedText("下载文件大小与预期不符");

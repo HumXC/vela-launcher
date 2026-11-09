@@ -144,9 +144,9 @@ pub fn cancelled(io: Io, cancel: ?*const std.atomic.Value(bool), deadline: ?i96)
     if (deadline) |d| if (Io.Clock.awake.now(io).nanoseconds >= d) return error.TimedOut;
 }
 pub fn stream(file: File, output: ?File, io: Io, max_bytes: u64, cancel: ?*const std.atomic.Value(bool), deadline: ?i96) !Fingerprint {
-    var sha1 = std.crypto.hash.Sha1.init(.{});
-    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
-    var sha512 = std.crypto.hash.sha2.Sha512.init(.{});
+    var sha1 = @import("cache_hash").Sha1.init(.{});
+    var sha256 = @import("cache_hash").Sha256.init(.{});
+    var sha512 = @import("cache_hash").Sha512.init(.{});
     var reader_buffer: [64 * 1024]u8 = undefined;
     var copy_buffer: [64 * 1024]u8 = undefined;
     var reader = file.reader(io, &reader_buffer);

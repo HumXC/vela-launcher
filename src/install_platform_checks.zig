@@ -3,7 +3,7 @@ const std = @import("std");
 const content = @import("core/content_install.zig");
 const transactions = @import("core/instance_transactions.zig");
 const config = @import("core/config.zig");
-const java = @import("ui/java_manager.zig");
+const java = @import("application/java_manager.zig");
 const files = @import("core/loaders/files.zig");
 const planner = @import("core/minecraft/install_plan.zig");
 const metadata = @import("core/minecraft/metadata/root.zig");
@@ -27,7 +27,7 @@ export fn force_java_registry(a: *const std.mem.Allocator, io: *const std.Io, pa
     var manager = java.Manager.init(a.*, io.*, path[0..len]) catch return;
     defer manager.deinit();
     manager.addDownloaded(runtime) catch {};
-    _ = manager.resolve("compile-only", runtime.major);
+    _ = manager.resolve(runtime.major);
 }
 export fn force_loader_directory(io: *const std.Io, path: [*]const u8, len: usize) void {
     const dir = files.directory(io.*, path[0..len], true) catch return;

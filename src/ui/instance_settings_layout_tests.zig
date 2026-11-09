@@ -5,8 +5,8 @@ const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
 const tasks = @import("../core/tasks.zig");
 const view = @import("instances_view.zig");
-const manager_module = @import("instances_manager.zig");
-const java = @import("java_manager.zig");
+const manager_module = @import("../application/instances_manager.zig");
+const java = @import("../application/java_manager.zig");
 const theme = @import("theme.zig");
 
 const saved: config.Instance = .{ .id = "settings-renderer-instance", .name = "Saved Fixture", .minecraft_version = "1.21.1", .min_memory_mb = 512, .max_memory_mb = 4096 };
@@ -330,7 +330,7 @@ fn atBothSizes(comptime scenario: fn () anyerror!void) !void {
         defer store.deinit();
         try store.update(.{ .instances = &.{saved}, .selected_instance = saved.id, .settings = .{ .default_memory_mb = 2048 } });
         // Match java.Manager's current registry schema; these controls use registered paths.
-        const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .runtimes = &[_]java.Runtime{runtime}, .choices = .{}, .hidden = &[_]java.Runtime{} }, .{});
+        const fixture = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 3), .runtimes = &[_]java.Runtime{runtime}, .hidden = &[_]java.Runtime{} }, .{});
         defer a.free(fixture);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/java.json", .data = fixture });
         var java_registry = try java.Manager.init(a, std.testing.io, root);
@@ -810,4 +810,26 @@ test "UI layout installed settings invalid minimum retains draft against effecti
 
 test "UI layout installed settings locked controls do not submit from real pointer input" {
     try atBothSizes(lockedSettings);
+}
+
+fn renameInlineFeedback() !void {
+    Frame.ui.submitted = true;
+    view.syncTaskSnapshot(Frame.ui, .{ .phase = .working, .operation = .renaming, .instance = saved, .failure = null, .recovery_directory = null, .completed = 0, .total = 0, .task_id = 321 });
+    try dvui.testing.settle(Frame.draw);
+    try std.testing.expect(!Frame.ui.task.visible);
+    _ = try Frame.text("instance-settings-save", "正在保存", 16, null);
+    _ = try Frame.nativeControl("instance-settings-save", false);
+    Frame.ui.submitted = false;
+    Frame.ui.failure = error.AccessDenied;
+    view.syncTaskSnapshot(Frame.ui, .{ .phase = .failed, .operation = .renaming, .instance = saved, .failure = error.AccessDenied, .recovery_directory = null, .completed = 0, .total = 0, .task_id = 321 });
+    try dvui.testing.settle(Frame.draw);
+    try std.testing.expect(!Frame.ui.task.visible);
+    const validation = try Frame.captured("instance-settings-validation");
+    try expectInside((try Frame.captured("settings-test-page")).content, validation.border);
+    _ = try Frame.footers(true);
+    try Frame.savedUnchanged();
+}
+
+test "UI layout rename saving and failure stay in the installed settings form" {
+    try atBothSizes(renameInlineFeedback);
 }

@@ -274,9 +274,18 @@ pub const PackPlan = struct {
     loader: config.Loader = .vanilla,
     loader_version: ?[]const u8 = null,
     files: []const InstallFile = &.{},
+    /// New-instance seeds only; never receipt records or managed membership.
+    initial_world_files: []const InstallFile = &.{},
     unresolved: []const PackReference = &.{},
     /// Layers apply in this order. Archive extraction is not implemented here.
     override_layers: []const []const u8 = &.{},
+
+    pub fn sourceFileCount(self: PackPlan) usize {
+        return self.files.len + self.initial_world_files.len;
+    }
+    pub fn sourceFile(self: PackPlan, index: usize) InstallFile {
+        return if (index < self.files.len) self.files[index] else self.initial_world_files[index - self.files.len];
+    }
 };
 fn validateIdentity(identity: PackIdentity) !void {
     if (!providers.validToken(identity.project_id) or !providers.validToken(identity.version_id)) return error.InvalidContentId;
@@ -286,6 +295,25 @@ fn validateInstallFiles(files: []const InstallFile) !void {
     for (files) |file| try checkedPath(file.record.path);
     for (files, 0..) |file, i| {
         try validateFile(file.record);
+        if (file.required and file.selected == false) return error.RequiredFileExcluded;
+        for (files[0..i]) |other| if (pathsCollide(file.record.path, other.record.path)) return error.PathCollision;
+    }
+}
+pub fn initialWorldPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "saves/");
+}
+pub fn checkedInitialWorldPath(path: []const u8) !void {
+    if (!safeRelativePath(path)) return error.UnsafeRelativePath;
+    if (!initialWorldPath(path) or std.mem.indexOfScalarPos(u8, path, 6, '/') == null) return error.ProtectedPath;
+}
+pub fn validateInitialWorldFiles(files: []const InstallFile) !void {
+    if (files.len > providers.max_items) return error.TooManyItems;
+    for (files, 0..) |file, i| {
+        try checkedInitialWorldPath(file.record.path);
+        try providers.validateHashes(file.record.hashes);
+        if (file.record.size == null) return error.MissingFileSize;
+        if (file.record.size.? > providers.max_file_bytes) return error.FileTooLarge;
+        if (file.record.provider != .modrinth or file.record.identity_provenance != .pack_archive) return error.ProviderMismatch;
         if (file.required and file.selected == false) return error.RequiredFileExcluded;
         for (files[0..i]) |other| if (pathsCollide(file.record.path, other.record.path)) return error.PathCollision;
     }
@@ -335,9 +363,10 @@ pub fn parseMrpack(a: std.mem.Allocator, bytes: []const u8, identity: PackIdenti
     }
     const raw_files = try J.array(try J.field(root, "files"));
     var files: std.ArrayList(InstallFile) = .empty;
+    var worlds: std.ArrayList(InstallFile) = .empty;
     for (raw_files) |f| {
         const path = try J.text(f, "path");
-        try checkedPath(path);
+        if (initialWorldPath(path)) try checkedInitialWorldPath(path) else try checkedPath(path);
         var required = true;
         var unsupported = false;
         if (try J.optional(f, "env")) |env| {
@@ -358,14 +387,17 @@ pub fn parseMrpack(a: std.mem.Allocator, bytes: []const u8, identity: PackIdenti
         if (urls.len == 0 or urls.len > 16) return error.MissingDownload;
         for (urls) |url| if (!approvedPackUrl(url)) return error.UnapprovedDownloadHost;
         if (unsupported) continue;
-        try files.append(aa, .{ .record = .{ .path = path, .provider = .modrinth, .project_id = try aa.dupe(u8, identity.project_id), .version_id = try aa.dupe(u8, identity.version_id), .hashes = hashes, .size = size, .role = roleFor(path), .identity_provenance = .pack_archive, .standalone = false }, .download = .{ .remote = urls[0] }, .alternatives = urls, .required = required });
+        const target = if (initialWorldPath(path)) &worlds else &files;
+        try target.append(aa, .{ .record = .{ .path = path, .provider = .modrinth, .project_id = try aa.dupe(u8, identity.project_id), .version_id = try aa.dupe(u8, identity.version_id), .hashes = hashes, .size = size, .role = roleFor(path), .identity_provenance = .pack_archive, .standalone = false }, .download = .{ .remote = urls[0] }, .alternatives = urls, .required = required });
     }
     const result_files = try files.toOwnedSlice(aa);
     try validateInstallFiles(result_files);
     const layers = try aa.alloc([]const u8, 2);
     layers[0] = "overrides";
     layers[1] = if (side == .client) "client-overrides" else "server-overrides";
-    const value: PackPlan = .{ .identity = try cloneInto(PackIdentity, aa, identity), .name = name, .version = version, .minecraft_version = minecraft, .loader = loader, .loader_version = loader_version, .files = result_files, .override_layers = layers };
+    const result_worlds = try worlds.toOwnedSlice(aa);
+    try validateInitialWorldFiles(result_worlds);
+    const value: PackPlan = .{ .identity = try cloneInto(PackIdentity, aa, identity), .name = name, .version = version, .minecraft_version = minecraft, .loader = loader, .loader_version = loader_version, .files = result_files, .initial_world_files = result_worlds, .override_layers = layers };
     return .{ .arena = arena, .value = value };
 }
 
@@ -413,7 +445,7 @@ pub fn parseCurseForgePack(a: std.mem.Allocator, bytes: []const u8, identity: Pa
         for (refs[0..i]) |other| if (std.mem.eql(u8, other.project_id, out.project_id)) return error.DuplicateContent;
     }
     const overrides = try J.text(root, "overrides");
-    try checkedPath(overrides);
+    if (!safeRelativePath(overrides)) return error.UnsafeRelativePath;
     const layers = try aa.alloc([]const u8, 1);
     layers[0] = overrides;
     const value: PackPlan = .{ .identity = try cloneInto(PackIdentity, aa, identity), .name = name, .version = version, .minecraft_version = game, .loader = loader, .loader_version = loader_version, .unresolved = refs, .override_layers = layers };
@@ -494,6 +526,7 @@ pub const Completeness = struct {
     unresolved_references: usize,
 };
 pub fn checkCompleteness(pack: PackPlan, probe: Probe, prerequisites: CompletionPrerequisites) !Completeness {
+    if (pack.initial_world_files.len != 0) return error.ProtectedPath;
     try validateInstallFiles(pack.files);
     if (pack.unresolved.len > providers.max_items) return error.TooManyItems;
     var result: Completeness = .{ .complete = false, .verified_files = 0, .missing_required = 0, .missing_manual = 0, .hash_mismatches = 0, .undecided_optional = 0, .unresolved_references = 0 };

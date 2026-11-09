@@ -1,6 +1,7 @@
 //! Synchronous installation orchestration. Run outside the UI thread.
 const std = @import("std");
 const dl = @import("../downloader.zig");
+const network_proxy = @import("../proxy_policy.zig");
 const telemetry = @import("../install/download_details.zig");
 const task_registry = @import("../tasks.zig");
 const m = @import("metadata/root.zig");
@@ -33,8 +34,11 @@ pub const Config = struct {
     manifest_url: []const u8 = m.version_manifest_url,
     /// Metadata cache directory, owned by the caller and not shared by active services.
     http_cache: ?[]const u8 = null,
+    /// Launcher-owned shared file cache; standalone callers default beneath root.
+    artifact_cache_root: ?[]const u8 = null,
     environment: m.rules.Environment,
     proxy: ?[]const u8 = null,
+    proxy_policy: ?*const network_proxy.Policy = null,
     ca_bundle: ?[]const u8 = null,
     window: usize = 16,
     cancel: ?*const std.atomic.Value(bool) = null,
@@ -55,8 +59,12 @@ pub const Installed = struct {
 };
 /// Caller owns service/curl lifetime. Only one installer may mutate a given root.
 /// Returned metadata and plan own their data independently of download handles.
-pub fn run(a: A, io: std.Io, service: *dl.Service, config: Config) !Installed {
-    try validateConfig(config);
+pub fn run(a: A, io: std.Io, service: *dl.Service, options: Config) !Installed {
+    try validateConfig(options);
+    var policy = if (options.proxy_policy) |value| try value.clone(a) else try network_proxy.capture(a, io, options.proxy);
+    defer policy.deinit();
+    var config = options;
+    config.proxy_policy = &policy;
     const token = try reserveNamespace(io, config.namespace_token, config.worker_checks);
     defer if (config.namespace_token == null) token.release();
     var reserved_config = config;
@@ -104,7 +112,8 @@ pub fn validateConfig(config: Config) !void {
 
 /// Consumes both loaded owners on every path; version and plan move to the result.
 /// The optional external control shares cancellation and deadline semantics with adapters.
-pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_loaded: loader.Loaded, external_control: ?installation.Control) !Installed {
+pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, options: Config, owned_loaded: loader.Loaded, external_control: ?installation.Control) !Installed {
+    var config = options;
     validateConfig(config) catch |err| {
         var failed_loaded = owned_loaded;
         failed_loaded.deinit();
@@ -121,6 +130,9 @@ pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
     defer loaded.sources.deinit();
     var version = loaded.version;
     errdefer version.deinit();
+    var policy = if (config.proxy_policy) |value| try value.clone(a) else try network_proxy.capture(a, io, config.proxy);
+    defer policy.deinit();
+    config.proxy_policy = &policy;
     const control: InstallControl = .{ .cancel = config.cancel, .external = external_control };
     try control.check();
     const index = version.value.asset_index orelse return error.MissingAssetIndex;
@@ -148,6 +160,8 @@ pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
         try fs.writeAtomic(a, io, file.path, assets_bytes, config.cancel);
         try control.check();
     };
+    const artifact_root = if (config.artifact_cache_root) |path| try a.dupe(u8, path) else try std.fs.path.join(a, &.{ config.root, ".vela", "cache" });
+    defer a.free(artifact_root);
     var downloaded: usize = 0;
     var reused: usize = 0;
     var tasks: std.ArrayList(PendingDownload) = .empty;
@@ -184,7 +198,7 @@ pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
                 continue;
             }
             try control.check();
-            const task = service.submit(.{ .url = file.url, .output = .{ .file = file.path }, .expected_sha1 = file.sha1, .expected_size = file.size, .proxy = config.proxy, .ca_bundle = config.ca_bundle }) catch |err| {
+            const task = service.submit(.{ .url = file.url, .output = .{ .file = file.path }, .expected_sha1 = file.sha1, .expected_size = file.size, .artifact_cache_root = artifact_root, .proxy = config.proxy, .proxy_policy = config.proxy_policy, .ca_bundle = config.ca_bundle }) catch |err| {
                 try control.check();
                 if (err == error.QueueFull and tasks.items.len != 0) break;
                 return err;
@@ -213,12 +227,14 @@ pub fn runLoaded(a: A, io: std.Io, service: *dl.Service, config: Config, owned_l
                 return error.DownloadFailed;
             }
             rememberFile(&recent, telemetry.file(tasks.items[i].path, snapshot));
-            received_done +|= snapshot.progress.received;
-            total_bytes_done = if (total_bytes_done) |sum| if (snapshot.progress.total) |n| sum +| n else null else null;
+            if (snapshot.source != .artifact) {
+                received_done +|= snapshot.progress.received;
+                total_bytes_done = if (total_bytes_done) |sum| if (snapshot.progress.total) |n| sum +| n else null else null;
+            }
             _ = tasks.swapRemove(i);
             try task.release();
             try control.check();
-            downloaded += 1;
+            if (snapshot.source == .artifact) reused += 1 else downloaded += 1;
             reportDownloads(config.task, tasks.items, reused + downloaded, plan.value.files.len, received_done, total_bytes_done, &download_rate, &recent);
             if (config.progress) |report| report(.{ .completed = reused + downloaded, .total = plan.value.files.len, .downloaded = downloaded, .reused = reused });
             try control.check();
@@ -293,10 +309,13 @@ fn reportDownloads(target: ?*task_registry.Task, pending: []const PendingDownloa
     const task = target orelse return;
     var details: task_registry.Details = .{ .stage = if (pending.len == 0) .verifying else .downloading, .completed = completed, .total = total, .received = received_done, .total_bytes = total_done };
     for (pending) |item| {
-        const value = telemetry.file(item.path, item.task.snapshot());
-        details.received +|= value.received;
-        details.total_bytes = if (details.total_bytes) |sum| if (value.total) |n| sum +| n else null else null;
-        details.bytes_per_second += value.bytes_per_second;
+        const snapshot = item.task.snapshot();
+        const value = telemetry.file(item.path, snapshot);
+        if (snapshot.source != .artifact) {
+            details.received +|= value.received;
+            details.total_bytes = if (details.total_bytes) |sum| if (value.total) |n| sum +| n else null else null;
+            details.bytes_per_second += value.bytes_per_second;
+        }
         details.addFile(value);
     }
     // Completed handles contribute to received_done, so the batch rate survives
@@ -354,7 +373,7 @@ fn fetchBoundedControlled(a: A, io: std.Io, service: *dl.Service, config: Config
     } else null;
     defer if (cache_path) |path| a.free(path);
     try control.check();
-    const task = try service.submit(.{ .url = url, .output = .bytes, .expected_sha1 = sha1, .expected_size = size, .max_bytes = max_bytes, .proxy = config.proxy, .ca_bundle = config.ca_bundle, .cache_path = cache_path });
+    const task = try service.submit(.{ .url = url, .output = .bytes, .expected_sha1 = sha1, .expected_size = size, .max_bytes = max_bytes, .proxy = config.proxy, .proxy_policy = config.proxy_policy, .ca_bundle = config.ca_bundle, .cache_path = cache_path });
     defer {
         task.cancel();
         task.join();

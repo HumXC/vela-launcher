@@ -1,7 +1,7 @@
 const std = @import("std");
 const config = @import("core/config.zig");
 const servers = @import("core/servers.zig");
-const server_manager = @import("ui/server_manager.zig");
+const server_manager = @import("application/server_manager.zig");
 const game_selection_view = @import("ui/game_selection_view.zig");
 const servers_view = @import("ui/servers_view.zig");
 
@@ -14,8 +14,8 @@ const fixture_instances: []const config.Instance = &.{
     .{ .id = "instance-beta", .name = "Beta Home", .minecraft_version = "1.21" },
 };
 const fixture_servers: []const config.Server = &.{
-    .{ .id = "server-alpha", .name = "Alpha Server", .address = "127.0.0.1", .port = 25566, .instance_id = "instance-beta", .show_on_home = true },
-    .{ .id = "server-beta", .name = "Beta Server", .address = "127.0.0.1", .instance_id = "instance-alpha", .show_on_home = true },
+    .{ .id = "server-alpha", .name = "Alpha Server", .address = "127.0.0.1", .port = 25566, .instance_id = "instance-beta" },
+    .{ .id = "server-beta", .name = "Beta Server", .address = "127.0.0.1", .instance_id = "instance-alpha" },
 };
 
 fn offlineQuery(_: std.mem.Allocator, _: std.Io, _: config.Server, _: servers.Options) anyerror!servers.OwnedStatus {

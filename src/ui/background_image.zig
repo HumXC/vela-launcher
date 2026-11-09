@@ -12,7 +12,7 @@ const max_pixels = 24_000_000;
 const max_side = 1440;
 extern fn stbi_info_from_memory([*]const u8, c_int, *c_int, *c_int, *c_int) c_int;
 extern fn WebPGetInfo([*]const u8, usize, *c_int, *c_int) c_int;
-extern fn WebPDecodeRGBAInto([*]const u8, usize, [*]u8, usize, c_int) ?[*]u8;
+const webp_decoder = @import("../core/webp_decode.zig");
 
 /// UI-thread reference count. Jobs transfer ownership only after done/acquire.
 pub const Image = struct {
@@ -257,7 +257,7 @@ fn decode(io: std.Io, path: []const u8, cancel: *std.atomic.Value(bool)) !*Image
     const rgba: []u8 = if (webp) blk: {
         const data = try heap.alloc(u8, w * h * 4);
         errdefer heap.free(data);
-        if (WebPDecodeRGBAInto(bytes.ptr, bytes.len, data.ptr, data.len, @intCast(w * 4)) == null) return error.InvalidBackgroundImage;
+        webp_decoder.rgbaInto(io, bytes, data, @intCast(w * 4)) catch |err| return if (err == error.Canceled) err else error.InvalidBackgroundImage;
         break :blk data;
     } else blk: {
         const data = dvui.c.stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &width, &height, &channels, 4) orelse return error.InvalidBackgroundImage;

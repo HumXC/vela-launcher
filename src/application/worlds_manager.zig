@@ -296,6 +296,7 @@ pub const Manager = struct {
     pending: ?*Job = null,
     active: ?*Job = null,
     active_current: bool = false,
+    shutting_down: bool = false,
     published: ?*Job = null,
     last_operation: ?*Job = null,
     list_failure: ?anyerror = null,
@@ -396,6 +397,37 @@ pub const Manager = struct {
         self.active_current = false;
         self.list_failure = null;
     }
+    pub fn shutdownOperation(self: *const Manager) ?@import("../core/shutdown.zig").Operation {
+        const job = self.active orelse self.pending orelse return null;
+        const request = job.request orelse return null;
+        return switch (request) {
+            .backup => .save_backup,
+            .copy => .save_copy,
+            .restore => .save_restore,
+            else => null,
+        };
+    }
+
+    pub fn beginShutdown(self: *Manager) void {
+        self.shutting_down = true;
+        if (self.active) |job| {
+            if (job.request == null or self.shutdownOperation() != null) self.cancelTask(job);
+        }
+        if (self.pending) |job| {
+            const cancellable = if (job.request) |request| switch (request) {
+                .backup, .copy, .restore => true,
+                else => false,
+            } else true;
+            if (cancellable) {
+                self.cancelTask(job);
+                job.failure = error.Canceled;
+                self.finishTask(job);
+                job.destroy();
+                self.pending = null;
+            }
+        }
+    }
+
     pub fn cancel(self: *Manager) void {
         self.cancelActive();
         if (self.pending) |job| {
@@ -452,7 +484,7 @@ pub const Manager = struct {
                 .uncertain => outcome.cause orelse error.WorldOperationUncertain,
             };
             // Refresh once, never repeat or automatically retry the mutation itself.
-            if (self.pending == null and self.sameSelection(job)) self.refresh() catch |err| {
+            if (!self.shutting_down and self.pending == null and self.sameSelection(job)) self.refresh() catch |err| {
                 self.list_failure = err;
             };
         } else if (self.active_current and self.sameSelection(job)) {
@@ -1038,6 +1070,31 @@ test "manager requires scope and rejects dynamic guards before allocation" {
     try std.testing.expectError(error.UnsupportedWorldGuard, Manager.initOptions(failing.allocator(), std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture, .is_running = DynamicGuard.running }, .worker = Fixture.work }));
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "shutdown cancels queued backups but completes submitted world renames without refresh" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |backup| {
+        var paths = try instances.Paths.init(a, std.testing.io, ".");
+        defer paths.deinit();
+        var registry = tasks.Registry.init(a);
+        defer registry.deinit();
+        var fixture: Fixture = .{};
+        var coordinator = instance_leases.Coordinator.init(std.testing.io);
+        var manager = try Manager.initOptions(a, std.testing.io, &paths, &registry, .{ .scope = coordinator.worldScope(3), .guard = .{ .context = &fixture }, .worker = Fixture.work });
+        defer manager.deinit();
+        try manager.select(test_instance);
+        try settle(&manager);
+        try manager.perform(if (backup) .{ .backup = "World" } else .{ .rename_display = .{ .folder = "World", .name = "New name", .confirmed = true } });
+        try std.testing.expectEqual(backup, manager.shutdownOperation() != null);
+        manager.beginShutdown();
+        manager.beginShutdown();
+        try settle(&manager);
+        try std.testing.expect(!registry.hasActive());
+        try std.testing.expect(!manager.snapshot().worker_active);
+        try std.testing.expectEqual(@as(u32, if (backup) 1 else 2), fixture.started.load(.acquire));
+        try std.testing.expectEqual(if (backup) tasks.State.canceled else tasks.State.succeeded, registry.tasks()[0].state);
+    }
 }
 
 test "busy world list waits for content mutation release then succeeds" {

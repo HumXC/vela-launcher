@@ -5,6 +5,7 @@ const windows_fs = @import("windows_durable_fs.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
 pub const appearance = @import("appearance.zig");
+pub const proxy_config = @import("proxy_config.zig");
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const max_json = 4 * 1024 * 1024;
@@ -38,7 +39,6 @@ pub const Server = struct {
     address: []const u8,
     port: u16 = 25565,
     instance_id: ?[]const u8 = null,
-    show_on_home: bool = false,
 };
 pub const AccountKind = enum { offline, microsoft };
 pub const Account = struct {
@@ -49,6 +49,8 @@ pub const Account = struct {
     credential_ref: ?[]const u8 = null,
 };
 pub const Settings = struct {
+    proxy: proxy_config.Settings = .{},
+    proxy_pending_credential_ref: ?[]const u8 = null,
     game_exit_behavior: GameExitBehavior = .restore_launcher,
     default_memory_mb: u32 = 2048,
     download_connections: u16 = 8,
@@ -125,6 +127,8 @@ fn containsId(comptime T: type, items: []const T, id: []const u8) bool {
 fn validate(doc: Document) !void {
     if (doc.schema_version != 1) return error.UnsupportedSchemaVersion;
     try appearance.validate(doc.appearance);
+    try proxy_config.validate(doc.settings.proxy);
+    if (doc.settings.proxy_pending_credential_ref) |reference| if (!credentials.validateReference(reference)) return error.InvalidProxyCredential;
     if (!validMemory(doc.settings.default_memory_mb)) return error.InvalidMemory;
     if (doc.settings.download_connections == 0 or doc.settings.download_connections > 64) return error.InvalidDownloadConnections;
     if (!validText(doc.settings.microsoft_client_id, 4096, true)) return error.InvalidClientId;
@@ -479,7 +483,7 @@ const sample: Document = .{
         .debug_launch = true,
         .origin = .{ .kind = .modrinth, .project_id = "project", .version_id = "release" },
     }},
-    .servers = &.{.{ .id = "game", .name = "Friends", .address = "localhost", .instance_id = "game", .show_on_home = true }},
+    .servers = &.{.{ .id = "game", .name = "Friends", .address = "localhost", .instance_id = "game" }},
     .accounts = &.{.{ .id = "game", .name = "Player", .uuid = "uuid", .kind = .microsoft, .credential_ref = "vault:player" }},
     .selected_instance = "game",
     .selected_server = "game",
@@ -1067,6 +1071,30 @@ fn configAllocationFailures(a: Allocator, reconcile: bool) !void {
 test "update preparation and reconcile allocation failures clean up without publishing" {
     try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, configAllocationFailures, .{false});
     try @import("test_allocations").checkAllAllocationFailures(std.testing.allocator, configAllocationFailures, .{true});
+}
+
+test "proxy settings own strings and roundtrip references without plaintext credentials" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer a.free(root);
+    var store = try Store.init(a, std.testing.io, root);
+    defer store.deinit();
+    var host = "proxy.example".*;
+    var user = "fixture-user".*;
+    const reference = "0123456789abcdef0123456789abcdef";
+    try store.update(.{ .settings = .{ .proxy = .{ .mode = .manual, .protocol = .socks5, .host = &host, .username = &user, .port = 1080, .credential_ref = reference }, .proxy_pending_credential_ref = "abcdef0123456789abcdef0123456789" } });
+    @memset(&host, 'x');
+    @memset(&user, 'x');
+    try std.testing.expectEqualStrings("proxy.example", store.snapshot().settings.proxy.host);
+    try std.testing.expectEqualStrings("fixture-user", store.snapshot().settings.proxy.username);
+    try store.reconcile();
+    const saved = store.snapshot().settings;
+    try std.testing.expectEqual(@import("proxy_config.zig").Protocol.socks5, saved.proxy.protocol);
+    try std.testing.expectEqualStrings(reference, saved.proxy.credential_ref.?);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789", saved.proxy_pending_credential_ref.?);
+    try std.testing.expectError(error.InvalidProxyCredential, validate(.{ .settings = .{ .proxy = .{ .credential_ref = "plaintext" } } }));
 }
 
 test "CurseForge reference settings default validate clone and roundtrip" {

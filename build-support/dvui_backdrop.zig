@@ -19,8 +19,11 @@ pub fn apply(b: *std.Build, module: *std.Build.Module) void {
     const adwaita = run.addOutputFileArg("Adwaita.zig");
     const font = run.addOutputFileArg("Font.zig");
     const font_cache = run.addOutputFileArg("FontCache.zig");
+    run.addFileArg(source.path(b, "widgets/MenuItemWidget.zig"));
+    const menu_item = run.addOutputFileArg("MenuItemWidget.zig");
     const files = b.addWriteFiles();
-    _ = files.addCopyDirectory(source, "", .{ .exclude_extensions = &.{ "render.zig", "Window.zig", "Adwaita.zig", "Font.zig", "FontCache.zig" } });
+    _ = files.addCopyDirectory(source, "", .{ .exclude_extensions = &.{ "render.zig", "Window.zig", "Adwaita.zig", "Font.zig", "FontCache.zig", "MenuItemWidget.zig" } });
+    _ = files.addCopyFile(menu_item, "widgets/MenuItemWidget.zig");
     _ = files.addCopyFile(font, "Font.zig");
     _ = files.addCopyFile(font_cache, "FontCache.zig");
     _ = files.addCopyFile(adwaita, "themes/Adwaita.zig");
@@ -33,7 +36,7 @@ pub fn apply(b: *std.Build, module: *std.Build.Module) void {
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
-    if (args.len != 11) return error.ExpectedFiveInputsAndOutputs;
+    if (args.len != 13) return error.ExpectedSixInputsAndOutputs;
     const render = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], a, .limited(1024 * 1024));
     const window = try std.Io.Dir.cwd().readFileAlloc(init.io, args[2], a, .limited(1024 * 1024));
     const adwaita = try std.Io.Dir.cwd().readFileAlloc(init.io, args[3], a, .limited(1024 * 1024));
@@ -58,6 +61,11 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[8], .data = patched_adwaita });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[9], .data = patched_font });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[10], .data = patched_cache });
+    const menu_item = try std.Io.Dir.cwd().readFileAlloc(init.io, args[11], a, .limited(1024 * 1024));
+    // Initialization owns border/shadow; drawBackground owns exactly one state fill.
+    const outline_only = try replaceExact(a, menu_item, "    self.data().borderAndBackground(.{});", "    self.data().borderAndBackground(.{ .fill_color = .{ .color = dvui.Color.transparent } });");
+    const single_fill = try replaceExact(a, outline_only, "                if (self.highlight) {\n                    rs.r.fill(cr, .{ .color = cols.color(.fill), .fade = 1.0 });\n                }", "                rs.r.fill(cr, .{ .color = cols.color(.fill), .fade = 1.0 });");
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[12], .data = single_fill });
 }
 
 fn replaceExact(a: std.mem.Allocator, source: []const u8, before: []const u8, after: []const u8) ![]u8 {

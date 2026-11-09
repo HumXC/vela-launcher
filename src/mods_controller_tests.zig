@@ -1,6 +1,6 @@
 const std = @import("std");
-const controller_module = @import("ui/mods_controller.zig");
-const content = @import("ui/content_manager.zig");
+const controller_module = @import("application/mods_controller.zig");
+const content = @import("application/content_manager.zig");
 const config = @import("core/config.zig");
 const instances = @import("core/instances.zig");
 const tasks = @import("core/tasks.zig");
@@ -37,6 +37,38 @@ fn drain(controller: *controller_module.Controller, service: *content.Manager) !
     }
     return error.TestWorkerTimeout;
 }
+test "mods shutdown cancels queued scans and keeps worker ownership until joined" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".minecraft/versions/First/mods");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var paths = try instances.Paths.init(a, io, root);
+    defer paths.deinit();
+    var registry = tasks.Registry.init(a);
+    defer registry.deinit();
+    var backend = try content.Manager.initOptions(a, io, &paths, &registry, .{ .lease = Lease.callbacks(), .transport_options = .{ .fixture_http = noHttp } });
+    defer backend.deinit();
+    var controller = controller_module.Controller.init(a, io, &paths);
+    defer controller.deinit();
+    try controller.select(first, .mod, &backend);
+    // Even a completed worker remains owned until the main thread joins it.
+    try std.testing.expect(controller.active != null);
+    controller.refresh();
+    try std.testing.expect(controller.needs_scan);
+    controller.cancel();
+    try std.testing.expect(!controller.needs_scan);
+    try std.testing.expect(controller.active.?.canceled.load(.acquire));
+    try std.testing.expect(controller.busy());
+    try drain(&controller, &backend);
+    try std.testing.expect(!controller.busy());
+    try std.testing.expect(controller.active == null and controller.published == null);
+    controller.tick(&backend);
+    try std.testing.expect(!controller.busy());
+}
+
 test "mods controller retires stale inventory and owns selected instance" {
     const a = std.testing.allocator;
     const io = std.testing.io;

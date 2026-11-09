@@ -5,8 +5,8 @@ const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
 const model_module = @import("model.zig");
 const resource_menu = @import("resource_type_menu.zig");
-const controller_module = @import("mods_controller.zig");
-const content = @import("content_manager.zig");
+const controller_module = @import("../application/mods_controller.zig");
+const content = @import("../application/content_manager.zig");
 const presentation = @import("mods_view.zig");
 const components = @import("components.zig");
 const theme = @import("theme.zig");
@@ -59,13 +59,14 @@ pub fn sidebar(model: *model_module.Model, pending: *?model_module.Msg, doc: *co
     }
 }
 
-fn boundSnapshot(model: *const model_module.Model, doc: *const config.Document, controller: *controller_module.Controller, ui: *presentation.Ui, backend: *content.Manager, allow_mutations: bool) !presentation.Snapshot {
+fn boundSnapshot(model: *const model_module.Model, doc: *const config.Document, controller: *controller_module.Controller, ui: *presentation.Ui, backend: *content.Manager, allow_mutations: bool) !@import("../application/mods_snapshot.zig").Snapshot {
     const instance = selected(model, doc) orelse {
         ui.acquisition.cancelPageLoads(backend);
         if (!ui.acquisition.locked()) ui.acquisition.reset();
         return .{ .failure = error.NoSelectedInstance };
     };
     if (!controller.matches(instance, ui.kind)) {
+        if (!allow_mutations) return .{ .busy = controller.busy() or backend.isBusy() };
         ui.acquisition.cancelPageLoads(backend);
         controller.select(instance, ui.kind, backend) catch |err| return .{ .failure = err, .busy = backend.isBusy() };
         ui.clearIntent();
@@ -97,7 +98,7 @@ pub fn draw(model: *const model_module.Model, doc: *const config.Document, contr
     ui.list = doc.settings.resource_list_view;
     const snapshot = try boundSnapshot(model, doc, controller, ui, backend, allow_mutations);
     ui.acquisition.tick(backend, allow_mutations);
-    if (ui.acquisition.changed) {
+    if (allow_mutations and ui.acquisition.changed) {
         ui.acquisition.changed = false;
         controller.refresh();
     }
@@ -203,6 +204,7 @@ test "mods page rebinding after deletion cancels stale page loads and global blo
     defer ui.deinit();
     var test_ui = try dvui.testing.init(.{});
     defer test_ui.deinit();
+    try @import("fonts.zig").installForTesting(test_ui.window);
     var model: model_module.Model = .{ .panel = .mods };
     try std.testing.expect(model.mods_instance.set(first.id));
     var doc: config.Document = .{ .instances = &.{first}, .selected_instance = first.id };

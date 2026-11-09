@@ -35,7 +35,7 @@ pub const JournalHooks = struct {
     remove: *const fn (*anyopaque, credentials.Reference) anyerror!void,
     references: *const fn (*anyopaque) []const credentials.Reference,
 };
-pub const Fixture = struct { transport: auth.Transport, store: credentials.Store, entropy: auth.Entropy, journal: JournalHooks };
+pub const Fixture = struct { transport: auth.Transport, store: credentials.Store, entropy: auth.Entropy, journal: JournalHooks, fail_reset_spawn: bool = false };
 pub const Options = struct { root: []const u8, http_options: HttpOptions = .{}, fixture: ?Fixture = null };
 pub const LaunchIdentity = struct { id: []const u8, username: []const u8, uuid: []const u8, kind: config.AccountKind, access_token: ?[]const u8 };
 pub const OwnedLaunchSession = struct {
@@ -111,6 +111,9 @@ pub const Manager = struct {
     remember_available: bool = false,
     reset_needed: bool = false,
     pending_ack: ?credentials.Reference = null,
+    shutting_down: bool = false,
+    shutdown_finished: bool = false,
+    shutdown_failure: ?anyerror = null,
     pub fn init(a: A, io: Io, root: []const u8) !Manager {
         return initWithOptions(a, io, .{ .root = root });
     }
@@ -334,20 +337,85 @@ pub const Manager = struct {
         }
         self.scheduleReset();
     }
+    pub fn beginShutdown(self: *Manager) void {
+        if (self.shutting_down) return;
+        self.shutting_down = true;
+        self.clearSession();
+        if (self.publication) |job| {
+            job.cancel.cancel();
+            job.wipeOutputToken();
+        }
+        if (self.active) |job| switch (job.action) {
+            .begin, .poll, .refresh, .refresh_session, .probe => self.cancel(),
+            else => {}, // Credential writes, sign-out and acknowledgements settle normally.
+        } else if (self.device != null) self.cancel();
+    }
+
+    /// Includes joined results awaiting publication, unlike the interactive busy flag.
+    pub fn shutdownBusy(self: *const Manager) bool {
+        return !self.shutdown_finished and (self.active != null or self.publication != null or
+            self.reset_needed or self.pending_ack != null or self.device != null);
+    }
+
+    /// Pump on every shutdown frame, including while shutdownBusy() is true.
+    /// A failed publication gets one retry (with reconciliation when uncertain).
+    /// No credential cleanup/ack is attempted for an unconfirmed publication.
+    pub fn finishShutdown(self: *Manager, store: *config.Store) void {
+        self.beginShutdown();
+        if (self.shutdown_finished) return;
+        self.tick(store);
+        if (self.active != null) return;
+        if (self.publication) |job| {
+            self.retryPublication(store) catch |err| {
+                // New credentials remain staged in the existing journal. Sign-out
+                // retains the old config reference; deleting an absent vault item
+                // is idempotent. Never acknowledge either uncertain outcome here.
+                self.shutdown_failure = err;
+                self.cleanup_count = job.output.cleanup_count;
+                job.destroy();
+                self.publication = null;
+            };
+            if (self.active != null) return;
+        }
+        // scheduleReset already tried allocation/spawn. On shutdown its failure
+        // is terminal; deinit wipes the idle client, and an unacked ref stays staged.
+        self.reset_needed = false;
+        self.pending_ack = null;
+        self.device = null;
+        self.clearSession();
+        if (self.shutdown_failure) |err| {
+            self.failure = err;
+            self.phase = .failed;
+        }
+        self.shutdown_finished = true;
+    }
+
     fn scheduleReset(self: *Manager) void {
         if (self.active != null or (!self.reset_needed and self.pending_ack == null)) return;
+        if (self.worker.fixture) |fixture| if (fixture.fail_reset_spawn) {
+            self.resetSchedulingFailed(error.SystemResources);
+            return;
+        };
         const job = wa.create(Job) catch |err| {
-            self.failure = err;
+            self.resetSchedulingFailed(err);
             return;
         };
         const action: Action = if (self.pending_ack != null) (if (self.reset_needed or self.phase == .cancelled) .ack_reset else .ack) else .reset;
         job.* = .{ .worker = self.worker, .action = action, .reference = self.pending_ack };
         self.start(job, self.phase) catch |err| {
-            self.failure = err;
+            self.resetSchedulingFailed(err);
             return;
         };
         self.pending_ack = null;
         if (action == .reset or action == .ack_reset) self.reset_needed = false;
+    }
+    fn resetSchedulingFailed(self: *Manager, err: anyerror) void {
+        self.failure = err;
+        if (self.shutting_down) {
+            self.shutdown_failure = err;
+            self.reset_needed = false;
+            self.pending_ack = null;
+        }
     }
 
     pub fn signOut(self: *Manager, store: *config.Store, id: []const u8) !void {
@@ -381,6 +449,7 @@ pub const Manager = struct {
         self.finish(job);
     }
     pub fn tick(self: *Manager, store: *config.Store) void {
+        if (self.shutdown_finished) return;
         self.syncSelection(store) catch |err| {
             self.failure = err;
         };
@@ -401,7 +470,7 @@ pub const Manager = struct {
             self.finish(job);
         }
         self.scheduleReset();
-        if (self.active == null and self.publication == null and (self.phase == .device_pending or self.phase == .slow_down)) {
+        if (!self.shutting_down and self.active == null and self.publication == null and (self.phase == .device_pending or self.phase == .slow_down)) {
             const device = self.device orelse return;
             if (now(self.io) >= device.next_poll_ms) {
                 const job = self.newJob(.poll, store) catch |err| {
@@ -558,6 +627,9 @@ const Job = struct {
             self.output.phase = .cancelled;
             self.output.failure = null;
         }
+        // Device-code polling is one logical operation. Release its transport
+        // once finished so later login/refresh operations capture current settings.
+        if (self.output.phase != .device_pending and self.output.phase != .slow_down) self.worker.releaseTransport();
         self.output.cleanup_count = self.worker.references().len;
         self.done.store(true, .release);
     }
@@ -720,6 +792,13 @@ const Worker = struct {
         };
         return response;
     }
+    fn releaseTransport(w: *Worker) void {
+        if (w.adapter) |*adapter| {
+            adapter.deinit();
+            w.adapter = null;
+            w.transport = null;
+        }
+    }
     fn ensureTransport(w: *Worker) !void {
         if (w.transport != null) return;
         if (w.fixture) |f| {
@@ -850,6 +929,7 @@ const Worker = struct {
             },
             .refresh_session => {
                 if (w.client == null or !std.mem.eql(u8, w.client_id, job.client_id)) return error.LoginRequired;
+                try w.ensureTransport();
                 try w.client.?.refreshSession(now(w.io), &job.cancel);
                 try w.capture(job);
             },

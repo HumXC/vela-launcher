@@ -30,7 +30,7 @@ const Fixture = struct {
             try std.fmt.allocPrint(alloc, "{{\"data\":{{\"id\":34,\"modId\":12,\"gameId\":432,\"displayName\":\"Release\",\"fileName\":\"pack.zip\",\"hashes\":[{{\"algo\":1,\"value\":\"{s}\"}}],\"fileLength\":123,\"isAvailable\":true,\"downloadUrl\":\"https://{s}/pack.zip\",\"gameVersions\":[\"1.20.1\",\"Fabric\"],\"dependencies\":[]}}}}", .{ hash, if (self.bad_host) @as([]const u8, "evil.example") else "edge.forgecdn.net" })
         else
             try std.fmt.allocPrint(alloc, "{{\"data\":{{\"id\":12,\"gameId\":432,\"classId\":6,\"name\":\"Example\",\"summary\":\"Fixture\",\"allowModDistribution\":{s},\"links\":{{\"websiteUrl\":\"https://www.curseforge.com/minecraft/mc-mods/example\"}}}}}}", .{if (self.allowed) @as([]const u8, "true") else "false"});
-        return .{ .allocator = alloc, .status = self.status, .body = body };
+        return .{ .allocator = alloc, .status = self.status, .body = body, .allocation = body };
     }
     fn put(_: *anyopaque, _: []const u8, _: []const u8) credentials.Error!void {
         return error.Denied;
@@ -139,5 +139,22 @@ test "pack source MR inspection permits empty content and staged overrides" {
     item.pack.files = &files;
     try source.resolveInspection(a, io, &item, .{}, null);
     files[0].alternatives = &.{"https://evil.example/file"};
+    try std.testing.expectError(error.UnapprovedDownloadHost, source.resolveInspection(a, io, &item, .{}, null));
+}
+
+test "indexed worlds retain source host and alternative authorization" {
+    var item = inspection();
+    defer item.deinit();
+    item.provider = .modrinth;
+    item.pack.identity.provider = .modrinth;
+    item.pack.files = &.{};
+    item.pack.unresolved = &.{};
+    var worlds = [_]manifest.InstallFile{.{ .record = .{ .path = "saves/World/level.dat", .provider = .modrinth, .project_id = "p", .version_id = "v", .hashes = .{ .sha1 = hash }, .size = 0, .identity_provenance = .pack_archive }, .download = .{ .remote = "https://cdn.modrinth.com/world.dat" } }};
+    item.pack.initial_world_files = &worlds;
+    try source.resolveInspection(a, io, &item, .{}, null);
+    worlds[0].alternatives = &.{"https://evil.example/world.dat"};
+    try std.testing.expectError(error.UnapprovedDownloadHost, source.resolveInspection(a, io, &item, .{}, null));
+    worlds[0].alternatives = &.{};
+    worlds[0].download = .{ .remote = "https://evil.example/world.dat" };
     try std.testing.expectError(error.UnapprovedDownloadHost, source.resolveInspection(a, io, &item, .{}, null));
 }

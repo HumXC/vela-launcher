@@ -148,7 +148,8 @@ const Fixture = struct {
         try std.testing.expect(req.sensitive and !req.follow_redirects and !req.allow_http_loopback);
         if (self.failure) |err| return err;
         if (self.cancel_on_return) |token| token.cancel();
-        return .{ .status = self.status, .body = try self.native.allocator().dupe(u8, self.body), .allocator = self.native.allocator() };
+        const body = try self.native.allocator().dupe(u8, self.body);
+        return .{ .status = self.status, .body = body, .allocator = self.native.allocator(), .allocation = body };
     }
 };
 

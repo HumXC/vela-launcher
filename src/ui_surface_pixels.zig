@@ -13,6 +13,49 @@ var pixel: [1]dvui.Color.PMA = .{.{ .r = 200, .g = 210, .b = 220, .a = 255 }};
 var empty: [0]u8 = .{};
 var image: background.Image = .{ .bytes = &empty, .path = &empty, .width = 1, .height = 1, .pixels = @splat(&pixel), .digest = @splat(0), .extension = "png" };
 
+fn checkControlFills() !void {
+    const win = dvui.currentWindow();
+    for ([_]u8{ 60, 80, 100 }) |opacity| {
+        theme.applyAppearance(.{ .panel_opacity = opacity });
+        theme.setPanelBackdrop(null, .{}, dvui.windowRectScale());
+        var picture = dvui.Picture.start(.{ .w = 768, .h = 320 }) orelse return error.MissingTextureTarget;
+        defer picture.texture.destroyLater();
+        surface.fill(.{ .r = picture.r, .s = 1 }, .{}, .{ .color = dvui.Color.white });
+        const options = theme.controlOptions(20).override(.{
+            .id_extra = opacity,
+            .rect = .{ .x = 20, .y = 20, .w = 200, .h = 48 },
+            .margin = .all(0),
+            .tab_index = 0,
+        });
+        var buffer: [16]u8 = @splat(0);
+        var entry: dvui.TextEntryWidget = undefined;
+        entry.init(@src(), .{ .text = .{ .buffer = &buffer } }, options);
+        entry.draw();
+        entry.deinit();
+        var button: dvui.ButtonWidget = undefined;
+        button.init(@src(), .{ .draw_focus = false }, options.override(.{ .rect = .{ .x = 20, .y = 100, .w = 200, .h = 48 } }));
+        theme.buttonBackground(&button, .{});
+        button.deinit();
+        var choice: usize = 0;
+        _ = dvui.dropdown(@src(), &.{""}, .{ .choice = &choice }, .{}, options.override(.{ .rect = .{ .x = 20, .y = 180, .w = 200, .h = 48 } }));
+        picture.stop();
+        const pixels = try dvui.textureReadTarget(win.lifo(), picture.texture);
+        defer win.lifo().free(pixels);
+        const width: usize = picture.texture.width;
+        const reference = pixels[44 * width + 100];
+        for ([_]usize{ 124, 204 }) |y| {
+            const actual = pixels[y * width + 100];
+            inline for (.{ "r", "g", "b", "a" }) |channel| {
+                if (@abs(@as(i32, @field(reference, channel)) - @as(i32, @field(actual, channel))) > 1) {
+                    std.log.err("control fill mismatch opacity={} y={}: entry={} actual={}", .{ opacity, y, reference, actual });
+                    return error.ControlFillMismatch;
+                }
+            }
+        }
+    }
+    std.debug.print("control fills: input, button and dropdown match at 60/80/100 percent opacity\n", .{});
+}
+
 fn start() dvui.App.StartOptions {
     return .{ .size = .{ .w = 768, .h = 320 }, .min_size = .{ .w = 768, .h = 320 }, .title = "Vela surface pixel regression", .vsync = false, .persist_window_geometry = false };
 }
@@ -24,6 +67,7 @@ fn frame() !dvui.App.Result {
     defer win.natural_scale = previous_scale;
     defer theme.applyAppearance(.{});
     defer theme.setPanelBackdrop(null, .{}, .{ .r = .{}, .s = 1 });
+    try checkControlFills();
     var cases: usize = 0;
     var edge_samples: usize = 0;
     var maximum_error: f32 = 0;

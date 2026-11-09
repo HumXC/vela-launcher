@@ -136,7 +136,7 @@ const HttpAdapter = struct {
             .deadline_ns = self.deadline,
             .cancel = cancellation,
             .follow_redirects = false,
-            .require_public_address = self.client.proxy.len == 0,
+            .require_public_address = true,
         });
         defer response.deinit();
         return .{ .status = response.status, .body = try a.dupe(u8, response.body) };

@@ -30,6 +30,8 @@ pub const FetchRequest = struct {
     max_bytes: u64,
     expected_size: ?u64,
     expected_sha1: ?[20]u8,
+    expected_sha256: ?[32]u8 = null,
+    expected_sha512: ?[64]u8 = null,
     deadline_ns: ?i96,
     cancel: ?*const std.atomic.Value(bool),
 };
@@ -233,6 +235,7 @@ fn validateOptionPaths(options: Options) !void {
     if (options.plan.actions.len > providers.max_items * 2 or options.files.len > providers.max_items or
         options.manual_files.len > providers.max_items or options.plan.conflicts.len > providers.max_items * 2) return error.TooManyItems;
     if (options.pack) |pack| {
+        if (pack.initial_world_files.len != 0) return error.ProtectedPath;
         if (pack.files.len > providers.max_items) return error.TooManyItems;
     }
     if (options.instance_id.len == 0 or options.instance_id.len > manifest.max_path_bytes or
@@ -353,15 +356,19 @@ const ProductionFetcher = struct {
     download_budget: ?*downloader.Budget,
     proxy: ?[]const u8,
     ca_bundle: ?[]const u8,
+    cache_root: []const u8,
+    policy: ?@import("proxy_policy.zig").Policy = null,
     fn deinit(self: *ProductionFetcher) void {
         if (self.service) |service| {
             service.deinit();
             curl.globalDeinit();
         }
+        if (self.policy) |*policy| policy.deinit();
     }
     fn fetchToFile(context: ?*anyopaque, io: Io, request: FetchRequest) !void {
         const self: *ProductionFetcher = @ptrCast(@alignCast(context.?));
         try fs.cancelled(io, request.cancel, request.deadline_ns);
+        if (self.policy == null) self.policy = try @import("proxy_policy.zig").capture(self.allocator, self.io, self.proxy);
         if (self.service == null) {
             try curl.globalInit();
             errdefer curl.globalDeinit();
@@ -371,9 +378,12 @@ const ProductionFetcher = struct {
             .url = request.url,
             .output = .{ .file = request.absolute_path },
             .expected_sha1 = request.expected_sha1,
+            .expected_sha256 = request.expected_sha256,
+            .expected_sha512 = request.expected_sha512,
+            .artifact_cache_root = self.cache_root,
             .expected_size = request.expected_size,
             .max_bytes = std.math.cast(usize, request.max_bytes) orelse return error.BodyTooLarge,
-            .proxy = self.proxy orelse "",
+            .proxy_policy = &self.policy.?,
             .ca_bundle = self.ca_bundle,
             .timeout_ms = 120_000,
             .https_only = true,
@@ -387,7 +397,7 @@ const ProductionFetcher = struct {
                 defer task.release() catch unreachable;
                 if (cancellation) |err| return err;
                 if (snapshot.failure) |err| return err;
-                if (snapshot.http_status < 200 or snapshot.http_status >= 300) return error.HttpStatus;
+                if (snapshot.source != .artifact and (snapshot.http_status < 200 or snapshot.http_status >= 300)) return error.HttpStatus;
                 return;
             }
             fs.cancelled(io, request.cancel, request.deadline_ns) catch |err| {
@@ -437,6 +447,8 @@ fn stage(a: A, io: Io, options: Options, fetcher: Fetcher, txn: Dir, txn_path: [
                 .max_bytes = limit,
                 .expected_size = file.record.size,
                 .expected_sha1 = digest,
+                .expected_sha256 = try @import("artifact_cache.zig").parseHex(32, file.record.hashes.sha256),
+                .expected_sha512 = try @import("artifact_cache.zig").parseHex(64, file.record.hashes.sha512),
                 .deadline_ns = options.deadline_ns,
                 .cancel = options.cancel,
             });
@@ -696,7 +708,7 @@ pub fn execute(a: A, io: Io, options: Options) !Report {
     try fs.write(roots.metadata, io, manifest_temp, next_bytes);
     defer roots.metadata.deleteFile(io, manifest_temp) catch {};
     var entries: std.ArrayList(Entry) = .empty;
-    var production: ProductionFetcher = .{ .allocator = a, .io = io, .proxy = options.proxy, .ca_bundle = options.ca_bundle, .download_budget = options.download_budget };
+    var production: ProductionFetcher = .{ .allocator = a, .io = io, .proxy = options.proxy, .ca_bundle = options.ca_bundle, .download_budget = options.download_budget, .cache_root = options.paths.cache };
     defer production.deinit();
     const fetcher = options.fetcher orelse Fetcher{ .context = &production, .fetchToFile = ProductionFetcher.fetchToFile };
     for (options.plan.actions) |action| {
@@ -1202,4 +1214,25 @@ test "journal path preflight bounds precede uninitialized entries" {
         .manifest_temp = ".content-" ++ transaction_id ++ ".next",
     };
     try std.testing.expectError(error.InvalidJournal, validateJournal(journal, "instance", "Test", transaction_id));
+}
+
+test "generic content executor rejects initial world source plans before acquiring lease" {
+    var fixture = try ReceiptFixture.init();
+    defer fixture.deinit();
+    var options = fixture.options(.{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = "instance", .pack_version = "v1" }, .ready = true, .fully_applied = true }, &.{});
+    var world = testCFInstallFile();
+    world.record.path = "saves/World/level.dat";
+    world.record.provider = .modrinth;
+    world.record.identity_provenance = .pack_archive;
+    options.pack = .{ .identity = .{ .provider = .modrinth, .project_id = "p", .version_id = "v" }, .name = "World", .version = "v", .minecraft_version = "1.21.1", .initial_world_files = &.{world} };
+    options.prerequisites = .{ .overrides_processed = true, .dependencies_resolved = true, .loader_ready = true };
+    const Probe = struct {
+        fn inspect(_: ?*anyopaque, _: []const u8) !?manifest.LocalFile {
+            return error.UnexpectedProbe;
+        }
+    };
+    try std.testing.expectError(error.ProtectedPath, manifest.checkCompleteness(options.pack.?, .{ .context = null, .inspect = Probe.inspect }, options.prerequisites));
+    try std.testing.expectError(error.ProtectedPath, execute(std.testing.allocator, std.testing.io, options));
+    try std.testing.expectEqual(@as(usize, 0), fixture.guard.acquired);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
 }

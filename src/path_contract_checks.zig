@@ -2,6 +2,6 @@
 test {
     _ = @import("core/minecraft/install_plan.zig");
     _ = @import("core/minecraft/native_extract.zig");
-    _ = @import("ui/game_library.zig");
-    _ = @import("ui/game_launch.zig");
+    _ = @import("application/game_library.zig");
+    _ = @import("application/game_launch.zig");
 }

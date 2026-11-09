@@ -60,7 +60,7 @@ const Metadata = struct {
         try fs.cancelled(io, cancel, null);
         self.secret = try store.get(a, &ref);
         try fs.cancelled(io, cancel, null);
-        self.adapter = try transport.Adapter.initWithOptions(a, io, cancel, 1, options.transport_options);
+        self.adapter = try transport.Adapter.init(a, io, cancel, 1, options.transport_options);
     }
     fn deinit(self: *Metadata) void {
         if (self.secret) |*secret| secret.deinit();
@@ -117,8 +117,10 @@ pub fn resolveInspection(a: A, io: std.Io, inspection: *pack_import.Inspection, 
     try fs.cancelled(io, cancel, null);
     if (inspection.provider != inspection.pack.identity.provider) return error.ProviderMismatch;
     if (inspection.provider == .modrinth) {
-        for (inspection.pack.files) |file| {
-            try manifest.checkedPathForInstance(file.record.path, null);
+        try manifest.validateInitialWorldFiles(inspection.pack.initial_world_files);
+        for (0..inspection.pack.sourceFileCount()) |index| {
+            const file = inspection.pack.sourceFile(index);
+            if (index < inspection.pack.files.len) try manifest.checkedPathForInstance(file.record.path, null);
             if (file.record.identity_provenance == .pack_override and file.record.role == .override and file.download == .manual_required) continue;
             try validateMrFile(.{ .filename = std.fs.path.basename(file.record.path), .hashes = file.record.hashes, .size = file.record.size, .download = file.download }, options);
             for (file.alternatives) |url| if (!providers.approvedDownloadUrl(url, options.transport_options.approved_download_hosts)) return error.UnapprovedDownloadHost;

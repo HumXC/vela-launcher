@@ -163,6 +163,17 @@ pub const Control = struct {
         if (!c.SDL_HideWindow(window)) return error.HideWindowFailed;
     }
 
+    /// Prompting must not restore or raise an already-visible normal window.
+    pub fn showForPrompt(self: *Control) !void {
+        const window = self.window orelse return error.NotInitialized;
+        const flags = c.SDL_GetWindowFlags(window);
+        const hidden = flags & c.SDL_WINDOW_HIDDEN != 0;
+        const minimized = flags & c.SDL_WINDOW_MINIMIZED != 0;
+        if (hidden and !c.SDL_ShowWindow(window)) return error.ShowWindowFailed;
+        if (minimized and !c.SDL_RestoreWindow(window)) return error.RestoreWindowFailed;
+        if ((hidden or minimized) and !c.SDL_RaiseWindow(window)) return error.RaiseWindowFailed;
+    }
+
     pub fn restoreAndFocus(self: *Control) !void {
         const window = self.window orelse return error.NotInitialized;
         if (!c.SDL_ShowWindow(window)) return error.ShowWindowFailed;

@@ -1,4 +1,40 @@
 const std = @import("std");
+
+test "online pack archive inspection reuses production cache after cleanup" {
+    const providers = @import("core/content_providers.zig");
+    const cache = @import("core/artifact_cache.zig");
+    const downloader = @import("core/downloader.zig");
+    var fixture = try fixtures.Fixture.init();
+    defer fixture.deinit();
+    try fixtures.zip(fixture.tmp.dir, "cached.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = fixtures.index }});
+    const archive = try fixture.tmp.dir.readFileAlloc(io, "cached.mrpack", a, .limited(1024 * 1024));
+    defer a.free(archive);
+    var digest: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(archive, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const files = [_]providers.File{.{ .filename = "cached.mrpack", .primary = true, .size = archive.len, .hashes = .{ .sha512 = &hex }, .download = .{ .remote = "https://cdn.modrinth.com/data/fixture/versions/v1/cached.mrpack" } }};
+    const version: providers.Version = .{ .provider = .modrinth, .project_id = "fixture", .id = "v1", .name = "Cache fixture", .minecraft_versions = &.{"1.21.1"}, .loaders = &.{"fabric"}, .files = &files, .dependencies = &.{} };
+    const source = try fixture.path("cached.mrpack");
+    defer a.free(source);
+    const hashes: cache.Hashes = .{ .sha512 = digest };
+    const cached = (try hashes.path(a, fixture.paths.cache)).?;
+    defer a.free(cached);
+    try cache.publish(a, io, source, cached, hashes, archive.len, 1024 * 1024);
+    try fixture.tmp.dir.deleteFile(io, "cached.mrpack");
+    var budget = try downloader.Budget.init(io, 1);
+    defer budget.deinit();
+    const options: backend.Options = .{ .transport_options = .{ .cache_root = fixture.paths.cache, .download_budget = &budget, .http = .{ .proxy = "http://127.0.0.1:1" } } };
+    var cancel: backend.CancelToken = .init(false);
+    for (0..2) |_| {
+        var inspected = try backend.inspect(a, io, &fixture.paths, .{ .online = version }, options, &cancel);
+        defer inspected.deinit();
+        try inspected.cleanup(io);
+    }
+    const retained = try std.Io.Dir.cwd().readFileAlloc(io, cached, a, .limited(1024 * 1024));
+    defer a.free(retained);
+    try std.testing.expectEqualSlices(u8, archive, retained);
+}
+
 const backend = @import("core/pack_install.zig");
 const credentials = @import("core/credentials.zig");
 const http = @import("core/http_transport.zig");
@@ -39,7 +75,8 @@ const Provider = struct {
             \\{"data":{"id":34,"modId":12,"gameId":432,"displayName":"Release","fileName":"example.jar","hashes":[{"algo":1,"value":"fc19318dd13128ce14344d066510a982269c241b"}],"fileLength":4,"isAvailable":true,"downloadUrl":"https://edge.forgecdn.net/files/12/34/example.jar","gameVersions":["1.20.1","Forge"],"dependencies":[]}}
             ;
         };
-        return .{ .allocator = alloc, .status = 200, .body = try alloc.dupe(u8, bytes) };
+        const body = try alloc.dupe(u8, bytes);
+        return .{ .allocator = alloc, .status = 200, .body = body, .allocation = body };
     }
     fn get(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8) credentials.Error!credentials.Secret {
         const self: *Provider = @ptrCast(@alignCast(raw));
@@ -81,6 +118,7 @@ test "CurseForge archive references are reauthorized and installed only in the p
     defer a.free(loader_version);
     try std.testing.expectEqualStrings("1.20.1-47.3.0", loader_version);
     var request: backend.Request = .{ .paths = &fixture.paths, .inspection = &inspection, .instance = .{ .id = "cf-pack", .name = "CF Pack", .minecraft_version = "1.20.1", .loader = .forge, .loader_version = loader_version }, .options = provider.options() };
+    request.options.transport_options.cache_root = fixture.paths.cache;
     var telemetry: @import("core/tasks.zig").Task = .{ .id = 0, .title = "pack test", .kind = .modpack_install };
     provider.telemetry = &telemetry;
     request.options.telemetry = &telemetry;
@@ -162,7 +200,7 @@ test "adapted pack instances prepare and precommit both external archive formats
             const archive = try fixture.path(archive_name);
             defer a.free(archive);
             var cancel: backend.CancelToken = .init(false);
-            var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel);
+            var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel, null);
             defer inspection.deinit();
             defer inspection.cleanup(io) catch {};
             const adapted = (try versions.normalize(a, inspection.pack.loader, inspection.pack.minecraft_version, inspection.pack.loader_version)).?;
@@ -209,7 +247,7 @@ test "pack preparation and precommit reject wrong MC prefixes and unequal loader
                 const archive = try fixture.path(archive_name);
                 defer a.free(archive);
                 var cancel: backend.CancelToken = .init(false);
-                var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel);
+                var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel, null);
                 defer inspection.deinit();
                 defer inspection.cleanup(io) catch {};
                 if (std.mem.startsWith(u8, dependency, "1.20.2-"))

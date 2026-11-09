@@ -8,7 +8,7 @@ const paths_mod = @import("../core/instances.zig");
 const CancelToken = std.atomic.Value(bool);
 const metadata = @import("../core/minecraft/metadata/root.zig");
 const vanilla = @import("../core/minecraft/metadata_loader.zig");
-const preparation = @import("../application/instance_preparation.zig");
+const preparation = @import("instance_preparation.zig");
 const loader = @import("../core/loaders/install.zig");
 const loaders = @import("../core/loaders/root.zig");
 const http = @import("../core/http_transport.zig");
@@ -186,7 +186,6 @@ const Job = struct {
     probe_major: u32 = 0,
     runtime_path: ?[]const u8 = null,
     installer_path: ?[]const u8 = null,
-    installer_key: []const u8,
     actual_row: ?config.Instance = null,
 
     fn create(a: A, io: Io, root: []const u8, request: Request, options: Options) !*Job {
@@ -198,8 +197,7 @@ const Job = struct {
         errdefer paths.deinit();
         const aa = arena.allocator();
         const owned = try clone(Request, aa, request);
-        const key = try std.fmt.allocPrint(aa, "{s}:installer", .{owned.instance.id});
-        self.* = .{ .a = a, .io = io, .arena = arena, .paths = paths, .request = owned, .options = try clone(Options, aa, options), .installer_key = key };
+        self.* = .{ .a = a, .io = io, .arena = arena, .paths = paths, .request = owned, .options = try clone(Options, aa, options) };
         return self;
     }
     fn destroy(self: *Job) void {
@@ -523,22 +521,26 @@ const Core = struct {
         if (job.thread != null or self.discovery_owned or self.download_token != null or self.instance_owned) return;
         self.phase = .cleaning;
     }
-    fn selected(self: *const Core, role: JavaRole) !?java_manager.Runtime {
+    const JavaSelection = struct { path: []const u8, major: u32 };
+
+    fn selected(self: *const Core, role: JavaRole) !?JavaSelection {
         const services = self.services.?;
         const job = self.job.?;
         const required = if (role == .runtime) job.runtime_major.? else job.installer_major.?;
         const row = job.request.instance;
         if (role == .runtime) if (row.java_path) |path| {
+            if (services.java.isHidden(path)) return error.SelectedJavaUnavailable;
             for (services.java.entries()) |runtime| if (textEqual(runtime.path, path)) {
                 if (runtime.major != required) return error.IncompatibleJava;
                 try runtime.architecture.requireHost();
-                return runtime;
+                break;
             };
-            return null;
+            // A saved external path is an explicit binding even when unregistered.
+            // The worker probes it before any install or publication.
+            return .{ .path = path, .major = required };
         };
-        const key = if (role == .runtime) row.name else job.installer_key;
-        if (services.java.selectedPath(key) != null and services.java.resolve(key, required) == null) return error.IncompatibleJava;
-        return services.java.resolve(key, required);
+        const runtime = services.java.resolve(required) orelse return null;
+        return .{ .path = runtime.path, .major = runtime.major };
     }
     fn exactSelection(self: *const Core, role: JavaRole, path: []const u8) !void {
         const runtime = (try self.selected(role)) orelse return error.JavaSelectionChanged;
@@ -560,13 +562,11 @@ const Core = struct {
         }
         if (!self.discovered) {
             if (services.java.isSearching()) return error.JavaDiscoveryBusy;
-            const explicit_path = if (role == .runtime) job.request.instance.java_path else null;
-            try services.java.search(explicit_path orelse "");
+            try services.java.search("");
             self.discovery_owned = true;
             self.phase = .discovering_java;
             return;
         }
-        if (role == .runtime and job.request.instance.java_path != null) return error.SelectedJavaUnavailable;
         if (services.java_download.isBusy()) return error.JavaDownloadBusy;
         const required = if (role == .runtime) job.runtime_major.? else job.installer_major.?;
         const request: downloads.Request = .{ .vendor = self.options.java_vendor, .major = @intCast(required) };
@@ -679,7 +679,7 @@ pub const Controller = struct {
     pub fn presentsCreation(self: *const Controller, manager: *const instances_manager.Manager) bool {
         return if (self.core.job) |job| manager.snapshot().task_id == job.instance_task_id else false;
     }
-    pub fn ownership(self: *const Controller) @import("../application/creation_runtime.zig").Ownership {
+    pub fn ownership(self: *const Controller) @import("creation_runtime.zig").Ownership {
         return .{
             .pinned = switch (self.core.phase) {
                 .idle, .complete, .failed, .canceled => false,
@@ -773,10 +773,16 @@ pub const Controller = struct {
             core.discovered = true;
             if (bound.java.searchFailure()) |err| core.fail(err);
             if (!core.cancel_requested) {
-                for (bound.java.searchResults()) |runtime| {
-                    bound.java.add(&.{runtime.path}) catch |err| {
+                const results = bound.java.searchResults();
+                if (results.len > 0) {
+                    const paths = core.a.alloc([]const u8, results.len) catch |err| {
                         core.fail(err);
-                        break;
+                        return;
+                    };
+                    defer core.a.free(paths);
+                    for (results, paths) |runtime, *path| path.* = runtime.path;
+                    bound.java.add(paths) catch |err| {
+                        core.fail(err);
                     };
                 }
                 if (!core.cancel_requested) core.acquireJava(core.role.?) catch |err| {
@@ -807,6 +813,8 @@ pub const Controller = struct {
                 core.fail(error.InstancePublicationOwnershipLost);
                 return;
             }
+            // Retain the child snapshot before releasing ownership on failure or cleanup.
+            job.task.?.reportDetails(snap.details);
             if (snap.phase == .awaiting_publication or core.phase == .awaiting_reconciliation) {
                 if (!allow_mutations) {
                     bound.instances.retainCreationForShutdown() catch |err| {
@@ -1279,7 +1287,7 @@ test "ordinary Fabric and Quilt creation uses registered Java 21 without an inst
         fixture.row.loader_version = "0.16.0";
         fixture.instances.installer.?.run = ProfileFixture.install;
         try fixture.registerRuntime(21);
-        try std.testing.expect(fixture.java.resolve("unused-installer", 8) == null);
+        try std.testing.expect(fixture.java.resolve(8) == null);
         var value = try fixture.controller();
         defer value.deinit(fixture.services());
         value.core.options.runner.transport = .{ .get = ProfileFixture.get };
@@ -1514,7 +1522,7 @@ test "ordinary coordinator selected incompatible runtime never falls back or dow
     defer fixture.deinit();
     try fixture.registerRuntime(17);
     try fixture.registerRuntime(21);
-    try fixture.java.choose(fixture.row.name, "/fixture/java-21", 21);
+    fixture.row.java_path = "/fixture/java-21";
     var value = try fixture.controller();
     defer value.deinit(fixture.services());
     try value.start(try fixture.request(), fixture.services());
@@ -1569,8 +1577,6 @@ test "ordinary coordinator Java roles resolve independent exact-major selections
     defer fixture.deinit();
     try fixture.registerRuntime(17);
     try fixture.registerRuntime(8);
-    try fixture.java.choose(fixture.row.name, "/fixture/java-17", 17);
-    try fixture.java.choose("game:installer", "/fixture/java-8", 8);
     var value = try fixture.controller();
     defer value.deinit(fixture.services());
     try value.start(try fixture.request(), fixture.services());
@@ -1754,6 +1760,53 @@ test "ordinary auto Java forwards full live details and completes creation" {
     try std.testing.expectEqual(@as(f64, 0), terminal.files[0].bytes_per_second);
     fixture.registry.pruneFinished(0);
     try std.testing.expectEqualDeep(terminal, fixture.download.snapshot().details);
+}
+
+test "ordinary failed and canceled installation retain child details after cleanup and pruning" {
+    const Installer = struct {
+        failure: anyerror,
+        fn run(raw: ?*anyopaque, _: A, _: Io, _: instances_manager.CreateRequest, control: instances_manager.Control) !instances_manager.Installed {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            var details: tasks.Details = .{ .stage = .downloading, .completed = 2, .total = 5, .received = 4096, .total_bytes = 8192, .bytes_per_second = 1024, .omitted_files = 3 };
+            details.addFile(tasks.File.init("libraries/failed.jar", 1024, 4096, 1024, if (self.failure == error.Canceled) .canceled else .failed, self.failure));
+            control.task.?.reportDetails(details);
+            return self.failure;
+        }
+    };
+    for ([_]anyerror{ error.TransferFailed, error.Canceled }) |failure| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        try fixture.registerRuntime(17);
+        var installer: Installer = .{ .failure = failure };
+        fixture.instances.installer = .{ .context = &installer, .run = Installer.run };
+        var value = try fixture.controller();
+        defer value.deinit(fixture.services());
+        try value.start(try fixture.request(), fixture.services());
+        try fixture.until(&value, .creating);
+        const parent = value.core.job.?.task.?;
+        try std.testing.expectEqual(tasks.Stage.scanning, parent.details().stage);
+        const terminal: Phase = if (failure == error.Canceled) .canceled else .failed;
+        for (0..24) |_| {
+            if (value.snapshot().phase == terminal) break;
+            fixture.advance(&value);
+        }
+        try std.testing.expectEqual(terminal, value.snapshot().phase);
+        try std.testing.expect(!value.core.instance_owned);
+        const details = value.creationSnapshot().details;
+        try std.testing.expectEqual(tasks.Stage.downloading, details.stage);
+        try std.testing.expectEqual(@as(u64, 2), details.completed);
+        try std.testing.expectEqual(@as(?u64, 5), details.total);
+        try std.testing.expectEqual(@as(u64, 4096), details.received);
+        try std.testing.expectEqual(@as(?u64, 8192), details.total_bytes);
+        try std.testing.expectEqual(@as(usize, 3), details.omitted_files);
+        try std.testing.expectEqual(@as(f64, 0), details.bytes_per_second);
+        try std.testing.expectEqual(@as(usize, 1), details.file_count);
+        try std.testing.expectEqualStrings("libraries/failed.jar", details.files[0].path());
+        try std.testing.expectEqual(failure, details.files[0].failure.?);
+        try std.testing.expectEqualDeep(details, parent.details());
+        fixture.registry.pruneFinished(0);
+        try std.testing.expectEqualDeep(details, value.creationSnapshot().details);
+    }
 }
 
 test "ordinary auto Java extraction failure retains received history and stopped terminal details" {
@@ -1988,5 +2041,115 @@ test "creation rejects foreign selected and re-probed JVM architectures before i
         try std.testing.expectEqual(@as(usize, 0), fixture.create_count);
         try std.testing.expectEqual(@as(usize, 0), fixture.store.snapshot().instances.len);
         try std.testing.expect(!fixture.registry.hasActive());
+    }
+}
+
+test "creation preserves an unregistered explicit Java path through publication" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.row.java_path = "/external/jdk/bin/java";
+    var value = try fixture.controller();
+    defer value.deinit(fixture.services());
+    try value.startOrdinary(fixture.row, fixture.services());
+    try fixture.until(&value, .awaiting_publication);
+    try std.testing.expectEqual(@as(usize, 1), fixture.probe_count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.java.entries().len);
+    try std.testing.expect(!value.core.discovered);
+    try std.testing.expectEqualStrings(fixture.row.java_path.?, value.core.job.?.runtime_path.?);
+    try value.publishOrdinary(fixture.services(), true);
+    try fixture.until(&value, .complete);
+    try std.testing.expectEqualStrings(fixture.row.java_path.?, fixture.store.snapshot().instances[0].java_path.?);
+}
+
+test "creation rejects incompatible external Java before installation without automatic fallback" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.registerRuntime(17);
+    fixture.row.java_path = "/external/jdk/bin/java";
+    fixture.probe_major = 21;
+    var value = try fixture.controller();
+    defer value.deinit(fixture.services());
+    try value.startOrdinary(fixture.row, fixture.services());
+    for (0..8) |_| fixture.advance(&value);
+    try std.testing.expectEqual(Phase.failed, value.snapshot().phase);
+    try std.testing.expectEqual(error.JavaMajorMismatch, value.snapshot().failure.?);
+    try std.testing.expectEqual(@as(usize, 1), fixture.probe_count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.create_count);
+    try std.testing.expect(!value.core.discovered);
+    try std.testing.expect(!value.ownership().java_download);
+}
+
+test "creation discovery registers one atomic batch and preserves failure and cancellation" {
+    const Case = enum { success, capacity, save_failure, canceled, search_failure };
+    const architecture = @import("../core/java_runtime.zig");
+    for ([_]Case{ .success, .capacity, .save_failure, .canceled, .search_failure }) |case| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        var arena: std.heap.ArenaAllocator = .init(fixture.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const baseline: usize = if (case == .capacity) 255 else 0;
+        const existing = try a.alloc(java_manager.Runtime, baseline);
+        for (existing, 0..) |*runtime, index| runtime.* = .{
+            .path = try std.fmt.allocPrint(a, "/registered/jdk-{d}/bin/java", .{index}),
+            .major = 21,
+            .vendor = "Existing",
+            .architecture = architecture.host(),
+        };
+        const json = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 3), .runtimes = existing, .hidden = &[_]java_manager.Runtime{} }, .{});
+        try fixture.tmp.dir.createDirPath(std.testing.io, ".vela");
+        try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".vela/java.json", .data = json });
+        const reloaded = try java_manager.Manager.init(fixture.a, std.testing.io, fixture.root);
+        fixture.java.deinit();
+        fixture.java = reloaded;
+        if (case == .save_failure) {
+            try fixture.tmp.dir.deleteFile(std.testing.io, ".vela/java.json");
+            try fixture.tmp.dir.createDir(std.testing.io, ".vela/java.json", .default_dir);
+        }
+        const results = [_]java_manager.Runtime{
+            .{ .path = "/discovered/first/bin/java", .major = 17, .vendor = "First", .architecture = architecture.host() },
+            .{ .path = "/discovered/second/bin/java", .major = 17, .vendor = "Second", .architecture = architecture.host() },
+        };
+        var value = try fixture.controller();
+        defer value.deinit(fixture.services());
+        try value.startOrdinary(fixture.row, fixture.services());
+        Fixture.joinPrivate(&value);
+        // Hand the coordinator a completed discovery worker, avoiding host-dependent scans.
+        const SearchJob = @typeInfo(@TypeOf(fixture.java.active.?)).pointer.child;
+        const search = try std.heap.page_allocator.create(SearchJob);
+        search.* = .{ .io = std.testing.io, .path = "", .results = &results, .failure = if (case == .search_failure) error.FixtureSearchFailure else null };
+        search.done.store(true, .release);
+        fixture.java.active = search;
+        value.core.discovery_owned = true;
+        value.core.phase = .discovering_java;
+        value.core.role = .runtime;
+        if (case == .canceled) value.cancel(fixture.services());
+        value.tick(fixture.services());
+        try std.testing.expect(!value.ownership().java_discovery);
+        if (case == .success) {
+            try std.testing.expectEqual(@as(usize, 2), fixture.java.entries().len);
+            try std.testing.expectEqual(Phase.probing_java, value.snapshot().phase);
+            try std.testing.expectEqualStrings(results[0].path, value.core.job.?.probe_path);
+            var loaded = try java_manager.Manager.init(fixture.a, std.testing.io, fixture.root);
+            defer loaded.deinit();
+            try std.testing.expectEqual(@as(usize, 2), loaded.entries().len);
+        } else {
+            for (0..4) |_| fixture.advance(&value);
+            try std.testing.expectEqual(baseline, fixture.java.entries().len);
+            try std.testing.expectEqual(@as(usize, 0), fixture.probe_count);
+            try std.testing.expectEqual(@as(usize, 0), fixture.create_count);
+            try std.testing.expect(!value.ownership().java_download);
+            switch (case) {
+                .capacity => try std.testing.expectEqual(error.TooManyRuntimes, value.snapshot().failure.?),
+                .search_failure => try std.testing.expectEqual(error.FixtureSearchFailure, value.snapshot().failure.?),
+                .save_failure => try std.testing.expect(value.snapshot().failure != null),
+                .canceled => try std.testing.expectEqual(Phase.canceled, value.snapshot().phase),
+                .success => unreachable,
+            }
+            if (case != .save_failure) {
+                const saved = try fixture.tmp.dir.readFileAlloc(std.testing.io, ".vela/java.json", a, .limited(1024 * 1024));
+                try std.testing.expectEqualStrings(json, saved);
+            }
+        }
     }
 }

@@ -4,13 +4,13 @@ const state = @import("ui/model.zig");
 const view = @import("ui/view.zig");
 const theme = @import("ui/theme.zig");
 const fonts = @import("ui/fonts.zig");
-const game_library = @import("ui/game_library.zig");
-const java_manager = @import("ui/java_manager.zig");
+const game_library = @import("application/game_library.zig");
+const java_manager = @import("application/java_manager.zig");
 const java_view = @import("ui/java_view.zig");
 const file_picker = @import("ui/file_picker.zig");
 const file_picker_sdl = @import("ui/file_picker_sdl.zig");
 const components = @import("ui/components.zig");
-const game_launch = @import("ui/game_launch.zig");
+const game_launch = @import("application/game_launch.zig");
 const config = @import("core/config.zig");
 const instance_paths = @import("core/instances.zig");
 const task_registry = @import("core/tasks.zig");
@@ -19,24 +19,24 @@ const lifecycle = @import("core/lifecycle.zig");
 const shutdown_view = @import("ui/shutdown_view.zig");
 const settings_view = @import("ui/settings_view.zig");
 const appearance_view = @import("ui/appearance_view.zig");
-const java_download_controller = @import("ui/java_download_controller.zig");
+const java_download_controller = @import("application/java_download_controller.zig");
 const java_download_view = @import("ui/java_download_view.zig");
-const server_manager = @import("ui/server_manager.zig");
+const server_manager = @import("application/server_manager.zig");
 const servers_view = @import("ui/servers_view.zig");
 const logs_view = @import("ui/logs_view.zig");
 const worlds = @import("core/worlds.zig");
 const instance_leases = @import("core/instance_leases.zig");
 const avatar_manager = @import("ui/avatar_manager.zig");
-const accounts_manager = @import("ui/accounts_manager.zig");
+const accounts_manager = @import("application/accounts_manager.zig");
 const accounts_view = @import("ui/accounts_view.zig");
-const instances_manager = @import("ui/instances_manager.zig");
+const instances_manager = @import("application/instances_manager.zig");
 const instances_view = @import("ui/instances_view.zig");
-const content_manager = @import("ui/content_manager.zig");
-const mods_controller = @import("ui/mods_controller.zig");
+const content_manager = @import("application/content_manager.zig");
+const mods_controller = @import("application/mods_controller.zig");
 const mods_view = @import("ui/mods_view.zig");
-const instance_creation_controller = @import("ui/instance_creation_controller.zig");
-const cf_credentials_controller = @import("ui/curseforge_credentials_controller.zig");
-const worlds_manager = @import("ui/worlds_manager.zig");
+const instance_creation_controller = @import("application/instance_creation_controller.zig");
+const cf_credentials_controller = @import("application/curseforge_credentials_controller.zig");
+const worlds_manager = @import("application/worlds_manager.zig");
 const worlds_view = @import("ui/worlds_view.zig");
 // The normal root has no acceptance capability and retains its production services.
 const acceptance_enabled = @hasDecl(@import("root"), "vela_lifecycle_acceptance");
@@ -50,7 +50,13 @@ pub const dvui_app: dvui.App = .{
 };
 pub const main = dvui.App.main;
 pub const panic = dvui.App.panic;
-pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
+const diagnostic_log = @import("core/diagnostic_log.zig");
+pub const std_options: std.Options = .{ .logFn = logFn, .log_level = .info };
+
+fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    diagnostic_log.write(level, scope, format, args);
+    dvui.App.logFn(level, scope, format, args);
+}
 
 var native_backend_configuration_error: ?anyerror = null;
 
@@ -79,6 +85,7 @@ var launcher: game_launch.Controller = undefined;
 var paths: instance_paths.Paths = undefined;
 var configuration: config.Store = undefined;
 var settings_ui: settings_view.Ui = undefined;
+var proxy_settings: @import("application/proxy_settings_controller.zig").Controller = undefined;
 var appearance_ui: appearance_view.Ui = undefined;
 var java_download: java_download_controller.Controller = undefined;
 var java_download_ui: java_download_view.Ui = undefined;
@@ -105,10 +112,35 @@ var cf_credentials_failure: ?anyerror = null;
 var tasks: task_registry.Registry = undefined;
 var window: window_control.Control = .{};
 var policy: lifecycle.Policy = .{};
+var shutdown_summary: @import("core/shutdown.zig").Summary = .{};
+var shutdown_waiting_picker: bool = false;
 var observed_instances: u64 = 0;
 
 fn creationServices() instance_creation_controller.Services {
     return .{ .store = &configuration, .java = &java, .java_download = &java_download, .instances = &instance_manager };
+}
+
+fn runtime() @import("application/runtime.zig").Runtime {
+    return .{
+        .store = &configuration,
+        .tasks = &tasks,
+        .library = &library,
+        .java = &java,
+        .java_download = &java_download,
+        .launcher = &launcher,
+        .leases = &leases,
+        .servers = &servers,
+        .worlds = &world_manager,
+        .accounts = &accounts,
+        .instances = &instance_manager,
+        .content = &content,
+        .mods = &mods,
+        .credentials = if (cf_credentials) |*controller| controller else null,
+        .proxy_settings = &proxy_settings,
+        .ordinary_creation = &ordinary_creation,
+        .pack_creation = &packs.installer,
+        .pack_catalog = &packs.browser,
+    };
 }
 
 fn cfCredentialsLease() bool {
@@ -220,6 +252,16 @@ pub fn init(win: *dvui.Window) !void {
         return err;
     };
     errdefer configuration.deinit();
+    diagnostic_log.start(main_init.io, paths.root) catch |err| {
+        std.log.warn("Cannot initialize launcher diagnostic log: {s}", .{@errorName(err)});
+    };
+    errdefer {
+        diagnostic_log.write(.err, .launcher, "initialization failed", .{});
+        diagnostic_log.stop();
+    }
+    diagnostic_log.write(.info, .launcher, "startup platform={s}/{s} mode={s}", .{ @tagName(@import("builtin").os.tag), @tagName(@import("builtin").cpu.arch), @tagName(@import("builtin").mode) });
+    try @import("core/proxy_policy.zig").setDefault(main_init.io, configuration.snapshot().settings.proxy, main_init.environ_map);
+    errdefer @import("core/proxy_policy.zig").clearDefault(main_init.io);
     download_budget = try @import("core/downloader.zig").Budget.init(main_init.io, configuration.snapshot().settings.download_connections);
     errdefer download_budget.deinit();
     if (acceptance_enabled) try acceptance.validateProfile(configuration.snapshot());
@@ -227,6 +269,9 @@ pub fn init(win: *dvui.Window) !void {
     observed_instances = instanceFingerprint(configuration.snapshot());
     settings_ui = try settings_view.Ui.init(main_init.gpa, configuration.snapshot().settings);
     errdefer settings_ui.deinit();
+    proxy_settings = try @import("application/proxy_settings_controller.zig").Controller.init(main_init.gpa, main_init.io, .{ .environ = main_init.environ_map });
+    errdefer proxy_settings.deinit();
+    settings_ui.proxy_controller = &proxy_settings;
     appearance_ui = try appearance_view.Ui.init(main_init.gpa, main_init.io, configuration.snapshot().appearance);
     errdefer appearance_ui.deinit();
     appearance_ui.picker = &picker;
@@ -270,6 +315,7 @@ pub fn init(win: *dvui.Window) !void {
     errdefer java_ui.deinit();
     var java_options: java_download_controller.Options = if (acceptance_enabled) acceptance.javaOptions(paths.root, &tasks, &download_budget) else .{ .root = paths.root, .task_registry = &tasks, .download_budget = &download_budget };
     java_options.download_budget = &download_budget;
+    java_options.cache_root = if (acceptance_enabled) null else paths.cache;
     java_options.owned_delete_admission = .{ .check = checkOwnedJavaDeletion };
     java_download = try java_download_controller.Controller.initWithOptions(main_init.gpa, main_init.io, java_options);
     errdefer java_download.deinit();
@@ -292,6 +338,7 @@ pub fn init(win: *dvui.Window) !void {
     const instance_mutation = leases.mutation(2);
     instance_manager = try instances_manager.Manager.initWithOptions(main_init.gpa, main_init.io, &paths, &tasks, leases.guard(instance_mutation), .{ .context = instance_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback }, .{ .cache_root = paths.cache, .download_budget = &download_budget });
     errdefer instance_manager.deinit();
+    try instance_manager.recoverRenames(&configuration);
     instance_manager.setWorkerRecheck(instance_leases.Mutation.workerRecheckCallback);
     instance_manager.setCreationAdmission(.{ .check = checkJavaForCreation });
     instance_manager.setInstaller(instances_manager.productionInstaller());
@@ -302,7 +349,7 @@ pub fn init(win: *dvui.Window) !void {
     const content_options: content_manager.Options = .{
         .lease = .{ .context = content_mutation, .acquire = instance_leases.Mutation.acquireCallback, .recheck = instance_leases.Mutation.recheckCallback, .release = instance_leases.Mutation.releaseCallback },
         .worker_recheck = instance_leases.Mutation.workerRecheckCallback,
-        .transport_options = .{ .allow_curseforge = true, .download_budget = &download_budget },
+        .transport_options = .{ .allow_curseforge = true, .download_budget = &download_budget, .cache_root = paths.cache },
         .allow_curseforge_remote = true,
     };
     content = try content_manager.Manager.initOptions(main_init.gpa, main_init.io, &paths, &tasks, if (acceptance_enabled) acceptance.contentOptions(content_options) else content_options);
@@ -357,6 +404,7 @@ pub fn deinit(win: *dvui.Window) void {
         if (cf_credentials) |*controller| controller.deinit();
         cf_credentials = null;
         appearance_ui.deinit();
+        proxy_settings.deinit();
         settings_ui.deinit();
         java_ui.deinit();
         picker.deinit();
@@ -364,6 +412,9 @@ pub fn deinit(win: *dvui.Window) void {
         library.deinit();
         download_budget.deinit();
         tasks.deinit();
+        @import("core/proxy_policy.zig").clearDefault((dvui.App.main_init orelse unreachable).io);
+        diagnostic_log.write(.info, .launcher, "shutdown workers_joined=true", .{});
+        diagnostic_log.stop();
         configuration.deinit();
         paths.deinit();
         library_initialized = false;
@@ -385,6 +436,7 @@ pub fn frame() !dvui.App.Result {
         return result;
     }
     return frameActive() catch |err| {
+        diagnostic_log.write(.err, .launcher, "frame failed error={s}", .{@errorName(err)});
         _ = applyWindowActions(.{ .cancel_background = true }) catch {};
         const result = try drainFrameFailure(&picker, &fatal_frame_error, err);
         file_picker_sdl.pump(&picker, dvui.currentWindow());
@@ -426,32 +478,46 @@ fn frameActive() !dvui.App.Result {
         return .ok;
     }
     if (acceptance_enabled) try acceptance.beforeFrame(&launcher, &world_manager, &configuration, &paths);
-    library.tick();
-    if (!acceptance_enabled and model.panel == .instances and instances_ui.mode == .create and !instances_ui.submitted) {
-        if (instances_ui.draft.base) |base| {
-            library.previewVersion(base) catch |err| {
-                instances_ui.failure = err;
-            };
-        } else library.cancelPreview();
-    } else library.cancelPreview();
-    packs.syncActive(model.panel == .instances and instances_ui.mode == .packs, creationServices());
-    const creation_owners = ordinary_creation.ownership().merge(packs.installer.ownership());
-    _ = creation_owners.tickJava(&java);
-    launcher.tick();
-    leases.tick();
-    _ = creation_owners.tickJavaDownload(&java_download, &java);
-    servers.tick();
-    world_manager.tick();
+    if (policy.shutdown == .none) packs.syncActive(model.panel == .instances and instances_ui.mode == .packs, creationServices());
+    const main_init = dvui.App.main_init orelse return error.MissingAppInit;
+    runtime().tick(policy.shutdown != .canceling);
+    if (policy.shutdown == .prompt) runtime().finishAccepted();
+    try @import("core/proxy_policy.zig").setDefault(main_init.io, configuration.snapshot().settings.proxy, main_init.environ_map);
     avatars.tick();
-    accounts.tick(&configuration);
-    _ = creation_owners.tickInstances(&instance_manager);
-    ordinary_creation.tickWithMutations(creationServices(), policy.shutdown == .none);
-    packs.tick(creationServices(), policy.shutdown == .none);
-    content.tick();
-    if (cf_credentials) |*controller| controller.tick(&configuration);
+    if (policy.shutdown == .canceling) {
+        finishSettingsForExit();
+        runtime().finishShutdown();
+        packs.tickPresentation(creationServices(), false);
+        if (shutdown_waiting_picker) {
+            if (picker.isDrained()) {
+                shutdown_waiting_picker = false;
+                try window.hide();
+            } else {
+                try window.showForPrompt();
+                components.title(@src(), "正在退出启动器");
+                components.hint(@src(), "请先关闭系统文件选择窗口，其他任务正在安全收尾。");
+            }
+        }
+        const remaining = activeBackgroundCount();
+        if (acceptance_enabled) try observeLifecycleFrame(remaining, .{});
+        if (remaining == 0 and try applyWindowActions(policy.backgroundJoined())) return .close;
+        // Keep pumping completions while hidden, without rebuilding pages or dispatching intents.
+        dvui.timer(dvui.parentGet().data().id.update("shutdown-drain"), 50_000);
+        return .ok;
+    }
+    if (policy.shutdown == .none) {
+        if (!acceptance_enabled and model.panel == .instances and instances_ui.mode == .create and !instances_ui.submitted) {
+            if (instances_ui.draft.base) |base| {
+                library.previewVersion(base) catch |err| {
+                    instances_ui.failure = err;
+                };
+            } else library.cancelPreview();
+        } else library.cancelPreview();
+    }
+    packs.tickPresentation(creationServices(), policy.shutdown == .none);
     const fingerprint = instanceFingerprint(configuration.snapshot());
     const library_phase = library.snapshot().phase;
-    if (fingerprint != observed_instances and library_phase != .loading) {
+    if (policy.shutdown == .none and fingerprint != observed_instances and library_phase != .loading) {
         if (library.refreshInstalled()) |_| {
             observed_instances = fingerprint;
         } else |err| {
@@ -479,6 +545,9 @@ fn frameActive() !dvui.App.Result {
         try content.setCurseForgePolicy(cf_policy);
         try packs.configure(.{ .enabled = cf_policy.enabled, .terms_approved = cf_policy.terms_approved, .credential_ref = cf_policy.credential_ref }, settings.download_connections);
     }
+    const closing_operations = runtime().shutdownSummary();
+    policy.confirm_operations = closing_operations.any();
+    if (policy.shutdown != .prompt) shutdown_summary = closing_operations;
     if (try synchronizeGameLifecycle()) {
         try window.checkNativeDisplay();
         return .close;
@@ -511,13 +580,16 @@ fn frameActive() !dvui.App.Result {
         .mods = &mods,
         .mods_ui = &mods_ui,
     });
-    const phase = library.snapshot().phase;
     const launch_phase = launcher.snapshot().phase;
     if (try synchronizeGameLifecycle()) {
         try window.checkNativeDisplay();
         return .close;
     }
     const active = activeBackgroundCount();
+    if (policy.shutdown == .none) {
+        shutdown_summary = runtime().shutdownSummary();
+        policy.confirm_operations = shutdown_summary.any();
+    }
     var close_ready = appearance_view.takeClose(&appearance_ui);
     if (window.takeCloseRequested()) close_ready = appearance_view.guardClose(&appearance_ui);
     if (close_ready) {
@@ -528,7 +600,7 @@ fn frameActive() !dvui.App.Result {
     }
     var shutdown_layout: shutdown_view.Layout = .{};
     if (policy.shutdown == .prompt) {
-        if (shutdown_view.drawWithLayout(active, &shutdown_layout)) |choice| {
+        if (shutdown_view.drawWithLayout(shutdown_summary, &shutdown_layout)) |choice| {
             if (acceptance_enabled) acceptance.observeChoice(choice);
             if (try applyWindowActions(policy.chooseClose(choice, active))) {
                 try window.checkNativeDisplay();
@@ -542,15 +614,17 @@ fn frameActive() !dvui.App.Result {
             return .close;
         }
     }
-    if (try applyWindowActions(policy.backgroundChanged(active))) {
-        try window.checkNativeDisplay();
-        return .close;
-    }
     dvui.currentWindow().backend.impl.log_events = false;
-    if (phase == .loading or java.isSearching() or java_download.isBusy() or servers.isBusy() or world_manager.snapshot().worker_active or accounts.snapshot().busy or instance_manager.isBusy() or content.isBusy() or cfCredentialsBusy() or ordinary_creation.ownership().pinned or packs.busy() or launch_phase == .preparing or launch_phase == .running or policy.shutdown != .none) dvui.refresh(null, @src(), null);
+    if (activeBackgroundCount() != 0 or launch_phase == .preparing or launch_phase == .running or policy.shutdown != .none) dvui.refresh(null, @src(), null);
     if (acceptance_enabled and !tasks.hasActive()) tasks.pruneFinished(0);
-    if (acceptance_enabled) try acceptance.afterFrame(.{
-        .startup_idle = model.panel == .home and active == 0 and tasks.tasks().len == 0 and phase == .complete and !java.isSearching() and !java_download.isBusy() and !servers.isBusy() and !world_manager.snapshot().worker_active and world_manager.snapshot().failure == null and !accounts.snapshot().busy and !instance_manager.isBusy() and !content.isBusy() and content.snapshot().failure == null and !cfCredentialsBusy() and !ordinary_creation.ownership().pinned,
+    if (acceptance_enabled) try observeLifecycleFrame(active, shutdown_layout);
+    try window.checkNativeDisplay();
+    return .ok;
+}
+
+fn observeLifecycleFrame(active: usize, shutdown_layout: shutdown_view.Layout) !void {
+    try acceptance.afterFrame(.{
+        .startup_idle = model.panel == .home and active == 0 and tasks.tasks().len == 0 and library.snapshot().phase == .complete and !java.isSearching() and !java_download.isBusy() and !servers.isBusy() and !world_manager.snapshot().worker_active and world_manager.snapshot().failure == null and !accounts.snapshot().busy and !instance_manager.isBusy() and !content.isBusy() and content.snapshot().failure == null and !cfCredentialsBusy() and !ordinary_creation.ownership().pinned,
         .game = launcher.snapshot(),
         .world = world_manager.snapshot(),
         .accounts = accounts.snapshot(),
@@ -561,8 +635,6 @@ fn frameActive() !dvui.App.Result {
         .panel = @tagName(model.panel),
         .shutdown_layout = shutdown_layout,
     });
-    try window.checkNativeDisplay();
-    return .ok;
 }
 
 fn checkJavaForCreation(_: ?*anyopaque) !void {
@@ -613,51 +685,46 @@ fn synchronizeGameLifecycle() !bool {
 }
 
 fn activeBackgroundCount() usize {
-    var count: usize = 0;
-    for (tasks.tasks()) |task| {
-        switch (task.state) {
-            .queued, .running, .canceling => count += 1,
-            else => {},
-        }
-    }
-    if (library.snapshot().phase == .loading) count += 1;
-    if (java.isSearching()) count += 1;
-    // Owned deletion has no registry task and remains owned until tick joins it.
-    if (java_download.isDeleting()) count += 1;
-    if (servers.isBusy()) count += 1;
-    if (world_manager.snapshot().worker_active and world_manager.snapshot().loading) count += 1;
-    if (accounts.snapshot().busy) count += 1;
-    if (ordinary_creation.ownership().pinned) count += 1;
-    if (packs.busy()) count += 1;
+    var count = runtime().activeCount();
+    if (packs.presentationBusy()) count += 1;
+    if (avatars.isBusy()) count += 1;
     if (picker.isBusy()) count += 1;
     return count;
 }
 
+fn finishSettingsForExit() void {
+    settings_ui.flush();
+    if (cf_credentials) |*controller| {
+        settings_view.finishWithCredentials(&settings_ui, &configuration, controller, content.isBusy());
+    } else settings_view.finishUnavailable(&settings_ui, &configuration);
+    settings_ui.clearSecrets();
+}
+
 fn applyWindowActions(actions: lifecycle.Actions) !bool {
+    if (actions.hide or actions.quit or actions.cancel_background) {
+        finishSettingsForExit();
+        // A flushed proxy edit may have started a worker after the close decision.
+        if (actions.quit and activeBackgroundCount() != 0) return applyWindowActions(policy.closeRequested(activeBackgroundCount()));
+    }
     if (acceptance_enabled) acceptance.observeActions(actions);
     if (actions.show_home) model.panel = .home;
     if (actions.show_logs) model.panel = .logs;
-    if (actions.hide) window.hide() catch |err| {
+    if (actions.cancel_background) shutdown_waiting_picker = picker.isBusy();
+    if (actions.hide and !shutdown_waiting_picker) window.hide() catch |err| {
         std.log.warn("Cannot hide launcher window: {s}", .{@errorName(err)});
     };
     if (actions.restore) window.restoreAndFocus() catch |err| {
         std.log.warn("Cannot restore launcher window: {s}", .{@errorName(err)});
     };
+    if (actions.prompt_background) window.showForPrompt() catch |err| {
+        std.log.warn("Cannot show shutdown confirmation: {s}", .{@errorName(err)});
+    };
     if (actions.cancel_background) {
         java_view.discardPicker(&java_ui);
         picker.beginShutdown();
-        ordinary_creation.cancel(creationServices());
-        packs.cancel(creationServices());
-        for (tasks.tasks()) |task| _ = tasks.cancel(task.id);
-        library.cancel();
-        java.cancelSearch();
-        java_download.cancel();
-        servers.cancel();
-        world_manager.cancel();
-        accounts.cancel();
-        instance_manager.cancel();
-        content.cancel();
-        if (cf_credentials) |*controller| controller.cancel();
+        runtime().beginShutdown();
+        packs.cancelPresentation();
+        avatars.cancel();
     }
     if (actions.quit) {
         picker_quit_requested = true;

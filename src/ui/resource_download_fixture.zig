@@ -56,7 +56,7 @@ pub fn execute(raw: ?*anyopaque, a: std.mem.Allocator, io: std.Io, request: http
         }
         return error.UnexpectedNetwork;
     };
-    return .{ .status = 200, .body = body, .allocator = a };
+    return .{ .status = 200, .body = body, .allocator = a, .allocation = body };
 }
 fn versionJson(a: std.mem.Allocator, scenario: *const Scenario, id: []const u8, version: []const u8) ![]u8 {
     var digest: [64]u8 = undefined;

@@ -3,7 +3,7 @@
 const std = @import("std");
 const config = @import("../core/config.zig");
 const instances = @import("../core/instances.zig");
-const instance_preparation = @import("../application/instance_preparation.zig");
+const instance_preparation = @import("instance_preparation.zig");
 const tasks = @import("../core/tasks.zig");
 const providers = @import("../core/content_providers.zig");
 const credentials = @import("../core/credentials.zig");
@@ -43,6 +43,7 @@ pub const Proposal = struct {
     blocker: ?anyerror = null,
     root: ?providers.VersionKey = null,
     kind: Kind = .mod,
+    removal: bool = false,
     choices: []const providers.DependencyChoice = &.{},
 };
 pub const Snapshot = struct {
@@ -199,6 +200,7 @@ const Job = struct {
         self.options.transport_options.approved_download_hosts = try clone([]const []const u8, owned, options.transport_options.approved_download_hosts);
         self.options.transport_options.http.proxy = try clone(?[]const u8, owned, options.transport_options.http.proxy);
         self.options.transport_options.http.ca_bundle = try clone(?[]const u8, owned, options.transport_options.http.ca_bundle);
+        self.options.transport_options.cache_root = try clone(?[]const u8, owned, options.transport_options.cache_root);
         self.instance = try clone(config.Instance, owned, instance);
         self.request = try clone(Request, owned, request);
         // Paths methods allocate on the owning worker, never the UI allocator.
@@ -300,6 +302,7 @@ pub const Manager = struct {
     retired_stages: ?*Job = null,
     pending_refresh: bool = false,
     joining: bool = false,
+    shutting_down: bool = false,
     failure: ?anyerror = null,
     pub fn init(a: A, io: Io, paths: *const instances.Paths, registry: *tasks.Registry, lease: install.Lease) !Manager {
         return initOptions(a, io, paths, registry, .{ .lease = lease });
@@ -445,6 +448,31 @@ pub const Manager = struct {
     pub fn isBusy(self: *const Manager) bool {
         return self.active != null or self.pending_refresh;
     }
+    pub fn shutdownOperation(self: *const Manager) ?@import("../core/shutdown.zig").Operation {
+        const job = self.active orelse return null;
+        return switch (job.request) {
+            .commit => |proposal| if (proposal.removal) null else switch (proposal.kind) {
+                .mod => .mod_install,
+                .resourcepack => .resourcepack_install,
+                .shader => .shader_install,
+                .modpack => if (self.snapshot().pack_membership != null) .pack_update else .pack_install,
+            },
+            else => null,
+        };
+    }
+
+    pub fn beginShutdown(self: *Manager) void {
+        self.shutting_down = true;
+        self.pending_refresh = false;
+        const job = self.active orelse return;
+        switch (job.request) {
+            // Already submitted local edits and recovery finish their transaction.
+            .enabled_toggle, .recover => {},
+            .commit => |proposal| if (!proposal.removal) self.cancel(),
+            else => self.cancel(),
+        }
+    }
+
     pub fn setDownloadConnections(self: *Manager, connections: u16) !void {
         if (connections == 0 or connections > 64) return error.InvalidConnections;
         self.connections = connections;
@@ -523,11 +551,6 @@ pub const Manager = struct {
         for (inspection.source_sha256) |byte| if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return error.ArchiveIdentityMismatch;
         try validateAbsolute(inspection.stage_absolute_path);
         try self.startOwned(.{ .inspected_pack = identity }, inspection);
-    }
-    pub fn importPack(self: *Manager, absolute_path: []const u8) !void {
-        const selected = self.selected orelse return error.NoSelectedInstance;
-        const origin = selected.instance.origin orelse return error.PackIdentityRequired;
-        try self.importPackFor(absolute_path, .{ .provider = origin.kind, .project_id = origin.project_id, .version_id = origin.version_id });
     }
     pub fn importPackFor(self: *Manager, absolute_path: []const u8, identity: manifest.PackIdentity) !void {
         try validateAbsolute(absolute_path);
@@ -706,7 +729,7 @@ pub const Manager = struct {
                     };
                     if (committed) {
                         self.retirePreview(null);
-                        self.pending_refresh = self.selected != null and job.request != .enabled_toggle;
+                        self.pending_refresh = !self.shutting_down and self.selected != null and job.request != .enabled_toggle;
                     }
                 }
             }
@@ -849,7 +872,17 @@ fn observe(job: *Job, a: A, previous: manifest.Manifest, desired: manifest.Manif
     };
     return try records.toOwnedSlice(a);
 }
+test "existing instance proposals reject initial world sources before becoming ready" {
+    const world: manifest.InstallFile = .{
+        .record = .{ .path = "saves/World/level.dat", .provider = .modrinth, .project_id = "pack", .version_id = "v1", .hashes = .{ .sha1 = "a9993e364706816aba3e25717850c26c9cd0d89d" }, .size = 3, .identity_provenance = .pack_archive },
+        .download = .{ .remote = "https://cdn.modrinth.com/world.dat" },
+    };
+    const pack: manifest.PackPlan = .{ .identity = .{ .provider = .modrinth, .project_id = "pack", .version_id = "v1" }, .name = "World Pack", .version = "v1", .minecraft_version = "1.21.1", .initial_world_files = &.{world} };
+    try std.testing.expectError(error.ProtectedPath, desiredFor(std.testing.allocator, .{ .instance_id = "instance", .pack_version = "v0" }, &.{}, pack));
+}
+
 fn desiredFor(a: A, previous: manifest.Manifest, files: []const manifest.InstallFile, pack: ?manifest.PackPlan) !manifest.Manifest {
+    if (pack) |value| if (value.initial_world_files.len != 0) return error.ProtectedPath;
     var records: std.ArrayList(manifest.ManagedFile) = .empty;
     var replacement: ?providers.Owned([]const []const u8) = null;
     defer if (replacement) |*owned| owned.deinit();
@@ -1494,7 +1527,7 @@ const CfMetadata = struct {
         try job.check();
         self.secret = try store.get(std.heap.page_allocator, &reference);
         try job.check();
-        self.adapter = try transport.Adapter.initWithOptions(std.heap.page_allocator, job.io, job.cancelToken(), job.connections, job.options.transport_options);
+        self.adapter = try transport.Adapter.init(std.heap.page_allocator, job.io, job.cancelToken(), job.connections, job.options.transport_options);
     }
     fn deinit(self: *CfMetadata) void {
         if (self.secret) |*secret| secret.deinit();
@@ -2030,11 +2063,11 @@ fn prepareRemoval(job: *Job, adapter: *transport.Adapter, path: []const u8) !voi
     const observed = try observe(job, a, previous, desired);
     var plan = try manifest.buildUpdatePlan(a, previous, desired, observed, &.{}, .{ .instance_id = job.instance.id, .instance_name = job.instance.name, .running = false });
     defer plan.deinit();
-    job.result.proposal = .{ .plan = try clone(manifest.UpdatePlan, a, plan.value), .desired = try clone(manifest.Manifest, a, desired), .ready = plan.value.ready, .dependencies_ready = true };
+    job.result.proposal = .{ .plan = try clone(manifest.UpdatePlan, a, plan.value), .desired = try clone(manifest.Manifest, a, desired), .ready = plan.value.ready, .dependencies_ready = true, .removal = true };
 }
 fn runBackend(job: *Job) !void {
     try job.check();
-    var adapter = try transport.Adapter.initWithOptions(std.heap.page_allocator, job.io, job.cancelToken(), job.connections, job.options.transport_options);
+    var adapter = try transport.Adapter.init(std.heap.page_allocator, job.io, job.cancelToken(), job.connections, job.options.transport_options);
     defer adapter.deinit();
     adapter.telemetry = job.task;
     if (job.held and job.request != .recover) {
@@ -2243,6 +2276,23 @@ const CancelJoinFixture = struct {
         return task;
     }
 };
+
+test "shutdown confirms installs but lets content removals finish" {
+    for ([_]bool{ false, true }) |removal| {
+        var fixture: CancelJoinFixture = .{};
+        var registry = tasks.Registry.init(std.testing.allocator);
+        defer registry.deinit();
+        var service = try Manager.initOptions(std.testing.allocator, std.testing.io, &CancelJoinFixture.paths, &registry, fixture.options());
+        defer service.deinit();
+        const request: Request = .{ .commit = .{ .removal = removal, .plan = .{ .actions = &.{}, .conflicts = &.{}, .next_manifest = .{ .instance_id = CancelJoinFixture.instance.id, .pack_version = "test", .files = &.{} }, .ready = true, .fully_applied = true } } };
+        const job = try Job.create(service.allocator, service.io, service.paths, CancelJoinFixture.instance, request, service.options, service.connections);
+        job.task = try registry.create(.mod_install, "Shutdown intent fixture");
+        service.active = job;
+        try std.testing.expectEqual(!removal, service.shutdownOperation() != null);
+        service.beginShutdown();
+        try std.testing.expectEqual(!removal, job.task.?.canceled());
+    }
+}
 
 test "content shutdown drain is idempotent and clears pending refresh without a worker" {
     var fixture: CancelJoinFixture = .{};

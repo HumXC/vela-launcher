@@ -11,12 +11,37 @@ const providers = @import("content_providers.zig");
 const content_install = @import("content_install.zig");
 const archive = @import("safe_archive.zig");
 const fs = @import("content_fs.zig");
+const diagnostic_log = @import("diagnostic_log.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 pub const CancelToken = std.atomic.Value(bool);
 const stage_directory = "pack-imports";
 /// Shared compressed archive cap for online downloads and local imports.
 pub const archive_limit: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Bounded, caller-owned diagnostic; survives failed preparation arena cleanup.
+pub const Diagnostics = struct {
+    path: [1025]u8 = @splat(0),
+    len: usize = 0,
+
+    pub fn setPath(self: *Diagnostics, value: []const u8) void {
+        self.len = @min(value.len, self.path.len - 1);
+        @memcpy(self.path[0..self.len], value[0..self.len]);
+        self.path[self.len] = 0;
+    }
+    pub fn pathSlice(self: *const Diagnostics) []const u8 {
+        return self.path[0..self.len];
+    }
+};
+const TargetPolicy = struct {
+    initial_worlds: bool = false,
+    diagnostics: ?*Diagnostics = null,
+};
+pub const InitialWorldFile = struct {
+    path: []const u8,
+    source_absolute_path: []const u8,
+    fingerprint: fs.Fingerprint,
+};
 
 pub const Inspection = struct {
     arena: std.heap.ArenaAllocator,
@@ -44,6 +69,7 @@ pub const Prepared = struct {
     pack: manifest.PackPlan,
     files: []const manifest.InstallFile,
     manual_files: []const content_install.ManualFile,
+    initial_world_files: []const InitialWorldFile = &.{},
     stage_absolute_path: []const u8,
     instance_id: []const u8,
     instance_name: []const u8,
@@ -60,6 +86,34 @@ pub const Prepared = struct {
         try cleanupStage(io, self.stage_absolute_path);
     }
 };
+
+/// Copy only into the caller-owned fresh game stage, before atomic publication.
+/// Refuse even an empty existing saves root; failure removes only our new root.
+pub fn copyInitialWorlds(prepared: *const Prepared, io: Io, stage: Io.Dir, cancel: ?*const CancelToken, diagnostics: ?*Diagnostics) !void {
+    try fs.cancelled(io, cancel, null);
+    if (prepared.initial_world_files.len == 0) return;
+    if (diagnostics) |d| d.setPath("saves");
+    if (try fs.inspectEntry(stage, io, "saves") != null) return error.PackGameCollision;
+    try stage.createDir(io, "saves", fs.privatePermissions(true));
+    errdefer stage.deleteTree(io, "saves") catch {};
+    for (prepared.initial_world_files) |file| {
+        if (diagnostics) |d| d.setPath(file.path);
+        try fs.cancelled(io, cancel, null);
+        try checkedOverride(file.path, null, true);
+        if (!worldFilePath(file.path)) return error.ProtectedPath;
+        const from = try fs.openAbsolute(io, std.fs.path.dirname(file.source_absolute_path) orelse return error.UnsafePath);
+        defer from.close(io);
+        const source = try fs.openRegular(from, io, std.fs.path.basename(file.source_absolute_path));
+        defer source.close(io);
+        const to = try fs.parent(stage, io, file.path, true);
+        defer to.deinit(io);
+        const actual = try fs.copy(source, to.dir, io, to.name, 1024 * 1024 * 1024, cancel, null);
+        try actual.verify(.{ .sha256 = &file.fingerprint.sha256 }, file.fingerprint.size);
+    }
+    try fs.cancelled(io, cancel, null);
+    try fs.syncDir(stage, io);
+    if (diagnostics) |d| d.len = 0;
+}
 
 /// Can clean abandoned stages without retaining Prepared's arena. Only accepts
 /// our private stage layout, never arbitrary supplied archive/game paths.
@@ -86,22 +140,37 @@ fn cleanupStage(io: Io, path: []const u8) !void {
     try parent.deleteTree(io, name);
 }
 
-pub fn inspect(a: Allocator, io: Io, paths: *const instances.Paths, archive_absolute_path: []const u8, cancel: ?*const CancelToken) !Inspection {
+pub fn inspect(a: Allocator, io: Io, paths: *const instances.Paths, archive_absolute_path: []const u8, cancel: ?*const CancelToken, diagnostics: ?*Diagnostics) !Inspection {
+    return inspectWithExpectation(a, io, paths, archive_absolute_path, null, cancel, diagnostics);
+}
+
+const ArchiveExpectation = struct { hashes: providers.Hashes, size: ?u64 };
+
+/// Verify untrusted downloader output while copying it into private staging.
+/// No archive bytes are extracted until all supplied hashes and size match.
+/// The caller retains ownership of the source; it is never moved or modified.
+pub fn inspectVerified(a: Allocator, io: Io, paths: *const instances.Paths, archive_absolute_path: []const u8, hashes: providers.Hashes, size: ?u64, cancel: ?*const CancelToken, diagnostics: ?*Diagnostics) !Inspection {
+    try providers.validateHashes(hashes);
+    return inspectWithExpectation(a, io, paths, archive_absolute_path, .{ .hashes = hashes, .size = size }, cancel, diagnostics);
+}
+
+fn inspectWithExpectation(a: Allocator, io: Io, paths: *const instances.Paths, archive_absolute_path: []const u8, expected: ?ArchiveExpectation, cancel: ?*const CancelToken, diagnostics: ?*Diagnostics) !Inspection {
+    if (diagnostics) |d| d.len = 0;
     try fs.cancelled(io, cancel, null);
     if (!std.fs.path.isAbsolute(archive_absolute_path) or std.mem.indexOfScalar(u8, archive_absolute_path, 0) != null) return error.ArchivePathNotAbsolute;
     const ext = std.fs.path.extension(archive_absolute_path);
     const provider: providers.Provider = if (std.ascii.eqlIgnoreCase(ext, ".mrpack")) .modrinth else if (std.ascii.eqlIgnoreCase(ext, ".zip")) .curseforge else return error.UnsupportedPackArchive;
-    return inspectArchive(a, io, paths, archive_absolute_path, provider, null, cancel);
+    return inspectArchive(a, io, paths, archive_absolute_path, provider, null, expected, cancel, diagnostics);
 }
 
 pub fn prepare(a: Allocator, io: Io, paths: *const instances.Paths, instance: config.Instance, archive_absolute_path: []const u8, cancel: ?*const CancelToken) !Prepared {
     try fs.cancelled(io, cancel, null);
     if (!fs.safeComponent(instance.id) or !fs.safeComponent(instance.name)) return error.UnsafeInstance;
-    var inspection = try inspect(a, io, paths, archive_absolute_path, cancel);
+    var inspection = try inspect(a, io, paths, archive_absolute_path, cancel, null);
     var owned = true;
     defer if (owned) inspection.deinit();
     errdefer if (owned) inspection.cleanup(io) catch {};
-    const prepared = try finishPrepare(io, instance, &inspection, cancel);
+    const prepared = try finishPrepare(io, instance, &inspection, cancel, .{});
     owned = false;
     return prepared;
 }
@@ -109,24 +178,38 @@ pub fn prepare(a: Allocator, io: Io, paths: *const instances.Paths, instance: co
 /// Reuses the inspected private copy, never the mutable original archive. The
 /// caller retains the inspection and must clean it after the owning worker joins.
 pub fn prepareInspected(a: Allocator, io: Io, paths: *const instances.Paths, instance: config.Instance, inspection: *const Inspection, cancel: ?*const CancelToken) !Prepared {
+    return prepareInspectedImpl(a, io, paths, instance, inspection, cancel, .{});
+}
+
+/// Only for a new instance's private precommit stage. Initial worlds are never
+/// included in the updatable content manifest or pack membership.
+pub fn prepareNewInstance(a: Allocator, io: Io, paths: *const instances.Paths, instance: config.Instance, inspection: *const Inspection, cancel: ?*const CancelToken, diagnostics: ?*Diagnostics) !Prepared {
+    if (diagnostics) |d| d.len = 0;
+    return prepareInspectedImpl(a, io, paths, instance, inspection, cancel, .{ .initial_worlds = true, .diagnostics = diagnostics });
+}
+
+fn prepareInspectedImpl(a: Allocator, io: Io, paths: *const instances.Paths, instance: config.Instance, inspection: *const Inspection, cancel: ?*const CancelToken, policy: TargetPolicy) !Prepared {
     try fs.cancelled(io, cancel, null);
     if (!fs.safeComponent(instance.id) or !fs.safeComponent(instance.name)) return error.UnsafeInstance;
     const extracted_path = try std.fs.path.join(a, &.{ inspection.stage_absolute_path, "extracted" });
     defer a.free(extracted_path);
     const extracted = try fs.openAbsolute(io, extracted_path);
     defer extracted.close(io);
-    try validatePackTargets(a, io, extracted, inspection.pack, instance.name, cancel);
+    try validatePackTargets(a, io, extracted, inspection.pack, instance.name, cancel, policy);
     try compatible(a, instance, inspection.pack);
-    var next = try inspectArchive(a, io, paths, inspection.archive_absolute_path, inspection.provider, inspection.source_sha256, cancel);
+    var next = try inspectArchive(a, io, paths, inspection.archive_absolute_path, inspection.provider, inspection.source_sha256, null, cancel, policy.diagnostics);
     var owned = true;
     defer if (owned) next.deinit();
     errdefer if (owned) next.cleanup(io) catch {};
-    const prepared = try finishPrepare(io, instance, &next, cancel);
+    const prepared = try finishPrepare(io, instance, &next, cancel, policy);
     owned = false;
     return prepared;
 }
 
-fn inspectArchive(a: Allocator, io: Io, paths: *const instances.Paths, archive_absolute_path: []const u8, provider: providers.Provider, expected_hash: ?[64]u8, cancel: ?*const CancelToken) !Inspection {
+fn inspectArchive(a: Allocator, io: Io, paths: *const instances.Paths, archive_absolute_path: []const u8, provider: providers.Provider, expected_hash: ?[64]u8, expected: ?ArchiveExpectation, cancel: ?*const CancelToken, diagnostics: ?*Diagnostics) !Inspection {
+    const inspection_started = Io.Clock.awake.now(io).nanoseconds;
+    diagnostic_log.write(.info, .pack, "inspection_begin file={s}", .{archive_absolute_path});
+    errdefer diagnostic_log.write(.err, .pack, "inspection_failed elapsed_ms={d} file={s}", .{ @divTrunc(Io.Clock.awake.now(io).nanoseconds - inspection_started, std.time.ns_per_ms), archive_absolute_path });
     try fs.cancelled(io, cancel, null);
     if (!std.fs.path.isAbsolute(archive_absolute_path) or std.mem.indexOfScalar(u8, archive_absolute_path, 0) != null) return error.ArchivePathNotAbsolute;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -153,13 +236,17 @@ fn inspectArchive(a: Allocator, io: Io, paths: *const instances.Paths, archive_a
     if ((try source.stat(io)).size > archive_limit) return error.ArchiveLimitExceeded;
     // Public inspection detects the provider from this owned copy on reinspection.
     const archive_name = if (provider == .modrinth) "archive.mrpack" else "archive.zip";
+    const copy_started = Io.Clock.awake.now(io).nanoseconds;
     const source_hash = try fs.copy(source, stage, io, archive_name, archive_limit, cancel, null);
-    if (expected_hash) |expected| {
-        if (!std.mem.eql(u8, &source_hash.sha256, &expected)) return error.InspectedArchiveChanged;
+    if (expected) |value| try source_hash.verify(value.hashes, value.size);
+    diagnostic_log.write(.info, .pack, "archive_copy_verified elapsed_ms={d} bytes={d} file={s}", .{ @divTrunc(Io.Clock.awake.now(io).nanoseconds - copy_started, std.time.ns_per_ms), source_hash.size, archive_absolute_path });
+    if (expected_hash) |inspected_hash| {
+        if (!std.mem.eql(u8, &source_hash.sha256, &inspected_hash)) return error.InspectedArchiveChanged;
     }
     const copied_path = try std.fs.path.join(aa, &.{ stage_path, archive_name });
     const extracted = try fs.child(stage, io, "extracted", true, true);
     defer extracted.close(io);
+    const extract_started = Io.Clock.awake.now(io).nanoseconds;
     var result = try archive.extract(aa, io, copied_path, extracted, .zip, .{
         .max_archive_bytes = archive_limit,
         .max_file_bytes = 1024 * 1024 * 1024,
@@ -168,6 +255,7 @@ fn inspectArchive(a: Allocator, io: Io, paths: *const instances.Paths, archive_a
         .max_path_bytes = manifest.max_path_bytes,
         .max_path_depth = 18,
     }, cancel);
+    diagnostic_log.write(.info, .pack, "archive_extracted elapsed_ms={d} file={s}", .{ @divTrunc(Io.Clock.awake.now(io).nanoseconds - extract_started, std.time.ns_per_ms), archive_absolute_path });
     defer result.deinit(aa);
     try fs.cancelled(io, cancel, null);
     const index_name = if (provider == .modrinth) "modrinth.index.json" else "manifest.json";
@@ -187,7 +275,8 @@ fn inspectArchive(a: Allocator, io: Io, paths: *const instances.Paths, archive_a
     // The nested owner must not retain an allocator pointing at our movable arena.
     var parsed = if (provider == .modrinth) try manifest.parseMrpack(a, bytes, identity, .client) else try manifest.parseCurseForgePack(a, bytes, identity);
     errdefer parsed.deinit();
-    try validatePackTargets(aa, io, extracted, parsed.value, null, cancel);
+    try validatePackTargets(aa, io, extracted, parsed.value, null, cancel, .{ .initial_worlds = true, .diagnostics = diagnostics });
+    diagnostic_log.write(.info, .pack, "inspection_complete elapsed_ms={d} file={s}", .{ @divTrunc(Io.Clock.awake.now(io).nanoseconds - inspection_started, std.time.ns_per_ms), archive_absolute_path });
     return .{
         .arena = arena,
         .parsed = parsed,
@@ -199,7 +288,7 @@ fn inspectArchive(a: Allocator, io: Io, paths: *const instances.Paths, archive_a
     };
 }
 
-fn finishPrepare(io: Io, instance: config.Instance, inspection: *Inspection, cancel: ?*const CancelToken) !Prepared {
+fn finishPrepare(io: Io, instance: config.Instance, inspection: *Inspection, cancel: ?*const CancelToken, policy: TargetPolicy) !Prepared {
     try fs.cancelled(io, cancel, null);
     const aa = inspection.arena.allocator();
     const parsed = inspection.parsed;
@@ -207,7 +296,7 @@ fn finishPrepare(io: Io, instance: config.Instance, inspection: *Inspection, can
     const extracted_path = try std.fs.path.join(aa, &.{ stage_path, "extracted" });
     const extracted = try fs.openAbsolute(io, extracted_path);
     defer extracted.close(io);
-    try validatePackTargets(aa, io, extracted, inspection.pack, instance.name, cancel);
+    try validatePackTargets(aa, io, extracted, inspection.pack, instance.name, cancel, policy);
     try compatible(aa, instance, inspection.pack);
     const identity = inspection.pack.identity;
     var files: std.ArrayList(manifest.InstallFile) = .empty;
@@ -217,17 +306,22 @@ fn finishPrepare(io: Io, instance: config.Instance, inspection: *Inspection, can
         for (files.items[0..i]) |other| if (targetCollision(file.record.path, other.record.path)) return error.PathCollision;
     }
     var manual: std.ArrayList(content_install.ManualFile) = .empty;
-    var context: Walk = .{ .a = aa, .io = io, .cancel = cancel, .identity = identity, .files = &files, .manual = &manual };
+    var worlds: std.ArrayList(InitialWorldFile) = .empty;
+    var context: Walk = .{ .a = aa, .io = io, .cancel = cancel, .identity = identity, .files = &files, .manual = &manual, .worlds = &worlds, .policy = policy };
     for (parsed.value.override_layers) |layer| {
         try fs.cancelled(io, cancel, null);
-        try safeTarget(layer);
+        try safeLayer(layer);
         const dir = fs.descend(extracted, io, layer, false) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
         defer dir.close(io);
         const absolute = try std.fs.path.join(aa, &.{ stage_path, "extracted", layer });
+        context.allow_worlds = policy.initial_worlds;
         try context.walk(dir, absolute, "", 0);
+    }
+    for (parsed.value.initial_world_files) |file| {
+        for (worlds.items) |world| if (targetCollision(file.record.path, world.path)) return error.PathCollision;
     }
     const merged = try files.toOwnedSlice(aa);
     var pack = parsed.value;
@@ -241,6 +335,7 @@ fn finishPrepare(io: Io, instance: config.Instance, inspection: *Inspection, can
         .pack = pack,
         .files = merged,
         .manual_files = try manual.toOwnedSlice(aa),
+        .initial_world_files = try worlds.toOwnedSlice(aa),
         .stage_absolute_path = stage_path,
         .instance_id = try aa.dupe(u8, instance.id),
         .instance_name = try aa.dupe(u8, instance.name),
@@ -257,13 +352,35 @@ fn compatible(a: Allocator, instance: config.Instance, pack: manifest.PackPlan) 
     if (instance.loader != pack.loader) return error.LoaderMismatch;
     if (!try pack_loader_version.equivalent(a, instance.loader, instance.minecraft_version, instance.loader_version, pack.loader_version)) return error.LoaderVersionMismatch;
 }
+fn safeLayer(path: []const u8) !void {
+    if (!manifest.safeRelativePath(path)) return error.UnsafeRelativePath;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| if (!fs.safeComponent(part)) return error.UnsafeRelativePath;
+}
 fn safeTarget(path: []const u8) !void {
     try manifest.checkedPathForInstance(path, null);
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| if (!fs.safeComponent(part)) return error.UnsafeRelativePath;
 }
+fn worldPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "saves") or std.mem.startsWith(u8, path, "saves/");
+}
+fn checkedOverride(path: []const u8, instance_name: ?[]const u8, allow_worlds: bool) !void {
+    if (allow_worlds and worldPath(path)) {
+        if (!manifest.safeRelativePath(path)) return error.UnsafeRelativePath;
+        var parts = std.mem.splitScalar(u8, path, '/');
+        while (parts.next()) |part| if (!fs.safeComponent(part)) return error.UnsafeRelativePath;
+    } else {
+        try manifest.checkedPathForInstance(path, instance_name);
+        try safeTarget(path);
+    }
+}
+fn worldFilePath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "saves/") and std.mem.indexOfScalarPos(u8, path, 6, '/') != null;
+}
+
 /// Inspect every override path before merging, compatibility checks, or publication.
-fn validateOverrideTargets(a: Allocator, io: Io, dir: Io.Dir, prefix: []const u8, instance_name: ?[]const u8, cancel: ?*const CancelToken, visited: *usize) anyerror!void {
+fn validateOverrideTargets(a: Allocator, io: Io, dir: Io.Dir, prefix: []const u8, instance_name: ?[]const u8, cancel: ?*const CancelToken, visited: *usize, policy: TargetPolicy) anyerror!void {
     var iterator = dir.iterate();
     while (try iterator.next(io)) |entry| {
         try fs.cancelled(io, cancel, null);
@@ -271,35 +388,49 @@ fn validateOverrideTargets(a: Allocator, io: Io, dir: Io.Dir, prefix: []const u8
         if (visited.* > 32_768) return error.TooManyItems;
         const path = if (prefix.len == 0) try a.dupe(u8, entry.name) else try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, entry.name });
         defer a.free(path);
-        try manifest.checkedPathForInstance(path, instance_name);
-        try safeTarget(path);
+        errdefer if (policy.diagnostics) |d| {
+            if (d.len == 0) d.setPath(path);
+        };
+        try checkedOverride(path, instance_name, policy.initial_worlds);
         const stat = (try fs.inspectEntry(dir, io, entry.name)) orelse return error.MissingOverride;
         switch (stat.kind) {
             .directory => {
                 const child = try fs.child(dir, io, entry.name, false, false);
                 defer child.close(io);
-                try validateOverrideTargets(a, io, child, path, instance_name, cancel, visited);
+                try validateOverrideTargets(a, io, child, path, instance_name, cancel, visited, policy);
             },
-            .file => {},
+            .file => {
+                if (worldPath(path) and !worldFilePath(path)) return error.ProtectedPath;
+            },
             else => return error.UnsafeFileType,
         }
     }
 }
-fn validatePackTargets(a: Allocator, io: Io, extracted: Io.Dir, pack: manifest.PackPlan, instance_name: ?[]const u8, cancel: ?*const CancelToken) !void {
+fn validatePackTargets(a: Allocator, io: Io, extracted: Io.Dir, pack: manifest.PackPlan, instance_name: ?[]const u8, cancel: ?*const CancelToken, policy: TargetPolicy) !void {
     if (pack.files.len > providers.max_items or pack.unresolved.len > providers.max_items) return error.TooManyItems;
     for (pack.files) |file| {
+        errdefer if (policy.diagnostics) |d| {
+            if (d.len == 0) d.setPath(file.record.path);
+        };
         try manifest.checkedPathForInstance(file.record.path, instance_name);
         try safeTarget(file.record.path);
     }
+    try manifest.validateInitialWorldFiles(pack.initial_world_files);
+    for (pack.initial_world_files) |file| {
+        if (policy.diagnostics) |d| d.setPath(file.record.path);
+        if (!policy.initial_worlds) return error.ProtectedPath;
+        try checkedOverride(file.record.path, instance_name, true);
+    }
+    if (policy.diagnostics) |d| d.len = 0;
     var visited: usize = 0;
     for (pack.override_layers) |layer| {
-        try safeTarget(layer);
+        try safeLayer(layer);
         const dir = fs.descend(extracted, io, layer, false) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
         defer dir.close(io);
-        try validateOverrideTargets(a, io, dir, "", instance_name, cancel, &visited);
+        try validateOverrideTargets(a, io, dir, "", instance_name, cancel, &visited, policy);
     }
 }
 const Walk = struct {
@@ -309,6 +440,9 @@ const Walk = struct {
     identity: manifest.PackIdentity,
     files: *std.ArrayList(manifest.InstallFile),
     manual: *std.ArrayList(content_install.ManualFile),
+    worlds: *std.ArrayList(InitialWorldFile),
+    policy: TargetPolicy,
+    allow_worlds: bool = false,
     visited: usize = 0,
 
     fn walk(self: *Walk, dir: Io.Dir, absolute: []const u8, prefix: []const u8, depth: usize) anyerror!void {
@@ -319,7 +453,10 @@ const Walk = struct {
             self.visited += 1;
             if (self.visited > 32_768) return error.TooManyItems;
             const path = if (prefix.len == 0) try self.a.dupe(u8, entry.name) else try std.fmt.allocPrint(self.a, "{s}/{s}", .{ prefix, entry.name });
-            try safeTarget(path);
+            errdefer if (self.policy.diagnostics) |d| {
+                if (d.len == 0) d.setPath(path);
+            };
+            try checkedOverride(path, null, self.allow_worlds);
             const stat = (try fs.inspectEntry(dir, self.io, entry.name)) orelse return error.MissingOverride;
             const source_path = try std.fs.path.join(self.a, &.{ absolute, entry.name });
             switch (stat.kind) {
@@ -332,6 +469,14 @@ const Walk = struct {
                     const file = try fs.openRegular(dir, self.io, entry.name);
                     defer file.close(self.io);
                     const hash = try fs.stream(file, null, self.io, 1024 * 1024 * 1024, self.cancel, null);
+                    if (self.allow_worlds and worldPath(path)) {
+                        if (!worldFilePath(path)) return error.ProtectedPath;
+                        // Initial worlds cannot be overwritten by a later override layer.
+                        for (self.worlds.items) |other| if (targetCollision(other.path, path)) return error.PathCollision;
+                        if (self.worlds.items.len >= providers.max_items) return error.TooManyItems;
+                        try self.worlds.append(self.a, .{ .path = path, .source_absolute_path = source_path, .fingerprint = hash });
+                        continue;
+                    }
                     const install: manifest.InstallFile = .{
                         .record = .{ .path = path, .provider = self.identity.provider, .project_id = self.identity.project_id, .version_id = self.identity.version_id, .hashes = .{ .sha256 = try self.a.dupe(u8, &hash.sha256) }, .size = hash.size, .role = .override, .identity_provenance = .pack_override, .standalone = false },
                         .download = .{ .manual_required = .{ .official_page = "", .reason = .missing_url } },
@@ -448,6 +593,71 @@ const test_cf =
     \\{"manifestVersion":1,"manifestType":"minecraftModpack","name":"CF Export","version":"v1","minecraft":{"version":"1.21.1","modLoaders":[{"id":"fabric-0.16.10","primary":true}]},"files":[{"projectID":123,"fileID":456,"required":true}],"overrides":"supplied"}
 ;
 
+test "verified pack staging rejects provider mismatches before extraction and preserves source" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    // Deliberately not a ZIP: a hash failure must win over the extraction error.
+    try fixture.tmp.dir.writeFile(io, .{ .sub_path = "download.mrpack", .data = "untrusted callback output" });
+    const path = try fixture.path("download.mrpack");
+    defer a.free(path);
+    const original = (try fs.fingerprint(fixture.tmp.dir, io, "download.mrpack", null, null)).?;
+    const wrong_sha1 = "0000000000000000000000000000000000000000";
+    const wrong_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+    const wrong_sha512 = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    for ([_]providers.Hashes{
+        .{ .sha1 = wrong_sha1 },
+        .{ .sha256 = wrong_sha256 },
+        .{ .sha512 = wrong_sha512 },
+        .{ .sha1 = &original.sha1, .sha256 = &original.sha256, .sha512 = wrong_sha512 },
+    }) |hashes| {
+        try std.testing.expectError(error.HashMismatch, inspectVerified(a, io, &fixture.paths, path, hashes, original.size, null, null));
+    }
+    try std.testing.expectError(error.SizeMismatch, inspectVerified(a, io, &fixture.paths, path, original.hashes(), original.size + 1, null, null));
+    var cancel = CancelToken.init(true);
+    try std.testing.expectError(error.Canceled, inspectVerified(a, io, &fixture.paths, path, original.hashes(), original.size, &cancel, null));
+    const after = (try fs.fingerprint(fixture.tmp.dir, io, "download.mrpack", null, null)).?;
+    try std.testing.expect(original.eql(after));
+    const stages_path = try fixture.path(".vela/pack-imports");
+    defer a.free(stages_path);
+    const stages = try fs.openAbsolute(io, stages_path);
+    defer stages.close(io);
+    var iterator = stages.iterate();
+    try std.testing.expect(try iterator.next(io) == null);
+}
+
+fn testVerifiedInspectionAllocationFailure(a: Allocator, paths: *const instances.Paths, path: []const u8, fingerprint: fs.Fingerprint) !void {
+    var inspected = try inspectVerified(a, std.testing.io, paths, path, fingerprint.hashes(), fingerprint.size, null, null);
+    defer inspected.deinit();
+    try inspected.cleanup(std.testing.io);
+}
+
+test "verified pack staging owns a separate copy and cleans allocation failures" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    try testZip(fixture.tmp.dir, "download.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = test_mrpack }});
+    const path = try fixture.path("download.mrpack");
+    defer a.free(path);
+    const fingerprint = (try fs.fingerprint(fixture.tmp.dir, io, "download.mrpack", null, null)).?;
+    var inspected = try inspectVerified(a, io, &fixture.paths, path, fingerprint.hashes(), fingerprint.size, null, null);
+    defer inspected.deinit();
+    try std.testing.expectEqualStrings(&fingerprint.sha256, &inspected.source_sha256);
+    try std.testing.expect(!std.mem.eql(u8, path, inspected.archive_absolute_path));
+    try inspected.cleanup(io);
+    try @import("test_allocations").checkAllAllocationFailures(a, testVerifiedInspectionAllocationFailure, .{ &fixture.paths, path, fingerprint });
+    const after = (try fs.fingerprint(fixture.tmp.dir, io, "download.mrpack", null, null)).?;
+    try std.testing.expect(fingerprint.eql(after));
+    const stages_path = try fixture.path(".vela/pack-imports");
+    defer a.free(stages_path);
+    const stages = try fs.openAbsolute(io, stages_path);
+    defer stages.close(io);
+    var iterator = stages.iterate();
+    try std.testing.expect(try iterator.next(io) == null);
+}
+
 test "private pack archives preserve format through public reinspection and trusted preparation" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -460,7 +670,7 @@ test "private pack archives preserve format through public reinspection and trus
         try testZip(fixture.tmp.dir, sample.name, &.{.{ .path = sample.index, .bytes = sample.bytes }});
         const path = try fixture.path(sample.name);
         defer a.free(path);
-        var preview = try inspect(a, io, &fixture.paths, path, null);
+        var preview = try inspect(a, io, &fixture.paths, path, null, null);
         defer preview.deinit();
         defer preview.cleanup(io) catch {};
         try std.testing.expectEqual(sample.provider, preview.provider);
@@ -469,7 +679,7 @@ test "private pack archives preserve format through public reinspection and trus
         try std.testing.expect(std.mem.eql(u8, preview.stage_absolute_path, std.fs.path.dirname(preview.archive_absolute_path).?));
         // The public handoff must use the owned bytes even after the original is gone.
         try fixture.tmp.dir.deleteFile(io, sample.name);
-        var reinspected = try inspect(a, io, &fixture.paths, preview.archive_absolute_path, null);
+        var reinspected = try inspect(a, io, &fixture.paths, preview.archive_absolute_path, null, null);
         defer reinspected.deinit();
         defer reinspected.cleanup(io) catch {};
         try std.testing.expectEqual(sample.provider, reinspected.provider);
@@ -702,7 +912,7 @@ test "pack inspection exposes exact prerequisites without target or game publica
     try testZip(fixture.tmp.dir, "local.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = test_mrpack }});
     const path = try fixture.path("local.mrpack");
     defer a.free(path);
-    var inspected = try inspect(a, io, &fixture.paths, path, null);
+    var inspected = try inspect(a, io, &fixture.paths, path, null, null);
     defer inspected.deinit();
     defer inspected.cleanup(io) catch {};
     try std.testing.expectEqualStrings("1.21.1", inspected.pack.minecraft_version);
@@ -718,7 +928,7 @@ test "pack inspection exposes exact prerequisites without target or game publica
     try testZip(fixture.tmp.dir, "local.zip", &.{.{ .path = "manifest.json", .bytes = test_cf }});
     const cf_path = try fixture.path("local.zip");
     defer a.free(cf_path);
-    var cf = try inspect(a, io, &fixture.paths, cf_path, null);
+    var cf = try inspect(a, io, &fixture.paths, cf_path, null, null);
     defer cf.deinit();
     defer cf.cleanup(io) catch {};
     try std.testing.expectEqual(providers.Provider.curseforge, cf.provider);
@@ -737,7 +947,7 @@ test "pack preparation reuses inspected bytes after original archive changes" {
     try testZip(fixture.tmp.dir, "local.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = test_mrpack }, .{ .path = "overrides/config/keep.txt", .bytes = "inspected" } });
     const path = try fixture.path("local.mrpack");
     defer a.free(path);
-    var inspected = try inspect(a, io, &fixture.paths, path, null);
+    var inspected = try inspect(a, io, &fixture.paths, path, null, null);
     defer inspected.deinit();
     defer inspected.cleanup(io) catch {};
     try testZip(fixture.tmp.dir, "local.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = test_mrpack }, .{ .path = "overrides/config/keep.txt", .bytes = "different" } });
@@ -762,7 +972,7 @@ test "pack preparation rejects tampered inspected copy before extraction" {
     try testZip(fixture.tmp.dir, "local.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = test_mrpack }});
     const path = try fixture.path("local.mrpack");
     defer a.free(path);
-    var inspected = try inspect(a, io, &fixture.paths, path, null);
+    var inspected = try inspect(a, io, &fixture.paths, path, null, null);
     defer inspected.deinit();
     defer inspected.cleanup(io) catch {};
     const stage = try fs.openAbsolute(io, inspected.stage_absolute_path);
@@ -781,7 +991,7 @@ test "pack preparation rejects tampered inspected copy before extraction" {
 }
 
 fn testInspectionAllocationFailure(a: Allocator, paths: *const instances.Paths, path: []const u8) !void {
-    var inspected = try inspect(a, std.testing.io, paths, path, null);
+    var inspected = try inspect(a, std.testing.io, paths, path, null, null);
     defer inspected.deinit();
     try inspected.cleanup(std.testing.io);
 }
@@ -795,7 +1005,7 @@ test "pack inspection cancellation and allocation failure leave no private stage
     const path = try fixture.path("local.mrpack");
     defer a.free(path);
     var cancel = CancelToken.init(true);
-    try std.testing.expectError(error.Canceled, inspect(a, io, &fixture.paths, path, &cancel));
+    try std.testing.expectError(error.Canceled, inspect(a, io, &fixture.paths, path, &cancel, null));
     try @import("test_allocations").checkAllAllocationFailures(a, testInspectionAllocationFailure, .{ &fixture.paths, path });
     const stages_path = try fixture.path(".vela/pack-imports");
     defer a.free(stages_path);
@@ -818,11 +1028,11 @@ test "target-free inspection rejects launcher receipts in indexes and override l
         const index = try testRemoteIndex(a, &.{target});
         defer a.free(index);
         try testZip(fixture.tmp.dir, "local.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = index }});
-        try std.testing.expectError(error.ProtectedPath, inspect(a, io, &fixture.paths, path, null));
+        try std.testing.expectError(error.ProtectedPath, inspect(a, io, &fixture.paths, path, null, null));
         const override_path = try std.fmt.allocPrint(a, "overrides/{s}", .{target});
         defer a.free(override_path);
         try testZip(fixture.tmp.dir, "local.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = test_mrpack }, .{ .path = override_path, .bytes = "receipt" } });
-        try std.testing.expectError(error.ProtectedPath, inspect(a, io, &fixture.paths, path, null));
+        try std.testing.expectError(error.ProtectedPath, inspect(a, io, &fixture.paths, path, null, null));
     }
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(io, ".minecraft", .{}));
 }
@@ -845,7 +1055,7 @@ test "preparation protects exact target JSON and JAR before compatibility in ind
             const entries = [_]TestEntry{ .{ .path = "modrinth.index.json", .bytes = index }, .{ .path = override_path, .bytes = "launcher-owned" } };
             try testZip(fixture.tmp.dir, "local.mrpack", entries[0..if (override) @as(usize, 2) else 1]);
             // Target-free inspection intentionally permits an otherwise ordinary root JSON/JAR.
-            var inspected = try inspect(a, io, &fixture.paths, path, null);
+            var inspected = try inspect(a, io, &fixture.paths, path, null, null);
             defer inspected.deinit();
             defer inspected.cleanup(io) catch {};
             try std.testing.expectError(error.ProtectedPath, prepareInspected(a, io, &fixture.paths, incompatible, &inspected, null));
@@ -863,7 +1073,7 @@ test "inspection and preparation retain ordinary root configuration JSON" {
     try testZip(fixture.tmp.dir, "local.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = test_mrpack }, .{ .path = "overrides/settings.json", .bytes = "settings" }, .{ .path = "client-overrides/Other.json", .bytes = "other" } });
     const path = try fixture.path("local.mrpack");
     defer a.free(path);
-    var inspected = try inspect(a, io, &fixture.paths, path, null);
+    var inspected = try inspect(a, io, &fixture.paths, path, null, null);
     defer inspected.deinit();
     defer inspected.cleanup(io) catch {};
     var prepared = try prepareInspected(a, io, &fixture.paths, test_instance, &inspected, null);
@@ -886,8 +1096,183 @@ test "pack target preflight bounds precede uninitialized inspection collections"
     const references = try a.alloc(manifest.PackReference, providers.max_items + 1);
     defer a.free(references);
     var pack: manifest.PackPlan = .{ .identity = .{ .provider = .modrinth, .project_id = "project", .version_id = "v1" }, .name = "Pack", .version = "v1", .minecraft_version = "1.20.1", .files = files };
-    try std.testing.expectError(error.TooManyItems, validatePackTargets(a, io, tmp.dir, pack, "Test", null));
+    try std.testing.expectError(error.TooManyItems, validatePackTargets(a, io, tmp.dir, pack, "Test", null, .{}));
     pack.files = &.{};
     pack.unresolved = references;
-    try std.testing.expectError(error.TooManyItems, validatePackTargets(a, io, tmp.dir, pack, "Test", null));
+    try std.testing.expectError(error.TooManyItems, validatePackTargets(a, io, tmp.dir, pack, "Test", null, .{}));
+}
+
+test "initial worlds copy only to fresh stages and never enter managed membership" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    inline for (.{ "overrides", "client-overrides" }) |layer| {
+        var fixture = try TestFixture.init();
+        defer fixture.deinit();
+        try testZip(fixture.tmp.dir, "world.mrpack", &.{
+            .{ .path = "modrinth.index.json", .bytes = test_mrpack },
+            .{ .path = layer ++ "/saves/枪战地图/level.dat", .bytes = "initial-world" },
+            .{ .path = "overrides/config/map.txt", .bytes = "managed" },
+        });
+        const path = try fixture.path("world.mrpack");
+        defer a.free(path);
+        var diagnostics: Diagnostics = .{};
+        var inspection = try inspect(a, io, &fixture.paths, path, null, &diagnostics);
+        defer inspection.deinit();
+        defer inspection.cleanup(io) catch {};
+        try std.testing.expectError(error.ProtectedPath, prepare(a, io, &fixture.paths, test_instance, path, null));
+        try std.testing.expectError(error.ProtectedPath, prepareInspected(a, io, &fixture.paths, test_instance, &inspection, null));
+        var prepared = try prepareNewInstance(a, io, &fixture.paths, test_instance, &inspection, null, &diagnostics);
+        defer prepared.deinit();
+        defer prepared.cleanup(io) catch {};
+        try std.testing.expectEqual(@as(usize, 1), prepared.initial_world_files.len);
+        try std.testing.expectEqual(@as(usize, 1), prepared.files.len);
+        try std.testing.expectEqualStrings("config/map.txt", prepared.files[0].record.path);
+        var membership = try manifest.membershipForPack(a, prepared.pack);
+        defer membership.deinit();
+        for (membership.value.paths) |managed| try std.testing.expect(!worldPath(managed));
+        const stage = try fs.descend(fixture.tmp.dir, io, "fresh", true);
+        defer stage.close(io);
+        var cancel = CancelToken.init(true);
+        try std.testing.expectError(error.Canceled, copyInitialWorlds(&prepared, io, stage, &cancel, &diagnostics));
+        try std.testing.expect(try fs.inspectEntry(stage, io, "saves") == null);
+        cancel.store(false, .release);
+        try copyInitialWorlds(&prepared, io, stage, &cancel, &diagnostics);
+        const leaf = try fs.parent(stage, io, "saves/枪战地图/level.dat", false);
+        defer leaf.deinit(io);
+        const bytes = try fs.read(a, leaf.dir, io, leaf.name, 100);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("initial-world", bytes);
+        try std.testing.expectError(error.PackGameCollision, copyInitialWorlds(&prepared, io, stage, null, &diagnostics));
+        try std.testing.expectEqualStrings("saves", diagnostics.pathSlice());
+    }
+}
+
+test "initial world preparation rejects cross-layer collisions and protected targets" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const cases = [_]struct { first: []const u8, second: []const u8 }{
+        .{ .first = "overrides/saves/World/level.dat", .second = "client-overrides/saves/World/level.dat" },
+        .{ .first = "overrides/saves/World/a", .second = "client-overrides/saves/world/b" },
+        .{ .first = "overrides/saves/World/a", .second = "client-overrides/saves/World/a/b" },
+    };
+    for (cases) |case| {
+        var fixture = try TestFixture.init();
+        defer fixture.deinit();
+        try testZip(fixture.tmp.dir, "world.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = test_mrpack }, .{ .path = case.first, .bytes = "a" }, .{ .path = case.second, .bytes = "b" } });
+        const path = try fixture.path("world.mrpack");
+        defer a.free(path);
+        var inspection = try inspect(a, io, &fixture.paths, path, null, null);
+        defer inspection.deinit();
+        defer inspection.cleanup(io) catch {};
+        var diagnostics: Diagnostics = .{};
+        try std.testing.expectError(error.PathCollision, prepareNewInstance(a, io, &fixture.paths, test_instance, &inspection, null, &diagnostics));
+        try std.testing.expect(std.mem.startsWith(u8, diagnostics.pathSlice(), "saves/"));
+    }
+    for ([_][]const u8{ "overrides/assets/a", "overrides/.vela/pack-content.json", "overrides/.vela-instance.json", "overrides/Saves/World/level.dat", "overrides/saves/loose.dat" }) |target| {
+        var fixture = try TestFixture.init();
+        defer fixture.deinit();
+        try testZip(fixture.tmp.dir, "world.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = test_mrpack }, .{ .path = target, .bytes = "a" } });
+        const path = try fixture.path("world.mrpack");
+        defer a.free(path);
+        var diagnostics: Diagnostics = .{};
+        try std.testing.expectError(error.ProtectedPath, inspect(a, io, &fixture.paths, path, null, &diagnostics));
+        try std.testing.expect(diagnostics.len != 0);
+    }
+}
+
+test "initial world copy rejects changed source symlinks and existing empty saves" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    try testZip(fixture.tmp.dir, "world.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = test_mrpack }, .{ .path = "overrides/saves/World/level.dat", .bytes = "world" } });
+    const path = try fixture.path("world.mrpack");
+    defer a.free(path);
+    var inspection = try inspect(a, io, &fixture.paths, path, null, null);
+    defer inspection.deinit();
+    defer inspection.cleanup(io) catch {};
+    var prepared = try prepareNewInstance(a, io, &fixture.paths, test_instance, &inspection, null, null);
+    defer prepared.deinit();
+    defer prepared.cleanup(io) catch {};
+    const stage = try fs.descend(fixture.tmp.dir, io, "fresh", true);
+    defer stage.close(io);
+    const saves = try fs.child(stage, io, "saves", true, true);
+    saves.close(io);
+    try std.testing.expectError(error.PackGameCollision, copyInitialWorlds(&prepared, io, stage, null, null));
+    try stage.deleteTree(io, "saves");
+    const source_path = prepared.initial_world_files[0].source_absolute_path;
+    const source_dir = try fs.openAbsolute(io, std.fs.path.dirname(source_path).?);
+    defer source_dir.close(io);
+    try source_dir.deleteFile(io, "level.dat");
+    try fs.write(source_dir, io, "level.dat", "other");
+    try std.testing.expectError(error.HashMismatch, copyInitialWorlds(&prepared, io, stage, null, null));
+    try std.testing.expect(try fs.inspectEntry(stage, io, "saves") == null);
+    if (@import("builtin").os.tag != .windows) {
+        try source_dir.deleteFile(io, "level.dat");
+        try source_dir.symLink(io, "missing", "level.dat", .{});
+        try std.testing.expectError(error.UnsafeFileType, copyInitialWorlds(&prepared, io, stage, null, null));
+        try std.testing.expect(try fs.inspectEntry(stage, io, "saves") == null);
+        try stage.symLink(io, "outside", "saves", .{ .is_directory = true });
+        try std.testing.expectError(error.UnsafeFileType, copyInitialWorlds(&prepared, io, stage, null, null));
+    }
+}
+
+test "CurseForge override initial map imports without managed world records" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    const index = "{\"manifestVersion\":1,\"manifestType\":\"minecraftModpack\",\"name\":\"BattleArmory TACZ26.0.5\",\"version\":\"26.0.5\",\"minecraft\":{\"version\":\"1.21.1\",\"modLoaders\":[{\"id\":\"fabric-0.16.10\",\"primary\":true}]},\"files\":[],\"overrides\":\"overrides\"}";
+    try testZip(fixture.tmp.dir, "BattleArmory.zip", &.{ .{ .path = "manifest.json", .bytes = index }, .{ .path = "overrides/saves/枪战地图/level.dat", .bytes = "world" } });
+    const path = try fixture.path("BattleArmory.zip");
+    defer a.free(path);
+    var inspection = try inspect(a, io, &fixture.paths, path, null, null);
+    defer inspection.deinit();
+    defer inspection.cleanup(io) catch {};
+    try std.testing.expectError(error.ProtectedPath, prepareInspected(a, io, &fixture.paths, test_instance, &inspection, null));
+    var prepared = try prepareNewInstance(a, io, &fixture.paths, test_instance, &inspection, null, null);
+    defer prepared.deinit();
+    defer prepared.cleanup(io) catch {};
+    try std.testing.expectEqual(@as(usize, 0), prepared.pack.files.len);
+    try std.testing.expectEqual(@as(usize, 1), prepared.initial_world_files.len);
+    const stage = try fs.descend(fixture.tmp.dir, io, "fresh", true);
+    defer stage.close(io);
+    try copyInitialWorlds(&prepared, io, stage, null, null);
+    const leaf = try fs.parent(stage, io, "saves/枪战地图/level.dat", false);
+    defer leaf.deinit(io);
+    const actual = (try fs.fingerprint(leaf.dir, io, leaf.name, null, null)).?;
+    try std.testing.expect(actual.eql(prepared.initial_world_files[0].fingerprint));
+}
+
+test "CF declared arbitrary override roots seed worlds without managing saves" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_][]const u8{ "supplied", "custom/nested", "saves", "assets" }) |layer| {
+        var fixture = try TestFixture.init();
+        defer fixture.deinit();
+        const index = try std.fmt.allocPrint(a, "{{\"manifestVersion\":1,\"manifestType\":\"minecraftModpack\",\"name\":\"Worlds\",\"version\":\"1\",\"minecraft\":{{\"version\":\"1.21.1\",\"modLoaders\":[{{\"id\":\"fabric-0.16.10\",\"primary\":true}}]}},\"files\":[],\"overrides\":\"{s}\"}}", .{layer});
+        defer a.free(index);
+        const world = try std.fmt.allocPrint(a, "{s}/saves/World/level.dat", .{layer});
+        defer a.free(world);
+        try testZip(fixture.tmp.dir, "world.zip", &.{ .{ .path = "manifest.json", .bytes = index }, .{ .path = world, .bytes = "world" } });
+        const path = try fixture.path("world.zip");
+        defer a.free(path);
+        var inspection = try inspect(a, io, &fixture.paths, path, null, null);
+        defer inspection.deinit();
+        defer inspection.cleanup(io) catch {};
+        try std.testing.expectError(error.ProtectedPath, prepareInspected(a, io, &fixture.paths, test_instance, &inspection, null));
+        var prepared = try prepareNewInstance(a, io, &fixture.paths, test_instance, &inspection, null, null);
+        defer prepared.deinit();
+        defer prepared.cleanup(io) catch {};
+        try std.testing.expectEqual(@as(usize, 0), prepared.files.len);
+        try std.testing.expectEqual(@as(usize, 1), prepared.initial_world_files.len);
+        const stage = try fs.descend(fixture.tmp.dir, io, "fresh", true);
+        defer stage.close(io);
+        try copyInitialWorlds(&prepared, io, stage, null, null);
+        const leaf = try fs.parent(stage, io, "saves/World/level.dat", false);
+        defer leaf.deinit(io);
+        const bytes = try fs.read(a, leaf.dir, io, leaf.name, 100);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("world", bytes);
+    }
 }

@@ -435,6 +435,8 @@ fn verify(io: Io, path: []const u8, release: *const RuntimeRelease, hooks: Hooks
 pub fn ServiceTransport(comptime Service: type) type {
     return struct {
         service: *Service,
+        io: ?Io = null,
+        cache_root: ?[]const u8 = null,
         const Self = @This();
         pub fn transport(self: *Self) Transport {
             return .{ .context = self, .get = get, .download = download };
@@ -467,10 +469,25 @@ pub fn ServiceTransport(comptime Service: type) type {
                 };
             }
         }
+        fn cachePath(self: *Self, a: Allocator, url: []const u8) !?[]u8 {
+            const root = self.cache_root orelse return null;
+            const io = self.io orelse return null;
+            const directory = try std.fs.path.join(a, &.{ root, "http", "java-metadata" });
+            defer a.free(directory);
+            try Io.Dir.cwd().createDirPath(io, directory);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(url, &digest, .{});
+            return try std.fmt.allocPrint(a, "{s}/{s}.json", .{ directory, std.fmt.bytesToHex(digest, .lower) });
+        }
         fn get(context: *anyopaque, a: Allocator, url: []const u8, limit: usize, hooks: Hooks) ![]u8 {
             const self: *Self = @ptrCast(@alignCast(context));
             try hooks.check();
-            const task = try self.service.submit(.{ .url = url, .output = .bytes, .max_bytes = limit, .timeout_ms = 30_000, .https_only = true });
+            const cache_path = self.cachePath(a, url) catch |err| switch (err) {
+                error.Canceled => return err,
+                else => null,
+            };
+            defer if (cache_path) |path| a.free(path);
+            const task = try self.service.submit(.{ .url = url, .output = .bytes, .max_bytes = limit, .timeout_ms = 30_000, .https_only = true, .cache_path = cache_path });
             defer task.release() catch unreachable;
             try self.wait(task, hooks, .metadata);
             try hooks.check();
@@ -484,7 +501,7 @@ pub fn ServiceTransport(comptime Service: type) type {
             _ = io;
             const self: *Self = @ptrCast(@alignCast(context));
             try hooks.check();
-            const task = try self.service.submit(.{ .url = release.url, .output = .{ .file = path }, .expected_size = if (release.size_precision == .exact) release.size else null, .max_bytes = release.downloadLimit(), .timeout_ms = 600_000, .https_only = true });
+            const task = try self.service.submit(.{ .url = release.url, .output = .{ .file = path }, .expected_sha256 = release.sha256, .artifact_cache_root = self.cache_root, .expected_size = if (release.size_precision == .exact) release.size else null, .max_bytes = release.downloadLimit(), .timeout_ms = 600_000, .https_only = true });
             defer task.release() catch unreachable;
             try self.wait(task, hooks, .downloading);
             try hooks.check();

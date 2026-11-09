@@ -11,7 +11,7 @@ const content = @import("../core/content_install.zig");
 const loader_install = @import("../core/loaders/install.zig");
 const loader_base_install = @import("../core/loaders/base_install.zig");
 const metadata_loader = @import("../core/minecraft/metadata_loader.zig");
-const preparation = @import("../application/instance_preparation.zig");
+const preparation = @import("instance_preparation.zig");
 const downloader = @import("../core/downloader.zig");
 const A = std.mem.Allocator;
 const Io = std.Io;
@@ -82,6 +82,7 @@ pub const Control = struct {
     download_budget: ?*downloader.Budget = null,
     /// Immutable manager-owned root, frozen for the lifetime of the worker.
     cache_root: ?[]const u8 = null,
+    cache_mode: downloader.CacheMode = .prefer_cache,
     pub fn check(self: Control) !void {
         if (self.cancel.load(.acquire)) return error.Canceled;
     }
@@ -109,6 +110,9 @@ pub const LoaderCatalogue = struct {
     base: []const u8,
     kind: config.Loader,
     entries: []const LoaderEntry,
+    /// Unix seconds, intersected over production HTTP responses. Null preserves
+    /// the explicit adapter contract: locally supplied catalogues retain for 5 min.
+    http_fresh_until: ?i64 = null,
     pub fn clone(self: LoaderCatalogue, a: A) !LoaderCatalogue {
         var arena: std.heap.ArenaAllocator = .init(a);
         errdefer arena.deinit();
@@ -116,7 +120,7 @@ pub const LoaderCatalogue = struct {
         const entries = try owned.alloc(LoaderEntry, self.entries.len);
         for (self.entries, entries) |entry, *dest| dest.* = .{ .id = try owned.dupe(u8, entry.id), .stable = entry.stable, .release_time = try owned.dupe(u8, entry.release_time) };
         const base = try owned.dupe(u8, self.base);
-        return .{ .arena = arena, .base = base, .kind = self.kind, .entries = entries };
+        return .{ .arena = arena, .base = base, .kind = self.kind, .entries = entries, .http_fresh_until = self.http_fresh_until };
     }
     pub fn deinit(self: *LoaderCatalogue) void {
         self.arena.deinit();
@@ -219,6 +223,7 @@ const Job = struct {
     installer: ?Installer,
     catalogue_adapter: ?CatalogueAdapter,
     cache_root: ?[]const u8 = null,
+    cache_mode: downloader.CacheMode = .prefer_cache,
     loader_generation: u64 = 0,
     download_connections: u16,
     download_budget: ?*downloader.Budget = null,
@@ -257,7 +262,7 @@ const Job = struct {
     }
     fn perform(self: *Job) !void {
         const a = std.heap.page_allocator;
-        const control: Control = .{ .cancel = self.flag(), .task = self.task, .cache_root = self.cache_root, .download_budget = self.download_budget };
+        const control: Control = .{ .cancel = self.flag(), .task = self.task, .cache_root = self.cache_root, .download_budget = self.download_budget, .cache_mode = self.cache_mode };
         try control.check();
         // Workers use the frozen waiting checker; the owner lease stays nonblocking.
         var worker_lease = self.lease;
@@ -265,7 +270,7 @@ const Job = struct {
         const options: transactions.Options = .{ .cancel = self.flag(), .guard = .{ .running_ids = self.guard.running_ids }, .lease = .{ .context = worker_lease.context, .recheck = worker_lease.recheck }, .namespace_token = self.namespace_token, .worker_checks = true };
         switch (self.operation) {
             .renaming => {
-                control.report(.backing_up, 0, null);
+                control.report(.finalizing, 0, null);
                 self.result = try transactions.rename(a, self.io, self.root, self.request, self.new_name.?, options);
                 if (self.renamed_options) |edited| {
                     self.result.?.instance.java_path = edited.java_path;
@@ -323,6 +328,7 @@ pub const Manager = struct {
     loader_cache_next: usize = 0,
     active: ?*Job = null,
     pending: ?*Job = null,
+    shutdown_retained: bool = false,
     published: ?*Job = null,
     loader_data: ?*Job = null,
     phase: Phase = .idle,
@@ -346,6 +352,28 @@ pub const Manager = struct {
         const cache_root = if (options.cache_root) |root| try g.dupe(u8, root) else null;
         return .{ .allocator = a, .io = io, .arena = arena, .root = owned_root, .cache_root = cache_root, .download_budget = options.download_budget, .cache_clock = options.cache_clock, .registry = registry, .guard = owned_guard, .lease = lease };
     }
+    /// Recover interrupted renames before exposing this root to launch or editing.
+    /// The persisted configuration chooses rollback (old name) or completion (new).
+    pub fn recoverRenames(self: *Manager, store: *const config.Store) !void {
+        if (self.isBusy()) return error.Busy;
+        if (!std.mem.eql(u8, self.root, store.root)) return error.ConfigurationStoreChanged;
+        if (store.publicationUncertain()) return error.ConfigPublicationUncertain;
+        const token = try namespace.acquire(self.io);
+        defer token.release();
+        for (store.snapshot().instances) |instance| {
+            try self.lease.acquire(self.lease.context, instance.id);
+            defer self.lease.release(self.lease.context, instance.id);
+            _ = transactions.recoverRename(self.allocator, self.io, self.root, instance, .{
+                .guard = .{ .running_ids = self.guard.running_ids },
+                .lease = .{ .context = self.lease.context, .recheck = self.lease.recheck },
+                .namespace_token = token,
+            }) catch |err| {
+                std.log.err("无法恢复实例「{s}」的重命名：{s}", .{ instance.name, @errorName(err) });
+                return err;
+            };
+        }
+    }
+
     /// Optional worker checker uses the owner lease context and is frozen per job.
     pub fn setWorkerRecheck(self: *Manager, recheck: ?*const fn (?*anyopaque, []const u8) anyerror!void) void {
         self.worker_recheck = recheck;
@@ -388,7 +416,22 @@ pub const Manager = struct {
         self.default_java = owned;
     }
     pub fn isBusy(self: *const Manager) bool {
-        return self.active != null or self.pending != null;
+        return self.active != null or (self.pending != null and !self.shutdown_retained);
+    }
+
+    /// Called only after admission closes and creation coordinators release ownership.
+    /// Complete short committed mutations; retain failed evidence without retry loops.
+    pub fn finishShutdown(self: *Manager, store: *config.Store) void {
+        if (self.active != null or self.shutdown_retained) return;
+        const job = self.pending orelse return;
+        if (job.failure == null and job.operation != .creating) {
+            if (self.publish(store)) |_| return else |err| {
+                self.failure = err;
+            }
+        }
+        const failure: anyerror = if (self.failure) |err| err else if (job.failure) |err| err else error.ConfigurationNotPublished;
+        self.finishTask(job, .{ .failed = failure });
+        self.shutdown_retained = true;
     }
     pub fn deinit(self: *Manager) void {
         if (self.active) |job| {
@@ -439,11 +482,6 @@ pub const Manager = struct {
         if (self.installer == null) return error.InstallAdapterUnavailable;
         try self.startJob(.creating, request.instance, .{ .creation = request });
     }
-    pub fn startRename(self: *Manager, instance: config.Instance, new_name: []const u8) !void {
-        if (!config.validId(new_name)) return error.InvalidInstanceName;
-        if (std.ascii.eqlIgnoreCase(instance.name, new_name)) return error.InstanceNameUnchanged;
-        try self.start(.renaming, instance, new_name);
-    }
     /// Rename and launch options publish together; request remains the stale-check baseline.
     pub fn startRenameWithOptions(self: *Manager, original: config.Instance, updated: config.Instance) !void {
         try validateRequest(updated);
@@ -454,7 +492,7 @@ pub const Manager = struct {
         try self.startJob(.renaming, original, .{ .new_name = updated.name, .renamed_options = updated });
     }
     pub fn startDelete(self: *Manager, instance: config.Instance) !void {
-        try self.start(.deleting, instance, null);
+        try self.startJob(.deleting, instance, .{});
     }
     pub fn loadLoaders(self: *Manager, base: []const u8, kind: config.Loader) !void {
         try self.loadLoadersInner(base, kind, false);
@@ -473,7 +511,8 @@ pub const Manager = struct {
         for (&self.loader_cache) |*slot| {
             const entry = if (slot.*) |*value| value else continue;
             if (entry.catalogue.kind != kind or !std.mem.eql(u8, entry.catalogue.base, base)) continue;
-            if (now >= entry.valid_until_ms) {
+            const http_expired = if (entry.catalogue.http_fresh_until) |deadline| @divFloor(Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s) >= deadline else false;
+            if (now >= entry.valid_until_ms or http_expired) {
                 entry.catalogue.deinit();
                 slot.* = null;
                 break;
@@ -495,9 +534,27 @@ pub const Manager = struct {
             self.operation = .loading_loaders;
             return;
         }
-        try self.start(.loading_loaders, request, null);
+        try self.startJob(.loading_loaders, request, .{ .cache_mode = if (force) .revalidate else .prefer_cache });
     }
     fn rememberCatalogue(self: *Manager, catalogue: LoaderCatalogue) !void {
+        const now = self.cache_clock.now_ms(self.cache_clock.context, self.io);
+        const ttl: u64 = if (catalogue.http_fresh_until) |deadline| blk: {
+            const wall_now: i64 = @intCast(@divFloor(Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+            if (deadline <= wall_now) {
+                // A no-store/no-cache refresh must also remove a previous fresh entry.
+                for (&self.loader_cache) |*slot| {
+                    if (slot.*) |*entry| {
+                        if (entry.catalogue.kind == catalogue.kind and std.mem.eql(u8, entry.catalogue.base, catalogue.base)) {
+                            entry.catalogue.deinit();
+                            slot.* = null;
+                        }
+                    }
+                }
+                return;
+            }
+            const remaining_ns = @as(i128, deadline) * std.time.ns_per_s - Io.Clock.real.now(self.io).nanoseconds;
+            break :blk @intCast(@min(@as(i128, std.math.maxInt(u64)), @max(0, @divFloor(remaining_ns, std.time.ns_per_ms))));
+        } else loader_cache_ttl_ms;
         const owned = try catalogue.clone(self.allocator);
         var index = self.loader_cache_next;
         for (self.loader_cache, 0..) |slot, i| {
@@ -509,17 +566,15 @@ pub const Manager = struct {
             }
         }
         if (self.loader_cache[index]) |*entry| entry.catalogue.deinit();
-        self.loader_cache[index] = .{ .catalogue = owned, .valid_until_ms = self.cache_clock.now_ms(self.cache_clock.context, self.io) +| loader_cache_ttl_ms };
+        self.loader_cache[index] = .{ .catalogue = owned, .valid_until_ms = now +| ttl };
         self.loader_cache_next = (index + 1) % self.loader_cache.len;
     }
     const StartOptions = struct {
         creation: ?CreationRequest = null,
         new_name: ?[]const u8 = null,
         renamed_options: ?config.Instance = null,
+        cache_mode: downloader.CacheMode = .prefer_cache,
     };
-    fn start(self: *Manager, operation: Operation, instance: config.Instance, new_name: ?[]const u8) !void {
-        try self.startJob(operation, instance, .{ .new_name = new_name });
-    }
     fn startJob(self: *Manager, operation: Operation, instance: config.Instance, options: StartOptions) !void {
         if (self.isBusy()) return error.Busy;
         if (operation == .creating) if (self.creation_admission) |admission| try admission.check(admission.context);
@@ -535,6 +590,7 @@ pub const Manager = struct {
         }
         const job = try self.allocator.create(Job);
         job.* = .{ .allocator = self.allocator, .arena = .init(self.allocator), .io = self.io, .root = self.root, .operation = operation, .request = instance, .guard = self.guard, .lease = self.lease, .worker_recheck = self.worker_recheck, .namespace_token = namespace_token, .installer = self.installer, .catalogue_adapter = self.catalogue_adapter, .download_budget = self.download_budget, .download_connections = self.download_connections, .metadata = proof, .precommit = if (creation) |request| request.precommit else null };
+        job.cache_mode = options.cache_mode;
         job.publish_pack_manifest = job.precommit != null;
         errdefer job.destroy();
         job.request = try cloneInstance(job.arena.allocator(), instance);
@@ -737,6 +793,15 @@ pub const Manager = struct {
         if (job.result) |*result| try result.recheckPublication(self.root);
         const doc = store.snapshot();
         if (try self.reconciledDeletion(job, doc)) return;
+        if (job.operation == .renaming and job.uncertain_publication_store != null) {
+            for (doc.instances) |entry| if (std.mem.eql(u8, entry.id, job.request.id)) {
+                if (sameInstance(entry, job.value())) {
+                    try self.finishRenamePublication(job);
+                    return;
+                }
+                break;
+            };
+        }
         var updated = doc.*;
         const a = self.allocator;
         var entries: std.ArrayList(config.Instance) = .empty;
@@ -793,11 +858,25 @@ pub const Manager = struct {
         }
         store.update(updated) catch |err| {
             if (store.publicationUncertain()) {
-                if (job.operation == .creating or job.operation == .deleting) job.uncertain_publication_store = store;
+                if (job.operation == .creating or job.operation == .deleting or job.operation == .renaming) job.uncertain_publication_store = store;
                 if (job.operation == .deleting) job.unbound_server_ids = unbound_server_ids;
             }
             return err;
         };
+        if (job.operation == .renaming) {
+            // Store is committed even if journal cleanup fails; retries acknowledge it.
+            job.uncertain_publication_store = store;
+            try self.finishRenamePublication(job);
+        }
+    }
+
+    fn finishRenamePublication(self: *Manager, job: *Job) !void {
+        try transactions.finishRename(self.allocator, self.io, self.root, job.value(), .{
+            .guard = .{ .running_ids = self.guard.running_ids },
+            .lease = .{ .context = self.lease.context, .recheck = self.lease.recheck },
+            .namespace_token = job.namespace_token,
+        });
+        if (job.result) |*result| result.recovery_directory = null;
     }
     /// A retry may acknowledge only this job's own reconciled deletion effect.
     /// The original row still present means the ordinary guarded save must retry.
@@ -900,6 +979,7 @@ fn productionCatalogue(_: ?*anyopaque, a: A, io: Io, base: []const u8, kind: con
     try control.check();
     var client = try http_cache.Client.init(a, io, control.download_budget orelse return error.MissingDownloadBudget, control.cache_root);
     defer client.deinit();
+    client.cache_mode = control.cache_mode;
     const loader_kind: loaders.Kind = switch (kind) {
         .fabric => .fabric,
         .forge => .forge,
@@ -915,7 +995,7 @@ fn productionCatalogue(_: ?*anyopaque, a: A, io: Io, base: []const u8, kind: con
     const entries = try owned.alloc(LoaderEntry, catalogue.value.entries.len);
     for (catalogue.value.entries, entries) |entry, *dest| dest.* = .{ .id = try owned.dupe(u8, entry.id), .stable = entry.stable };
     const owned_base = try owned.dupe(u8, base);
-    return .{ .arena = arena, .base = owned_base, .kind = kind, .entries = entries };
+    return .{ .arena = arena, .base = owned_base, .kind = kind, .entries = entries, .http_fresh_until = if (client.response_count != 0 and client.cache_policy.store) client.cache_policy.fresh_until else 0 };
 }
 fn productionRun(_: ?*anyopaque, a: A, io: Io, request: CreateRequest, control: Control) !Installed {
     const files = @import("../core/loaders/files.zig");
@@ -987,7 +1067,7 @@ fn productionStage(a: A, io: Io, request: CreateRequest, control: Control, g: A,
     defer service.deinit();
     control.report(.metadata, 0, null);
     const prepared_control: ?loaders.Control = if (request.metadata == .loader) loaderControl(&io, control, 30 * 60 * 1000) else null;
-    const base_config: minecraft.Config = .{ .root = minecraft_root, .version_id = request.instance.minecraft_version, .target = .{ .directory_name = stage_name, .name = request.instance.name }, .game_directory = stage_path, .natives_directory = natives, .publish_metadata = false, .namespace_token = namespace_token, .worker_checks = true, .environment = if (prepared_target) |target| target.environment else if (vanilla_target) |target| target.environment else try preparation.environment(), .window = request.download_connections, .cancel = control.cancel, .task = control.task };
+    const base_config: minecraft.Config = .{ .root = minecraft_root, .artifact_cache_root = control.cache_root orelse try std.fs.path.join(g, &.{ request.root, ".vela", "cache" }), .version_id = request.instance.minecraft_version, .target = .{ .directory_name = stage_name, .name = request.instance.name }, .game_directory = stage_path, .natives_directory = natives, .publish_metadata = false, .namespace_token = namespace_token, .worker_checks = true, .environment = if (prepared_target) |target| target.environment else if (vanilla_target) |target| target.environment else try preparation.environment(), .window = request.download_connections, .cancel = control.cancel, .task = control.task };
     var base = switch (request.metadata) {
         .loader => |prepared| try loader_base_install.runPrepared(a, io, service, base_config, prepared.owner, prepared_target.?, prepared_control.?),
         .vanilla => |prepared| try minecraft.runVanillaPrepared(a, io, service, base_config, prepared.owner, vanilla_target.?),

@@ -9,8 +9,8 @@ const planner = @import("core/minecraft/install_plan.zig");
 const safe = @import("core/install/safe_fs.zig");
 const content_fs = @import("core/content_fs.zig");
 const native = @import("core/minecraft/native_extract.zig");
-const library = @import("ui/game_library.zig");
-const java = @import("ui/java_manager.zig");
+const library = @import("application/game_library.zig");
+const java = @import("application/java_manager.zig");
 
 const root = "/home/HumXC/vela-launcher";
 const version = "26.3";

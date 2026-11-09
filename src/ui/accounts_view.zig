@@ -2,7 +2,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("../core/config.zig");
-const accounts_manager = @import("accounts_manager.zig");
+const accounts_manager = @import("../application/accounts_manager.zig");
 const avatar_manager = @import("avatar_manager.zig");
 const avatar_image = @import("avatar_image.zig");
 const theme = @import("theme.zig");
@@ -247,8 +247,6 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, busy: bool) void {
     const scroll = components.scrollBody(@src());
     defer scroll.deinit();
     if (adding) {
-        const panel = components.formPanel(@src(), .{ .compact = true, .tag = "account-form-panel", .options = .{ .corners = .all(theme.cardRadius()), .margin = R.all(0), .min_size_content = .height(80) } });
-        defer panel.deinit();
         _ = components.field(@src(), "用户名或者邮箱", &ui.draft.name, .{ .tag = "account-name", .gap_after = 0 });
     } else if (account) |value| {
         if (microsoft) {
@@ -263,8 +261,6 @@ fn drawEditor(ui: *Ui, doc: *const config.Document, busy: bool) void {
             _ = dvui.spacer(@src(), .{ .min_size_content = .height(theme.spacing.card_gap) });
             components.text(@src(), "微软账户信息由登录同步。删除账户或退出登录将移除此账户，并清理已保存的登录凭据。", theme.colors.muted);
         } else {
-            const panel = components.formPanel(@src(), .{ .compact = true, .tag = "account-form-panel", .options = .{ .corners = .all(theme.cardRadius()), .margin = R.all(0), .min_size_content = .height(80) } });
-            defer panel.deinit();
             _ = components.field(@src(), "用户名", &ui.draft.name, .{ .tag = "account-name", .gap_after = 0 });
         }
         if (!current) components.text(@src(), "所选账户已更改，请关闭后重新编辑", theme.colors.danger);

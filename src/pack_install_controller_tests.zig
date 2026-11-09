@@ -1,6 +1,6 @@
 //! Atomic pack installation and UI ownership regression suite.
 test {
-    _ = @import("ui/pack_install_controller.zig");
+    _ = @import("application/pack_install_controller.zig");
     _ = @import("core/pack_install.zig");
     _ = @import("pack_source_integration_tests.zig");
     _ = @import("pack_page_tests.zig");
@@ -19,11 +19,15 @@ const row: config.Instance = .{ .id = "pack", .name = "Pack", .minecraft_version
 test "atomic pack precommit assembles overrides privately and receipt publication is idempotent" {
     var fixture = try fixtures.Fixture.init();
     defer fixture.deinit();
-    try fixtures.zip(fixture.tmp.dir, "pack.mrpack", &.{ .{ .path = "modrinth.index.json", .bytes = fixtures.index }, .{ .path = "overrides/config/options.txt", .bytes = "verified" } });
+    try fixtures.zip(fixture.tmp.dir, "pack.mrpack", &.{
+        .{ .path = "modrinth.index.json", .bytes = fixtures.index },
+        .{ .path = "overrides/config/options.txt", .bytes = "verified" },
+        .{ .path = "overrides/saves/枪战地图/level.dat", .bytes = "initial map" },
+    });
     const archive = try fixture.path("pack.mrpack");
     defer a.free(archive);
     var cancel: backend.CancelToken = .init(false);
-    var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel);
+    var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel, null);
     defer inspection.deinit();
     defer inspection.cleanup(io) catch {};
     const stage = try fs.descend(fixture.tmp.dir, io, ".minecraft/versions/private-stage", true);
@@ -35,7 +39,16 @@ test "atomic pack precommit assembles overrides privately and receipt publicatio
     const bytes = try stage.readFileAlloc(io, "config/options.txt", a, .limited(100));
     defer a.free(bytes);
     try std.testing.expectEqualStrings("verified", bytes);
-    try stage.access(io, ".vela/pack-content.json", .{});
+    const world = try stage.readFileAlloc(io, "saves/枪战地图/level.dat", a, .limited(100));
+    defer a.free(world);
+    try std.testing.expectEqualStrings("initial map", world);
+    const receipt = try stage.readFileAlloc(io, ".vela/pack-content.json", a, .limited(65536));
+    defer a.free(receipt);
+    var managed = try @import("core/content_manifest.zig").parse(a, receipt);
+    defer managed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), managed.value.files.len);
+    try std.testing.expectEqualStrings("config/options.txt", managed.value.files[0].path);
+    for (managed.value.pack_membership.?.paths) |path| try std.testing.expect(!std.mem.startsWith(u8, path, "saves/"));
     try std.testing.expect(try fs.inspectEntry(stage, io, ".vela-pack-work") == null);
     const versions = try fs.descend(fixture.tmp.dir, io, ".minecraft/versions", false);
     defer versions.close(io);
@@ -58,7 +71,7 @@ test "atomic pack cancellation and game collision never publish final instance" 
     const archive = try fixture.path("pack.mrpack");
     defer a.free(archive);
     var cancel: backend.CancelToken = .init(false);
-    var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel);
+    var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel, null);
     defer inspection.deinit();
     defer inspection.cleanup(io) catch {};
     const stage = try fs.descend(fixture.tmp.dir, io, ".minecraft/versions/private-stage", true);
@@ -83,7 +96,7 @@ test "atomic pack cancellation and game collision never publish final instance" 
 }
 
 test "atomic pack controller declaration surface" {
-    std.testing.refAllDecls(@import("ui/pack_install_controller.zig").Controller);
+    std.testing.refAllDecls(@import("application/pack_install_controller.zig").Controller);
 }
 
 test "optional decisions are explicit and manual substitutes retain original hash validation" {
@@ -94,7 +107,7 @@ test "optional decisions are explicit and manual substitutes retain original has
         const archive = try fixture.path("source.mrpack");
         defer a.free(archive);
         var cancel: backend.CancelToken = .init(false);
-        var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel);
+        var inspection = try packs.inspect(a, io, &fixture.paths, archive, &cancel, null);
         defer inspection.deinit();
         defer inspection.cleanup(io) catch {};
         const stage = try fs.descend(fixture.tmp.dir, io, "stage", true);
@@ -129,7 +142,7 @@ test "canceling completed inspection before publication discards its late result
         try fixtures.zip(fixture.tmp.dir, "source.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = fixtures.index }});
         const archive = try fixture.path("source.mrpack");
         defer a.free(archive);
-        var controller = try @import("ui/pack_install_controller.zig").Controller.init(a, io, &fixture.paths, .{});
+        var controller = try @import("application/pack_install_controller.zig").Controller.init(a, io, &fixture.paths, .{});
         defer controller.deinit(undefined);
         try controller.inspectLocal(archive);
         const job = controller.core.job.?;
@@ -196,5 +209,84 @@ test "pack loader adaptation preserves modern loader contracts and legacy NeoFor
         defer a.free(version);
         try std.testing.expectEqualStrings("21.1.80-beta", version);
         try std.testing.expectEqual(null, try adapt(a, kind, "1.21.1", null));
+    }
+}
+
+const WorldTransport = struct {
+    corrupt: bool = false,
+    calls: usize = 0,
+    fn request(raw: ?*anyopaque, allocator: std.mem.Allocator, _: std.Io, req: @import("core/http_transport.zig").Request) !@import("core/http_transport.zig").Response {
+        const self: *WorldTransport = @ptrCast(@alignCast(raw.?));
+        try std.testing.expectEqualStrings("https://cdn.modrinth.com/world.dat", req.url);
+        try std.testing.expect(req.require_public_address and !req.follow_redirects);
+        self.calls += 1;
+        const bytes = try allocator.dupe(u8, if (self.corrupt) "evil" else "good");
+        return .{ .allocator = allocator, .status = 200, .body = bytes, .allocation = bytes };
+    }
+};
+
+test "indexed initial maps verify remote and manual bytes preserve optional choices and reject existing installs" {
+    const Mode = enum { remote_good, remote_bad, manual_good, manual_bad, exclude, undecided, existing };
+    for ([_]Mode{ .remote_good, .remote_bad, .manual_good, .manual_bad, .exclude, .undecided, .existing }) |mode| {
+        var fixture = try fixtures.Fixture.init();
+        defer fixture.deinit();
+        try fixtures.zip(fixture.tmp.dir, "world.mrpack", &.{.{ .path = "modrinth.index.json", .bytes = "{\"formatVersion\":1,\"game\":\"minecraft\",\"versionId\":\"v1\",\"name\":\"World Pack\",\"dependencies\":{\"minecraft\":\"1.21.1\"},\"files\":[{\"path\":\"saves/World/level.dat\",\"hashes\":{\"sha1\":\"fc19318dd13128ce14344d066510a982269c241b\",\"sha512\":\"10259bfe1a41058e4671d05a3b962b774c4b16946b4040bc055059d1859d5f15ec4d7f01ca3f7561632d00add6122d337022a151174e5b9cebf430254b8e9fa7\"},\"fileSize\":4,\"downloads\":[\"https://cdn.modrinth.com/world.dat\"],\"env\":{\"client\":\"optional\",\"server\":\"optional\"}}]}" }});
+        const archive = try fixture.path("world.mrpack");
+        defer a.free(archive);
+        var transport: WorldTransport = .{ .corrupt = mode == .remote_bad };
+        var cancel: backend.CancelToken = .init(false);
+        const options: backend.Options = .{ .transport_options = .{ .fixture_http = WorldTransport.request, .fixture_context = &transport } };
+        var inspection = try backend.inspect(a, io, &fixture.paths, .{ .local = archive }, options, &cancel);
+        defer inspection.deinit();
+        defer inspection.cleanup(io) catch {};
+        try std.testing.expectEqual(@as(usize, 0), inspection.pack.files.len);
+        try std.testing.expectEqual(@as(usize, 1), inspection.pack.initial_world_files.len);
+        try std.testing.expectError(error.ProtectedPath, packs.prepare(a, io, &fixture.paths, row, archive, &cancel));
+        try std.testing.expectError(error.ProtectedPath, packs.prepareInspected(a, io, &fixture.paths, row, &inspection, &cancel));
+        const stage = try fs.descend(fixture.tmp.dir, io, "stage", true);
+        defer stage.close(io);
+        const path = try fixture.path("stage");
+        defer a.free(path);
+        var request: backend.Request = .{ .paths = &fixture.paths, .inspection = &inspection, .instance = row, .options = options };
+        if (mode != .undecided) request.optional = &.{.{ .path = "saves/World/level.dat", .include = mode != .exclude }};
+        const manual_path = try fixture.path("manual.dat");
+        defer a.free(manual_path);
+        if (mode == .manual_good or mode == .manual_bad) {
+            try fixture.tmp.dir.writeFile(io, .{ .sub_path = "manual.dat", .data = if (mode == .manual_good) "good" else "evil" });
+            request.manual_files = &.{.{ .path = "saves/World/level.dat", .source_absolute_path = manual_path }};
+        }
+        if (mode == .existing) {
+            const existing = try fs.descend(stage, io, "saves/World", true);
+            defer existing.close(io);
+            try fs.write(existing, io, "level.dat", "user");
+        }
+        const expected: ?anyerror = switch (mode) {
+            .remote_bad => error.Sha1Mismatch,
+            .manual_bad => error.HashMismatch,
+            .undecided => error.OptionalDecisionRequired,
+            .existing => error.PackGameCollision,
+            else => null,
+        };
+        if (expected) |err| {
+            try std.testing.expectError(err, backend.precommit(&request, a, io, path, &cancel));
+            try std.testing.expect(try fs.inspectEntry(stage, io, ".vela") == null);
+            if (mode != .existing) try std.testing.expect(try fs.inspectEntry(stage, io, "saves") == null);
+        } else {
+            try backend.precommit(&request, a, io, path, &cancel);
+            const receipt = try stage.readFileAlloc(io, ".vela/pack-content.json", a, .limited(65536));
+            defer a.free(receipt);
+            var parsed = try @import("core/content_manifest.zig").parse(a, receipt);
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 0), parsed.value.files.len);
+            try std.testing.expectEqual(@as(usize, 0), parsed.value.pack_membership.?.paths.len);
+        }
+        if (mode == .remote_good or mode == .manual_good or mode == .existing) {
+            const bytes = try stage.readFileAlloc(io, "saves/World/level.dat", a, .limited(10));
+            defer a.free(bytes);
+            try std.testing.expectEqualStrings(if (mode == .existing) "user" else "good", bytes);
+        }
+        if (mode == .exclude) try std.testing.expect(try fs.inspectEntry(stage, io, "saves") == null);
+        if (mode == .exclude or mode == .undecided or mode == .manual_good or mode == .manual_bad) try std.testing.expectEqual(@as(usize, 0), transport.calls);
+        try std.testing.expect(try fs.inspectEntry(stage, io, ".vela-pack-work") == null);
     }
 }

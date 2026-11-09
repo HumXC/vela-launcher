@@ -24,7 +24,8 @@ const Fixture = struct {
             // Boolean comparison avoids printing credentials on failure.
             try std.testing.expect(std.mem.eql(u8, fixture_key, request.headers[0].value));
         }
-        return .{ .allocator = a, .status = self.status, .body = try a.dupe(u8, "payload") };
+        const body = try a.dupe(u8, "payload");
+        return .{ .allocator = a, .status = self.status, .body = body, .allocation = body };
     }
 };
 
@@ -45,7 +46,7 @@ test "pack download auth scopes key to approved exact CDN and owns its copy" {
     defer a.free(absolute);
     var fixture: Fixture = .{};
     var caller_key = fixture_key.*;
-    var adapter = try transport.Adapter.initWithOptions(a, io, null, 1, .{ .allow_curseforge = true, .curseforge_download_key = &caller_key, .approved_download_hosts = &.{ "edge.forgecdn.net", "cdn.modrinth.com", "edge.forgecdn.net.evil.example", "other.example" }, .fixture_http = Fixture.execute, .fixture_context = &fixture });
+    var adapter = try transport.Adapter.init(a, io, null, 1, .{ .allow_curseforge = true, .curseforge_download_key = &caller_key, .approved_download_hosts = &.{ "edge.forgecdn.net", "cdn.modrinth.com", "edge.forgecdn.net.evil.example", "other.example" }, .fixture_http = Fixture.execute, .fixture_context = &fixture });
     defer adapter.deinit();
     @memset(&caller_key, 'X');
     const fetch = adapter.fetcher();
@@ -84,7 +85,7 @@ test "pack download auth scopes key to approved exact CDN and owns its copy" {
     }
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     // Exact host still needs explicit approval.
-    var unapproved = try transport.Adapter.initWithOptions(a, io, null, 1, .{ .allow_curseforge = true, .curseforge_download_key = fixture_key, .fixture_http = Fixture.execute, .fixture_context = &fixture });
+    var unapproved = try transport.Adapter.init(a, io, null, 1, .{ .allow_curseforge = true, .curseforge_download_key = fixture_key, .fixture_http = Fixture.execute, .fixture_context = &fixture });
     defer unapproved.deinit();
     const denied = unapproved.fetcher();
     try std.testing.expectError(error.UnapprovedDownloadHost, denied.fetchToFile(denied.context, io, requestFor(tmp.dir, absolute, good_url)));
@@ -111,8 +112,8 @@ test "pack download auth rejects ambiguous URLs and keeps metadata scope separat
 
 test "pack download auth rejects malformed key before HTTP" {
     for ([_][]const u8{ "", "a\r\nb", "a b" }) |key| {
-        try std.testing.expectError(error.InvalidCredential, transport.Adapter.initWithOptions(std.testing.allocator, std.testing.io, null, 1, .{ .curseforge_download_key = key }));
+        try std.testing.expectError(error.InvalidCredential, transport.Adapter.init(std.testing.allocator, std.testing.io, null, 1, .{ .curseforge_download_key = key }));
     }
     const oversized: [513]u8 = @splat('x');
-    try std.testing.expectError(error.InvalidCredential, transport.Adapter.initWithOptions(std.testing.allocator, std.testing.io, null, 1, .{ .curseforge_download_key = &oversized }));
+    try std.testing.expectError(error.InvalidCredential, transport.Adapter.init(std.testing.allocator, std.testing.io, null, 1, .{ .curseforge_download_key = &oversized }));
 }
