@@ -9,7 +9,8 @@ pub fn curl(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
         .link_vendor = true,
         .mbedtls_pthreads = target.result.os.tag == .linux or target.result.os.tag.isDarwin(),
     });
-    if (target.result.os.tag == .windows)
+    // A fresh configuration may not have fetched the C-binding dependencies yet.
+    if (target.result.os.tag == .windows and b.graph.needed_lazy_dependencies.count() == 0)
         disableWindowsTranslationFortify(dependency.module("curl").import_table.get("c").?);
     return dependency;
 }
