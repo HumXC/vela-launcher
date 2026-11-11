@@ -1114,7 +1114,9 @@ test "content manager native baseline rejects wrong CPU ABA with identical trust
             if (file.handle != source.handle) return delegate(userdata, file);
             stats += 1;
             if (stats == 4) change(original) catch return error.Unexpected;
-            const result = try delegate(userdata, file);
+            var result = try delegate(userdata, file);
+            // Keep the modeled mutation observable independently of filesystem clock resolution.
+            if (mutations != 0) result.ctime.nanoseconds = baseline.ctime.nanoseconds + 1;
             // Return the pre-inspection baseline, then inspect actual good B.
             if (stats == 2) change(replacement) catch return error.Unexpected;
             return result;

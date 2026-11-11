@@ -1375,7 +1375,7 @@ test "native original baselines survive restored bytes and publication rollback"
             try reader.interface.readSliceAll(restored);
             try std.testing.expectEqualSlices(u8, zip, restored);
             try std.testing.expectEqual(originals[0].mtime.nanoseconds, (try source.stat(io)).mtime.nanoseconds);
-            try std.testing.expect(originals[0].ctime.nanoseconds != (try source.stat(io)).ctime.nanoseconds);
+            try std.testing.expect(originals[0].ctime.nanoseconds != (try source.stat(hooked_io)).ctime.nanoseconds);
         }
         var listing = try tmp.dir.openDir(io, ".", .{ .iterate = true });
         defer listing.close(io);
