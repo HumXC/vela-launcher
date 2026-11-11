@@ -1,0 +1,147 @@
+name: Ubuntu build and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (for example 0.2.0 or v0.2.0-rc.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  LC_ALL: C.UTF-8
+
+jobs:
+  build:
+    name: Ubuntu 22.04 / Linux x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate release version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            tag=$(python3 scripts/package-linux.py "$REQUESTED_VERSION" --validate-only)
+          else
+            tag="v0.0.0-ci.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Reject existing release tags
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          count=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" \
+            --jq "map(select(.ref == \"refs/tags/$RELEASE_TAG\")) | length")
+          if [[ "$count" != 0 ]]; then
+            echo "::error::Tag $RELEASE_TAG already exists; choose a new version."
+            exit 1
+          fi
+      - name: Install Ubuntu build and runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config python3 binutils ca-certificates \
+            fontconfig fonts-dejavu-core zenity glslang-tools wayland-protocols \
+            libwayland-dev libxkbcommon-dev libasound2-dev libdbus-1-dev \
+            libdecor-0-dev libusb-1.0-0-dev libudev-dev libgl1-mesa-dev \
+            libegl1-mesa-dev libvulkan-dev libsecret-1-0 \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev libxfixes-dev \
+            libxext-dev libxrender-dev libxss-dev
+      - name: Install pinned Zig compiler
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.0
+          cache-key: ubuntu-22.04-x86_64-gnu235
+      - name: Run local test suites
+        run: zig build test -Dcpu=baseline -j2
+      - name: Build release executable
+        run: |
+          zig build compile-app -Doptimize=ReleaseSmall -Dtarget=x86_64-linux-gnu.2.35 -Dcpu=baseline -j2
+          strip --strip-unneeded zig-out/bin/vela
+      - name: Smoke test with isolated data and software renderer
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+          SDL_RENDER_DRIVER: software
+          VELA_FONT_PATH: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+        run: |
+          data_dir=$(mktemp -d "$RUNNER_TEMP/vela-smoke.XXXXXX")
+          status=0
+          timeout 10s zig-out/bin/vela --data-dir "$data_dir" > "$RUNNER_TEMP/vela-smoke.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/vela-smoke.log"
+          if [[ "$status" != 124 ]]; then
+            echo "::error::Expected the launcher to stay running until timeout; got $status"
+            exit 1
+          fi
+      - name: Verify ELF compatibility and package
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: python3 scripts/package-linux.py "$RELEASE_TAG"
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-x86_64
+          path: dist
+      - name: Verify downloaded checksums
+        working-directory: dist
+        run: sha256sum --check --strict ./*.sha256
+      - name: Create draft with assets, then publish
+        run: |
+          # Check again after the build; never overwrite an existing tag/release.
+          count=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" \
+            --jq "map(select(.ref == \"refs/tags/$RELEASE_TAG\")) | length")
+          test "$count" = 0
+          flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 \
+            --target "$GITHUB_SHA" --title "Vela $RELEASE_TAG" \
+            --generate-notes --draft "${flags[@]}"
+          gh release edit "$RELEASE_TAG" --draft=false

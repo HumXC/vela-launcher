@@ -1,6 +1,6 @@
 # Building and testing
 
-Use Zig 0.17.0 (the manifest minimum), a C toolchain and the platform libraries required by SDL3. Python 3 is needed for managed local fixtures; override its executable with `-Dpython=/absolute/path/to/python3`. The source-package verifier requires Python 3.12 or newer for safe tar extraction. Dependency downloads require network access on a cold package cache. Test fixtures use loopback servers and temporary directories, not public Minecraft services. Nix environment configuration is outside this build change.
+Use Zig 0.17.0 (the manifest minimum), a C toolchain and the platform libraries required by SDL3. Python 3 is needed for managed local fixtures; override its executable with `-Dpython=/absolute/path/to/python3`. The source-package verifier requires Python 3.12 or newer for safe tar extraction. Dependency downloads require network access on a cold package cache. Test fixtures use loopback servers and temporary directories, not public Minecraft services.
 
 ## Commands
 
@@ -41,6 +41,106 @@ Production DVUI builds disable Tree-sitter and embed no fonts. The pinned DVUI p
 `build-support/freetype.zig` trims the bundled FreeType driver sources and generates a matching module registry. It removes Type 1, standalone CID Type 1, Type 42, PFR, BDF, PCF, Windows FNT and SDF renderers. TrueType/SFNT, CFF and its helpers, variable fonts, hinting, embedded bitmap strikes and the normal renderers remain enabled. Exact source/module checks fail on dependency drift; package sources stay immutable.
 
 macOS requires an existing SDK supplied with `-Dmacos-sdk=/absolute/MacOSX.sdk`; SDK acquisition is separate. Platform compile checks do not prove native macOS/Windows linking or runtime behavior.
+
+## Nix packages
+
+The locked flake exposes native packages and apps for x86_64-linux and
+aarch64-linux. Nix must have the nix-command and flakes features enabled.
+
+~~~sh
+nix build .#vela             # also the default: nix build
+nix run .#vela               # also the default: nix run
+nix flake check              # build and isolated startup check for this system
+nix develop                 # development shell and dependency generator
+~~~
+
+The result includes the launcher, a desktop entry, X11/Wayland runtime libraries,
+libsecret, and the fontconfig/zenity/xdg-utils commands. The wrapper invokes the
+Nix glibc loader with a process-local library search path, preserving the Zig ELF
+without patchelf/strip rewriting. It does not set LD_LIBRARY_PATH for Java or
+other child processes. The wrapper defaults data to
+$XDG_DATA_HOME/vela, or ~/.local/share/vela when XDG_DATA_HOME is unset. An explicit
+--data-dir takes precedence over VELA_DATA_DIR and this package default.
+
+The package uses system fonts; install a suitable Chinese font through your
+normal system configuration, or pass VELA_FONT_PATH pointing to a font file.
+Persistent credentials require a running Secret Service provider. Graphics drivers
+and desktop services belong to the host. A Nix package is a Nix store closure,
+not a portable standalone executable: do not copy just result/bin/vela to another
+machine. Java is not bundled, and downloaded upstream JDKs/game native libraries
+may still need NixOS compatibility support; packaging the launcher alone does not
+establish that every Minecraft version runs on NixOS. Configure a suitable Nix JDK
+when needed. Nix on non-NixOS Linux may additionally require host driver integration.
+
+deps.nix pins the complete Zig dependency closure with Nix content hashes.
+nix/package.nix compiles in the Nix sandbox with a prefilled dependency cache, ReleaseSmall and baseline CPU
+features, using the same pinned Zig 0.17.0 as the development shell. No local Zig
+caches, docs, game data or credentials are included in the package source. The
+flake excludes the unused Pugl backend and a legacy Tree-sitter wrapper from the
+build cache because their manifests/build APIs are incompatible with Zig 0.17;
+both remain in the generated lock.
+After changing build.zig.zon, run nix develop --command generate-nix-deps to
+regenerate deps.nix with the pinned zon2nix generator, review the dependency diff,
+and run nix flake check. Downloads use Nix fetchers rather than Zig's HTTP client.
+The Nix package version currently follows the source manifest's 0.1.0; Ubuntu's
+manual release label does not rewrite it.
+
+The Nix packages Actions workflow builds and checks both architectures on native
+runners. The startup check runs the installed wrapper with dummy SDL video,
+software rendering, an explicit fixture font and a temporary user data directory,
+without development-shell library paths. It does not test real graphics drivers,
+Microsoft login, Secret Service interaction or Minecraft launches. The workflow
+validates packages; it does not upload a binary cache or a standalone Nix archive.
+
+## GitHub Actions: Ubuntu CI and releases
+
+The Ubuntu build and release workflow runs on pushes to main and pull requests.
+It installs Zig 0.17.0 and Ubuntu dependencies, runs the local test suites, builds
+Linux x86_64 with ReleaseSmall, baseline CPU features and a glibc 2.35 target,
+and performs an isolated dummy-video/software-renderer smoke test. This is not
+an interactive desktop or real Minecraft launch test.
+
+To publish, first push the workflow to the repository's default branch. In GitHub,
+open Actions → Ubuntu build and release → Run workflow, select the branch, and
+enter a version such as 0.2.0, v0.2.0 or 0.2.0-rc.1. The workflow normalizes the
+version to a v-prefixed tag and builds the exact selected commit. Existing tags
+are rejected. The version labels the release, archive, VERSION and build-info.json;
+it does not rewrite the source manifest or embed a new application UI version.
+
+Only manual runs publish. Successful builds create a draft release with the
+archive and SHA-256 checksum, then publish it; prerelease suffixes automatically
+mark the release as a prerelease. A failure during upload/publication may leave a
+draft: inspect it and delete that incomplete draft/tag before retrying the same
+version. No existing release assets or tags are overwritten. Only the publishing
+job receives contents: write; no personal access token is required. Repository
+rules that prohibit tag creation or release writes must allow this workflow.
+
+Assets are named vela-v<VERSION>-linux-x86_64.tar.gz and the matching .sha256.
+PR and push runs upload the same format as temporary Actions artifacts, without
+creating tags or releases. The archive contains a native executable, VERSION and
+build-info.json; it is not an AppImage and does not bundle Java, desktop services
+or graphics drivers. ELF inspection rejects a Nix loader/RPATH and glibc symbol
+requirements newer than 2.35. Windows, macOS and ARM64 release jobs are not included
+in this workflow.
+
+On Ubuntu 22.04, install runtime dependencies with:
+
+~~~sh
+sudo apt-get install ca-certificates fontconfig fonts-dejavu-core zenity libsecret-1-0 libasound2 libdbus-1-3 libdecor-0-0 libusb-1.0-0 libxkbcommon0 libwayland-client0 libwayland-cursor0 libwayland-egl1 libudev1 libgl1 libegl1 libvulkan1 libx11-6 libxcursor1 libxi6 libxrandr2 libxfixes3 libxext6 libxrender1 libxss1
+~~~
+
+Extract the archive into a writable directory and run ./vela. Persistent credentials
+require a running Secret Service provider, such as GNOME Keyring. Use your normal
+graphics drivers and configure or download a suitable JDK in the launcher. Verify
+the archive with sha256sum -c vela-v<VERSION>-linux-x86_64.tar.gz.sha256 before extraction.
+
+To reproduce packaging in an Ubuntu 22.04 environment with the workflow's tools:
+
+~~~sh
+zig build compile-app -Doptimize=ReleaseSmall -Dtarget=x86_64-linux-gnu.2.35 -Dcpu=baseline -j2
+strip --strip-unneeded zig-out/bin/vela
+python3 scripts/package-linux.py 0.2.0
+~~~
 
 ## Source packages
 

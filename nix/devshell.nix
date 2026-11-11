@@ -2,6 +2,7 @@
   mkShellNoCC,
   zig,
   zls,
+  dependency-generator,
   pkg-config,
   python3,
   wayland,
@@ -21,7 +22,8 @@
   wayland-scanner,
   glslang,
   writeShellScriptBin,
-}: let
+}:
+let
   # 去除 zig 输出的 "failed command" 信息
   wrap-zig = writeShellScriptBin "zig" ''
     if [ "$#" -eq 0 ]; then
@@ -47,39 +49,39 @@
     set -euo pipefail
     tmp=$(mktemp ./deps.nix.XXXXXXXX)
     trap 'rm -f -- "$tmp"' EXIT
-    nix run github:nix-community/zon2nix > "$tmp"
+    ${dependency-generator}/bin/zon2nix > "$tmp"
     mv -- "$tmp" deps.nix
   '';
 in
-  mkShellNoCC {
-    packages = [
-      wrap-zig
-      zig
-      zls
-      pkg-config
-      python3
-      zulu21
-      zulu25
-      wayland-scanner
-      wayland
-      glslang
-      libxkbcommon
-      zenity
-      generate-nix-deps
-    ];
-    LD_LIBRARY_PATH = lib.makeLibraryPath [
-      stdenv.cc.cc.lib
-      alsa-lib
-      dbus
-      libdecor
-      libusb1
-      libxkbcommon
-      vulkan-loader
-      wayland
-      udev
-      libglvnd
-    ];
-    shellHook = ''
-      export PATH="$PWD/zig-out/bin:$PATH"
-    '';
-  }
+mkShellNoCC {
+  packages = [
+    wrap-zig
+    zig
+    zls
+    pkg-config
+    python3
+    zulu21
+    zulu25
+    wayland-scanner
+    wayland
+    glslang
+    libxkbcommon
+    zenity
+    generate-nix-deps
+  ];
+  LD_LIBRARY_PATH = lib.makeLibraryPath [
+    stdenv.cc.cc.lib
+    alsa-lib
+    dbus
+    libdecor
+    libusb1
+    libxkbcommon
+    vulkan-loader
+    wayland
+    udev
+    libglvnd
+  ];
+  shellHook = ''
+    export PATH="$PWD/zig-out/bin:$PATH"
+  '';
+}
