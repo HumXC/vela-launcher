@@ -46,21 +46,43 @@
             '';
           });
         }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          vela-bin = pkgs.callPackage ./nix/binary.nix { };
+        }
       );
-      apps = forAllSystems (system: {
-        vela = {
-          type = "app";
-          program = "${self.packages.${system}.vela}/bin/vela";
-          meta.description = "Vela Minecraft launcher";
-        };
-        default = self.apps.${system}.vela;
-      });
-      checks = forAllSystems (system: {
-        package = self.packages.${system}.vela;
-        startup = nixpkgs.legacyPackages.${system}.callPackage ./nix/check.nix {
-          vela = self.packages.${system}.vela;
-        };
-      });
+      apps = forAllSystems (
+        system:
+        {
+          vela = {
+            type = "app";
+            program = "${self.packages.${system}.vela}/bin/vela";
+            meta.description = "Vela Minecraft launcher";
+          };
+          default = self.apps.${system}.vela;
+        }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          vela-bin = {
+            type = "app";
+            program = "${self.packages.${system}.vela-bin}/bin/vela";
+            meta.description = "Vela Minecraft launcher (official binary)";
+          };
+        }
+      );
+      checks = forAllSystems (
+        system:
+        {
+          package = self.packages.${system}.vela;
+          startup = nixpkgs.legacyPackages.${system}.callPackage ./nix/check.nix {
+            vela = self.packages.${system}.vela;
+          };
+        }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          binary-package = self.packages.${system}.vela-bin;
+          binary-startup = nixpkgs.legacyPackages.${system}.callPackage ./nix/check.nix {
+            vela = self.packages.${system}.vela-bin;
+          };
+        }
+      );
       devShells = forAllSystems (
         system:
         let

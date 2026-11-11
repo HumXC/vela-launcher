@@ -54,6 +54,14 @@ nix flake check              # build and isolated startup check for this system
 nix develop                 # development shell and dependency generator
 ~~~
 
+On x86_64-linux, `nix build .#vela-bin` and `nix run .#vela-bin` use the official
+v0.1.0 GitHub Release instead of compiling Zig sources. The release URL and SHA-256
+are pinned in nix/binary.nix; update both together for a new release. No ARM64
+release binary is currently available, so vela-bin is not exposed on aarch64-linux.
+The default package remains the source-built vela on both architectures.
+Both packages use nix/runtime.nix for the same runtime libraries, wrapper and
+desktop entry. `nix flake check` also builds and smoke-tests vela-bin on x86_64-linux.
+
 The result includes the launcher, a desktop entry, X11/Wayland runtime libraries,
 libsecret, and the fontconfig/zenity/xdg-utils commands. The wrapper invokes the
 Nix glibc loader with a process-local library search path, preserving the Zig ELF
