@@ -51,32 +51,13 @@ let
     linkFarm =
       name: entries:
       linkFarm name (
-        builtins.filter
-          (
-            entry:
-            !(builtins.elem entry.name [
-              "tree_sitter-0.25.0-8heIf51vAQConvVIgvm-9mVIbqh7yabZYqPXfOpS3YoG"
-              "pugl-0.1.0-CUvtTqRjAQAQ2sX-zW39HvOnN8MLoyJQneShRiBG8F4n"
-            ])
-          )
-          (
-            map (
-              entry:
-              if entry.name == "N-V-__8AAGkrewARcKiSyLfJKsaW0ZoqHh4hzi4mTGwekxjk" then
-                entry
-                // {
-                  # fetchzip strips the directory expected by webp.zig.
-                  path = linkFarm "webp-zig-layout" [
-                    {
-                      name = "libwebp-1.6.0";
-                      path = entry.path;
-                    }
-                  ];
-                }
-              else
-                entry
-            ) entries
-          )
+        builtins.filter (
+          entry:
+          !(builtins.elem entry.name [
+            "tree_sitter-0.25.0-8heIf51vAQConvVIgvm-9mVIbqh7yabZYqPXfOpS3YoG"
+            "pugl-0.1.0-CUvtTqRjAQAQ2sX-zW39HvOnN8MLoyJQneShRiBG8F4n"
+          ])
+        ) entries
       );
     # Match zon2nix's prefetch semantics with current nixpkgs fetchgit.
     fetchgit =

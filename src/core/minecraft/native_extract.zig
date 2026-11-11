@@ -1279,7 +1279,11 @@ test "native original baselines survive restored bytes and publication rollback"
                 if (source_stats == 2) change(replacement) catch return error.Unexpected;
                 if (source_stats == 3) change(before) catch return error.Unexpected;
             }
-            const result = try delegate_stat(userdata, file);
+            var result = try delegate_stat(userdata, file);
+            // Model a distinct mutation timestamp even on filesystems whose ctime
+            // clock does not advance between these deliberately rapid writes.
+            if (file.handle == source.handle and mutations != 0)
+                result.ctime.nanoseconds = original.ctime.nanoseconds + 1;
             if (file.handle == second_source.handle and phase == .final_stat_cancel) {
                 source_stats += 1;
                 if (source_stats == 5) flag.store(true, .release);

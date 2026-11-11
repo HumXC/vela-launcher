@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn link(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, module: *std.Build.Module) void {
     const source = b.dependency("webp", .{});
     const decoder = b.addLibrary(.{ .name = "vela-webp-decoder", .linkage = .static, .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
-    const root = source.path("libwebp-1.6.0");
+    const root = source.path("");
     decoder.root_module.addIncludePath(root);
     decoder.root_module.addCSourceFiles(.{ .root = root, .flags = &.{"-std=c99"}, .files = &.{
         "src/dec/alpha_dec.c",
