@@ -23,6 +23,7 @@
   glslang,
   writeShellScriptBin,
   apple-sdk,
+  libiconv,
 }:
 let
   # 去除 zig 输出的 "failed command" 信息
@@ -37,7 +38,8 @@ let
     case "$cmd" in
       ${lib.optionalString stdenv.hostPlatform.isDarwin ''
         build)
-          exec ${zig}/bin/zig build -Dmacos-sdk=${apple-sdk.sdkroot} "$@"
+          exec ${zig}/bin/zig build -Dmacos-sdk=${apple-sdk.sdkroot} \
+            --search-prefix ${lib.getLib libiconv} --search-prefix ${lib.getDev libiconv} "$@"
           ;;
       ''}
       build|build-exe|build-lib|build-obj|test|run|translate-c)
@@ -78,7 +80,10 @@ mkShellNoCC (
       libxkbcommon
       zenity
     ]
-    ++ lib.optionals stdenv.hostPlatform.isDarwin [ apple-sdk ];
+    ++ lib.optionals stdenv.hostPlatform.isDarwin [
+      apple-sdk
+      libiconv
+    ];
     shellHook = ''
       export PATH="$PWD/zig-out/bin:$PATH"
     '';

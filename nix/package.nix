@@ -9,6 +9,7 @@
   wayland-scanner,
   glslang,
   apple-sdk,
+  libiconv,
 }:
 let
   version = "0.1.0";
@@ -64,7 +65,7 @@ stdenv.mkDerivation {
   ]
   ++ lib.optionals stdenv.hostPlatform.isDarwin [ apple-sdk ]
   ++ runtime.nativeBuildInputs;
-  buildInputs = runtime.libraries;
+  buildInputs = runtime.libraries ++ lib.optionals stdenv.hostPlatform.isDarwin [ libiconv ];
   dontConfigure = true;
   strictDeps = true;
   # Zig owns C compilation and optimization flags.
@@ -78,7 +79,7 @@ stdenv.mkDerivation {
     export ZIG_LOCAL_PKG_DIR=${deps}
     # Keep bundled-library defaults; the Nix sandbox provides offline isolation.
     zig build compile-app \
-      ${lib.optionalString stdenv.hostPlatform.isDarwin "-Dmacos-sdk=${apple-sdk.sdkroot} -Dtarget=${stdenv.hostPlatform.parsed.cpu.name}-macos.${stdenv.hostPlatform.darwinMinVersion}"} \
+      ${lib.optionalString stdenv.hostPlatform.isDarwin "-Dmacos-sdk=${apple-sdk.sdkroot} -Dtarget=${stdenv.hostPlatform.parsed.cpu.name}-macos.${stdenv.hostPlatform.darwinMinVersion} --search-prefix ${lib.getLib libiconv} --search-prefix ${lib.getDev libiconv}"} \
       -Doptimize=ReleaseSmall -Dcpu=baseline -j2 --prefix "$TMPDIR/vela-install"
     runHook postBuild
   '';
