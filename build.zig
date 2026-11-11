@@ -27,6 +27,8 @@ pub fn build(b: *std.Build) void {
     // Apply SDK paths through the module graph below. DVUI forwards its SDK
     // options to SDL with names unsupported by the pinned SDL build script.
     const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3, .@"tree-sitter" = false });
+    // Let Zig fetch newly discovered lazy dependencies before inspecting their artifacts.
+    if (b.graph.needed_lazy_dependencies.count() != 0) return;
     const dvui = dvui_dep.module("dvui_sdl3");
     @import("build-support/freetype.zig").apply(b, dvui);
     @import("build-support/dvui_backdrop.zig").apply(b, dvui);
