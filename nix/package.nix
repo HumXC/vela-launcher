@@ -9,9 +9,11 @@
   wayland-scanner,
   glslang,
   apple-sdk,
-  libiconv,
+  pkgsStatic,
 }:
 let
+  # Zig 0.17 crashes when linking the Nix Apple iconv dylib; its static build works.
+  libiconv = pkgsStatic.libiconv;
   version = "0.1.0";
   src = lib.fileset.toSource {
     root = ../.;

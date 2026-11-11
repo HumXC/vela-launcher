@@ -23,9 +23,11 @@
   glslang,
   writeShellScriptBin,
   apple-sdk,
-  libiconv,
+  pkgsStatic,
 }:
 let
+  # Zig 0.17 crashes when linking the Nix Apple iconv dylib; its static build works.
+  libiconv = pkgsStatic.libiconv;
   # 去除 zig 输出的 "failed command" 信息
   wrap-zig = writeShellScriptBin "zig" ''
     if [ "$#" -eq 0 ]; then
