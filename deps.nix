@@ -244,7 +244,7 @@ linkFarm "zig-packages" [
     };
   }
   {
-    name = "N-V-__8AAGkrewDTgNKh5MlbRJjCuaMy0MA6gG9S6J-DKXOt";
+    name = "N-V-__8AAGkrewARcKiSyLfJKsaW0ZoqHh4hzi4mTGwekxjk";
     path = fetchzip {
       url = "https://github.com/webmproject/libwebp/archive/refs/tags/v1.6.0.tar.gz";
       hash = "sha256-7i4fGBTsTjAkBzCjVqXqX4n22j6dLgF/0mz4ajNA45U=";

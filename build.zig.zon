@@ -6,7 +6,7 @@
     .dependencies = .{
         .webp = .{
             .url = "https://github.com/webmproject/libwebp/archive/refs/tags/v1.6.0.tar.gz",
-            .hash = "N-V-__8AAGkrewDTgNKh5MlbRJjCuaMy0MA6gG9S6J-DKXOt",
+            .hash = "N-V-__8AAGkrewARcKiSyLfJKsaW0ZoqHh4hzi4mTGwekxjk",
         },
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c#02ff0c523fb92a38939b04d0145c4a9602a74d56",

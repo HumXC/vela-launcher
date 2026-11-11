@@ -62,7 +62,7 @@ let
           (
             map (
               entry:
-              if entry.name == "N-V-__8AAGkrewDTgNKh5MlbRJjCuaMy0MA6gG9S6J-DKXOt" then
+              if entry.name == "N-V-__8AAGkrewARcKiSyLfJKsaW0ZoqHh4hzi4mTGwekxjk" then
                 entry
                 // {
                   # fetchzip strips the directory expected by webp.zig.
