@@ -100,36 +100,37 @@ without development-shell library paths. It does not test real graphics drivers,
 Microsoft login, Secret Service interaction or Minecraft launches. The workflow
 validates packages; it does not upload a binary cache or a standalone Nix archive.
 
-## GitHub Actions: Ubuntu CI and releases
+## GitHub Actions: multiplatform CI and releases
 
-The Ubuntu build and release workflow runs on pushes to main and pull requests.
-It installs Zig 0.17.0 and Ubuntu dependencies, runs the local test suites, builds
-Linux x86_64 with ReleaseSmall, baseline CPU features and a glibc 2.35 target,
-and performs an isolated dummy-video/software-renderer smoke test. This is not
-an interactive desktop or real Minecraft launch test.
+The release workflow builds Linux, Windows and macOS for x86_64 and aarch64 on
+matching native runners, using Zig 0.17.0, ReleaseSmall and baseline CPU features.
+Linux targets glibc 2.35; macOS targets macOS 12.0 and uses the Xcode SDK. Linux
+x86_64 runs the full local test suites. Every target verifies the executable
+architecture and runtime dependencies, packages it, checks its SHA-256, extracts
+it and runs an isolated dummy-video/software-renderer startup check. This is not
+an interactive desktop, real login or Minecraft launch test.
 
-To publish, first push the workflow to the repository's default branch. In GitHub,
-open Actions → Ubuntu build and release → Run workflow, select the branch, and
-enter a version such as 0.2.0, v0.2.0 or 0.2.0-rc.1. The workflow normalizes the
-version to a v-prefixed tag and builds the exact selected commit. Existing tags
-are rejected. The version labels the release, archive, VERSION and build-info.json;
-it does not rewrite the source manifest or embed a new application UI version.
+Pushes and pull requests upload six temporary Actions artifacts without publishing.
+For manual validation, select Actions → Multiplatform build and release → Run
+workflow, enter a version, and leave publish disabled. To publish a new version,
+enable publish; all six builds must succeed before publication. Existing release
+tags are rejected. The version labels the archive, VERSION and build-info.json;
+it does not rewrite the source manifest or application UI version.
 
-Only manual runs publish. Successful builds create a draft release with the
-archive and SHA-256 checksum, then publish it; prerelease suffixes automatically
-mark the release as a prerelease. A failure during upload/publication may leave a
-draft: inspect it and delete that incomplete draft/tag before retrying the same
-version. No existing release assets or tags are overwritten. Only the publishing
-job receives contents: write; no personal access token is required. Repository
-rules that prohibit tag creation or release writes must allow this workflow.
+Linux and macOS assets use vela-v<VERSION>-<PLATFORM>-<ARCH>.tar.gz; Windows uses
+.zip. Each has a matching .sha256. Linux archives contain vela; Windows archives
+contain vela.exe; macOS archives contain Vela.app. All include VERSION and
+build-info.json with the exact commit, compiler and target. macOS bundles use
+ad-hoc signatures, not Developer ID signing or Apple notarization. Java, desktop
+services and graphics drivers are not bundled. ELF checks enforce standard
+loaders and glibc <= 2.35; PE checks reject unbundled non-system DLL imports;
+Mach-O checks reject build-machine library paths and verify the deployment target.
 
-Assets are named vela-v<VERSION>-linux-x86_64.tar.gz and the matching .sha256.
-PR and push runs upload the same format as temporary Actions artifacts, without
-creating tags or releases. The archive contains a native executable, VERSION and
-build-info.json; it is not an AppImage and does not bundle Java, desktop services
-or graphics drivers. ELF inspection rejects a Nix loader/RPATH and glibc symbol
-requirements newer than 2.35. Windows, macOS and ARM64 release jobs are not included
-in this workflow.
+Publication first checks that all six archives and checksums are present, then
+creates a draft with all assets before publishing it. Prerelease versions are
+marked accordingly. A publication failure can leave a draft: inspect it before
+retrying. Existing tags and assets are never overwritten. Only the publication
+job receives contents: write.
 
 On Ubuntu 22.04, install runtime dependencies with:
 
@@ -147,7 +148,8 @@ To reproduce packaging in an Ubuntu 22.04 environment with the workflow's tools:
 ~~~sh
 zig build compile-app -Doptimize=ReleaseSmall -Dtarget=x86_64-linux-gnu.2.35 -Dcpu=baseline -j2
 strip --strip-unneeded zig-out/bin/vela
-python3 scripts/package-linux.py 0.2.0
+python3 scripts/package-release.py 0.2.0 --platform linux --arch x86_64
+python3 scripts/smoke-release.py v0.2.0 --platform linux --arch x86_64
 ~~~
 
 ## Source packages

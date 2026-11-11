@@ -1,4 +1,4 @@
-name: Ubuntu build and release
+name: Multiplatform build and release
 
 on:
   push:
@@ -10,12 +10,17 @@ on:
         description: 'Release version (for example 0.2.0 or v0.2.0-rc.1)'
         required: true
         type: string
+      publish:
+        description: 'Publish a Release after all six targets pass'
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: ubuntu-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: release-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 defaults:
@@ -23,13 +28,11 @@ defaults:
     shell: bash
 
 env:
-  LC_ALL: C.UTF-8
+  LC_ALL: C
 
 jobs:
-  build:
-    name: Ubuntu 22.04 / Linux x86_64
+  prepare:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -43,28 +46,78 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
-            tag=$(python3 scripts/package-linux.py "$REQUESTED_VERSION" --validate-only)
+            tag=$(python3 scripts/package-release.py "$REQUESTED_VERSION" --validate-only)
           else
             tag="v0.0.0-ci.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Reject existing release tags
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
           count=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" \
             --jq "map(select(.ref == \"refs/tags/$RELEASE_TAG\")) | length")
-          if [[ "$count" != 0 ]]; then
-            echo "::error::Tag $RELEASE_TAG already exists; choose a new version."
-            exit 1
-          fi
-      - name: Install Ubuntu build and runtime dependencies
+          test "$count" = 0
+      - name: Test release validation
+        run: python3 -m unittest discover -s scripts -p 'test_release.py'
+
+  build:
+    name: ${{ matrix.platform }} / ${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux
+            arch: x86_64
+            target: x86_64-linux-gnu.2.35
+            python: python3
+          - runner: ubuntu-22.04-arm
+            platform: linux
+            arch: aarch64
+            target: aarch64-linux-gnu.2.35
+            python: python3
+          - runner: windows-2022
+            platform: windows
+            arch: x86_64
+            target: x86_64-windows-gnu
+            python: python
+          - runner: windows-11-arm
+            platform: windows
+            arch: aarch64
+            target: aarch64-windows-gnu
+            python: python
+          - runner: macos-15-intel
+            platform: macos
+            arch: x86_64
+            target: x86_64-macos.12.0
+            python: python3
+          - runner: macos-15
+            platform: macos
+            arch: aarch64
+            target: aarch64-macos.12.0
+            python: python3
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      PLATFORM: ${{ matrix.platform }}
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+      PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
         timeout-minutes: 10
         run: |
           # Keep Ubuntu signature verification while avoiding ubuntu.com DNS outages.
-          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+          if [[ "$ARCH" == x86_64 && -f /etc/apt/apt-mirrors.txt ]]; then
             printf '%s\n' https://mirrors.edge.kernel.org/ubuntu | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           fi
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
@@ -81,46 +134,43 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.17.0
-          cache-key: ubuntu-22.04-x86_64-gnu235
-      - name: Run local test suites
+          cache-key: ${{ matrix.target }}
+      - name: Test release validation
+        run: '"$PYTHON" -m unittest discover -s scripts -p test_release.py'
+      - name: Run complete local test suites
+        if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
         run: zig build test -Dcpu=baseline -j2
       - name: Build release executable
         run: |
-          zig build compile-app -Doptimize=ReleaseSmall -Dtarget=x86_64-linux-gnu.2.35 -Dcpu=baseline -j2
-          strip --strip-unneeded zig-out/bin/vela
-      - name: Smoke test with isolated data and software renderer
-        env:
-          SDL_VIDEODRIVER: dummy
-          SDL_AUDIODRIVER: dummy
-          SDL_RENDER_DRIVER: software
-          VELA_FONT_PATH: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
-        run: |
-          data_dir=$(mktemp -d "$RUNNER_TEMP/vela-smoke.XXXXXX")
-          status=0
-          timeout 10s zig-out/bin/vela --data-dir "$data_dir" > "$RUNNER_TEMP/vela-smoke.log" 2>&1 || status=$?
-          cat "$RUNNER_TEMP/vela-smoke.log"
-          if [[ "$status" != 124 ]]; then
-            echo "::error::Expected the launcher to stay running until timeout; got $status"
-            exit 1
+          sdk_args=()
+          if [[ "$PLATFORM" == macos ]]; then
+            sdk_args+=("-Dmacos-sdk=$(xcrun --sdk macosx --show-sdk-path)")
           fi
-      - name: Verify ELF compatibility and package
-        env:
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
-        run: python3 scripts/package-linux.py "$RELEASE_TAG"
+          zig build compile-app -Doptimize=ReleaseSmall -Dtarget="$TARGET" -Dcpu=baseline -j2 "${sdk_args[@]}"
+          if [[ "$PLATFORM" == linux ]]; then
+            strip --strip-unneeded zig-out/bin/vela
+          elif [[ "$PLATFORM" == macos ]]; then
+            strip -x zig-out/bin/vela
+          fi
+      - name: Verify native executable and package
+        run: '"$PYTHON" scripts/package-release.py "$RELEASE_TAG" --platform "$PLATFORM" --arch "$ARCH"'
+      - name: Verify extracted package startup
+        run: '"$PYTHON" scripts/smoke-release.py "$RELEASE_TAG" --platform "$PLATFORM" --arch "$ARCH"'
       - name: Upload build artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: linux-x86_64
+          name: ${{ matrix.platform }}-${{ matrix.arch }}
           path: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
           if-no-files-found: error
           retention-days: 14
 
   release:
     name: Publish GitHub Release
-    if: github.event_name == 'workflow_dispatch'
-    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: [prepare, build]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
@@ -128,26 +178,33 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: linux-x86_64
           path: dist
-      - name: Verify downloaded checksums
+          merge-multiple: true
+      - name: Verify complete release and checksums
         working-directory: dist
-        run: sha256sum --check --strict ./*.sha256
-      - name: Create draft with assets, then publish
         run: |
-          # Check again after the build; never overwrite an existing tag/release.
+          for platform in linux windows macos; do
+            extension=tar.gz
+            if [[ "$platform" == windows ]]; then extension=zip; fi
+            for arch in x86_64 aarch64; do
+              archive="vela-$RELEASE_TAG-$platform-$arch.$extension"
+              test -f "$archive"
+              test -f "$archive.sha256"
+            done
+          done
+          sha256sum --check --strict ./*.sha256
+      - name: Create draft with all assets, then publish
+        run: |
           count=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" \
             --jq "map(select(.ref == \"refs/tags/$RELEASE_TAG\")) | length")
           test "$count" = 0
           flags=()
-          if [[ "$RELEASE_TAG" == *-* ]]; then
-            flags+=(--prerelease)
-          fi
-          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 \
+          if [[ "$RELEASE_TAG" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 \
             --target "$GITHUB_SHA" --title "Vela $RELEASE_TAG" \
             --generate-notes --draft "${flags[@]}"
           gh release edit "$RELEASE_TAG" --draft=false
