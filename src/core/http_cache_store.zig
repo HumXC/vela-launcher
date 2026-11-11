@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = Io.Dir;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const fs = @import("content_fs.zig");
 
 pub const Record = struct {
     schema: u32 = 1,
@@ -159,9 +160,9 @@ pub fn save(a: Allocator, io: Io, root: []const u8, key: [32]u8, record: Record)
     std.mem.writeInt(u32, frame[8..12], @intCast(bytes.len), .little);
     std.mem.writeInt(u64, frame[12..20], @intCast(record.body.len), .little);
     Sha256.hash(bytes, frame[20..52], .{});
-    const base = try Dir.cwd().createDirPathOpen(io, root, .{ .permissions = .fromMode(0o700) });
+    const base = try Dir.cwd().createDirPathOpen(io, root, .{ .permissions = fs.privatePermissions(true) });
     defer base.close(io);
-    base.createDir(io, subdir, .fromMode(0o700)) catch |err| switch (err) {
+    base.createDir(io, subdir, fs.privatePermissions(true)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -172,7 +173,7 @@ pub fn save(a: Allocator, io: Io, root: []const u8, key: [32]u8, record: Record)
     var random: [16]u8 = undefined;
     try Io.randomSecure(io, &random);
     const temporary = (".http-" ++ std.fmt.bytesToHex(random, .lower) ++ ".tmp").*;
-    const file = try dir.createFile(io, &temporary, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    const file = try dir.createFile(io, &temporary, .{ .exclusive = true, .permissions = fs.privatePermissions(false) });
     var closed = false;
     defer if (!closed) file.close(io);
     defer dir.deleteFile(io, &temporary) catch {};

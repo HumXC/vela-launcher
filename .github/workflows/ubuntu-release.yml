@@ -119,6 +119,12 @@ jobs:
           # Keep Ubuntu signature verification while avoiding ubuntu.com DNS outages.
           if [[ "$ARCH" == x86_64 && -f /etc/apt/apt-mirrors.txt ]]; then
             printf '%s\n' https://mirrors.edge.kernel.org/ubuntu | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          elif [[ "$ARCH" == aarch64 ]]; then
+            for apt_source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+              if [[ -f "$apt_source" ]]; then
+                sudo sed -i 's|https\?://ports.ubuntu.com/ubuntu-ports|https://mirrors.dotsrc.org/ubuntu-ports|g' "$apt_source"
+              fi
+            done
           fi
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update

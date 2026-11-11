@@ -23,7 +23,8 @@ def main():
     if checksum != [hashlib.sha256(archive.read_bytes()).hexdigest(), archive.name]:
         raise RuntimeError("Archive checksum mismatch")
     with tempfile.TemporaryDirectory(prefix="vela-smoke-") as temporary:
-        root = Path(temporary)
+        # macOS temporary paths can contain /var aliases; pass the canonical root.
+        root = Path(temporary).resolve()
         if args.platform == "windows":
             with zipfile.ZipFile(archive) as zipped:
                 for member in zipped.namelist():

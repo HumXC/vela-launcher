@@ -16,7 +16,8 @@ pub fn configure(easy: *c.CURL, route: *const @import("proxy_policy.zig").Route,
     if (route.username.len != 0) {
         try set(easy, c.CURLOPT_PROXYUSERNAME, route.username.ptr);
         try set(easy, c.CURLOPT_PROXYPASSWORD, route.password.ptr);
-        try set(easy, c.CURLOPT_PROXYAUTH, @as(c_long, c.CURLAUTH_ANY));
+        // CURLAUTH_ANY is an unsigned-long bitmask; preserve its bits on LLP64.
+        try set(easy, c.CURLOPT_PROXYAUTH, @as(c_long, @bitCast(@as(c_ulong, c.CURLAUTH_ANY))));
     }
     if (public_address and route.proxy.len == 0) {
         try set(easy, c.CURLOPT_OPENSOCKETFUNCTION, &public_network.openSocket);
