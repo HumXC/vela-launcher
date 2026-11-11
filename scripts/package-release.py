@@ -147,7 +147,8 @@ def package(binary, destination, tag, platform, arch):
         else:
             with tarfile.open(archive, "w:gz") as tar:
                 tar.add(directory, arcname=name)
-    checksum.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n", encoding="utf-8")
+    # GNU sha256sum interprets CR in a Windows CRLF line as part of the filename.
+    checksum.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n", encoding="utf-8", newline="\n")
     print(archive)
     print(checksum)
 

@@ -8,6 +8,7 @@
   pkg-config,
   wayland-scanner,
   glslang,
+  apple-sdk,
 }:
 let
   version = "0.1.0";
@@ -56,9 +57,12 @@ stdenv.mkDerivation {
   nativeBuildInputs = [
     zig
     pkg-config
+  ]
+  ++ lib.optionals stdenv.hostPlatform.isLinux [
     wayland-scanner
     glslang
   ]
+  ++ lib.optionals stdenv.hostPlatform.isDarwin [ apple-sdk ]
   ++ runtime.nativeBuildInputs;
   buildInputs = runtime.libraries;
   dontConfigure = true;
@@ -74,11 +78,12 @@ stdenv.mkDerivation {
     export ZIG_LOCAL_PKG_DIR=${deps}
     # Keep bundled-library defaults; the Nix sandbox provides offline isolation.
     zig build compile-app \
+      ${lib.optionalString stdenv.hostPlatform.isDarwin "-Dmacos-sdk=${apple-sdk.sdkroot} -Dtarget=${stdenv.hostPlatform.parsed.cpu.name}-macos.${stdenv.hostPlatform.darwinMinVersion}"} \
       -Doptimize=ReleaseSmall -Dcpu=baseline -j2 --prefix "$TMPDIR/vela-install"
     runHook postBuild
   '';
 
-  installPhase = runtime.install "$TMPDIR/vela-install/bin/vela";
+  installPhase = runtime.install "$TMPDIR/vela-install/bin/vela" version;
 
   # Preserve the Zig-linked ELF; the wrapper supplies its loader and libraries.
   dontPatchELF = true;
@@ -91,6 +96,8 @@ stdenv.mkDerivation {
     platforms = [
       "x86_64-linux"
       "aarch64-linux"
+      "x86_64-darwin"
+      "aarch64-darwin"
     ];
   };
 }

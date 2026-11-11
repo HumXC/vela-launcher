@@ -22,6 +22,7 @@
   wayland-scanner,
   glslang,
   writeShellScriptBin,
+  apple-sdk,
 }:
 let
   # 去除 zig 输出的 "failed command" 信息
@@ -34,6 +35,11 @@ let
     shift
 
     case "$cmd" in
+      ${lib.optionalString stdenv.hostPlatform.isDarwin ''
+        build)
+          exec ${zig}/bin/zig build -Dmacos-sdk=${apple-sdk.sdkroot} "$@"
+          ;;
+      ''}
       build|build-exe|build-lib|build-obj|test|run|translate-c)
         exec ${zig}/bin/zig "$cmd" --color on "$@" \
           2> >(sed '/failed command:/d' >&2)
@@ -53,35 +59,45 @@ let
     mv -- "$tmp" deps.nix
   '';
 in
-mkShellNoCC {
-  packages = [
-    wrap-zig
-    zig
-    zls
-    pkg-config
-    python3
-    zulu21
-    zulu25
-    wayland-scanner
-    wayland
-    glslang
-    libxkbcommon
-    zenity
-    generate-nix-deps
-  ];
-  LD_LIBRARY_PATH = lib.makeLibraryPath [
-    stdenv.cc.cc.lib
-    alsa-lib
-    dbus
-    libdecor
-    libusb1
-    libxkbcommon
-    vulkan-loader
-    wayland
-    udev
-    libglvnd
-  ];
-  shellHook = ''
-    export PATH="$PWD/zig-out/bin:$PATH"
-  '';
-}
+mkShellNoCC (
+  {
+    packages = [
+      wrap-zig
+      zig
+      zls
+      pkg-config
+      python3
+      zulu21
+      zulu25
+      generate-nix-deps
+    ]
+    ++ lib.optionals stdenv.hostPlatform.isLinux [
+      wayland-scanner
+      wayland
+      glslang
+      libxkbcommon
+      zenity
+    ]
+    ++ lib.optionals stdenv.hostPlatform.isDarwin [ apple-sdk ];
+    shellHook = ''
+      export PATH="$PWD/zig-out/bin:$PATH"
+    '';
+  }
+  // lib.optionalAttrs stdenv.hostPlatform.isLinux {
+    LD_LIBRARY_PATH = lib.makeLibraryPath [
+      stdenv.cc.cc.lib
+      alsa-lib
+      dbus
+      libdecor
+      libusb1
+      libxkbcommon
+      vulkan-loader
+      wayland
+      udev
+      libglvnd
+    ];
+  }
+  // lib.optionalAttrs stdenv.hostPlatform.isDarwin {
+    SDKROOT = apple-sdk.sdkroot;
+  }
+)

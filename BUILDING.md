@@ -44,8 +44,10 @@ macOS requires an existing SDK supplied with `-Dmacos-sdk=/absolute/MacOSX.sdk`;
 
 ## Nix packages
 
-The locked flake exposes native packages and apps for x86_64-linux and
-aarch64-linux. Nix must have the nix-command and flakes features enabled.
+The locked flake exposes native packages and apps for x86_64-linux, aarch64-linux,
+x86_64-darwin and aarch64-darwin. Darwin means macOS; aarch64-darwin is Apple Silicon.
+Nix must have the nix-command and flakes features enabled. Darwin uses a separately
+locked nixpkgs 26.05 branch because nixpkgs 26.11 removed Intel Mac support.
 
 ~~~sh
 nix build .#vela             # also the default: nix build
@@ -54,25 +56,30 @@ nix flake check              # build and isolated startup check for this system
 nix develop                 # development shell and dependency generator
 ~~~
 
-On x86_64-linux, `nix build .#vela-bin` and `nix run .#vela-bin` use the official
-v0.1.0 GitHub Release instead of compiling Zig sources. The release URL and SHA-256
-are pinned in nix/binary.nix; update both together for a new release. No ARM64
-release binary is currently available, so vela-bin is not exposed on aarch64-linux.
-The default package remains the source-built vela on both architectures.
-Both packages use nix/runtime.nix for the same runtime libraries, wrapper and
-desktop entry. `nix flake check` also builds and smoke-tests vela-bin on x86_64-linux.
+On all four systems, `nix build .#vela-bin` and `nix run .#vela-bin` use the official
+v0.1.1 GitHub Release instead of compiling Zig sources. Each platform/architecture
+has its own release URL and SHA-256 in nix/binary.nix; update all four together.
+The default remains the source-built vela. Both packages share nix/runtime.nix,
+and `nix flake check` builds and smoke-tests both variants on the current system.
 
-The result includes the launcher, a desktop entry, X11/Wayland runtime libraries,
-libsecret, and the fontconfig/zenity/xdg-utils commands. The wrapper invokes the
-Nix glibc loader with a process-local library search path, preserving the Zig ELF
-without patchelf/strip rewriting. It does not set LD_LIBRARY_PATH for Java or
-other child processes. The wrapper defaults data to
-$XDG_DATA_HOME/vela, or ~/.local/share/vela when XDG_DATA_HOME is unset. An explicit
---data-dir takes precedence over VELA_DATA_DIR and this package default.
+On Linux, the result includes a desktop entry, X11/Wayland runtime libraries,
+libsecret and fontconfig/zenity/xdg-utils. The wrapper invokes the Nix glibc loader
+with a process-local library search path, preserving Zig ELF metadata. It does not
+set LD_LIBRARY_PATH for Java or other child processes. Data defaults to
+$XDG_DATA_HOME/vela, or ~/.local/share/vela when XDG_DATA_HOME is unset.
+
+On macOS, both variants install Applications/Vela.app and bin/vela. They use native
+macOS frameworks and Keychain; Linux display libraries are not included. The source
+package builds against the pinned Nix Apple SDK inside the sandbox, without relying
+on host Xcode. The app and CLI share a wrapper that defaults data to
+$XDG_DATA_HOME/vela, or ~/Library/Application Support/vela. The Nix app bundle is
+locally assembled and is not Apple-notarized. Open it through result/Applications,
+or expose the application using your normal Nix/Home Manager app integration.
+An explicit --data-dir takes precedence over VELA_DATA_DIR and the package default.
 
 The package uses system fonts; install a suitable Chinese font through your
 normal system configuration, or pass VELA_FONT_PATH pointing to a font file.
-Persistent credentials require a running Secret Service provider. Graphics drivers
+On Linux, persistent credentials require a running Secret Service provider. Graphics drivers
 and desktop services belong to the host. A Nix package is a Nix store closure,
 not a portable standalone executable: do not copy just result/bin/vela to another
 machine. Java is not bundled, and downloaded upstream JDKs/game native libraries
@@ -90,15 +97,17 @@ both remain in the generated lock.
 After changing build.zig.zon, run nix develop --command generate-nix-deps to
 regenerate deps.nix with the pinned zon2nix generator, review the dependency diff,
 and run nix flake check. Downloads use Nix fetchers rather than Zig's HTTP client.
-The Nix package version currently follows the source manifest's 0.1.0; Ubuntu's
-manual release label does not rewrite it.
+The source package version follows the source manifest; a manual release label
+does not rewrite it. vela-bin follows the pinned official release version.
 
-The Nix packages Actions workflow builds and checks both architectures on native
-runners. The startup check runs the installed wrapper with dummy SDL video,
-software rendering, an explicit fixture font and a temporary user data directory,
-without development-shell library paths. It does not test real graphics drivers,
-Microsoft login, Secret Service interaction or Minecraft launches. The workflow
-validates packages; it does not upload a binary cache or a standalone Nix archive.
+The Nix packages Actions workflow builds and checks all four systems on native
+runners. Startup checks run the installed wrapper with dummy SDL video, software
+rendering, an explicit fixture font and a canonical temporary user data directory,
+without development-shell library paths. macOS also checks the .app entry point
+and the default Application Support directory with XDG_DATA_HOME unset. These checks
+do not test Finder integration, real graphics drivers, Microsoft login, credential
+services or Minecraft launches. The workflow validates packages; it does not upload
+a binary cache or a standalone Nix archive.
 
 ## GitHub Actions: multiplatform CI and releases
 
